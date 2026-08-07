@@ -26,6 +26,7 @@ import type * as TabLeaseRegistryModule from "../../src/browser/tabLeaseRegistry
 import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import { __test__ as targetCloseAuthorityTest } from "../../src/browser/targetCloseAuthority.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
+import { createTemporaryProfileAuthority } from "../../src/privateTempRoot.js";
 
 const logger = vi.fn<(message: string) => void>();
 
@@ -137,8 +138,12 @@ async function settleLocalOwnedTarget(options: {
     import("../../src/browser/ownedBrowserResources.js"),
     import("../../src/browser/targetCloseAuthority.js"),
   ]);
-  const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-local-target-disposition-"));
-  const profileDirectory = await captureProfileDirectoryIdentity(profileDir);
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "oracle-local-target-authority-"));
+  const temporaryProfileAuthority = await createTemporaryProfileAuthority("profile-", {
+    tempDirectory: temporaryRoot,
+  });
+  const profileDir = temporaryProfileAuthority.profileDirectory.canonicalPath;
+  const profileDirectory = temporaryProfileAuthority.profileDirectory;
   const { owner, authority } = manualOwner(profileDirectory, "close-on-last-lease");
   const generationId = "70000000-0000-4000-8000-000000000007" as const;
   const targetId = `local-${options.mode}-${options.keepBrowser ? "preserve" : "close"}`;
@@ -164,6 +169,7 @@ async function settleLocalOwnedTarget(options: {
     targetLabel: "Owned Chrome",
     userDataDir: profileDir,
     profileDirectoryIdentity: profileDirectory,
+    temporaryProfileAuthority,
     profileKind: options.usingCopiedProfile ? "copied" : "temporary",
     keepBrowser: options.keepBrowser,
     closeOwnedTargetOnComplete: !options.keepBrowser,
@@ -272,7 +278,7 @@ async function settleLocalOwnedTarget(options: {
     };
   } finally {
     localTargetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
-    await rm(profileDir, { recursive: true, force: true });
+    await rm(temporaryRoot, { recursive: true, force: true });
   }
 }
 

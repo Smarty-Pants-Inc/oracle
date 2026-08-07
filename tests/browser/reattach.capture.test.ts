@@ -1,7 +1,4 @@
 import { describe, expect, test, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
 import { resumeBrowserSession, __test__ } from "../../src/browser/reattach.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 import type { ChromeClient } from "../../src/browser/types.js";
@@ -9,6 +6,7 @@ import type { RecordedChromeTerminationOutcome } from "../../src/browser/profile
 import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import {
   authenticatedLocalTargetCleanupDeps,
+  createTemporaryProfileFixture,
   createBrowserLogger,
   physicalChromeProcessIdentity,
   withCommittedPromptEpoch,
@@ -85,7 +83,9 @@ function executorStyleGeminiRecoveryRuntime(options: {
 
 describe("resumeBrowserSession", { timeout: 15_000 }, () => {
   test("selects target and captures markdown via stubs", async () => {
-    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-reattach-profile-"));
+    const { profileDir, temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-reattach-profile-",
+    );
     const processIdentity = await physicalChromeProcessIdentity(profileDir);
     const runtime = withCommittedPromptEpoch(
       withRecoveryCleanup(
@@ -103,6 +103,8 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
           keepBrowser: false,
           closeOwnedTargetOnComplete: true,
         },
+        undefined,
+        { temporaryProfileAuthority },
       ),
     );
     const listTargets = vi.fn(
@@ -233,7 +235,7 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
     );
     expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
     expect(removeProfile).toHaveBeenCalledWith(profileDir, processIdentity.profileDirectory);
-    await rm(profileDir, { recursive: true, force: true });
+    await cleanup();
   }, 15_000);
 
   test("harvests the exact committed Gemini provider identity after DOM history shift", async () => {

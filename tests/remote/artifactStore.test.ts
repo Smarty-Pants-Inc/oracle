@@ -417,7 +417,7 @@ describe("RemoteArtifactStore", () => {
       const artifactPath = path.join(writeAuthority.artifactsDirectory, "result.txt");
       const artifact = await writeArtifact(artifactPath, Buffer.from("same-length-a"));
       await rm(artifactPath);
-      await writeFile(artifactPath, "same-length-b");
+      await writeFile(artifactPath, "same-length-a");
 
       await expect(
         artifacts.prepareRequiredArtifacts({

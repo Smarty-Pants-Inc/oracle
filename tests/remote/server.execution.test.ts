@@ -6,15 +6,14 @@ import {
   link,
   mkdir,
   mkdtemp,
-  open,
   readdir,
-  rename,
   rm,
   symlink,
   writeFile,
   readFile,
   stat,
 } from "node:fs/promises";
+import type * as FsPromises from "node:fs/promises";
 import type { RemoteServerInstance } from "../../src/remote/server.js";
 import { bootstrapRemoteManualChromeOwner } from "../../src/remote/serverLifecycle.js";
 import { createRemoteBrowserTransactionExecutor } from "../../src/remote/client.js";
@@ -569,55 +568,99 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
-  test("removes successful and partial files after multi-file materialization fails", async () => {
-    const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-scratch-partial-"));
-    const run = await serverExecutionTest.createRemoteScratchRun("run-", {
-      tempDirectory: ambient,
-    });
-    const generation = await serverExecutionTest.createRemoteScratchGeneration(run, "attachments-");
-    const files: NonNullable<
-      Parameters<typeof serverExecutionTest.materializeRemoteAttachments>[3]
-    > = [];
-    const attachments = [
-      {
-        fileName: "first.txt",
-        displayPath: "first.txt",
-        sizeBytes: 5,
-        contentBase64: Buffer.from("first").toString("base64"),
-      },
-      {
-        fileName: "second.txt",
-        displayPath: "second.txt",
-        sizeBytes: 6,
-        contentBase64: Buffer.from("second").toString("base64"),
-      },
-    ];
-    const probe = await open(path.join(generation.path, "probe"), "w");
-    const sync = vi
-      .spyOn(Object.getPrototypeOf(probe), "sync")
-      .mockResolvedValueOnce(undefined)
-      .mockRejectedValueOnce(new Error("simulated sync failure"));
-    await probe.close();
-    await rm(path.join(generation.path, "probe"));
-    try {
-      await expect(
-        serverExecutionTest.materializeRemoteAttachments(
-          attachments,
-          generation.path,
-          "attachment",
-          files,
-        ),
-      ).rejects.toThrow("Remote attachment scratch materialization failed");
-      expect(files).toHaveLength(2);
-      expect(await serverExecutionTest.removeRemoteScratchGeneration(generation, files)).toBe(true);
-      await expect(lstat(generation.path)).rejects.toMatchObject({ code: "ENOENT" });
-      await serverExecutionTest.releaseRemoteScratchRun(run, []);
-      await expect(lstat(run.path)).rejects.toMatchObject({ code: "ENOENT" });
-    } finally {
-      sync.mockRestore();
-      await rm(ambient, { recursive: true, force: true });
-    }
-  });
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "cleans partial remote scratch attachments after the second sync fails",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-scratch-partial-"));
+      const scratchRoot = path.join(root, "oracle-private");
+      const transactionStoreDir = path.join(root, "transactions");
+      const actualFs = await vi.importActual<typeof FsPromises>("node:fs/promises");
+      let scratchSyncs = 0;
+      let server: RemoteServerInstance | null = null;
+
+      vi.resetModules();
+      vi.doMock("node:fs/promises", () => ({
+        ...actualFs,
+        open: async (...args: Parameters<typeof actualFs.open>) => {
+          const handle = await actualFs.open(...args);
+          if (
+            typeof args[0] !== "string" ||
+            !["1-first.txt", "2-second.txt"].includes(path.basename(args[0]))
+          ) {
+            return handle;
+          }
+          return new Proxy(handle, {
+            get(target, property) {
+              if (property === "sync") {
+                return async () => {
+                  scratchSyncs += 1;
+                  if (scratchSyncs === 2)
+                    throw new Error("simulated second attachment sync failure");
+                  return await target.sync();
+                };
+              }
+              const value = Reflect.get(target, property, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        },
+      }));
+      // Reload after the fs mock because ESM captures the production bindings at import time.
+      const { createTestRemoteServer: createIsolatedTestRemoteServer } =
+        await import("./serverTestBuilders.js");
+      const { setOracleHomeDirOverrideForTest: setIsolatedOracleHome } =
+        await import("../../src/oracleHome.js");
+      try {
+        await mkdir(scratchRoot, { mode: 0o700 });
+        const scratchSnapshot = await readdir(scratchRoot);
+        setIsolatedOracleHome(root);
+        const runBrowser = vi.fn(async () => {
+          throw new Error("partial scratch attachment must not reach browser execution");
+        });
+        server = await createIsolatedTestRemoteServer(
+          { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
+          { transactionStoreDir, runBrowser },
+        );
+
+        const response = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${"b".repeat(64)}/run`,
+          token: "a".repeat(64),
+          body: {
+            ...remoteRunPayload(),
+            attachments: [
+              {
+                fileName: "first.txt",
+                displayPath: "first.txt",
+                sizeBytes: 5,
+                contentBase64: Buffer.from("first").toString("base64"),
+              },
+              {
+                fileName: "second.txt",
+                displayPath: "second.txt",
+                sizeBytes: 6,
+                contentBase64: Buffer.from("second").toString("base64"),
+              },
+            ],
+          },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(scratchSyncs).toBe(2);
+        expect(runBrowser).not.toHaveBeenCalled();
+        const scratchAfter = await readdir(scratchRoot);
+        expect(scratchAfter).toEqual(scratchSnapshot);
+        expect(scratchAfter).toEqual([]);
+      } finally {
+        await server?.close().catch(() => undefined);
+        setIsolatedOracleHome(null);
+        vi.doUnmock("node:fs/promises");
+        vi.resetModules();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
   test("fails before scratch descendants when Windows private authority is unavailable", async () => {
     const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-hostile-temp-"));
     const establishWindowsPrivateDirectory = vi.fn(async () => {
@@ -709,41 +752,61 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     },
   );
 
-  test("rejects and retains a substituted scratch generation", async () => {
+  test("retains a scratch generation substituted after its tracked file is unlinked", async () => {
     const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-scratch-cleanup-"));
-    const run = await serverExecutionTest.createRemoteScratchRun("run-", {
-      tempDirectory: ambient,
-    });
-    const generation = await serverExecutionTest.createRemoteScratchGeneration(run, "attachments-");
-    const attachment = {
-      fileName: "note.txt",
-      displayPath: "note.txt",
-      sizeBytes: 5,
-      contentBase64: Buffer.from("hello").toString("base64"),
-    };
+    const actualFs = await vi.importActual<typeof FsPromises>("node:fs/promises");
+    let replacementPath: string | undefined;
+
+    vi.resetModules();
+    vi.doMock("node:fs/promises", () => ({
+      ...actualFs,
+      unlink: async (...args: Parameters<typeof actualFs.unlink>) => {
+        await actualFs.unlink(...args);
+        const trackedFile = String(args[0]);
+        if (path.basename(trackedFile) !== "1-note.txt" || replacementPath) return;
+        const generationPath = path.dirname(trackedFile);
+        await actualFs.rename(generationPath, `${generationPath}-displaced`);
+        await actualFs.mkdir(generationPath, { mode: 0o700 });
+        replacementPath = generationPath;
+      },
+    }));
+    // Reload after the fs mock because ESM captures the production bindings at import time.
+    const { __test__: isolatedServerExecutionTest } =
+      await import("../../src/remote/serverExecution.js");
     try {
-      const materialized = await serverExecutionTest.materializeRemoteAttachments(
-        [attachment],
+      const run = await isolatedServerExecutionTest.createRemoteScratchRun("run-", {
+        tempDirectory: ambient,
+      });
+      const generation = await isolatedServerExecutionTest.createRemoteScratchGeneration(
+        run,
+        "attachments-",
+      );
+      const materialized = await isolatedServerExecutionTest.materializeRemoteAttachments(
+        [
+          {
+            fileName: "note.txt",
+            displayPath: "note.txt",
+            sizeBytes: 5,
+            contentBase64: Buffer.from("hello").toString("base64"),
+          },
+        ],
         generation.path,
         "attachment",
       );
-      const moved = `${generation.path}-moved`;
-      const attackerFile = path.join(generation.path, "attacker.txt");
-      await rename(generation.path, moved);
-      await mkdir(generation.path, { mode: 0o700 });
-      await writeFile(attackerFile, "attacker content");
-      await expect(serverExecutionTest.assertRemoteScratchGeneration(generation)).rejects.toThrow(
-        "Remote attachment scratch generation changed",
-      );
+
       expect(
-        await serverExecutionTest.removeRemoteScratchGeneration(generation, materialized.files),
+        await isolatedServerExecutionTest.removeRemoteScratchGeneration(
+          generation,
+          materialized.files,
+        ),
       ).toBe(false);
-      await serverExecutionTest.releaseRemoteScratchRun(run, [
-        { generation, files: materialized.files },
-      ]);
-      expect(await readFile(attackerFile, "utf8")).toBe("attacker content");
-      expect((await lstat(moved)).isDirectory()).toBe(true);
+      expect(replacementPath).toBe(generation.path);
+      expect((await lstat(replacementPath!)).isDirectory()).toBe(true);
+      expect(await readdir(replacementPath!)).toEqual([]);
+      expect((await lstat(`${generation.path}-displaced`)).isDirectory()).toBe(true);
     } finally {
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
       await rm(ambient, { recursive: true, force: true });
     }
   });

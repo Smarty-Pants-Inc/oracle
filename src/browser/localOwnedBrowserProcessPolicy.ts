@@ -1,11 +1,12 @@
 import {
+  removeTemporaryProfileAuthority,
+  type TemporaryProfileAuthority,
+} from "../privateTempRoot.js";
+import {
   releaseManualChromeOwnerEndpointAuthority,
   settleManualChromeOwner,
 } from "./manualChromeOwner.js";
-import {
-  isSafeChromeTerminationOutcome,
-  removeProfileDirectoryIfIdentityMatches,
-} from "./profileState.js";
+import { isSafeChromeTerminationOutcome } from "./profileState.js";
 import {
   retainBrowserTabLeaseTeardownAuthority,
   type BrowserTabLease,
@@ -115,6 +116,7 @@ export interface LocalOwnedBrowserProcessPolicyOptions {
   target: LocalOwnedBrowserTargetAuthority | null;
   keepBrowser: boolean;
   userDataDir: string;
+  temporaryProfileAuthority?: TemporaryProfileAuthority;
   logger: BrowserLogger;
   manualProcessErrorPrefix?: string;
   settleManualProcess?: (
@@ -216,10 +218,13 @@ export async function settleLocalOwnedBrowserProcess(
       reason: `Temporary Chrome profile authority changed after process termination: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
-  const removed = await removeProfileDirectoryIfIdentityMatches(
-    options.userDataDir,
-    chrome.processIdentity.profileDirectory,
-  ).catch(() => false);
+  if (!options.temporaryProfileAuthority) {
+    return {
+      status: "pending",
+      reason: "Exact temporary Chrome profile authority is unavailable",
+    };
+  }
+  const removed = await removeTemporaryProfileAuthority(options.temporaryProfileAuthority);
   return removed
     ? { status: "completed", disposition: "terminated" }
     : {

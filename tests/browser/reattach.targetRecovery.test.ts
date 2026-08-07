@@ -15,6 +15,7 @@ import {
 import {
   authenticatedLocalTargetCleanupDeps,
   createBrowserLogger,
+  createTemporaryProfileFixture,
   physicalChromeProcessIdentity,
   restartBoundProcessIdentity,
   syntheticChromeProcessIdentity,
@@ -26,7 +27,9 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
   const { finalizeRecoveredRuntime } = __test__;
   const stopped = { status: "stopped", pid: 1234, signal: "SIGTERM" } as const;
   test("derives the recovery lock from prompt identity and ordered cleanup authority", async () => {
-    const profileDir = path.join(os.tmpdir(), "oracle-browser-lock-identity");
+    const { profileDir, temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-browser-lock-identity-",
+    );
     const runtime = withCommittedPromptEpoch(
       withRecoveryCleanup(
         {
@@ -44,6 +47,8 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
           keepBrowser: false,
           closeOwnedTargetOnComplete: true,
         },
+        undefined,
+        { temporaryProfileAuthority },
       ),
     );
 
@@ -56,6 +61,7 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
         chromeTargetId: "new-target",
       }),
     ).toBe(await __test__.defaultRecoveryLockPath(runtime));
+    await cleanup();
   });
 
   test("does not promote endpoint metadata after the recorded Chrome generation exits", async () => {
@@ -296,7 +302,9 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
   );
 
   test("does not mutate a replacement process, endpoint, or profile during deferred teardown", async () => {
-    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-replacement-owner-"));
+    const { profileDir, temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-browser-replacement-owner-",
+    );
     const recordedIdentity = await physicalChromeProcessIdentity(profileDir, 9_107);
     const replacementIdentity = {
       ...recordedIdentity,
@@ -320,6 +328,8 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
             profileKind: "temporary",
             keepBrowser: false,
           },
+          undefined,
+          { temporaryProfileAuthority },
         ),
         createBrowserLogger(),
         {
@@ -346,7 +356,7 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
       expect(closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
       expect(removeProfile).not.toHaveBeenCalled();
     } finally {
-      await rm(profileDir, { recursive: true, force: true });
+      await cleanup();
     }
   });
   test("preserves pre-upgrade target authority without endpoint reconstruction", async () => {
@@ -491,7 +501,9 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
   });
 
   test("settles interrupted temporary target acquisition through exact process teardown", async () => {
-    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-interrupted-target-"));
+    const { profileDir, temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-browser-interrupted-target-",
+    );
     const processIdentity = await physicalChromeProcessIdentity(profileDir, 9_112);
     const events: string[] = [];
     const closeRetainedTarget = vi.fn();
@@ -522,6 +534,7 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
       },
       undefined,
       {
+        temporaryProfileAuthority,
         acquisition: {
           generationId: "interrupted-project-sources",
           pendingResource: "chrome-target",
@@ -543,12 +556,14 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
       expect(cleanupDeps.closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
       expect(events).toEqual(["process-kill", "profile-remove", "endpoint-release"]);
     } finally {
-      await rm(profileDir, { recursive: true, force: true });
+      await cleanup();
     }
   });
 
   test("subsumes stale target capability through exact temporary Chrome teardown after restart", async () => {
-    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-restart-settlement-"));
+    const { profileDir, temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-browser-restart-settlement-",
+    );
     const processIdentity = await physicalChromeProcessIdentity(profileDir, 9_110);
     const events: string[] = [];
     const closeRetainedTarget = vi.fn(closeChromeTargetWithRetainedCapability);
@@ -579,6 +594,8 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
         keepBrowser: false,
         closeOwnedTargetOnComplete: true,
       },
+      undefined,
+      { temporaryProfileAuthority },
     );
 
     try {
@@ -603,7 +620,7 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
       ).resolves.toMatchObject({ status: "completed" });
       expect(events).toHaveLength(3);
     } finally {
-      await rm(profileDir, { recursive: true, force: true });
+      await cleanup();
     }
   });
 
@@ -614,7 +631,13 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
   ] as const)(
     "does not subsume unavailable target cleanup by tearing down $name Chrome",
     async ({ profileKind, keepBrowser }) => {
-      const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-preserved-restart-"));
+      const temporaryFixture =
+        profileKind === "temporary"
+          ? await createTemporaryProfileFixture("oracle-browser-preserved-restart-")
+          : null;
+      const profileDir =
+        temporaryFixture?.profileDir ??
+        (await mkdtemp(path.join(os.tmpdir(), "oracle-browser-preserved-restart-")));
       const processIdentity = await physicalChromeProcessIdentity(profileDir, 9_111);
       const terminateExactChromeForProfile = vi.fn(async () => stopped);
       try {
@@ -634,6 +657,10 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
               keepBrowser,
               closeOwnedTargetOnComplete: true,
             },
+            undefined,
+            temporaryFixture
+              ? { temporaryProfileAuthority: temporaryFixture.temporaryProfileAuthority }
+              : {},
           ),
           createBrowserLogger(),
           {
@@ -648,13 +675,16 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
         });
         expect(terminateExactChromeForProfile).not.toHaveBeenCalled();
       } finally {
-        await rm(profileDir, { recursive: true, force: true });
+        if (temporaryFixture) await temporaryFixture.cleanup();
+        else await rm(profileDir, { recursive: true, force: true });
       }
     },
   );
 
   test("treats an already-absent contained temporary profile as complete", async () => {
-    const profileDir = path.join(os.tmpdir(), "oracle-browser-already-absent-cleanup");
+    const { profileDir, temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-browser-already-absent-cleanup-",
+    );
     await rm(profileDir, { recursive: true, force: true });
     const terminateRecordedChromeForProfile = vi.fn(async () => stopped);
     const removeProfile = vi.fn(async () => true);
@@ -667,6 +697,8 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
           profileKind: "temporary",
           keepBrowser: false,
         },
+        undefined,
+        { temporaryProfileAuthority },
       ),
       createBrowserLogger(),
       { terminateRecordedChromeForProfile, removeProfile },
@@ -675,12 +707,15 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
     expect(result.status).toBe("completed");
     expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
     expect(removeProfile).not.toHaveBeenCalled();
+    await cleanup();
   });
 
   test("does not treat an absent profile as proof that an exact Chrome generation stopped", async () => {
-    const profileDir = path.join(os.tmpdir(), "oracle-browser-absent-live-generation");
+    const { profileDir, temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-browser-absent-live-generation-",
+    );
+    const processIdentity = await physicalChromeProcessIdentity(profileDir, 9_109);
     await rm(profileDir, { recursive: true, force: true });
-    const processIdentity = syntheticChromeProcessIdentity(profileDir, 9_109);
     const retainChromeEndpointAuthority = vi.fn();
     const removeProfile = vi.fn(async () => true);
 
@@ -692,6 +727,8 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
           profileKind: "temporary",
           keepBrowser: false,
         },
+        undefined,
+        { temporaryProfileAuthority },
       ),
       createBrowserLogger(),
       {
@@ -707,14 +744,14 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
     });
     expect(retainChromeEndpointAuthority).not.toHaveBeenCalled();
     expect(removeProfile).not.toHaveBeenCalled();
+    await cleanup();
   });
 
   test("removes an exact temporary profile even when no process was launched", async () => {
-    const profileDir = await mkdtemp(
-      path.join(os.tmpdir(), "oracle-browser-missing-process-identity-"),
+    const { profileDir, temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-browser-missing-process-identity-",
     );
-    const profileDirectoryIdentity = (await physicalChromeProcessIdentity(profileDir))
-      .profileDirectory;
+    const profileDirectoryIdentity = temporaryProfileAuthority.profileDirectory;
     const removeProfile = vi.fn(async () => true);
     try {
       const result = await finalizeRecoveredRuntime(
@@ -724,6 +761,7 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
             {
               userDataDir: profileDir,
               profileDirectoryIdentity,
+              temporaryProfileAuthority,
               recoveryCleanup: {
                 ownsTarget: false,
                 profileKind: "temporary",
@@ -739,12 +777,14 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
       expect(result.status).toBe("completed");
       expect(removeProfile).toHaveBeenCalledWith(profileDir, profileDirectoryIdentity);
     } finally {
-      await rm(profileDir, { recursive: true, force: true });
+      await cleanup();
     }
   });
 
   test("preserves cleanup when persisted process identity lacks physical profile authority", async () => {
-    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-legacy-identity-"));
+    const { profileDir, temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-browser-legacy-identity-",
+    );
     const legacyIdentity = {
       pid: 1234,
       processStartTime: "legacy-process-generation",
@@ -762,6 +802,8 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
         profileKind: "temporary",
         keepBrowser: false,
       },
+      undefined,
+      { temporaryProfileAuthority },
     );
     const terminateRecordedChromeForProfile = vi.fn(async () => stopped);
     try {
@@ -784,13 +826,15 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
       });
       expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
     } finally {
-      await rm(profileDir, { recursive: true, force: true });
+      await cleanup();
     }
   });
 
   test("preserves destructive cleanup for a legacy profile identity version", async () => {
-    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-legacy-profile-v1-"));
-    const current = await captureProfileDirectoryIdentity(profileDir);
+    const { profileDir, temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-browser-legacy-profile-v1-",
+    );
+    const current = temporaryProfileAuthority.profileDirectory;
     const legacyProfile = { ...current, version: 1 } as unknown as typeof current;
     const removeProfile = vi.fn(async () => true);
     try {
@@ -801,6 +845,7 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
             {
               userDataDir: profileDir,
               profileDirectoryIdentity: legacyProfile,
+              temporaryProfileAuthority,
               recoveryCleanup: {
                 ownsTarget: false,
                 profileKind: "temporary",
@@ -822,7 +867,7 @@ describe("recovery target authority", { timeout: 15_000 }, () => {
       expect(removeProfile).not.toHaveBeenCalled();
       await expect(captureProfileDirectoryIdentity(profileDir)).resolves.toEqual(current);
     } finally {
-      await rm(profileDir, { recursive: true, force: true });
+      await cleanup();
     }
   });
 

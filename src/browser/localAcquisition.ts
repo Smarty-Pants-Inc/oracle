@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, mkdir } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { BrowserAutomationError } from "../oracle/errors.js";
+import { createTemporaryProfileAuthority } from "../privateTempRoot.js";
 import { launchChrome, type ChromeLaunchResult } from "./chromeLifecycle.js";
-import { resolveUserDataBaseDir } from "./localExecutionContext.js";
 import { acquireManualChromeOwner } from "./manualChromeOwner.js";
 import {
   assertManualLoginProfileReadyForRun,
@@ -66,9 +66,10 @@ export async function acquireLocalBrowserResources({
   const manualProfileDir = config.manualLoginProfileDir
     ? path.resolve(config.manualLoginProfileDir)
     : defaultManualLoginProfileDir();
-  const userDataDir = manualLogin
-    ? manualProfileDir
-    : await mkdtemp(path.join(await resolveUserDataBaseDir(), "oracle-browser-"));
+  const temporaryProfileAuthority = manualLogin
+    ? undefined
+    : await createTemporaryProfileAuthority("oracle-browser-");
+  const userDataDir = temporaryProfileAuthority?.profileDirectory.canonicalPath ?? manualProfileDir;
   const effectiveKeepBrowser = Boolean(config.keepBrowser);
   const generationId = randomUUID();
   const resourceOwnerId = options.sessionId?.trim() || randomUUID();
@@ -91,13 +92,16 @@ export async function acquireLocalBrowserResources({
       });
     }
 
-    const profileDirectoryIdentity = await captureProfileDirectoryIdentity(userDataDir);
+    const profileDirectoryIdentity = temporaryProfileAuthority
+      ? temporaryProfileAuthority.profileDirectory
+      : await captureProfileDirectoryIdentity(userDataDir);
     resourceAuthority = new LocalOwnedBrowserResourceAuthority({
       ownerId: resourceOwnerId,
       purpose: "Local ChatGPT",
       targetLabel: "Owned Chrome",
       userDataDir,
       profileDirectoryIdentity,
+      ...(temporaryProfileAuthority ? { temporaryProfileAuthority } : {}),
       profileKind: manualLogin ? "manual-login" : usingCopiedProfile ? "copied" : "temporary",
       keepBrowser: effectiveKeepBrowser,
       closeOwnedTargetOnComplete: true,

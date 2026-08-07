@@ -22,6 +22,7 @@ import { createReattachSettlement } from "../../src/browser/reattachSettlement.j
 import {
   authenticatedLocalTargetCleanupDeps,
   createBrowserLogger,
+  createTemporaryProfileFixture,
   syntheticChromeProcessIdentity,
   withCommittedPromptEpoch,
   withRecoveryCleanup,
@@ -431,7 +432,10 @@ describe("recovery settlement retries", { timeout: 15_000 }, () => {
     expect(acquireRecoveryLock).toHaveBeenCalledOnce();
   });
 
-  test("rejects serialized temporary profiles outside approved runtime roots", async () => {
+  test("rejects serialized temporary profile paths outside their exact authority", async () => {
+    const { temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-outside-runtime-authority-",
+    );
     const terminateRecordedChromeForProfile = vi.fn(async () => stopped);
     const result = await finalizeRecoveredRuntime(
       withRecoveryCleanup(
@@ -447,16 +451,25 @@ describe("recovery settlement retries", { timeout: 15_000 }, () => {
           profileKind: "temporary",
           keepBrowser: false,
         },
+        undefined,
+        { temporaryProfileAuthority },
       ),
       createBrowserLogger(),
       { terminateRecordedChromeForProfile },
     );
 
-    expect(result).toMatchObject({ status: "pending", error: expect.stringMatching(/outside/) });
+    expect(result).toMatchObject({
+      status: "pending",
+      error: expect.stringMatching(/persisted authority/i),
+    });
     expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
+    await cleanup();
   });
 
   test("rejects noncanonical temporary profile paths before termination", async () => {
+    const { temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-noncanonical-runtime-authority-",
+    );
     const terminateRecordedChromeForProfile = vi.fn(async () => stopped);
     const profileDir = `${path.join(os.tmpdir(), "oracle-browser-parent")}${path.sep}..${path.sep}oracle-browser-traversal`;
     const result = await finalizeRecoveredRuntime(
@@ -467,6 +480,8 @@ describe("recovery settlement retries", { timeout: 15_000 }, () => {
           profileKind: "temporary",
           keepBrowser: false,
         },
+        undefined,
+        { temporaryProfileAuthority },
       ),
       createBrowserLogger(),
       { terminateRecordedChromeForProfile },
@@ -474,6 +489,7 @@ describe("recovery settlement retries", { timeout: 15_000 }, () => {
 
     expect(result).toMatchObject({ status: "pending", error: expect.stringMatching(/canonical/) });
     expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
+    await cleanup();
   });
 
   test("serializes concurrent recovery for one session", async () => {
@@ -545,16 +561,21 @@ describe("recovery settlement retries", { timeout: 15_000 }, () => {
   });
 
   test("does not finalize resources after failed fallback recovery", async () => {
+    const { profileDir, temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-browser-failed-recovery-",
+    );
     const terminateRecordedChromeForProfile = vi.fn(async () => stopped);
     const removeProfile = vi.fn(async () => true);
     const runtime = withCommittedPromptEpoch(
       withRecoveryCleanup(
-        { chromePort: 9222, userDataDir: path.join(os.tmpdir(), "oracle-browser-failed-recovery") },
+        { chromePort: 9222, userDataDir: profileDir },
         {
           ownsTarget: false,
           profileKind: "temporary",
           keepBrowser: false,
         },
+        undefined,
+        { temporaryProfileAuthority },
       ),
     );
 
@@ -571,5 +592,6 @@ describe("recovery settlement retries", { timeout: 15_000 }, () => {
     ).rejects.toThrow("fallback capture failed");
     expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
     expect(removeProfile).not.toHaveBeenCalled();
+    await cleanup();
   });
 });

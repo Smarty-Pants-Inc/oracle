@@ -12,16 +12,16 @@ import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 import type { BrowserRecoveryCleanupResourceMetadata } from "../../src/sessionManager.js";
 import type { BrowserLogger, ChromeClient } from "../../src/browser/types.js";
 import {
-  captureProfileDirectoryIdentity,
   readOracleChromeOwner,
   writeOracleChromeOwner,
   type OracleChromeOwnerRecord,
 } from "../../src/browser/profileState.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
-import { createPrivateTempGeneration } from "../../src/privateTempRoot.js";
+import { createTemporaryProfileAuthority } from "../../src/privateTempRoot.js";
 import {
   authenticatedLocalTargetCleanupDeps,
   createBrowserLogger,
+  createTemporaryProfileFixture,
   physicalChromeProcessIdentity,
   resumeFallbackWithManualOwner,
   withCommittedPromptEpoch,
@@ -242,7 +242,7 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
 
     await expect(
       resumeBrowserSession(runtime, { manualLogin: false, headless: true }, createBrowserLogger(), {
-        createPrivateTempGeneration: establishProfile,
+        createTemporaryProfileAuthority: establishProfile,
         launchChrome,
         acquireRecoveryLock: vi.fn(async () => ({
           release: vi.fn(async (finalize?: () => Promise<void>) => await finalize?.()),
@@ -259,7 +259,7 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
     const runtime = withCommittedPromptEpoch({ tabUrl: "https://chatgpt.com/c/private-profile" });
     const acquisitionError = new Error("stop after private profile proof");
     const establishProfile = vi.fn((prefix: string) =>
-      createPrivateTempGeneration(prefix, { tempDirectory: ambient }),
+      createTemporaryProfileAuthority(prefix, { tempDirectory: ambient }),
     );
     const kill = vi.fn(async () => ({
       status: "stopped" as const,
@@ -286,10 +286,6 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
         kill,
       };
     });
-    const removeProfile = vi.fn(async (profilePath: string) => {
-      await rm(profilePath, { recursive: true, force: true });
-      return true;
-    });
     try {
       await expect(
         resumeBrowserSession(
@@ -297,7 +293,7 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
           { manualLogin: false, headless: true },
           createBrowserLogger(),
           {
-            createPrivateTempGeneration: establishProfile,
+            createTemporaryProfileAuthority: establishProfile,
             launchChrome: launchChrome as never,
             connectRecoveryTargetWithExactAuthority: vi.fn(async () => {
               throw acquisitionError;
@@ -305,14 +301,15 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
             acquireRecoveryLock: vi.fn(async () => ({
               release: vi.fn(async (finalize?: () => Promise<void>) => await finalize?.()),
             })),
-            recoveryCleanup: { removeProfile },
           },
         ),
       ).rejects.toBe(acquisitionError);
       expect(establishProfile).toHaveBeenCalledWith("oracle-reattach-");
       expect(launchChrome).toHaveBeenCalledOnce();
       expect(kill).toHaveBeenCalledOnce();
-      expect(removeProfile).toHaveBeenCalledOnce();
+      await expect(stat(launchChrome.mock.calls[0]?.[1] as string)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
     } finally {
       await rm(ambient, { recursive: true, force: true });
     }
@@ -589,11 +586,14 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
   });
 
   test("keeps a pre-owner launch acquisition pending when its durable claim is missing", async () => {
-    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-launch-claim-missing-"));
+    const { profileDir, temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-launch-claim-missing-",
+    );
     try {
-      const profileDirectoryIdentity = await captureProfileDirectoryIdentity(profileDir);
+      const profileDirectoryIdentity = temporaryProfileAuthority.profileDirectory;
       const resource: BrowserRecoveryCleanupResourceMetadata = {
         profileDirectoryIdentity,
+        temporaryProfileAuthority,
         chromeHost: "127.0.0.1",
         chromeProfileRoot: profileDir,
         userDataDir: profileDir,
@@ -632,7 +632,7 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
       });
       expect(inspectRunningChromeProcessesForLaunchClaim).not.toHaveBeenCalled();
     } finally {
-      await rm(profileDir, { recursive: true, force: true });
+      await cleanup();
     }
   });
 
@@ -745,8 +745,8 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
   });
 
   test("does not overwrite a replacement owner published before recovery promotion acquires the profile lock", async () => {
-    const profileDir = await mkdtemp(
-      path.join(os.tmpdir(), "oracle-browser-owner-promotion-race-"),
+    const { profileDir, temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-browser-owner-promotion-race-",
     );
     try {
       const launchClaim = {
@@ -759,7 +759,7 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
         generationId: "b0000000-0000-4000-8000-00000000000b",
         nonce: "b1000000-0000-4000-8000-00000000000b",
       };
-      const profileDirectory = await captureProfileDirectoryIdentity(profileDir);
+      const profileDirectory = temporaryProfileAuthority.profileDirectory;
       const replacementOwner = {
         port: 9_223,
         processIdentity: {
@@ -791,6 +791,7 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
         chromeProfileRoot: profileDir,
         userDataDir: profileDir,
         profileDirectoryIdentity: profileDirectory,
+        temporaryProfileAuthority,
         acquisition: {
           generationId: launchClaim.generationId,
           pendingResource: "chrome-process",
@@ -832,14 +833,16 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
       expect(writeOracleChromeOwner).not.toHaveBeenCalled();
       expect(releasePromotionLock).toHaveBeenCalledOnce();
     } finally {
-      await rm(profileDir, { recursive: true, force: true });
+      await cleanup();
     }
   });
 
   test("converges when the exact claimed Chrome generation is already gone", async () => {
-    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-reattach-claim-gone-"));
+    const { profileDir, temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-reattach-claim-gone-",
+    );
     try {
-      const profileDirectoryIdentity = await captureProfileDirectoryIdentity(profileDir);
+      const profileDirectoryIdentity = temporaryProfileAuthority.profileDirectory;
       const launchClaim = {
         version: 1 as const,
         generationId: "80000000-0000-4000-8000-000000000008",
@@ -847,6 +850,7 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
       };
       const resource: BrowserRecoveryCleanupResourceMetadata = {
         profileDirectoryIdentity,
+        temporaryProfileAuthority,
         chromeHost: "127.0.0.1",
         chromeProfileRoot: profileDir,
         userDataDir: profileDir,
@@ -891,7 +895,7 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
       expect(recovery.runtime.recoveryCleanupResources).toBeUndefined();
       expect(removeProfile).toHaveBeenCalledWith(profileDir, profileDirectoryIdentity);
     } finally {
-      await rm(profileDir, { recursive: true, force: true });
+      await cleanup();
     }
   });
 
@@ -913,9 +917,11 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
       /multiple process generations/i,
     ],
   ] as const)("fails closed when launch recovery finds %s", async (_label, discovery, error) => {
-    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-launch-claim-conflict-"));
+    const { profileDir, temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-launch-claim-conflict-",
+    );
     try {
-      const profileDirectoryIdentity = await captureProfileDirectoryIdentity(profileDir);
+      const profileDirectoryIdentity = temporaryProfileAuthority.profileDirectory;
       const launchClaim = {
         version: 1 as const,
         generationId: "80000000-0000-4000-8000-000000000008",
@@ -923,6 +929,7 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
       };
       const resource: BrowserRecoveryCleanupResourceMetadata = {
         profileDirectoryIdentity,
+        temporaryProfileAuthority,
         chromeHost: "127.0.0.1",
         chromeProfileRoot: profileDir,
         userDataDir: profileDir,
@@ -970,7 +977,7 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
       expect(captureChromeProcessIdentity).not.toHaveBeenCalled();
       expect(writeOracleChromeOwner).not.toHaveBeenCalled();
     } finally {
-      await rm(profileDir, { recursive: true, force: true });
+      await cleanup();
     }
   });
 });

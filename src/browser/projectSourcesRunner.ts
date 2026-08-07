@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
-import { createPrivateTempChildGeneration } from "../privateTempRoot.js";
+import { createTemporaryProfileChildAuthority } from "../privateTempRoot.js";
 import {
   closeChromeTargetWithExactAuthority,
   connectWithNewTabWithExactAuthority,
@@ -164,12 +164,12 @@ async function runBrowserProjectSourcesUnlocked(
       profileCreate: profileCreateIntent,
     });
     await assertProjectSourcesProfileParent(profileCreateIntent, cleanupStorage);
-    const privateGeneration = await createPrivateTempChildGeneration(
+    const temporaryProfileAuthority = await createTemporaryProfileChildAuthority(
       cleanupStorage.runtimeRoot,
       "oracle-browser-",
       { randomId: () => targetGenerationId },
     );
-    const establishedIntent = { ...profileCreateIntent, privateGeneration };
+    const establishedIntent = { ...profileCreateIntent, temporaryProfileAuthority };
     await assertProjectSourcesProfileParent(establishedIntent, cleanupStorage);
     await persistProjectSourcesCleanupRuntime({}, cleanupStorage, {
       profileCreate: establishedIntent,
@@ -224,6 +224,9 @@ async function runBrowserProjectSourcesUnlocked(
     targetLabel: "Project Sources",
     userDataDir,
     profileDirectoryIdentity,
+    ...(cleanupProof.kind === "temporary"
+      ? { temporaryProfileAuthority: cleanupProof.temporaryProfileAuthority }
+      : {}),
     profileKind: manualLogin ? "manual-login" : "temporary",
     keepBrowser: effectiveKeepBrowser,
     closeOwnedTargetOnComplete: !effectiveKeepBrowser,

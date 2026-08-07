@@ -5,10 +5,18 @@ import type {
   BrowserRecoveryTargetCloseCapabilityMetadata,
   BrowserRuntimeMetadata,
 } from "../sessionManager.js";
+import {
+  parseTemporaryProfileAuthority,
+  type TemporaryProfileAuthority,
+} from "../privateTempRoot.js";
 import type { ChromeLaunchResult, RetainedChromeEndpointAuthority } from "./chromeLifecycle.js";
 import type { ChromeProcessLaunchClaim } from "./chromeProcessLaunchClaim.js";
 import type { ManualChromeOwner } from "./manualChromeOwner.js";
-import type { ChromeOwnerDisposition, ProfileDirectoryIdentity } from "./profileState.js";
+import {
+  sameProfileDirectoryIdentity,
+  type ChromeOwnerDisposition,
+  type ProfileDirectoryIdentity,
+} from "./profileState.js";
 import type { BrowserTabLease, BrowserTabLeaseReleaseOptions } from "./tabLeaseRegistry.js";
 import type { BrowserCaptureFinalizationResult, BrowserLogger } from "./types.js";
 import type { BrowserCaptureSettlementMode } from "./ownedBrowserResourceTransaction.js";
@@ -73,6 +81,7 @@ export interface LocalOwnedBrowserResourceAuthorityOptions {
   baseRuntime?: BrowserRuntimeMetadata;
   userDataDir: string;
   profileDirectoryIdentity: ProfileDirectoryIdentity;
+  temporaryProfileAuthority?: TemporaryProfileAuthority;
   profileKind: BrowserRecoveryProfileKind;
   keepBrowser: boolean;
   closeOwnedTargetOnComplete: boolean;
@@ -181,11 +190,34 @@ export class LocalOwnedBrowserResourceStateOwner {
     if (!generationId) {
       throw new Error("Local browser resource authority requires an acquisition generation.");
     }
+    const requiresTemporaryProfileAuthority =
+      options.profileKind === "temporary" || options.profileKind === "copied";
+    const temporaryProfileAuthority = options.temporaryProfileAuthority
+      ? parseTemporaryProfileAuthority(options.temporaryProfileAuthority)
+      : null;
+    if (requiresTemporaryProfileAuthority !== Boolean(temporaryProfileAuthority)) {
+      throw new Error(
+        requiresTemporaryProfileAuthority
+          ? "Temporary browser resources require exact temporary-profile authority."
+          : "Persistent browser resources cannot carry temporary-profile authority.",
+      );
+    }
+    if (
+      temporaryProfileAuthority &&
+      (temporaryProfileAuthority.profileDirectory.canonicalPath !== options.userDataDir ||
+        !sameProfileDirectoryIdentity(
+          temporaryProfileAuthority.profileDirectory,
+          options.profileDirectoryIdentity,
+        ))
+    ) {
+      throw new Error("Temporary browser profile metadata does not match its exact authority.");
+    }
     this.options = Object.freeze({
       ...options,
       ownerId: this.ownerId,
       generationId,
       profileDirectoryIdentity: Object.freeze({ ...options.profileDirectoryIdentity }),
+      ...(temporaryProfileAuthority ? { temporaryProfileAuthority } : {}),
       processLaunchClaim: Object.freeze({ ...options.processLaunchClaim }),
     });
     this.baseRuntime = this.options.baseRuntime ?? {};
@@ -414,6 +446,7 @@ export class LocalOwnedBrowserResourceStateOwner {
           processIdentity?.profileDirectory ??
           lease?.profileDirectory ??
           this.options.profileDirectoryIdentity,
+        temporaryProfileAuthority: this.options.temporaryProfileAuthority,
         chromePort: targetEndpoint?.chromePort ?? chrome?.port,
         chromeHost: targetEndpoint?.chromeHost ?? chrome?.host ?? "127.0.0.1",
         chromeBrowserWSEndpoint:

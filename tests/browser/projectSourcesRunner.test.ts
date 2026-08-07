@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { expect, test, vi } from "vitest";
 import type * as PrivateTempRootModule from "../../src/privateTempRoot.js";
+import { captureProfileDirectoryIdentity } from "../../src/browser/profileDirectoryAuthority.js";
 
 const { generationBAttachTarget, generationBCloseTarget, generationBCreateTarget } = vi.hoisted(
   () => ({
@@ -67,19 +68,27 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     const actual = await vi.importActual<typeof PrivateTempRootModule>(
       "../../src/privateTempRoot.js",
     );
+    mocks.removeProfile.mockImplementation((authority) =>
+      actual.removeTemporaryProfileAuthority(authority),
+    );
     return {
       ...actual,
       establishPrivateRuntimeAuthority: () =>
         actual.establishPrivateRuntimeAuthority({ tempDirectory: temporaryBase }),
-      createPrivateTempChildGeneration: async (
+      createTemporaryProfileChildAuthority: async (
         parent: PrivateTempRootModule.PrivateDirectoryAuthority,
         prefix: string,
         options?: PrivateTempRootModule.PrivateTempRootOptions,
       ) => {
-        const generation = await actual.createPrivateTempChildGeneration(parent, prefix, options);
-        await mocks.afterPrivateGeneration(generation);
-        return generation;
+        const authority = await actual.createTemporaryProfileChildAuthority(
+          parent,
+          prefix,
+          options,
+        );
+        await mocks.afterPrivateGeneration(authority.generation);
+        return authority;
       },
+      removeTemporaryProfileAuthority: mocks.removeProfile,
     };
   });
   vi.doMock("../../src/browser/config.js", () => ({
@@ -128,21 +137,9 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     );
     return {
       ...actual,
-      captureProfileDirectoryIdentity: vi.fn(
-        async (directory: string, options?: { create?: boolean }) =>
-          path.basename(directory).startsWith("oracle-browser-")
-            ? {
-                version: 2 as const,
-                platform: process.platform,
-                canonicalPath: path.resolve(directory),
-                device: "1",
-                inode: "1",
-                birthtimeNs: "3",
-              }
-            : actual.captureProfileDirectoryIdentity(directory, options),
-      ),
+      captureProfileDirectoryIdentity: actual.captureProfileDirectoryIdentity,
       isSafeChromeTerminationOutcome: vi.fn(() => true),
-      removeProfileDirectoryIfIdentityMatches: mocks.removeProfile,
+      removeProfileDirectoryIfIdentityMatches: actual.removeProfileDirectoryIfIdentityMatches,
     };
   });
 
@@ -206,7 +203,6 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     });
     mocks.closeTarget.mockResolvedValue({ status: "completed" });
     mocks.acquireLock.mockResolvedValue({ release: vi.fn(async () => undefined) });
-    mocks.removeProfile.mockResolvedValue(true);
     mocks.connectTarget.mockImplementation(async () => ({
       client: {
         close: vi.fn(async () => undefined),
@@ -241,14 +237,7 @@ test("persists and resolves Project Sources cleanup while discarding successful 
       port: 9222,
       pid: 1,
       processIdentity: {
-        profileDirectory: {
-          version: 2,
-          platform: process.platform,
-          canonicalPath: path.resolve(profileDir),
-          device: "1",
-          inode: "1",
-          birthtimeNs: "3",
-        },
+        profileDirectory: await captureProfileDirectoryIdentity(profileDir),
         launchClaim: options?.launchClaim,
       },
       endpointAuthority: {

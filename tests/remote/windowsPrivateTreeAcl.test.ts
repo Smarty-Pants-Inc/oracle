@@ -11,10 +11,14 @@ import { remoteTransactionHeadDirectory } from "../../src/remote/transactionStor
 import {
   buildWindowsPrivateDirectoriesCommand,
   buildWindowsPrivateDirectoryCommand,
+  buildWindowsPrivateFileInitializationCommand,
+  buildWindowsPrivateFileVerificationCommand,
   buildWindowsPrivateTreeAclCommand,
   establishWindowsPrivateDirectories,
   establishWindowsPrivateDirectory,
+  initializeWindowsPrivateFile,
   protectWindowsPrivateTreeAcl,
+  verifyWindowsPrivateFile,
   type WindowsPrivateTreeScope,
 } from "../../src/remote/windowsPrivateTreeAcl.js";
 import { resolveWindowsPowerShellExecutable } from "../../src/windowsSystemExecutable.js";
@@ -135,6 +139,37 @@ describe("Windows remote transaction private ACL authority", () => {
     expect([
       ...decodedCommand.matchAll(/\[System\.Convert\]::FromBase64String\('([A-Za-z0-9+/=]+)'\)/g),
     ]).toHaveLength(2);
+  });
+
+  test("creates or verifies one private file through exact native completion markers", async () => {
+    const filePath = String.raw`C:\Users\Oracle\.oracle\sessions\remote\artifacts\result.bin`;
+    const create = vi.fn(async () => ({ stdout: "oracle.windows-private-file.v1:created" }));
+    const exists = vi.fn(async () => ({ stdout: "oracle.windows-private-file.v1:exists" }));
+    const verify = vi.fn(async () => ({ stdout: "oracle.windows-private-file.v1:verified" }));
+
+    await expect(initializeWindowsPrivateFile(filePath, create)).resolves.toBe(true);
+    await expect(initializeWindowsPrivateFile(filePath, exists)).resolves.toBe(false);
+    await expect(verifyWindowsPrivateFile(filePath, verify)).resolves.toBeUndefined();
+
+    const createCommand = buildWindowsPrivateFileInitializationCommand(filePath);
+    const verifyCommand = buildWindowsPrivateFileVerificationCommand(filePath);
+    const decodedCreate = Buffer.from(createCommand.args.at(-1) ?? "", "base64").toString(
+      "utf16le",
+    );
+    const decodedVerify = Buffer.from(verifyCommand.args.at(-1) ?? "", "base64").toString(
+      "utf16le",
+    );
+    expect(create).toHaveBeenCalledWith(
+      createCommand.file,
+      createCommand.args,
+      createCommand.options,
+    );
+    expect(decodedCreate).toContain("New-PrivateFile $FilePath");
+    expect(decodedCreate).toContain("Assert-PrivateAcl (Get-PhysicalItem $ParentPath $true) $true");
+    expect(decodedCreate).not.toContain(".SetAccessControl(");
+    expect(decodedVerify).toContain("Assert-PrivateAcl (Get-PhysicalItem $FilePath $false) $false");
+    expect(createCommand.args.join("\0")).not.toContain(filePath);
+    expect(verifyCommand.args.join("\0")).not.toContain(filePath);
   });
 
   test("accepts an explicitly injected filesystem-only authority for simulated Windows", async () => {

@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
-import { lstat, mkdir, open, rename, rm, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, rename, rm, unlink, type FileHandle } from "node:fs/promises";
 import type { BrowserRunOptions, BrowserRunResult } from "../browserMode.js";
 import type { SavedBrowserFile } from "../browser/types.js";
 import {
@@ -24,6 +24,11 @@ import {
   type ResolvedRemoteTransportDeadlines,
 } from "./clientTransport.js";
 import { assertRemoteTransactionToken } from "./transactionToken.js";
+import {
+  establishWindowsPrivateDirectories,
+  initializeWindowsPrivateFile,
+  verifyWindowsPrivateFile,
+} from "./windowsPrivateTreeAcl.js";
 
 interface ArtifactFileIdentity {
   dev: number;
@@ -53,7 +58,7 @@ export async function transferRemoteArtifact(params: {
   RemoteArtifactDescriptorSchema.parse(params.descriptor);
   assertRemoteTransactionToken(params.transactionToken);
   const artifactsDir = resolveSessionArtifactsDir(params.sessionId);
-  await mkdir(artifactsDir, { recursive: true });
+  await establishArtifactDestinationDirectories(artifactsDir);
   await syncDirectory(path.dirname(artifactsDir));
   const sourceFilename = sanitizeArtifactFilename(
     params.descriptor.filename,
@@ -86,7 +91,7 @@ export async function transferRemoteArtifact(params: {
   } else {
     await rm(partPath, { force: true }).catch(() => undefined);
     params.log?.(`[browser] Transferring artifact ${sourceFilename} from bridge host...`);
-    await downloadArtifactToFile({
+    const downloadedIdentity = await downloadArtifactToFile({
       hostname: params.hostname,
       port: params.port,
       path: artifactPath,
@@ -94,17 +99,14 @@ export async function transferRemoteArtifact(params: {
       targetPath: partPath,
       descriptor: params.descriptor,
       deadlines: params.deadlines,
-    }).catch(async (error) => {
-      await rm(partPath, { force: true }).catch(() => undefined);
-      throw error;
     });
     try {
-      await verifyAndSyncArtifactFile(partPath, params.descriptor);
+      await verifyAndSyncArtifactFile(partPath, params.descriptor, downloadedIdentity);
       await rename(partPath, finalPath);
       await syncDirectory(artifactsDir);
-      verified = await verifyAndSyncArtifactFile(finalPath, params.descriptor);
+      verified = await verifyAndSyncArtifactFile(finalPath, params.descriptor, downloadedIdentity);
     } catch (error) {
-      await rm(partPath, { force: true }).catch(() => undefined);
+      await removeArtifactPathIfIdentity(partPath, downloadedIdentity);
       throw error;
     }
     params.log?.(`[browser] Transferred artifact to ${finalPath}`);
@@ -193,7 +195,8 @@ async function downloadArtifactToFile(params: {
   targetPath: string;
   descriptor: RemoteArtifactDescriptor;
   deadlines: ResolvedRemoteTransportDeadlines;
-}): Promise<void> {
+}): Promise<ArtifactFileIdentity> {
+  let downloadedIdentity: ArtifactFileIdentity | undefined;
   await consumeRemoteGet(
     {
       hostname: params.hostname,
@@ -223,7 +226,8 @@ async function downloadArtifactToFile(params: {
         res.resume();
         throw new Error("artifact content-length mismatch");
       }
-      const handle = await open(params.targetPath, "wx", 0o600);
+      const opened = await openArtifactDownloadTarget(params.targetPath);
+      const { handle, identity } = opened;
       try {
         let receivedBytes = 0;
         for await (const value of res) {
@@ -246,22 +250,117 @@ async function downloadArtifactToFile(params: {
           throw new Error("artifact size did not match the durable descriptor");
         }
         await handle.sync();
+        await assertOpenArtifactFileIdentity(handle, params.targetPath, identity);
+        if (process.platform === "win32") {
+          await verifyWindowsPrivateFile(params.targetPath);
+          await assertOpenArtifactFileIdentity(handle, params.targetPath, identity);
+        }
+        downloadedIdentity = identity;
       } finally {
         await handle.close();
+        if (!downloadedIdentity) await removeArtifactPathIfIdentity(params.targetPath, identity);
       }
     },
   );
+  if (!downloadedIdentity) throw new Error("artifact download identity was not established");
+  return downloadedIdentity;
+}
+
+async function establishArtifactDestinationDirectories(artifactsDirectory: string): Promise<void> {
+  if (process.platform !== "win32") {
+    await mkdir(artifactsDirectory, { recursive: true });
+    return;
+  }
+  const sessionDirectory = path.dirname(artifactsDirectory);
+  const sessionsRoot = path.dirname(sessionDirectory);
+  await mkdir(path.dirname(sessionsRoot), { recursive: true });
+  await establishWindowsPrivateDirectories([sessionsRoot, sessionDirectory, artifactsDirectory]);
+}
+
+async function openArtifactDownloadTarget(targetPath: string): Promise<{
+  handle: FileHandle;
+  identity: ArtifactFileIdentity;
+}> {
+  if (process.platform === "win32" && !(await initializeWindowsPrivateFile(targetPath))) {
+    throw new Error("Windows private artifact download target already exists");
+  }
+  const handle = await open(targetPath, process.platform === "win32" ? "r+" : "wx", 0o600);
+  try {
+    const fileStat = await handle.stat();
+    const identity = { dev: fileStat.dev, ino: fileStat.ino };
+    if (!fileStat.isFile() || fileStat.nlink !== 1 || fileStat.size !== 0) {
+      throw new Error("artifact download target is not an empty unlinked regular file");
+    }
+    await assertOpenArtifactFileIdentity(handle, targetPath, identity);
+    if (process.platform === "win32") {
+      await verifyWindowsPrivateFile(targetPath);
+      await assertOpenArtifactFileIdentity(handle, targetPath, identity);
+    }
+    return { handle, identity };
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+async function assertOpenArtifactFileIdentity(
+  handle: FileHandle,
+  targetPath: string,
+  expectedIdentity: ArtifactFileIdentity,
+): Promise<void> {
+  const [openStat, pathStat] = await Promise.all([handle.stat(), lstat(targetPath)]);
+  if (
+    !openStat.isFile() ||
+    openStat.nlink !== 1 ||
+    pathStat.isSymbolicLink() ||
+    !pathStat.isFile() ||
+    pathStat.nlink !== 1 ||
+    openStat.dev !== expectedIdentity.dev ||
+    openStat.ino !== expectedIdentity.ino ||
+    pathStat.dev !== expectedIdentity.dev ||
+    pathStat.ino !== expectedIdentity.ino
+  ) {
+    throw new Error("local artifact cache path changed during private file verification");
+  }
+}
+
+async function removeArtifactPathIfIdentity(
+  targetPath: string,
+  expectedIdentity: ArtifactFileIdentity,
+): Promise<void> {
+  const entry = await lstat(targetPath).catch((error) => {
+    if (readErrorCode(error) === "ENOENT") return null;
+    throw error;
+  });
+  if (
+    entry &&
+    !entry.isSymbolicLink() &&
+    entry.isFile() &&
+    entry.nlink === 1 &&
+    entry.dev === expectedIdentity.dev &&
+    entry.ino === expectedIdentity.ino
+  ) {
+    await unlink(targetPath);
+  }
 }
 
 async function verifyAndSyncArtifactFile(
   artifactPath: string,
   descriptor: RemoteArtifactDescriptor,
-): Promise<{ size: number; sha256: string }> {
+  expectedIdentity?: ArtifactFileIdentity,
+): Promise<{ size: number; sha256: string; identity: ArtifactFileIdentity }> {
+  if (process.platform === "win32") await verifyWindowsPrivateFile(artifactPath);
   const entry = await lstat(artifactPath);
   if (entry.isSymbolicLink() || !entry.isFile() || entry.nlink !== 1) {
     throw new Error("local artifact cache path is not an unlinked regular file");
   }
   const identity = { dev: entry.dev, ino: entry.ino };
+  if (
+    expectedIdentity &&
+    (identity.dev !== expectedIdentity.dev || identity.ino !== expectedIdentity.ino)
+  ) {
+    throw new Error("local artifact cache physical identity changed during publication");
+  }
   const handle = await open(artifactPath, "r+");
   try {
     const before = await handle.stat();
@@ -299,9 +398,23 @@ async function verifyAndSyncArtifactFile(
         identity,
       );
     }
-    await handle.chmod(0o600);
+    if (process.platform === "win32") {
+      await verifyWindowsPrivateFile(artifactPath);
+      const pathStat = await lstat(artifactPath);
+      if (
+        pathStat.isSymbolicLink() ||
+        !pathStat.isFile() ||
+        pathStat.nlink !== 1 ||
+        pathStat.dev !== identity.dev ||
+        pathStat.ino !== identity.ino
+      ) {
+        throw new Error("local artifact cache path changed during Windows ACL verification");
+      }
+    } else {
+      await handle.chmod(0o600);
+    }
     await handle.sync();
-    return { size: after.size, sha256 };
+    return { size: after.size, sha256, identity };
   } finally {
     await handle.close();
   }
@@ -344,6 +457,7 @@ async function quarantineStaleArtifactFile(
   ) {
     throw new Error("local artifact cache path changed during stale replacement");
   }
+  if (process.platform === "win32") await verifyWindowsPrivateFile(quarantinePath);
   await unlink(quarantinePath);
   await syncDirectory(path.dirname(artifactPath));
 }

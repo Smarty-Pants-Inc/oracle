@@ -125,6 +125,8 @@ export interface BrowserAutomationConfig {
 /** @internal Server-issued filesystem authority; never project into public run payloads. */
 export interface BrowserArtifactWriteAuthority {
   artifactsDirectory: string;
+  /** @internal Files must be born with and retain the canonical private Windows DACL. */
+  windowsPrivateFiles?: true;
 }
 
 export interface BrowserRunOptions {

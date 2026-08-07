@@ -6,11 +6,10 @@ import { syncDirectory } from "../fsDurability.js";
 import type { BrowserRuntimeMetadata } from "../sessionManager.js";
 import {
   assertPrivateDirectoryAuthority,
-  assertPrivateTempGeneration,
-  establishPrivateRuntimeAuthority,
-  parsePrivateTempGeneration,
+  assertTemporaryProfileAuthority,
+  parseTemporaryProfileAuthority,
   type PrivateDirectoryAuthority,
-  type PrivateTempGeneration,
+  type TemporaryProfileAuthority,
 } from "../privateTempRoot.js";
 import { sameChromeProcessIdentity } from "./chromeProcessIdentity.js";
 import {
@@ -68,7 +67,7 @@ export interface ProjectSourcesTemporaryCleanupProof {
   readonly generationId: string;
   readonly userDataDir: string;
   readonly approvedBase: ProfileDirectoryIdentity;
-  readonly privateGeneration: PrivateTempGeneration;
+  readonly temporaryProfileAuthority: TemporaryProfileAuthority;
   readonly profileDirectory: ProfileDirectoryIdentity;
   readonly marker: ProjectSourcesTemporaryMarkerProof;
 }
@@ -103,7 +102,7 @@ export interface ProjectSourcesProfileCreateIntent {
   readonly storageOwnerId: string;
   readonly markerToken: string;
   readonly parent: ProfileDirectoryIdentity;
-  readonly privateGeneration?: PrivateTempGeneration;
+  readonly temporaryProfileAuthority?: TemporaryProfileAuthority;
   readonly userDataDir: string;
   readonly proof?: ProjectSourcesTemporaryCleanupProof;
 }
@@ -231,10 +230,10 @@ function markerContentMatches(value: unknown, intent: ProjectSourcesProfileCreat
 export async function authenticateProjectSourcesTemporaryMarker(
   intent: ProjectSourcesProfileCreateIntent,
 ): Promise<ProjectSourcesTemporaryCleanupProof> {
-  if (!intent.privateGeneration) {
-    throw new Error("Project Sources temporary profile has no private child authority.");
+  if (!intent.temporaryProfileAuthority) {
+    throw new Error("Project Sources temporary profile has no exact profile authority.");
   }
-  await assertPrivateTempGeneration(intent.privateGeneration);
+  await assertTemporaryProfileAuthority(intent.temporaryProfileAuthority);
   const authorityPath = markerPath(intent.userDataDir);
   const before = captureMarkerFileIdentity(await lstat(authorityPath, { bigint: true }));
   const parsed: unknown = JSON.parse(await readFile(authorityPath, "utf8"));
@@ -242,7 +241,7 @@ export async function authenticateProjectSourcesTemporaryMarker(
   if (!sameMarkerFileIdentity(before, after) || !markerContentMatches(parsed, intent)) {
     throw new Error("Project Sources temporary profile authority marker changed or mismatched.");
   }
-  await assertPrivateTempGeneration(intent.privateGeneration);
+  await assertTemporaryProfileAuthority(intent.temporaryProfileAuthority);
   return {
     version: 1,
     kind: "temporary",
@@ -250,8 +249,8 @@ export async function authenticateProjectSourcesTemporaryMarker(
     generationId: intent.generationId,
     userDataDir: intent.userDataDir,
     approvedBase: intent.parent,
-    privateGeneration: intent.privateGeneration,
-    profileDirectory: await captureProfileDirectoryIdentity(intent.userDataDir),
+    temporaryProfileAuthority: intent.temporaryProfileAuthority,
+    profileDirectory: intent.temporaryProfileAuthority.profileDirectory,
     marker: { path: authorityPath, token: intent.markerToken, identity: before },
   };
 }
@@ -293,34 +292,39 @@ function parseTemporaryProof(value: unknown): ProjectSourcesTemporaryCleanupProo
   if (!value || typeof value !== "object") return null;
   const candidate = value as Record<string, unknown>;
   const approvedBase = parseProfileDirectoryIdentity(candidate.approvedBase, process.platform);
-  const privateGeneration = parsePrivateTempGeneration(
-    candidate.privateGeneration,
-    process.platform,
-  );
   const profileDirectory = parseProfileDirectoryIdentity(
     candidate.profileDirectory,
+    process.platform,
+  );
+  const temporaryProfileAuthority = parseTemporaryProfileAuthority(
+    candidate.temporaryProfileAuthority,
     process.platform,
   );
   const marker = candidate.marker as Record<string, unknown> | undefined;
   const markerIdentity = parseMarkerFileIdentity(marker?.identity);
   if (
+    Object.keys(candidate).sort().join(",") !==
+      "approvedBase,generationId,kind,marker,profileDirectory,storageOwnerId,temporaryProfileAuthority,userDataDir,version" ||
     candidate.version !== 1 ||
     candidate.kind !== "temporary" ||
     typeof candidate.storageOwnerId !== "string" ||
-    !UUID_PATTERN.test(String(candidate.generationId)) ||
+    typeof candidate.generationId !== "string" ||
+    !UUID_PATTERN.test(candidate.generationId) ||
     typeof candidate.userDataDir !== "string" ||
     !approvedBase ||
-    !privateGeneration ||
+    !temporaryProfileAuthority ||
     !profileDirectory ||
     path.resolve(candidate.userDataDir) !== candidate.userDataDir ||
     candidate.userDataDir !==
       path.join(approvedBase.canonicalPath, `oracle-browser-${candidate.generationId}`) ||
-    privateGeneration.path !== candidate.userDataDir ||
-    privateGeneration.parent.path !== approvedBase.canonicalPath ||
-    privateGeneration.parent.identity.device !== approvedBase.device ||
-    privateGeneration.parent.identity.inode !== approvedBase.inode ||
-    privateGeneration.parent.identity.birthtimeNs !== approvedBase.birthtimeNs ||
     profileDirectory.canonicalPath !== candidate.userDataDir ||
+    temporaryProfileAuthority.generation.path !== candidate.userDataDir ||
+    temporaryProfileAuthority.generation.parent.path !== approvedBase.canonicalPath ||
+    temporaryProfileAuthority.generation.parent.platform !== approvedBase.platform ||
+    temporaryProfileAuthority.generation.parent.identity.device !== approvedBase.device ||
+    temporaryProfileAuthority.generation.parent.identity.inode !== approvedBase.inode ||
+    temporaryProfileAuthority.generation.parent.identity.birthtimeNs !== approvedBase.birthtimeNs ||
+    !sameProfileDirectoryIdentity(temporaryProfileAuthority.profileDirectory, profileDirectory) ||
     !marker ||
     marker.path !== markerPath(candidate.userDataDir) ||
     typeof marker.token !== "string" ||
@@ -329,7 +333,21 @@ function parseTemporaryProof(value: unknown): ProjectSourcesTemporaryCleanupProo
   ) {
     return null;
   }
-  return candidate as unknown as ProjectSourcesTemporaryCleanupProof;
+  return Object.freeze({
+    version: 1,
+    kind: "temporary",
+    storageOwnerId: candidate.storageOwnerId as string,
+    generationId: candidate.generationId as string,
+    userDataDir: candidate.userDataDir as string,
+    approvedBase,
+    temporaryProfileAuthority,
+    profileDirectory,
+    marker: Object.freeze({
+      path: marker!.path as string,
+      token: marker!.token as string,
+      identity: markerIdentity,
+    }),
+  });
 }
 
 function parseManualProof(value: unknown): ProjectSourcesManualCleanupProof | null {
@@ -384,10 +402,10 @@ export function isProjectSourcesProfileCreateIntent(
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
   const parent = parseProfileDirectoryIdentity(candidate.parent, process.platform);
-  const privateGeneration =
-    candidate.privateGeneration === undefined
+  const temporaryProfileAuthority =
+    candidate.temporaryProfileAuthority === undefined
       ? undefined
-      : parsePrivateTempGeneration(candidate.privateGeneration, process.platform);
+      : parseTemporaryProfileAuthority(candidate.temporaryProfileAuthority, process.platform);
   const proof = candidate.proof === undefined ? undefined : parseTemporaryProof(candidate.proof);
   return Boolean(
     parent &&
@@ -397,23 +415,20 @@ export function isProjectSourcesProfileCreateIntent(
     typeof candidate.userDataDir === "string" &&
     path.resolve(candidate.userDataDir) ===
       path.join(parent.canonicalPath, `oracle-browser-${candidate.generationId}`) &&
-    (candidate.privateGeneration === undefined ||
-      (privateGeneration &&
-        privateGeneration.path === candidate.userDataDir &&
-        privateGeneration.parent.path === parent.canonicalPath &&
-        privateGeneration.parent.identity.device === parent.device &&
-        privateGeneration.parent.identity.inode === parent.inode &&
-        privateGeneration.parent.identity.birthtimeNs === parent.birthtimeNs)) &&
+    (candidate.temporaryProfileAuthority === undefined ||
+      (temporaryProfileAuthority &&
+        temporaryProfileAuthority.generation.path === candidate.userDataDir &&
+        temporaryProfileAuthority.generation.parent.path === parent.canonicalPath)) &&
     (!proof ||
-      (privateGeneration &&
+      (temporaryProfileAuthority &&
         proof.generationId === candidate.generationId &&
         proof.storageOwnerId === candidate.storageOwnerId &&
         proof.marker.token === candidate.markerToken &&
         sameProfileDirectoryIdentity(proof.approvedBase, parent) &&
-        proof.privateGeneration.path === privateGeneration.path &&
-        proof.privateGeneration.identity.device === privateGeneration.identity.device &&
-        proof.privateGeneration.identity.inode === privateGeneration.identity.inode &&
-        proof.privateGeneration.identity.birthtimeNs === privateGeneration.identity.birthtimeNs)),
+        sameProfileDirectoryIdentity(
+          proof.temporaryProfileAuthority.profileDirectory,
+          temporaryProfileAuthority.profileDirectory,
+        ))),
   );
 }
 
@@ -435,6 +450,10 @@ export function hasOwnedProjectSourcesProvenance(
       resource.profileDirectoryIdentity,
       process.platform,
     );
+    const temporaryProfileAuthority = parseTemporaryProfileAuthority(
+      resource.temporaryProfileAuthority,
+      process.platform,
+    );
     const disposition = acquisition?.processOwnerDisposition;
     if (
       !acquisition ||
@@ -447,13 +466,36 @@ export function hasOwnedProjectSourcesProvenance(
       resource.userDataDir !== proof.userDataDir ||
       resource.chromeProfileRoot !== proof.userDataDir ||
       acquisition.targetMarkerUrl !== `about:blank#oracle-project-sources=${proof.generationId}` ||
-      (disposition === "preserve" && !resource.recoveryCleanup.keepBrowser) ||
       (proof.kind === "temporary" &&
         (resource.recoveryCleanup.profileKind !== "temporary" ||
-          acquisition.processOwnerProvenance !== "temporary-launch")) ||
+          acquisition.processOwnerProvenance !== "temporary-launch" ||
+          !temporaryProfileAuthority ||
+          temporaryProfileAuthority.generation.platform !==
+            proof.temporaryProfileAuthority.generation.platform ||
+          temporaryProfileAuthority.generation.path !==
+            proof.temporaryProfileAuthority.generation.path ||
+          temporaryProfileAuthority.generation.identity.device !==
+            proof.temporaryProfileAuthority.generation.identity.device ||
+          temporaryProfileAuthority.generation.identity.inode !==
+            proof.temporaryProfileAuthority.generation.identity.inode ||
+          temporaryProfileAuthority.generation.identity.birthtimeNs !==
+            proof.temporaryProfileAuthority.generation.identity.birthtimeNs ||
+          temporaryProfileAuthority.generation.parent.path !==
+            proof.temporaryProfileAuthority.generation.parent.path ||
+          temporaryProfileAuthority.generation.parent.identity.device !==
+            proof.temporaryProfileAuthority.generation.parent.identity.device ||
+          temporaryProfileAuthority.generation.parent.identity.inode !==
+            proof.temporaryProfileAuthority.generation.parent.identity.inode ||
+          temporaryProfileAuthority.generation.parent.identity.birthtimeNs !==
+            proof.temporaryProfileAuthority.generation.parent.identity.birthtimeNs ||
+          !sameProfileDirectoryIdentity(
+            temporaryProfileAuthority.profileDirectory,
+            proof.profileDirectory,
+          ))) ||
       (proof.kind === "manual-login" &&
         (resource.recoveryCleanup.profileKind !== "manual-login" ||
-          acquisition.processOwnerProvenance !== "manual-canonical-owner"))
+          acquisition.processOwnerProvenance !== "manual-canonical-owner" ||
+          resource.temporaryProfileAuthority !== undefined))
     ) {
       return false;
     }
@@ -504,13 +546,8 @@ async function assertApprovedTemporaryBase(
   expected: ProfileDirectoryIdentity,
   storage: ProjectSourcesCleanupStorage,
 ): Promise<void> {
-  const approved = await establishPrivateRuntimeAuthority();
   await assertPrivateDirectoryAuthority(storage.runtimeRoot);
   if (
-    approved.path !== storage.runtimeRoot.path ||
-    approved.identity.device !== storage.runtimeRoot.identity.device ||
-    approved.identity.inode !== storage.runtimeRoot.identity.inode ||
-    approved.identity.birthtimeNs !== storage.runtimeRoot.identity.birthtimeNs ||
     expected.platform !== storage.runtimeRoot.platform ||
     expected.canonicalPath !== storage.runtimeRoot.path ||
     expected.device !== storage.runtimeRoot.identity.device ||
@@ -533,14 +570,14 @@ export async function assertProjectSourcesProfileParent(
   if (!sameProfileDirectoryIdentity(current, intent.parent)) {
     throw new Error("Project Sources temporary profile parent authority changed before recovery.");
   }
-  if (intent.privateGeneration) {
+  if (intent.temporaryProfileAuthority) {
     if (
-      intent.privateGeneration.path !== intent.userDataDir ||
-      intent.privateGeneration.parent.path !== intent.parent.canonicalPath
+      intent.temporaryProfileAuthority.generation.path !== intent.userDataDir ||
+      intent.temporaryProfileAuthority.generation.parent.path !== intent.parent.canonicalPath
     ) {
       throw new Error("Project Sources private child does not match its creation intent.");
     }
-    await assertPrivateTempGeneration(intent.privateGeneration);
+    await assertTemporaryProfileAuthority(intent.temporaryProfileAuthority);
   }
 }
 
@@ -552,9 +589,11 @@ export async function assertProjectSourcesTemporaryProof(
     throw new Error("Project Sources temporary proof has different cleanup storage.");
   }
   await assertApprovedTemporaryBase(proof.approvedBase, storage);
-  await assertPrivateTempGeneration(proof.privateGeneration);
+  await assertTemporaryProfileAuthority(proof.temporaryProfileAuthority);
   const currentProfile = await captureProfileDirectoryIdentity(proof.userDataDir);
-  if (!sameProfileDirectoryIdentity(currentProfile, proof.profileDirectory)) {
+  if (
+    !sameProfileDirectoryIdentity(currentProfile, proof.temporaryProfileAuthority.profileDirectory)
+  ) {
     throw new Error("Project Sources temporary profile physical authority changed.");
   }
   const currentMarker = await authenticateProjectSourcesTemporaryMarker({
@@ -562,7 +601,7 @@ export async function assertProjectSourcesTemporaryProof(
     storageOwnerId: proof.storageOwnerId,
     markerToken: proof.marker.token,
     parent: proof.approvedBase,
-    privateGeneration: proof.privateGeneration,
+    temporaryProfileAuthority: proof.temporaryProfileAuthority,
     userDataDir: proof.userDataDir,
   });
   if (

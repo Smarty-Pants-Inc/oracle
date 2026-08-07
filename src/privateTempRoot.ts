@@ -14,6 +14,12 @@ import {
   isolateDirectoryGenerationForRemoval,
   removeIsolatedDirectoryGeneration,
 } from "./browser/filesystemLockDirectoryRemoval.js";
+import {
+  captureProfileDirectoryIdentity,
+  parseProfileDirectoryIdentity,
+  verifyProfileDirectoryIdentity,
+  type ProfileDirectoryIdentity,
+} from "./browser/profileDirectoryAuthority.js";
 import { getOracleHomeDir } from "./oracleHome.js";
 import {
   establishWindowsPrivateDirectories,
@@ -32,6 +38,14 @@ export interface PrivateDirectoryAuthority {
 export interface PrivateTempGeneration extends PrivateDirectoryAuthority {
   readonly parent: PrivateDirectoryAuthority;
 }
+export interface PrivateGenerationTemporaryProfileAuthority {
+  readonly version: 1;
+  readonly kind: "private-generation";
+  readonly generation: PrivateTempGeneration;
+  readonly profileDirectory: ProfileDirectoryIdentity;
+}
+
+export type TemporaryProfileAuthority = PrivateGenerationTemporaryProfileAuthority;
 
 export interface PrivateTempRootOptions {
   readonly platform?: NodeJS.Platform;
@@ -314,6 +328,32 @@ export function parsePrivateTempGeneration(
   }
   return Object.freeze({ parent, path: candidate.path, identity, platform });
 }
+export function parseTemporaryProfileAuthority(
+  value: unknown,
+  platform: NodeJS.Platform = process.platform,
+): TemporaryProfileAuthority | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  const generation = parsePrivateTempGeneration(candidate.generation, platform);
+  const profileDirectory = parseProfileDirectoryIdentity(candidate.profileDirectory, platform);
+  if (
+    Object.keys(candidate).sort().join(",") !== "generation,kind,profileDirectory,version" ||
+    candidate.version !== 1 ||
+    candidate.kind !== "private-generation" ||
+    !generation ||
+    !profileDirectory ||
+    profileDirectory.canonicalPath !== generation.path ||
+    !samePhysicalDirectoryIdentity(profileDirectory, generation.identity)
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    version: 1,
+    kind: "private-generation",
+    generation,
+    profileDirectory,
+  });
+}
 
 export async function createPrivateTempChildGeneration(
   parent: PrivateDirectoryAuthority,
@@ -399,6 +439,65 @@ export async function createPrivateTempGeneration(
 ): Promise<PrivateTempGeneration> {
   const root = await establishPrivateRuntimeAuthority(options);
   return await createPrivateTempChildGeneration(root, prefix, options);
+}
+export async function createTemporaryProfileChildAuthority(
+  parent: PrivateDirectoryAuthority,
+  prefix: string,
+  options: PrivateTempRootOptions = {},
+): Promise<TemporaryProfileAuthority> {
+  const generation = await createPrivateTempChildGeneration(parent, prefix, options);
+  const authority = Object.freeze({
+    version: 1 as const,
+    kind: "private-generation" as const,
+    generation,
+    profileDirectory: await captureProfileDirectoryIdentity(generation.path),
+  });
+  await assertTemporaryProfileAuthority(authority, options);
+  return authority;
+}
+
+export async function createTemporaryProfileAuthority(
+  prefix: string,
+  options: PrivateTempRootOptions = {},
+): Promise<TemporaryProfileAuthority> {
+  const parent = await establishPrivateRuntimeAuthority(options);
+  return await createTemporaryProfileChildAuthority(parent, prefix, options);
+}
+
+export async function assertTemporaryProfileAuthority(
+  authority: TemporaryProfileAuthority,
+  options: Pick<PrivateTempRootOptions, "windowsPrivateDirectoryAuthority"> = {},
+): Promise<void> {
+  const parsed = parseTemporaryProfileAuthority(authority, process.platform);
+  if (!parsed) {
+    throw new Error("Temporary profile authority is invalid for this platform");
+  }
+  await assertPrivateTempGeneration(parsed.generation, options);
+  if (
+    !(await verifyProfileDirectoryIdentity(
+      parsed.profileDirectory.canonicalPath,
+      parsed.profileDirectory,
+    ))
+  ) {
+    throw new Error(
+      `Temporary profile physical authority changed: ${parsed.profileDirectory.canonicalPath}`,
+    );
+  }
+  await assertPrivateTempGeneration(parsed.generation, options);
+}
+
+export async function removeTemporaryProfileAuthority(
+  authority: TemporaryProfileAuthority,
+  options: Pick<PrivateTempRootOptions, "windowsPrivateDirectoryAuthority"> = {},
+): Promise<boolean> {
+  const parsed = parseTemporaryProfileAuthority(authority, process.platform);
+  if (!parsed) return false;
+  try {
+    await assertTemporaryProfileAuthority(parsed, options);
+    return await removePrivateTempGeneration(parsed.generation, options);
+  } catch {
+    return false;
+  }
 }
 
 export async function removePrivateTempGeneration(

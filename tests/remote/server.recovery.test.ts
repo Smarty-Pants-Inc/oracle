@@ -14,6 +14,7 @@ import type { BrowserSessionConfig } from "../../src/sessionManager.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
+import { createTemporaryProfileAuthority } from "../../src/privateTempRoot.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import {
   captureProfileDirectoryIdentity,
@@ -936,9 +937,12 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-restart-cleanup-"));
       const transactionStoreDir = path.join(tmpDir, "transactions");
-      const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-remote-restart-"));
-      const profileDirectory = await captureProfileDirectoryIdentity(profileDir);
-      const canonicalProfileDir = profileDirectory.canonicalPath;
+      const temporaryProfileAuthority = await createTemporaryProfileAuthority(
+        "oracle-browser-remote-restart-",
+        { tempDirectory: tmpDir },
+      );
+      const profileDir = temporaryProfileAuthority.profileDirectory.canonicalPath;
+      const profileDirectory = temporaryProfileAuthority.profileDirectory;
       const identity = {
         pid: process.pid,
         processStartTime: "test-live-launched-owner",
@@ -954,7 +958,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         profileDirectory,
       };
       const chromePort = 45_678;
-      await writeOracleChromeOwner(canonicalProfileDir, {
+      await writeOracleChromeOwner(profileDir, {
         port: chromePort,
         processIdentity: identity,
         disposition: "close-on-last-lease",
@@ -975,6 +979,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             chromePid: identity.pid,
             chromeProcessIdentity: identity,
             profileDirectoryIdentity: profileDirectory,
+            temporaryProfileAuthority,
             chromePort,
             chromeHost: "127.0.0.1",
             chromeProfileRoot: profileDir,
@@ -1016,8 +1021,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
 
       let cleanupAttempts = 0;
       const exactChromeCleanup = vi.fn(
-        async (_recordedRuntime: BrowserRunTransaction["runtime"], recordedProfileDir: string) => {
+        async (recordedRuntime: BrowserRunTransaction["runtime"], recordedProfileDir: string) => {
           cleanupAttempts += 1;
+          const recordedResource = recordedRuntime.recoveryCleanupResources?.[0];
+          expect(recordedResource?.temporaryProfileAuthority).toEqual(temporaryProfileAuthority);
           const recordedProfileDirectory =
             await captureProfileDirectoryIdentity(recordedProfileDir);
           expect(sameProfileDirectoryIdentity(recordedProfileDirectory, profileDirectory)).toBe(
@@ -1084,7 +1091,12 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         ).resolves.toMatchObject({
           state: "pending",
           settlementMode: "abort",
-          finalization: { status: "pending" },
+          finalization: {
+            status: "pending",
+            runtime: {
+              recoveryCleanupResources: [{ temporaryProfileAuthority }],
+            },
+          },
         });
 
         const completedSettlement = await httpPostJson({

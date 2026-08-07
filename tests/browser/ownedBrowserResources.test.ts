@@ -25,6 +25,26 @@ const profileDirectory = {
   birthtimeNs: "3",
 };
 
+const temporaryProfileAuthority = {
+  version: 1 as const,
+  kind: "private-generation" as const,
+  generation: {
+    path: profileDirectory.canonicalPath,
+    identity: {
+      device: profileDirectory.device,
+      inode: profileDirectory.inode,
+      birthtimeNs: profileDirectory.birthtimeNs,
+    },
+    platform: process.platform,
+    parent: {
+      path: "/tmp",
+      identity: { device: "1", inode: "1", birthtimeNs: "1" },
+      platform: process.platform,
+    },
+  },
+  profileDirectory,
+};
+
 function acquisitionRuntime(
   pendingResource?: "tab-lease" | "chrome-process" | "chrome-target",
 ): BrowserRuntimeMetadata {
@@ -530,6 +550,7 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
       targetLabel: "Persistence-gated target",
       userDataDir: profileDirectory.canonicalPath,
       profileDirectoryIdentity: profileDirectory,
+      temporaryProfileAuthority,
       profileKind: "temporary",
       keepBrowser: false,
       closeOwnedTargetOnComplete: true,
@@ -611,6 +632,7 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
       userDataDir: profileDirectory.canonicalPath,
       profileDirectoryIdentity: profileDirectory,
       profileKind: "temporary",
+      temporaryProfileAuthority,
       keepBrowser: true,
       closeOwnedTargetOnComplete: true,
       generationId: "shared-generation",

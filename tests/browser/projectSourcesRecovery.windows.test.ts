@@ -4,11 +4,11 @@ import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:f
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { expect, test } from "vitest";
-import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
+import { expect, test, vi } from "vitest";
 import { captureProfileDirectoryIdentity } from "../../src/browser/profileState.js";
 import * as recovery from "../../src/browser/projectSourcesRecovery.js";
 import { resolveWindowsPowerShellExecutable } from "../../src/windowsSystemExecutable.js";
+import { createTemporaryProfileChildAuthority } from "../../src/privateTempRoot.js";
 
 const execFileAsync = promisify(execFile);
 const windowsTest = test.skipIf(process.platform !== "win32");
@@ -21,8 +21,7 @@ interface StorageFixture {
 
 async function createStorageFixture(): Promise<StorageFixture> {
   const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-project-sources-windows-root-"));
-  setOracleHomeDirOverrideForTest(oracleHome);
-  const storage = await recovery.establishProjectSourcesCleanupStorage();
+  const storage = await recovery.establishProjectSourcesCleanupStorage(oracleHome);
   const parent = await captureProfileDirectoryIdentity(storage.runtimeRoot.path);
   const intent = recovery.createProjectSourcesProfileCreateIntent(storage, parent, randomUUID());
   await recovery.persistProjectSourcesCleanupRuntime({}, storage, { profileCreate: intent });
@@ -30,7 +29,6 @@ async function createStorageFixture(): Promise<StorageFixture> {
 }
 
 async function removeFixture(...paths: string[]): Promise<void> {
-  setOracleHomeDirOverrideForTest(null);
   await Promise.all(paths.map((candidate) => rm(candidate, { recursive: true, force: true })));
 }
 
@@ -67,7 +65,7 @@ $Directory.SetAccessControl($Acl)
 }
 
 windowsTest(
-  "keeps Project Sources roots valid across ordinary child writes and case-only path aliases",
+  "keeps exact Project Sources storage valid across module reload and ordinary child writes",
   async () => {
     const fixture = await createStorageFixture();
     try {
@@ -76,19 +74,46 @@ windowsTest(
         path.join(fixture.storage.runtimeRoot.path, "ordinary-child.txt"),
         "ordinary",
       );
-      setOracleHomeDirOverrideForTest(fixture.oracleHome.toUpperCase());
-
+      const temporaryProfileAuthority = await createTemporaryProfileChildAuthority(
+        fixture.storage.runtimeRoot,
+        "oracle-browser-",
+        { randomId: () => fixture.intent.generationId },
+      );
+      const establishedIntent = { ...fixture.intent, temporaryProfileAuthority };
+      const proof = await recovery.createProjectSourcesTemporaryCleanupProof(
+        establishedIntent,
+        fixture.storage,
+      );
+      await recovery.persistProjectSourcesCleanupRuntime({}, fixture.storage, {
+        profileCreate: { ...establishedIntent, proof },
+      });
+      vi.resetModules();
+      // Intentional reload proves persisted storage authority does not depend on module-local state.
+      const reloadedRecovery = await import("../../src/browser/projectSourcesRecovery.js");
       await expect(
-        recovery.assertProjectSourcesCleanupStorage(fixture.storage),
+        reloadedRecovery.assertProjectSourcesCleanupStorage(fixture.storage),
       ).resolves.toBeUndefined();
       await expect(
-        recovery.readProjectSourcesCleanupJournal(fixture.storage),
+        reloadedRecovery.readProjectSourcesCleanupJournal(fixture.storage),
       ).resolves.toMatchObject({
-        profileCreate: { generationId: fixture.intent.generationId },
+        profileCreate: {
+          generationId: fixture.intent.generationId,
+          temporaryProfileAuthority: {
+            generation: { path: temporaryProfileAuthority.generation.path },
+            profileDirectory: {
+              canonicalPath: temporaryProfileAuthority.profileDirectory.canonicalPath,
+            },
+          },
+        },
       });
       await expect(
-        recovery.persistProjectSourcesCleanupRuntime({}, fixture.storage),
+        reloadedRecovery.retryPendingProjectSourcesCleanup(() => undefined, fixture.storage),
       ).resolves.toBeUndefined();
+      await expect(
+        readFile(temporaryProfileAuthority.generation.path, "utf8"),
+      ).rejects.toMatchObject({
+        code: "ENOENT",
+      });
       await expect(readFile(fixture.storage.journalPath, "utf8")).rejects.toMatchObject({
         code: "ENOENT",
       });

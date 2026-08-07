@@ -11,10 +11,6 @@ import type * as ProjectSourcesRecovery from "../../src/browser/projectSourcesRe
 
 type Recovery = typeof ProjectSourcesRecovery;
 type ManualProof = ProjectSourcesRecovery.ProjectSourcesManualCleanupProof;
-// The recovery module is reset to install its filesystem mock, so bind its fresh Oracle-home module.
-async function setRecoveryOracleHomeDirOverrideForTest(oracleHome: string | null): Promise<void> {
-  (await import("../../src/oracleHome.js")).setOracleHomeDirOverrideForTest(oracleHome);
-}
 
 function cleanupRuntime(
   proof: ManualProof,
@@ -64,8 +60,7 @@ async function createManualAuthority(recovery: Recovery) {
   const oracleHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-project-sources-settlement-"));
   const profileDir = path.join(oracleHome, "manual-profile");
   await fs.mkdir(profileDir);
-  await setRecoveryOracleHomeDirOverrideForTest(oracleHome);
-  const storage = await recovery.establishProjectSourcesCleanupStorage();
+  const storage = await recovery.establishProjectSourcesCleanupStorage(oracleHome);
   const profileDirectory = await captureProfileDirectoryIdentity(profileDir);
   const generationId = randomUUID();
   const leaseId = randomUUID();
@@ -145,7 +140,6 @@ async function loadRecoveryWithOneJournalRemovalFailure() {
 }
 
 async function removeAuthority(oracleHome: string): Promise<void> {
-  await setRecoveryOracleHomeDirOverrideForTest(null);
   await fs.rm(oracleHome, { recursive: true, force: true });
 }
 

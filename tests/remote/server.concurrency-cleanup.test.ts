@@ -2,7 +2,10 @@ import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
-import { createRemoteBrowserTransactionExecutor } from "../../src/remote/client.js";
+import {
+  createRemoteBrowserExecutor,
+  createRemoteBrowserTransactionExecutor,
+} from "../../src/remote/client.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import type { BrowserRunTransaction } from "../../src/browser/types.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
@@ -194,6 +197,58 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(retryCleanup.mock.calls[0]?.[2]).toMatchObject({ ownerId: settlementToken });
       } finally {
         releaseRun.resolve();
+        await server.close();
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "preserves a captured public answer when another public run holds browser authority",
+    async () => {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-public-settlement-race-"));
+      const secondRunStarted = Promise.withResolvers<void>();
+      const releaseSecondRun = Promise.withResolvers<void>();
+      const server = await createTestRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
+        {
+          transactionStoreDir: path.join(tmpDir, "transactions"),
+          runBrowser: async (options) => {
+            if (options.prompt === "B") {
+              secondRunStarted.resolve();
+              await releaseSecondRun.promise;
+            }
+            return browserTransaction(options.prompt, {
+              answerText: `${options.prompt} answer`,
+              answerMarkdown: `${options.prompt} answer`,
+              tookMs: 1,
+              answerTokens: 2,
+              answerChars: 8,
+            });
+          },
+        },
+      );
+      try {
+        const execute = createRemoteBrowserExecutor({
+          host: `127.0.0.1:${server.port}`,
+          token: "a".repeat(64),
+        });
+        const second = execute({ prompt: "B", config: {} });
+        await secondRunStarted.promise;
+
+        const first = await execute({ prompt: "A", config: {} });
+        expect(first).toMatchObject({
+          answerText: "A answer",
+          warnings: [expect.objectContaining({ code: "direct-finalize-cleanup-pending" })],
+        });
+        expect(first).not.toHaveProperty("runtime");
+        expect(first).not.toHaveProperty("bindSettlement");
+        expect(first).not.toHaveProperty("finalize");
+        expect(first).not.toHaveProperty("abort");
+
+        releaseSecondRun.resolve();
+        await expect(second).resolves.toMatchObject({ answerText: "B answer" });
+      } finally {
+        releaseSecondRun.resolve();
         await server.close();
         await rm(tmpDir, { recursive: true, force: true });
       }

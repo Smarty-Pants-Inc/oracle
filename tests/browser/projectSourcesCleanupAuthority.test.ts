@@ -18,7 +18,6 @@ import {
   parseOracleChromeOwnerRecord,
   type OracleChromeOwnerRecord,
 } from "../../src/browser/profileState.js";
-import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
 
 interface ManualPublicationAuthority {
   readonly oracleHome: string;
@@ -29,8 +28,7 @@ interface ManualPublicationAuthority {
 
 async function manualPublicationAuthority(): Promise<ManualPublicationAuthority> {
   const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-project-sources-publication-"));
-  setOracleHomeDirOverrideForTest(oracleHome);
-  const storage = await establishProjectSourcesCleanupStorage();
+  const storage = await establishProjectSourcesCleanupStorage(oracleHome);
   const profilePath = path.join(oracleHome, "manual-profile");
   await mkdir(profilePath);
   const profileDirectory = await captureProfileDirectoryIdentity(profilePath);
@@ -86,7 +84,6 @@ async function fileIdentity(receiptPath: string) {
 afterEach(() => {
   __test__.setBeforeManualAdmissionPublication(undefined);
   __test__.setBeforeManualAdmissionPreparationCleanup(undefined);
-  setOracleHomeDirOverrideForTest(null);
 });
 test("requires persisted disposition while delegating owner validation to the canonical parser", async () => {
   const authority = await manualPublicationAuthority();

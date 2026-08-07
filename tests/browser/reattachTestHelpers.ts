@@ -1,6 +1,8 @@
 import { vi } from "vitest";
+import os from "node:os";
 import path from "node:path";
 import { existsSync, realpathSync, statSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
 import { resumeBrowserSession, type ReattachCleanupDeps } from "../../src/browser/reattach.js";
 import type {
   BrowserRecoveryCleanupMetadata,
@@ -18,8 +20,20 @@ import {
   type RecordedChromeTerminationOutcome,
 } from "../../src/browser/profileState.js";
 import type { ExactChromeTargetCleanupResult } from "../../src/browser/chromeLifecycle.js";
+import { createTemporaryProfileAuthority } from "../../src/privateTempRoot.js";
 export function createBrowserLogger(): BrowserLogger {
   return vi.fn<(message: string) => void>();
+}
+export async function createTemporaryProfileFixture(prefix: string) {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), prefix));
+  const temporaryProfileAuthority = await createTemporaryProfileAuthority("profile-", {
+    tempDirectory: rootDir,
+  });
+  return {
+    profileDir: temporaryProfileAuthority.profileDirectory.canonicalPath,
+    temporaryProfileAuthority,
+    cleanup: () => rm(rootDir, { recursive: true, force: true }),
+  };
 }
 
 export function syntheticChromeProcessIdentity(

@@ -39,6 +39,19 @@ import {
 } from "./clientTransport.js";
 import { assertRemoteTransactionToken } from "./transactionToken.js";
 
+function retryableSettlementContention(response: {
+  statusCode: number;
+  json: unknown;
+}): "busy" | "server_closing" | null {
+  if (!response.json || typeof response.json !== "object" || !("error" in response.json)) {
+    return null;
+  }
+  const error = response.json.error;
+  if (response.statusCode === 409 && error === "busy") return "busy";
+  if (response.statusCode === 503 && error === "server_closing") return "server_closing";
+  return null;
+}
+
 export async function settleRemoteBrowserRecovery(
   params: RemoteRecoverySettlementOptions,
 ): Promise<BrowserCaptureFinalizationResult> {
@@ -100,7 +113,8 @@ export async function settleRemoteBrowserRecovery(
   } catch (error) {
     if (
       error instanceof BrowserAutomationError &&
-      error.details?.code !== "remote-settlement-binding-transport-failed"
+      error.details?.code !== "remote-settlement-binding-transport-failed" &&
+      error.details?.code !== "remote-settlement-contention-pending"
     ) {
       throw error;
     }
@@ -497,6 +511,23 @@ export async function bindRemoteBrowserSettlement(params: {
       error,
     );
   });
+  const contention = retryableSettlementContention(response);
+  if (contention) {
+    const runtime = markBrowserCaptureCleanupPending(params.runtime, params.mode);
+    throw new BrowserAutomationError(
+      `Remote ${params.mode} binding remains pending while the remote controller is ${
+        contention === "busy" ? "busy" : "closing"
+      }.`,
+      {
+        stage: "remote-settlement-binding",
+        code: "remote-settlement-contention-pending",
+        statusCode: response.statusCode,
+        transactionToken: params.transactionToken,
+        recoverableDisconnect: true,
+        runtime,
+      },
+    );
+  }
   if (response.statusCode === 409) {
     const conflict = RemoteSettlementConflictResponseSchema.safeParse(response.json);
     if (!conflict.success) {
@@ -609,6 +640,16 @@ export async function settleRemoteBrowserTransaction(params: {
       transportError instanceof Error ? transportError.message : String(transportError)
     }`;
     return pendingBrowserCaptureCleanup(params.runtime, message, params.mode);
+  }
+  const contention = retryableSettlementContention(response);
+  if (contention) {
+    return pendingBrowserCaptureCleanup(
+      params.runtime,
+      `Remote ${params.mode} remains pending while the remote controller is ${
+        contention === "busy" ? "busy" : "closing"
+      }.`,
+      params.mode,
+    );
   }
   if (response.statusCode === 409) {
     const conflict = RemoteSettlementConflictResponseSchema.safeParse(response.json);

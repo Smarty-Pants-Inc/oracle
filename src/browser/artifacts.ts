@@ -6,6 +6,11 @@ import { getOracleHomeDir } from "../oracleHome.js";
 import type { SessionArtifact, SessionArtifactFileIdentity } from "../sessionManager.js";
 import { isDeepResearchIncompleteText } from "./deepResearchResult.js";
 import type { BrowserArtifactWriteAuthority, BrowserLogger } from "./types.js";
+import {
+  establishWindowsPrivateDirectory,
+  initializeWindowsPrivateFile,
+  verifyWindowsPrivateFile,
+} from "../remote/windowsPrivateTreeAcl.js";
 
 const ARTIFACTS_DIRNAME = "artifacts";
 const ZIP_EOCD_SIGNATURE = 0x06054b50;
@@ -81,12 +86,47 @@ function resolveArtifactWriteDirectory(params: {
   return params.sessionId ? resolveSessionArtifactsDir(params.sessionId) : null;
 }
 
-async function openExclusiveArtifact(basePath: string) {
+async function openExclusiveArtifact(
+  basePath: string,
+  windowsPrivateFiles: boolean,
+): Promise<{
+  handle: FileHandle;
+  targetPath: string;
+  createdIdentity?: SessionArtifactFileIdentity;
+}> {
   const ext = path.extname(basePath);
   const stem = ext ? path.basename(basePath, ext) : path.basename(basePath);
   const dir = path.dirname(basePath);
   for (let suffix = 1; ; suffix += 1) {
     const targetPath = suffix === 1 ? basePath : path.join(dir, `${stem}-${suffix}${ext}`);
+    if (windowsPrivateFiles) {
+      if (!(await initializeWindowsPrivateFile(targetPath))) continue;
+      let handle: FileHandle | undefined;
+      let createdIdentity: SessionArtifactFileIdentity | undefined;
+      try {
+        const createdStat = await fs.lstat(targetPath, { bigint: true });
+        if (
+          createdStat.isSymbolicLink() ||
+          !createdStat.isFile() ||
+          createdStat.nlink !== 1n ||
+          createdStat.size !== 0n
+        ) {
+          throw new Error(
+            "Windows private browser artifact was not created as an empty regular file",
+          );
+        }
+        createdIdentity = fileIdentityFromStat(createdStat);
+        handle = await fs.open(targetPath, "r+");
+        await assertOpenArtifactIdentity(handle, targetPath, createdIdentity);
+        await verifyWindowsPrivateFile(targetPath);
+        await assertOpenArtifactIdentity(handle, targetPath, createdIdentity);
+        return { handle, targetPath, createdIdentity };
+      } catch (error) {
+        await handle?.close().catch(() => undefined);
+        if (createdIdentity) await removeExactArtifactPath(targetPath, createdIdentity);
+        throw error;
+      }
+    }
     try {
       return { handle: await fs.open(targetPath, "wx+", 0o600), targetPath };
     } catch (error) {
@@ -109,8 +149,63 @@ function fileIdentityFromStat(fileStat: {
   };
 }
 
-async function writeExclusiveArtifact(basePath: string, contents: Buffer) {
-  const { handle, targetPath } = await openExclusiveArtifact(basePath);
+function sameStableFileIdentity(
+  left: SessionArtifactFileIdentity,
+  right: SessionArtifactFileIdentity,
+): boolean {
+  return (
+    left.device === right.device &&
+    left.inode === right.inode &&
+    left.birthtimeNs === right.birthtimeNs
+  );
+}
+
+async function assertOpenArtifactIdentity(
+  handle: FileHandle,
+  targetPath: string,
+  expectedIdentity: SessionArtifactFileIdentity,
+): Promise<void> {
+  const [openStat, pathStat] = await Promise.all([
+    handle.stat({ bigint: true }),
+    fs.lstat(targetPath, { bigint: true }),
+  ]);
+  if (
+    !openStat.isFile() ||
+    openStat.nlink !== 1n ||
+    pathStat.isSymbolicLink() ||
+    !pathStat.isFile() ||
+    pathStat.nlink !== 1n ||
+    !sameStableFileIdentity(fileIdentityFromStat(openStat), expectedIdentity) ||
+    !sameStableFileIdentity(fileIdentityFromStat(pathStat), expectedIdentity)
+  ) {
+    throw new Error("Windows private browser artifact physical identity changed");
+  }
+}
+
+async function removeExactArtifactPath(
+  targetPath: string,
+  expectedIdentity: SessionArtifactFileIdentity,
+): Promise<void> {
+  const current = await fs.lstat(targetPath, { bigint: true }).catch(() => null);
+  if (
+    current &&
+    !current.isSymbolicLink() &&
+    current.isFile() &&
+    sameStableFileIdentity(fileIdentityFromStat(current), expectedIdentity)
+  ) {
+    await fs.rm(targetPath, { force: true }).catch(() => undefined);
+  }
+}
+
+async function writeExclusiveArtifact(
+  basePath: string,
+  contents: Buffer,
+  windowsPrivateFiles = false,
+) {
+  const { handle, targetPath, createdIdentity } = await openExclusiveArtifact(
+    basePath,
+    windowsPrivateFiles,
+  );
   let complete = false;
   try {
     await handle.writeFile(contents);
@@ -128,6 +223,10 @@ async function writeExclusiveArtifact(basePath: string, contents: Buffer) {
     ) {
       throw new Error("Browser artifact physical identity changed during write");
     }
+    if (windowsPrivateFiles) {
+      await verifyWindowsPrivateFile(targetPath);
+      await assertOpenArtifactIdentity(handle, targetPath, fileIdentity);
+    }
     complete = true;
     return {
       targetPath,
@@ -137,7 +236,10 @@ async function writeExclusiveArtifact(basePath: string, contents: Buffer) {
     };
   } finally {
     await handle.close().catch(() => undefined);
-    if (!complete) await fs.rm(targetPath, { force: true }).catch(() => undefined);
+    if (!complete) {
+      if (createdIdentity) await removeExactArtifactPath(targetPath, createdIdentity);
+      else await fs.rm(targetPath, { force: true }).catch(() => undefined);
+    }
   }
 }
 
@@ -382,10 +484,16 @@ export async function writeTextBrowserArtifact(params: {
   if (text.length === 0) return null;
   const dir = resolveArtifactWriteDirectory(params);
   if (!dir) return null;
-  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const windowsPrivateFiles = params.artifactWriteAuthority?.windowsPrivateFiles === true;
+  if (windowsPrivateFiles) await establishWindowsPrivateDirectory(dir);
+  else await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   const filename = sanitizeArtifactFilename(params.filename, "artifact.md");
   const contents = Buffer.from(`${text}\n`, "utf8");
-  const written = await writeExclusiveArtifact(path.join(dir, filename), contents);
+  const written = await writeExclusiveArtifact(
+    path.join(dir, filename),
+    contents,
+    windowsPrivateFiles,
+  );
   params.logger?.(`[browser] Saved ${params.kind} artifact to ${written.targetPath}`);
   return {
     kind: params.kind,
@@ -416,9 +524,15 @@ export async function writeBinaryBrowserArtifact(params: {
   if (params.contents.length === 0) return null;
   const dir = resolveArtifactWriteDirectory(params);
   if (!dir) return null;
-  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const windowsPrivateFiles = params.artifactWriteAuthority?.windowsPrivateFiles === true;
+  if (windowsPrivateFiles) await establishWindowsPrivateDirectory(dir);
+  else await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   const filename = sanitizeArtifactFilename(params.filename, "artifact.bin");
-  const written = await writeExclusiveArtifact(path.join(dir, filename), params.contents);
+  const written = await writeExclusiveArtifact(
+    path.join(dir, filename),
+    params.contents,
+    windowsPrivateFiles,
+  );
   const validation = validateArtifactBuffer({
     filename,
     mimeType: params.mimeType,

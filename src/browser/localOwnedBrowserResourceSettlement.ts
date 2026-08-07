@@ -342,6 +342,9 @@ export class LocalOwnedBrowserResourceSettlementAdapter {
       target: this.state.target,
       keepBrowser: this.state.keepsBrowser(),
       userDataDir: this.state.options.userDataDir,
+      ...(this.state.options.temporaryProfileAuthority
+        ? { temporaryProfileAuthority: this.state.options.temporaryProfileAuthority }
+        : {}),
       logger: this.state.options.logger,
       ...(this.state.options.manualProcessErrorPrefix
         ? { manualProcessErrorPrefix: this.state.options.manualProcessErrorPrefix }

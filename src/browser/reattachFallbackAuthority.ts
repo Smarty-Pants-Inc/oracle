@@ -1,4 +1,5 @@
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
+import type { TemporaryProfileAuthority } from "../privateTempRoot.js";
 import type { ChromeLaunchResult, RetainedChromeEndpointAuthority } from "./chromeLifecycle.js";
 import { settleManualChromeOwner, type ManualChromeOwner } from "./manualChromeOwner.js";
 import {
@@ -8,11 +9,7 @@ import {
   type LocalOwnedBrowserProcessSettlement,
 } from "./ownedBrowserResources.js";
 import type { ChromeProcessLaunchClaim } from "./chromeProcessLaunchClaim.js";
-import {
-  isSafeChromeTerminationOutcome,
-  type ChromeOwnerDisposition,
-  type ProfileDirectoryIdentity,
-} from "./profileState.js";
+import type { ChromeOwnerDisposition, ProfileDirectoryIdentity } from "./profileState.js";
 import {
   finalizeRecoveredRuntime,
   type ReattachCleanupDeps,
@@ -26,6 +23,7 @@ export interface ReattachFallbackAuthorityOptions {
   baseRuntime: BrowserRuntimeMetadata;
   userDataDir: string;
   profileIdentity: ProfileDirectoryIdentity;
+  temporaryProfileAuthority?: TemporaryProfileAuthority;
   manualLogin: boolean;
   keepBrowser: boolean;
   generationId: string;
@@ -84,36 +82,6 @@ export class ReattachFallbackAuthority {
         );
       }
     };
-    const settleTemporaryProcess = cleanup?.removeProfile
-      ? async (chrome: ChromeLaunchResult): Promise<LocalOwnedBrowserProcessSettlement> => {
-          if (options.keepBrowser) {
-            try {
-              await chrome.endpointAuthority?.release();
-              chrome.process?.unref?.();
-              return { status: "completed", disposition: "preserved" };
-            } catch (error) {
-              return pendingProcess(
-                `Exact Chrome endpoint release failed: ${error instanceof Error ? error.message : String(error)}`,
-              );
-            }
-          }
-          const termination = await chrome.kill().catch((error: unknown) => ({
-            status: "unsafe" as const,
-            pid: chrome.pid,
-            reason: error instanceof Error ? error.message : String(error),
-          }));
-          if (!isSafeChromeTerminationOutcome(termination)) {
-            return pendingProcess(termination.reason);
-          }
-          const removed = await cleanup.removeProfile!(
-            options.userDataDir,
-            chrome.processIdentity.profileDirectory,
-          ).catch(() => false);
-          return removed
-            ? { status: "completed", disposition: "terminated" }
-            : pendingProcess(`Profile removal was not confirmed: ${options.userDataDir}`);
-        }
-      : undefined;
     this.resources = new LocalOwnedBrowserResourceAuthority({
       ownerId: options.ownerId,
       purpose: "ChatGPT reattach fallback",
@@ -121,6 +89,9 @@ export class ReattachFallbackAuthority {
       baseRuntime: options.baseRuntime,
       userDataDir: options.userDataDir,
       profileDirectoryIdentity: options.profileIdentity,
+      ...(options.temporaryProfileAuthority
+        ? { temporaryProfileAuthority: options.temporaryProfileAuthority }
+        : {}),
       profileKind: options.manualLogin ? "manual-login" : "temporary",
       keepBrowser: options.keepBrowser,
       closeOwnedTargetOnComplete: true,
@@ -139,7 +110,6 @@ export class ReattachFallbackAuthority {
           }
         : {}),
       settleManualProcess,
-      ...(settleTemporaryProcess ? { settleTemporaryProcess } : {}),
       ...(options.runtimeHintCb
         ? {
             persistRuntime: async (runtime) => await options.runtimeHintCb?.(runtime),

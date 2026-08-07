@@ -1,9 +1,11 @@
 import { describe, expect, test, vi } from "vitest";
+import { execFile } from "node:child_process";
 import http from "node:http";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { mkdir, mkdtemp, readdir, rm, readFile, stat, writeFile } from "node:fs/promises";
+import { promisify } from "node:util";
 import {
   REMOTE_HEALTH_CLIENT_NONCE_HEADER,
   REMOTE_PROTOCOL_HEADER,
@@ -17,7 +19,10 @@ import { createRemoteBrowserTransactionExecutor } from "../../src/remote/client.
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import type { BrowserRunResult } from "../../src/browserMode.js";
 import type { BrowserRunTransaction } from "../../src/browser/types.js";
-import { writeBinaryBrowserArtifact } from "../../src/browser/artifacts.js";
+import {
+  saveBrowserTranscriptArtifact,
+  writeBinaryBrowserArtifact,
+} from "../../src/browser/artifacts.js";
 import {
   MAX_REMOTE_ARTIFACT_BYTES,
   MAX_REMOTE_ATTACHMENT_BYTES,
@@ -44,6 +49,84 @@ import {
 } from "./serverTestBuilders.js";
 import { httpPostJson, httpPostNdjson, readIncomingBody } from "./serverTestHttp.js";
 import { openTestRemoteTransactionStore } from "./testTransactionStore.js";
+import { resolveWindowsPowerShellExecutable } from "../../src/windowsSystemExecutable.js";
+import { establishWindowsPrivateDirectories } from "../../src/remote/windowsPrivateTreeAcl.js";
+
+const execFileAsync = promisify(execFile);
+
+function buildWindowsAclTestArgs(script: string, itemPaths: readonly string[]): string[] {
+  const encodedPaths = itemPaths.map((itemPath) =>
+    Buffer.from(itemPath, "utf8").toString("base64"),
+  );
+  const command = String.raw`
+$ItemPaths = @(${encodedPaths
+    .map(
+      (encodedPath) =>
+        `[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedPath}'))`,
+    )
+    .join(",")})
+${script}`;
+  return [
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-EncodedCommand",
+    Buffer.from(command, "utf16le").toString("base64"),
+  ];
+}
+
+async function grantPermissiveInheritedWindowsAcl(directoryPath: string): Promise<void> {
+  const script = String.raw`
+$Everyone = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
+$Inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+$Rule = [System.Security.AccessControl.FileSystemAccessRule]::new($Everyone, [System.Security.AccessControl.FileSystemRights]::ReadAndExecute, $Inheritance, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
+$Item = Get-Item -LiteralPath $ItemPaths[0] -Force
+$Acl = $Item.GetAccessControl()
+[void]$Acl.AddAccessRule($Rule)
+$Item.SetAccessControl($Acl)`;
+  await execFileAsync(
+    resolveWindowsPowerShellExecutable(),
+    buildWindowsAclTestArgs(script, [directoryPath]),
+    { timeout: 12_000, windowsHide: true },
+  );
+}
+
+async function assertCanonicalPrivateWindowsAcls(itemPaths: readonly string[]): Promise<void> {
+  const script = String.raw`
+$CurrentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$AllowedSids = @(
+  $CurrentSid,
+  [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
+  [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+)
+$FullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
+$Allow = [System.Security.AccessControl.AccessControlType]::Allow
+$NoPropagation = [System.Security.AccessControl.PropagationFlags]::None
+$DirectoryInheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+foreach ($ItemPath in $ItemPaths) {
+  $Item = Get-Item -LiteralPath $ItemPath -Force
+  if (($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Private artifact item is a reparse point: $ItemPath" }
+  $Acl = $Item.GetAccessControl()
+  if ($Acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $CurrentSid.Value) { throw "Unexpected owner: $ItemPath" }
+  if (-not $Acl.AreAccessRulesProtected) { throw "Inherited ACL remained enabled: $ItemPath" }
+  $Rules = @($Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+  if ($Rules.Count -ne $AllowedSids.Count) { throw "Unexpected rule count: $ItemPath" }
+  $ExpectedInheritance = if ($Item.PSIsContainer) { $DirectoryInheritance } else { [System.Security.AccessControl.InheritanceFlags]::None }
+  foreach ($Sid in $AllowedSids) {
+    $Matches = @($Rules | Where-Object { $_.IdentityReference.Value -eq $Sid.Value })
+    if ($Matches.Count -ne 1) { throw "Unexpected principal rules: $ItemPath" }
+    $Rule = $Matches[0]
+    if ($Rule.IsInherited -or $Rule.AccessControlType -ne $Allow -or [int64]$Rule.FileSystemRights -ne [int64]$FullControl -or $Rule.InheritanceFlags -ne $ExpectedInheritance -or $Rule.PropagationFlags -ne $NoPropagation) { throw "Unexpected private ACL rule: $ItemPath" }
+  }
+}
+[Console]::Out.Write('private')`;
+  const { stdout } = await execFileAsync(
+    resolveWindowsPowerShellExecutable(),
+    buildWindowsAclTestArgs(script, itemPaths),
+    { encoding: "utf8", timeout: 12_000, windowsHide: true },
+  );
+  expect(stdout).toBe("private");
+}
 
 describe("remote browser service", { timeout: 15_000 }, () => {
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
@@ -466,7 +549,15 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const clientHome = path.join(tmpDir, "oracle-home");
       const transactionStoreDir = path.join(tmpDir, "transactions");
       const clientSessionDirectory = path.join(clientHome, "sessions", "manual-copy-client");
-      await mkdir(clientSessionDirectory, { recursive: true });
+      if (process.platform === "win32") {
+        await mkdir(clientHome, { recursive: true });
+        await establishWindowsPrivateDirectories([
+          path.join(clientHome, "sessions"),
+          clientSessionDirectory,
+        ]);
+      } else {
+        await mkdir(clientSessionDirectory, { recursive: true });
+      }
       await writeFile(path.join(clientSessionDirectory, "artifacts"), "block local publication");
       setOracleHomeDirOverrideForTest(clientHome);
       const payload = Buffer.from([
@@ -885,6 +976,96 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         setOracleHomeDirOverrideForTest(null);
       }
     },
+  );
+
+  test.runIf(process.platform === "win32" && CAN_LISTEN_LOCALHOST)(
+    "keeps server transcripts, binaries, and client downloads private beneath permissive parents",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-windows-artifacts-"));
+      const serverHome = path.join(root, "server-home");
+      const clientHome = path.join(root, "client-home");
+      const transactionStoreDir = path.join(root, "transactions");
+      const hostArtifactPaths: string[] = [];
+      const payload = Buffer.from("private remote artifact", "utf8");
+      await grantPermissiveInheritedWindowsAcl(root);
+      await mkdir(serverHome);
+      await mkdir(clientHome);
+      setOracleHomeDirOverrideForTest(serverHome);
+      const server = await createTestRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
+        {
+          transactionStoreDir,
+          runBrowser: async (options) => {
+            if (!options.artifactWriteAuthority?.windowsPrivateFiles) {
+              throw new Error("Missing Windows private artifact write authority");
+            }
+            const transcript = await saveBrowserTranscriptArtifact({
+              sessionId: options.sessionId,
+              artifactWriteAuthority: options.artifactWriteAuthority,
+              prompt: options.prompt,
+              answerMarkdown: "private answer",
+            });
+            const binary = await writeBinaryBrowserArtifact({
+              sessionId: options.sessionId,
+              artifactWriteAuthority: options.artifactWriteAuthority,
+              kind: "file",
+              filename: "private-result.bin",
+              contents: payload,
+              label: "private-result.bin",
+              mimeType: "application/octet-stream",
+              sourceUrl: "browser-download",
+            });
+            if (!transcript || !binary) throw new Error("Expected private server artifacts");
+            hostArtifactPaths.push(transcript.path, binary.path);
+            return browserTransaction(options.prompt, {
+              answerText: "private answer",
+              answerMarkdown: "private answer",
+              tookMs: 1,
+              answerTokens: 2,
+              answerChars: 14,
+              savedFiles: [
+                {
+                  ...binary,
+                  kind: "file",
+                  url: "browser-download",
+                  finalUrl: "browser-download",
+                  filename: path.basename(binary.path),
+                },
+              ],
+            });
+          },
+        },
+      );
+      setOracleHomeDirOverrideForTest(clientHome);
+      try {
+        const result = await createRemoteBrowserTransactionExecutor({
+          host: `127.0.0.1:${server.port}`,
+          token: "a".repeat(64),
+        })({ prompt: "private artifact", config: {}, sessionId: "windows-private-client" });
+        const clientArtifact = result.artifacts?.[0];
+        if (!clientArtifact) throw new Error("Expected private client artifact");
+        await expect(readFile(clientArtifact.path)).resolves.toEqual(payload);
+
+        const serverArtifactsDirectory = path.dirname(hostArtifactPaths[0]!);
+        const serverNamespaceDirectory = path.dirname(serverArtifactsDirectory);
+        await assertCanonicalPrivateWindowsAcls([
+          path.join(serverHome, "sessions"),
+          serverNamespaceDirectory,
+          serverArtifactsDirectory,
+          ...hostArtifactPaths,
+          path.join(clientHome, "sessions"),
+          path.join(clientHome, "sessions", "windows-private-client"),
+          path.dirname(clientArtifact.path),
+          clientArtifact.path,
+        ]);
+        await result.finalize();
+      } finally {
+        await server.close();
+        setOracleHomeDirOverrideForTest(null);
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+    30_000,
   );
 });
 function createAuthenticatedTestServer(

@@ -7,6 +7,9 @@ const WINDOWS_PRIVATE_TREE_ACL_TIMEOUT_MS = 12_000;
 const WINDOWS_PRIVATE_TREE_ACL_COMPLETE_MARKER =
   "oracle.remote-transaction.private-tree.v1:complete";
 const WINDOWS_PRIVATE_DIRECTORY_COMPLETE_MARKER = "oracle.windows-private-directory.v1:complete";
+const WINDOWS_PRIVATE_FILE_CREATED_MARKER = "oracle.windows-private-file.v1:created";
+const WINDOWS_PRIVATE_FILE_EXISTS_MARKER = "oracle.windows-private-file.v1:exists";
+const WINDOWS_PRIVATE_FILE_VERIFIED_MARKER = "oracle.windows-private-file.v1:verified";
 const WINDOWS_PRIVATE_TREE_MAX_ENTRIES = 4_096;
 
 export interface WindowsPrivateTreeScope {
@@ -31,6 +34,9 @@ export type WindowsAclCommandExecutor = (
 
 export type WindowsPrivateTreeAuthority = (scope: WindowsPrivateTreeScope) => Promise<void>;
 export type WindowsPrivateDirectoryAuthority = (directoryPath: string) => Promise<void>;
+export type WindowsPrivateDirectoriesAuthority = (
+  directoryPaths: readonly string[],
+) => Promise<void>;
 
 const WINDOWS_PRIVATE_ACL_FUNCTIONS_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
@@ -272,6 +278,27 @@ foreach ($DirectoryPath in $DirectoryPaths) { Assert-PrivateAcl (Get-PhysicalIte
   return Buffer.from(command, "utf16le").toString("base64");
 }
 
+function encodeWindowsPrivateFileCommand(filePath: string, initialize: boolean): string {
+  const encodedPath = Buffer.from(filePath, "utf8").toString("base64");
+  const command = String.raw`
+$FilePath = [System.IO.Path]::GetFullPath([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedPath}')))
+${WINDOWS_PRIVATE_ACL_FUNCTIONS_SCRIPT}
+$ParentPath = [System.IO.Path]::GetDirectoryName($FilePath)
+Assert-PrivateAcl (Get-PhysicalItem $ParentPath $true) $true
+if (${initialize ? "$true" : "$false"}) {
+  if ([System.IO.File]::Exists($FilePath) -or [System.IO.Directory]::Exists($FilePath)) {
+    [Console]::Out.Write('${WINDOWS_PRIVATE_FILE_EXISTS_MARKER}')
+  } else {
+    New-PrivateFile $FilePath
+    [Console]::Out.Write('${WINDOWS_PRIVATE_FILE_CREATED_MARKER}')
+  }
+} else {
+  Assert-PrivateAcl (Get-PhysicalItem $FilePath $false) $false
+  [Console]::Out.Write('${WINDOWS_PRIVATE_FILE_VERIFIED_MARKER}')
+}`;
+  return Buffer.from(command, "utf16le").toString("base64");
+}
+
 const execFileAsync = promisify(execFile);
 
 const executeWindowsAclCommand: WindowsAclCommandExecutor = async (file, args, options) => {
@@ -326,6 +353,36 @@ export function buildWindowsPrivateDirectoryCommand(directoryPath: string): Wind
   return buildWindowsPrivateDirectoriesCommand([directoryPath]);
 }
 
+export function buildWindowsPrivateFileInitializationCommand(filePath: string): WindowsAclCommand {
+  assertAbsoluteNonRootWindowsPath(filePath);
+  return {
+    file: resolveWindowsPowerShellExecutable(),
+    args: [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-EncodedCommand",
+      encodeWindowsPrivateFileCommand(filePath, true),
+    ],
+    options: { timeoutMs: WINDOWS_PRIVATE_TREE_ACL_TIMEOUT_MS },
+  };
+}
+
+export function buildWindowsPrivateFileVerificationCommand(filePath: string): WindowsAclCommand {
+  assertAbsoluteNonRootWindowsPath(filePath);
+  return {
+    file: resolveWindowsPowerShellExecutable(),
+    args: [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-EncodedCommand",
+      encodeWindowsPrivateFileCommand(filePath, false),
+    ],
+    options: { timeoutMs: WINDOWS_PRIVATE_TREE_ACL_TIMEOUT_MS },
+  };
+}
+
 export function buildWindowsPrivateTreeAclCommand(
   scope: WindowsPrivateTreeScope,
 ): WindowsAclCommand {
@@ -353,21 +410,22 @@ export function buildWindowsPrivateTreeAclCommand(
 
 async function runWindowsPrivateAclCommand(
   command: WindowsAclCommand,
-  marker: string,
+  markers: readonly string[],
   failureMessage: string,
   execute: WindowsAclCommandExecutor,
-): Promise<void> {
+): Promise<string> {
   let stdout: string;
   try {
     ({ stdout } = await execute(command.file, command.args, command.options));
   } catch (error) {
     throw new Error(failureMessage, { cause: error });
   }
-  if (stdout !== marker) {
+  if (!markers.includes(stdout)) {
     throw new Error(
       `${failureMessage.replace(" protection failed", " verification")} did not complete`,
     );
   }
+  return stdout;
 }
 
 export async function establishWindowsPrivateDirectories(
@@ -376,7 +434,7 @@ export async function establishWindowsPrivateDirectories(
 ): Promise<void> {
   await runWindowsPrivateAclCommand(
     buildWindowsPrivateDirectoriesCommand(directoryPaths),
-    WINDOWS_PRIVATE_DIRECTORY_COMPLETE_MARKER,
+    [WINDOWS_PRIVATE_DIRECTORY_COMPLETE_MARKER],
     "Windows private directory protection failed",
     execute,
   );
@@ -389,13 +447,38 @@ export async function establishWindowsPrivateDirectory(
   await establishWindowsPrivateDirectories([directoryPath], execute);
 }
 
+export async function initializeWindowsPrivateFile(
+  filePath: string,
+  execute: WindowsAclCommandExecutor = executeWindowsAclCommand,
+): Promise<boolean> {
+  const marker = await runWindowsPrivateAclCommand(
+    buildWindowsPrivateFileInitializationCommand(filePath),
+    [WINDOWS_PRIVATE_FILE_CREATED_MARKER, WINDOWS_PRIVATE_FILE_EXISTS_MARKER],
+    "Windows private file creation failed",
+    execute,
+  );
+  return marker === WINDOWS_PRIVATE_FILE_CREATED_MARKER;
+}
+
+export async function verifyWindowsPrivateFile(
+  filePath: string,
+  execute: WindowsAclCommandExecutor = executeWindowsAclCommand,
+): Promise<void> {
+  await runWindowsPrivateAclCommand(
+    buildWindowsPrivateFileVerificationCommand(filePath),
+    [WINDOWS_PRIVATE_FILE_VERIFIED_MARKER],
+    "Windows private file protection failed",
+    execute,
+  );
+}
+
 export async function protectWindowsPrivateTreeAcl(
   scope: WindowsPrivateTreeScope,
   execute: WindowsAclCommandExecutor = executeWindowsAclCommand,
 ): Promise<void> {
   await runWindowsPrivateAclCommand(
     buildWindowsPrivateTreeAclCommand(scope),
-    WINDOWS_PRIVATE_TREE_ACL_COMPLETE_MARKER,
+    [WINDOWS_PRIVATE_TREE_ACL_COMPLETE_MARKER],
     "Windows remote transaction private ACL protection failed",
     execute,
   );

@@ -20,6 +20,9 @@
 - CLI/Browser follow-up: accept pre-prompt-epoch completed browser follow-ups only with unambiguous GPT/ChatGPT provenance and one exact ChatGPT conversation locator, rejecting Gemini, non-GPT, and conflicting metadata.
 - Browser/Project Sources: bind interrupted temporary-profile cleanup to a create-only authority marker under the exact physical profile, bind manual cleanup to an external Project-Sources admission receipt plus exact lease and owner evidence, and reconcile interrupted target acquisition without closing ambiguous or unrelated tabs.
 - Remote/Windows: resolve native PowerShell and OpenSSH only through fixed `\\?\GLOBALROOT\SystemRoot\System32` paths, kernel-canonicalize the result, and ignore mutable `SystemRoot`, `WINDIR`, and `PATH` before bridge or private-tree ACL operations; verified private ACLs are left unchanged so repeated authority checks cannot invalidate file-generation evidence.
+- Browser/Gemini API: restore `createGeminiWebExecutor` as the result-only auto-finalizing compatibility executor, expose lifecycle settlement through `createGeminiWebTransactionExecutor`, and preserve completed answers when cleanup remains retryable.
+- Browser recovery: persist one exact temporary-profile generation authority through local, reattach, copied-profile, and Project Sources cleanup; reject mismatched or malformed identities before effects and remove only the verified generation.
+- Remote/Windows artifacts: create server namespaces, artifact files, and client partial downloads under owner-only ACLs before writing bytes, preserve physical identity through promotion, and verify the final owner, DACL, and reparse state.
 
 ## 0.17.0 — 2026-08-02
 

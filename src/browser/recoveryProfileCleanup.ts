@@ -1,13 +1,18 @@
 import os from "node:os";
 import path from "node:path";
 import type { BrowserRecoveryCleanupResourceMetadata } from "../sessionManager.js";
-import type { BrowserRuntimeMetadata } from "../sessionStore.js";
-import { privateRuntimeRootPathCandidates } from "../privateTempRoot.js";
+import {
+  assertPrivateDirectoryAuthority,
+  assertTemporaryProfileAuthority,
+  parseTemporaryProfileAuthority,
+  removeTemporaryProfileAuthority,
+  type TemporaryProfileAuthority,
+} from "../privateTempRoot.js";
 import type { RetainedChromeEndpointAuthority } from "./chromeLifecycle.js";
 import {
   cleanupStaleProfileState,
   isSafeChromeTerminationOutcome,
-  removeProfileDirectoryIfIdentityMatches,
+  sameProfileDirectoryIdentity,
   verifyProfileDirectoryIdentity,
   type ProfileDirectoryIdentity,
 } from "./profileState.js";
@@ -62,22 +67,43 @@ export async function teardownLocalRecoveryGroup(
 ): Promise<string | null> {
   const profileKind = resource.recoveryCleanup.profileKind;
   const profileDir = resource.userDataDir;
-  const profileError = validateCleanupProfilePath(resource, profileKind);
+  const temporaryProfileAuthority =
+    profileKind === "temporary" || profileKind === "copied"
+      ? parseTemporaryProfileAuthority(resource.temporaryProfileAuthority)
+      : null;
+  const profileError = validateCleanupProfilePath(resource, profileKind, temporaryProfileAuthority);
   if (!profileDir || profileError) return profileError ?? "Cleanup profile path is missing";
-
+  if (temporaryProfileAuthority) {
+    try {
+      await assertPrivateDirectoryAuthority(temporaryProfileAuthority.generation.parent);
+    } catch (error) {
+      return `Temporary profile parent authority changed: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
   const processIdentity = resource.chromeProcessIdentity;
-  if (
-    !processIdentity &&
-    (profileKind === "temporary" || profileKind === "copied") &&
-    (await cleanupProfileAbsent(profileDir))
-  ) {
+  if (!processIdentity && temporaryProfileAuthority && (await cleanupProfileAbsent(profileDir))) {
     return null;
   }
-  const profileDirectory = physicalProfileDirectoryIdentity(
-    processIdentity?.profileDirectory ?? resource.profileDirectoryIdentity,
-  );
+  const profileDirectory =
+    temporaryProfileAuthority?.profileDirectory ??
+    physicalProfileDirectoryIdentity(
+      processIdentity?.profileDirectory ?? resource.profileDirectoryIdentity,
+    );
   if (!profileDirectory) {
     return "Chrome physical profile identity cleanup metadata is missing";
+  }
+  if (
+    processIdentity &&
+    !sameProfileDirectoryIdentity(processIdentity.profileDirectory, profileDirectory)
+  ) {
+    return "Chrome process identity does not match the temporary profile authority";
+  }
+  if (temporaryProfileAuthority) {
+    try {
+      await assertTemporaryProfileAuthority(temporaryProfileAuthority);
+    } catch (error) {
+      return `Temporary profile authority changed: ${error instanceof Error ? error.message : String(error)}`;
+    }
   }
   if (
     !(await (deps.verifyProfileDirectoryIdentity ?? verifyProfileDirectoryIdentity)(
@@ -121,13 +147,17 @@ export async function teardownLocalRecoveryGroup(
       : `Manual-login profile cleanup was not confirmed: ${profileDir}`;
   }
 
-  return (await removeCleanupProfile(profileDir, profileDirectory, deps.removeProfile))
+  if (!temporaryProfileAuthority) {
+    return "Exact temporary profile cleanup authority is missing";
+  }
+  return (await removeCleanupProfile(temporaryProfileAuthority, deps.removeProfile))
     ? null
     : `Profile removal was not confirmed: ${profileDir}`;
 }
 function validateCleanupProfilePath(
-  runtime: BrowserRuntimeMetadata,
+  runtime: BrowserRecoveryCleanupResourceMetadata,
   profileKind: "temporary" | "manual-login" | "copied" | "none",
+  temporaryProfileAuthority: TemporaryProfileAuthority | null,
 ): string | null {
   const profileDir = runtime.userDataDir;
   if (!profileDir) return "Cleanup profile path is missing";
@@ -138,46 +168,46 @@ function validateCleanupProfilePath(
   if (profileDir === root || profileDir === path.resolve(os.homedir())) {
     return `Refusing unsafe cleanup profile path: ${profileDir}`;
   }
-  if (
-    runtime.chromeProfileRoot &&
-    path.resolve(runtime.chromeProfileRoot) !== path.resolve(profileDir)
-  ) {
+  if (runtime.chromeProfileRoot && runtime.chromeProfileRoot !== profileDir) {
     return "Serialized Chrome profile roots disagree";
   }
-  if (profileKind !== "temporary" && profileKind !== "copied") return null;
-  const basename = path.basename(profileDir);
-  if (!basename.startsWith("oracle-browser-") && !basename.startsWith("oracle-reattach-")) {
-    return `Refusing unrecognized temporary profile path: ${profileDir}`;
+  if (profileKind !== "temporary" && profileKind !== "copied") {
+    return temporaryProfileAuthority
+      ? "Persistent profile cleanup cannot carry temporary-profile authority"
+      : null;
   }
-  const allowedRoots = [
-    ...privateRuntimeRootPathCandidates(),
-    os.tmpdir(),
-    "/tmp",
-    "/mnt/c/Users/Public/AppData/Local/Temp",
-    "/mnt/c/Temp",
-    "/mnt/c/Windows/Temp",
-  ].map((candidate) => path.resolve(candidate));
-  if (!allowedRoots.some((candidate) => isPathWithin(candidate, profileDir))) {
-    return `Temporary profile is outside approved runtime roots: ${profileDir}`;
+  if (!temporaryProfileAuthority) return "Exact temporary profile cleanup authority is missing";
+  if (
+    temporaryProfileAuthority.profileDirectory.canonicalPath !== profileDir ||
+    temporaryProfileAuthority.generation.path !== profileDir
+  ) {
+    return "Temporary profile path does not match its persisted authority";
+  }
+  const persistedProfile = physicalProfileDirectoryIdentity(runtime.profileDirectoryIdentity);
+  if (runtime.profileDirectoryIdentity !== undefined && !persistedProfile) {
+    return "Chrome physical profile identity cleanup metadata is missing";
+  }
+  if (
+    persistedProfile &&
+    !sameProfileDirectoryIdentity(persistedProfile, temporaryProfileAuthority.profileDirectory)
+  ) {
+    return "Temporary profile identity does not match its persisted authority";
   }
   return null;
 }
 
-function isPathWithin(parent: string, child: string): boolean {
-  const relative = path.relative(parent, path.resolve(child));
-  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
-}
-
 async function removeCleanupProfile(
-  profileDir: string,
-  expectedIdentity: ProfileDirectoryIdentity,
+  authority: TemporaryProfileAuthority,
   removeProfile?: (
     profileDir: string,
     expectedIdentity: ProfileDirectoryIdentity,
   ) => Promise<boolean>,
 ): Promise<boolean> {
-  if (removeProfile) {
-    return (await removeProfile(profileDir, expectedIdentity)) === true;
+  if (!removeProfile) return await removeTemporaryProfileAuthority(authority);
+  try {
+    await assertTemporaryProfileAuthority(authority);
+  } catch {
+    return false;
   }
-  return removeProfileDirectoryIfIdentityMatches(profileDir, expectedIdentity);
+  return (await removeProfile(authority.generation.path, authority.profileDirectory)) === true;
 }

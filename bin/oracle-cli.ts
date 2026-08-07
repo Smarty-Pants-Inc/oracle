@@ -2493,9 +2493,9 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     };
     console.log(chalk.dim(`Routing browser automation to remote host ${remoteHost}`));
   } else if (browserConfig && activeModel.startsWith("gemini")) {
-    const { createGeminiWebExecutor } = await import("../src/gemini-web/index.js");
+    const { createGeminiWebTransactionExecutor } = await import("../src/gemini-web/index.js");
     browserDeps = {
-      executeBrowser: createGeminiWebExecutor({
+      executeBrowser: createGeminiWebTransactionExecutor({
         youtube: options.youtube,
         generateImage: options.generateImage,
         editImage: options.editImage,
@@ -2906,9 +2906,9 @@ async function restartSession(sessionId: string, options: RestartCommandOptions)
     };
     console.log(chalk.dim(`Routing browser automation to remote host ${remoteHost}`));
   } else if (browserConfig && runOptions.model.startsWith("gemini")) {
-    const { createGeminiWebExecutor } = await import("../src/gemini-web/index.js");
+    const { createGeminiWebTransactionExecutor } = await import("../src/gemini-web/index.js");
     browserDeps = {
-      executeBrowser: createGeminiWebExecutor({
+      executeBrowser: createGeminiWebTransactionExecutor({
         youtube: storedOptions.youtube,
         generateImage: storedOptions.generateImage,
         editImage: storedOptions.editImage,

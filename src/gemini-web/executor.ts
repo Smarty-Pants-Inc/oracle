@@ -1,4 +1,5 @@
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import type {
   BrowserCaptureFinalizationResult,
   BrowserRunOptions,
@@ -10,6 +11,7 @@ import type {
 import { getCookies } from "@steipete/sweet-cookie";
 import { runProviderSubmissionFlow } from "../browser/providerDomFlow.js";
 import {
+  acknowledgeSettledTargetCloseCapabilities,
   completedBrowserCaptureCleanup,
   OwnedBrowserResourceTransaction,
   pendingBrowserCaptureCleanup,
@@ -588,7 +590,7 @@ async function loadGeminiCookies(
   };
 }
 
-export function createGeminiWebExecutor(
+export function createGeminiWebTransactionExecutor(
   geminiOptions: GeminiWebOptions,
 ): (runOptions: BrowserRunOptions) => Promise<BrowserRunTransaction> {
   return async (runOptions: BrowserRunOptions): Promise<BrowserRunTransaction> => {
@@ -791,5 +793,43 @@ export function createGeminiWebExecutor(
 
     const executionClient = modeSelection.mode === "dom" ? domClient : httpClient;
     return executionClient.execute();
+  };
+}
+
+/** Result-only public API; internal runners use the transaction executor above. */
+export function createGeminiWebExecutor(
+  geminiOptions: GeminiWebOptions,
+): (runOptions: BrowserRunOptions) => Promise<BrowserRunResult> {
+  const executeTransaction = createGeminiWebTransactionExecutor(geminiOptions);
+  return async (runOptions: BrowserRunOptions): Promise<BrowserRunResult> => {
+    const ownerId = runOptions.sessionId?.trim() || randomUUID();
+    const transaction = await executeTransaction({ ...runOptions, sessionId: ownerId });
+    const runtimeBeforeFinalization = transaction.runtime;
+    const finalization = await transaction.finalize();
+    await acknowledgeSettledTargetCloseCapabilities(
+      runtimeBeforeFinalization,
+      finalization.runtime,
+      ownerId,
+    );
+    const {
+      runtime: _runtime,
+      bindSettlement: _bindSettlement,
+      finalize: _finalize,
+      abort: _abort,
+      ...result
+    } = transaction;
+    if (finalization.status === "pending") {
+      result.warnings = [
+        ...(result.warnings ?? []),
+        {
+          code: "direct-finalize-cleanup-pending",
+          severity: "warning",
+          message:
+            "The assistant answer is complete, but internal browser cleanup remains pending.",
+          details: { stage: "browser-capture-finalization" },
+        },
+      ];
+    }
+    return result;
   };
 }

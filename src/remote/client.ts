@@ -693,6 +693,7 @@ async function buildRemoteBrowserTransaction(params: {
       error instanceof BrowserAutomationError &&
       (error.details?.code === "settlement-authority-persistence-failed" ||
         error.details?.code === "remote-settlement-binding-transport-failed" ||
+        error.details?.code === "remote-settlement-contention-pending" ||
         error.details?.code === "remote-artifact-manual-copy-waiver-pending")
     ) {
       return pendingBrowserCaptureCleanup(runtime, error.message, mode);

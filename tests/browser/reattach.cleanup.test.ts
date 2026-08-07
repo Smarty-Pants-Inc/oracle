@@ -9,6 +9,7 @@ import type { ReattachCleanupDeps } from "../../src/browser/reattachCleanupTypes
 import {
   authenticatedLocalTargetCleanupDeps,
   createBrowserLogger,
+  createTemporaryProfileFixture,
   physicalChromeProcessIdentity,
   withCommittedPromptEpoch,
   withRecoveryCleanup,
@@ -20,7 +21,9 @@ describe("recovery cleanup", { timeout: 15_000 }, () => {
   const stopped = { status: "stopped", pid: 1234, signal: "SIGTERM" } as const;
   test("defers cleanup until finalize and runs the finalizer once", async () => {
     const events: string[] = [];
-    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-reattach-fallback-profile-"));
+    const { profileDir, temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-reattach-fallback-profile-",
+    );
     const processIdentity = await physicalChromeProcessIdentity(profileDir);
     const runtime = withCommittedPromptEpoch(
       withRecoveryCleanup(
@@ -36,6 +39,8 @@ describe("recovery cleanup", { timeout: 15_000 }, () => {
           keepBrowser: false,
           closeOwnedTargetOnComplete: true,
         },
+        undefined,
+        { temporaryProfileAuthority },
       ),
     );
     const logger = createBrowserLogger();
@@ -76,6 +81,7 @@ describe("recovery cleanup", { timeout: 15_000 }, () => {
       "terminate",
       "remove-profile",
     ]);
+    await cleanup();
   });
 
   test("abort settles abort resources without running finalize", async () => {
@@ -108,7 +114,9 @@ describe("recovery cleanup", { timeout: 15_000 }, () => {
 
   test("retains cleanup authority when Chrome termination is unsafe", async () => {
     const removeProfile = vi.fn(async () => true);
-    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-unsafe-cleanup-"));
+    const { profileDir, temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-browser-unsafe-cleanup-",
+    );
     const processIdentity = await physicalChromeProcessIdentity(profileDir);
     try {
       const result = await finalizeRecoveredRuntime(
@@ -123,6 +131,8 @@ describe("recovery cleanup", { timeout: 15_000 }, () => {
             profileKind: "copied",
             keepBrowser: false,
           },
+          undefined,
+          { temporaryProfileAuthority },
         ),
         createBrowserLogger(),
         {
@@ -157,18 +167,21 @@ describe("recovery cleanup", { timeout: 15_000 }, () => {
       });
       expect(removeProfile).not.toHaveBeenCalled();
     } finally {
-      await rm(profileDir, { recursive: true, force: true });
+      await cleanup();
     }
   });
 
   test("closes every shared-process target before one teardown", async () => {
-    const profileDir = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-shared-group-"));
+    const { profileDir, temporaryProfileAuthority, cleanup } = await createTemporaryProfileFixture(
+      "oracle-browser-shared-group-",
+    );
     const processIdentity = await physicalChromeProcessIdentity(profileDir);
     const events: string[] = [];
     const oldResource = withRetainedTargetCapability({
       chromeProcessIdentity: processIdentity,
       chromePort: 9111,
       userDataDir: profileDir,
+      temporaryProfileAuthority,
       chromeTargetId: "old-target",
       recoveryCleanup: {
         ownsTarget: true,
@@ -218,7 +231,7 @@ describe("recovery cleanup", { timeout: 15_000 }, () => {
         "remove-profile",
       ]);
     } finally {
-      await rm(profileDir, { recursive: true, force: true });
+      await cleanup();
     }
   });
   test("holds the current lease through shared target close and atomic manual teardown", async () => {
@@ -302,8 +315,10 @@ describe("recovery cleanup", { timeout: 15_000 }, () => {
   });
 
   test("lets exact old-process teardown settle target failure without blocking current cleanup", async () => {
-    const oldProfile = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-old-group-"));
-    const currentProfile = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-current-group-"));
+    const oldFixture = await createTemporaryProfileFixture("oracle-browser-old-group-");
+    const currentFixture = await createTemporaryProfileFixture("oracle-browser-current-group-");
+    const oldProfile = oldFixture.profileDir;
+    const currentProfile = currentFixture.profileDir;
     const events: string[] = [];
     const oldIdentity = await physicalChromeProcessIdentity(oldProfile, 1111);
     const currentIdentity = await physicalChromeProcessIdentity(currentProfile, 2222);
@@ -312,6 +327,7 @@ describe("recovery cleanup", { timeout: 15_000 }, () => {
       profileDirectoryIdentity: oldIdentity.profileDirectory,
       chromePort: 9222,
       userDataDir: oldProfile,
+      temporaryProfileAuthority: oldFixture.temporaryProfileAuthority,
       chromeTargetId: "old-target",
       recoveryCleanup: {
         ownsTarget: true,
@@ -325,6 +341,7 @@ describe("recovery cleanup", { timeout: 15_000 }, () => {
       profileDirectoryIdentity: currentIdentity.profileDirectory,
       chromePort: 9333,
       userDataDir: currentProfile,
+      temporaryProfileAuthority: currentFixture.temporaryProfileAuthority,
       chromeTargetId: "current-target",
       recoveryCleanup: {
         ownsTarget: true,
@@ -374,16 +391,18 @@ describe("recovery cleanup", { timeout: 15_000 }, () => {
       ]);
       expect(result.runtime.recoveryCleanupResources).toBeUndefined();
     } finally {
-      await rm(oldProfile, { recursive: true, force: true });
-      await rm(currentProfile, { recursive: true, force: true });
+      await oldFixture.cleanup();
+      await currentFixture.cleanup();
     }
   }, 15_000);
 
   test("retries only resources that failed the previous cleanup pass", async () => {
-    const oldProfile = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-retry-old-group-"));
-    const currentProfile = await mkdtemp(
-      path.join(os.tmpdir(), "oracle-browser-retry-current-group-"),
+    const oldFixture = await createTemporaryProfileFixture("oracle-browser-retry-old-group-");
+    const currentFixture = await createTemporaryProfileFixture(
+      "oracle-browser-retry-current-group-",
     );
+    const oldProfile = oldFixture.profileDir;
+    const currentProfile = currentFixture.profileDir;
     const events: string[] = [];
     let oldAttempts = 0;
     let oldTerminationAttempts = 0;
@@ -420,6 +439,7 @@ describe("recovery cleanup", { timeout: 15_000 }, () => {
       profileDirectoryIdentity: oldIdentity.profileDirectory,
       chromePort: 9333,
       userDataDir: oldProfile,
+      temporaryProfileAuthority: oldFixture.temporaryProfileAuthority,
       chromeTargetId: "old-target",
       recoveryCleanup: {
         ownsTarget: true,
@@ -433,6 +453,7 @@ describe("recovery cleanup", { timeout: 15_000 }, () => {
       profileDirectoryIdentity: currentIdentity.profileDirectory,
       chromePort: 9444,
       userDataDir: currentProfile,
+      temporaryProfileAuthority: currentFixture.temporaryProfileAuthority,
       chromeTargetId: "current-target",
       recoveryCleanup: {
         ownsTarget: true,
@@ -479,8 +500,8 @@ describe("recovery cleanup", { timeout: 15_000 }, () => {
         `remove:${oldProfile}`,
       ]);
     } finally {
-      await rm(oldProfile, { recursive: true, force: true });
-      await rm(currentProfile, { recursive: true, force: true });
+      await oldFixture.cleanup();
+      await currentFixture.cleanup();
     }
   });
 });

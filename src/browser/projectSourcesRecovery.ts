@@ -6,14 +6,13 @@ import { getOracleHomeDir } from "../oracleHome.js";
 import {
   assertPrivateDirectoryAuthority,
   establishPrivateRuntimeAuthority,
-  removePrivateTempGeneration,
+  removeTemporaryProfileAuthority,
 } from "../privateTempRoot.js";
 import {
   type BrowserRecoveryTargetCloseCapabilityMetadata,
   type BrowserRuntimeMetadata,
   writeFileAtomicDurable,
 } from "../sessionManager.js";
-import { samePhysicalDirectoryIdentity } from "./filesystemLockDirectoryIdentity.js";
 import {
   assertProjectSourcesCleanupProof,
   assertProjectSourcesProfileParent,
@@ -38,7 +37,6 @@ import {
 import {
   captureProfileDirectoryIdentity,
   parseProfileDirectoryIdentity,
-  removeProfileDirectoryIfIdentityMatches,
   sameProfileDirectoryIdentity,
   type ProfileDirectoryIdentity,
 } from "./profileState.js";
@@ -80,13 +78,16 @@ export interface ProjectSourcesCleanupJournal {
 
 export interface ProjectSourcesRecoveryDeps extends ProjectSourcesPendingTargetDeps {
   retryCleanup?: typeof retryBrowserRecoveryCleanup;
-  removeProfileDirectoryIfIdentityMatches?: typeof removeProfileDirectoryIfIdentityMatches;
 }
 
-export async function establishProjectSourcesCleanupStorage(): Promise<ProjectSourcesCleanupStorage> {
-  const requestedRoot = path.resolve(getOracleHomeDir());
+export async function establishProjectSourcesCleanupStorage(
+  oracleHomeDirectory = getOracleHomeDir(),
+): Promise<ProjectSourcesCleanupStorage> {
+  const requestedRoot = path.resolve(oracleHomeDirectory);
   const root = await captureProfileDirectoryIdentity(requestedRoot, { create: true });
-  const runtimeRoot = await establishPrivateRuntimeAuthority();
+  const runtimeRoot = await establishPrivateRuntimeAuthority({
+    oracleStateDirectory: requestedRoot,
+  });
   const journalPath = path.join(root.canonicalPath, PROJECT_SOURCES_CLEANUP_JOURNAL);
   return {
     requestedRoot,
@@ -100,29 +101,15 @@ export async function establishProjectSourcesCleanupStorage(): Promise<ProjectSo
 export async function assertProjectSourcesCleanupStorage(
   storage: ProjectSourcesCleanupStorage,
 ): Promise<void> {
-  const currentRequestedRoot = path.resolve(getOracleHomeDir());
-  if (process.platform !== "win32" && currentRequestedRoot !== storage.requestedRoot) {
-    throw new Error("Project Sources cleanup Oracle-home root changed during the operation.");
-  }
-  const current = await captureProfileDirectoryIdentity(currentRequestedRoot);
+  const current = await captureProfileDirectoryIdentity(storage.requestedRoot);
   if (!sameProfileDirectoryIdentity(current, storage.root)) {
     throw new Error("Project Sources cleanup Oracle-home physical authority changed.");
   }
   await assertPrivateDirectoryAuthority(storage.runtimeRoot);
-  // Windows runtime selection is derived from the authenticated Oracle root. The exact assertion
-  // already rechecks physical generation around the owner, DACL, and reparse-point proof.
-  if (process.platform === "win32") return;
-  const currentRuntimeRoot = await establishPrivateRuntimeAuthority();
-  if (
-    currentRuntimeRoot.path !== storage.runtimeRoot.path ||
-    !samePhysicalDirectoryIdentity(currentRuntimeRoot.identity, storage.runtimeRoot.identity)
-  ) {
-    throw new Error("Project Sources private runtime root changed during the operation.");
-  }
 }
 
-export function projectSourcesCleanupJournalPath(): string {
-  return path.join(getOracleHomeDir(), PROJECT_SOURCES_CLEANUP_JOURNAL);
+export function projectSourcesCleanupJournalPath(oracleHomeDirectory = getOracleHomeDir()): string {
+  return path.join(oracleHomeDirectory, PROJECT_SOURCES_CLEANUP_JOURNAL);
 }
 
 function isProjectSourcesCleanupJournal(value: unknown): value is ProjectSourcesCleanupJournal {
@@ -320,16 +307,15 @@ export async function recoverPendingProjectSourcesProfileCreate(
   journal: ProjectSourcesCleanupJournal,
   storage: ProjectSourcesCleanupStorage,
   logger: BrowserLogger,
-  deps: ProjectSourcesRecoveryDeps = {},
 ): Promise<boolean> {
   const intent = journal.profileCreate;
   if (!intent) return false;
+  await assertProjectSourcesProfileParent(intent, storage);
   if (!(await projectSourcesEntryExists(intent.userDataDir))) {
     await persistProjectSourcesCleanupRuntime({}, storage);
     return true;
   }
-  await assertProjectSourcesProfileParent(intent, storage);
-  if (!intent.privateGeneration) {
+  if (!intent.temporaryProfileAuthority) {
     throw new Error(
       `Project Sources preserved an unproven temporary-profile occupant for manual recovery: ${intent.userDataDir}`,
     );
@@ -348,13 +334,15 @@ export async function recoverPendingProjectSourcesProfileCreate(
           { cause: error },
         );
       }
-      const removedPrivateChild = await removePrivateTempGeneration(intent.privateGeneration);
+      const removedPrivateChild = await removeTemporaryProfileAuthority(
+        intent.temporaryProfileAuthority,
+      );
       if (!removedPrivateChild) {
         throw new Error(
           `Project Sources private pre-marker profile removal was not confirmed: ${intent.userDataDir}`,
         );
       }
-      await assertPrivateDirectoryAuthority(intent.privateGeneration.parent);
+      await assertPrivateDirectoryAuthority(intent.temporaryProfileAuthority.generation.parent);
       await persistProjectSourcesCleanupRuntime({}, storage);
       logger(
         `[browser] Removed interrupted Project Sources private profile ${intent.userDataDir}.`,
@@ -366,15 +354,13 @@ export async function recoverPendingProjectSourcesProfileCreate(
     });
   }
   await assertProjectSourcesTemporaryProof(proof, storage);
-  const removed = await (
-    deps.removeProfileDirectoryIfIdentityMatches ?? removeProfileDirectoryIfIdentityMatches
-  )(intent.userDataDir, proof.profileDirectory);
+  const removed = await removeTemporaryProfileAuthority(proof.temporaryProfileAuthority);
   if (!removed) {
     throw new Error(
       `Project Sources proven temporary profile removal was not confirmed: ${intent.userDataDir}`,
     );
   }
-  await assertPrivateDirectoryAuthority(proof.privateGeneration.parent);
+  await assertPrivateDirectoryAuthority(proof.temporaryProfileAuthority.generation.parent);
   await syncDirectory(intent.parent.canonicalPath);
   logger(`[browser] Removed interrupted Project Sources temporary profile ${intent.userDataDir}.`);
   await persistProjectSourcesCleanupRuntime({}, storage);
@@ -398,7 +384,7 @@ export async function retryPendingProjectSourcesCleanup(
   const journal = await readProjectSourcesCleanupJournal(resolvedStorage);
   if (
     !journal ||
-    (await recoverPendingProjectSourcesProfileCreate(journal, resolvedStorage, logger, deps))
+    (await recoverPendingProjectSourcesProfileCreate(journal, resolvedStorage, logger))
   ) {
     return;
   }
@@ -459,16 +445,18 @@ export async function retryPendingProjectSourcesCleanup(
             deps,
           }),
         removeProfile: async (profileDir, expectedIdentity) => {
-          if (durableProof.kind === "temporary") {
-            await assertProjectSourcesTemporaryProof(durableProof, resolvedStorage);
+          if (durableProof.kind !== "temporary") return false;
+          await assertProjectSourcesTemporaryProof(durableProof, resolvedStorage);
+          if (
+            durableProof.temporaryProfileAuthority.generation.path !== profileDir ||
+            !sameProfileDirectoryIdentity(
+              durableProof.temporaryProfileAuthority.profileDirectory,
+              expectedIdentity,
+            )
+          ) {
+            return false;
           }
-          const removed = await (
-            deps.removeProfileDirectoryIfIdentityMatches ?? removeProfileDirectoryIfIdentityMatches
-          )(profileDir, expectedIdentity);
-          if (durableProof.kind === "temporary") {
-            await assertPrivateDirectoryAuthority(durableProof.privateGeneration.parent);
-          }
-          return removed;
+          return await removeTemporaryProfileAuthority(durableProof.temporaryProfileAuthority);
         },
       },
       persistFinalizationResult: async (result) => {

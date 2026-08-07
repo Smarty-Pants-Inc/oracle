@@ -5,7 +5,10 @@ import { mkdir } from "node:fs/promises";
 import type { BrowserRuntimeMetadata, BrowserSessionConfig } from "../sessionStore.js";
 import type { BrowserRecoveryTargetCloseCapabilityMetadata } from "../sessionManager.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import { assertPrivateTempGeneration, createPrivateTempGeneration } from "../privateTempRoot.js";
+import {
+  assertTemporaryProfileAuthority,
+  createTemporaryProfileAuthority,
+} from "../privateTempRoot.js";
 import {
   waitForAssistantResponse,
   captureAssistantMarkdown,
@@ -212,14 +215,19 @@ export async function resumeBrowserSessionViaNewChrome(
   const promptEpoch = promptLocator.epoch;
   const minTurnIndex = promptLocator.verifiedUserTurnIndex + 1;
   const manualLogin = Boolean(resolved.manualLogin);
-  const temporaryProfileGeneration = manualLogin
-    ? null
-    : await (deps.createPrivateTempGeneration ?? createPrivateTempGeneration)("oracle-reattach-");
-  const userDataDir = temporaryProfileGeneration
-    ? temporaryProfileGeneration.path
-    : (resolved.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile"));
+  const temporaryProfileAuthority = manualLogin
+    ? undefined
+    : await (deps.createTemporaryProfileAuthority ?? createTemporaryProfileAuthority)(
+        "oracle-reattach-",
+      );
+  const userDataDir =
+    temporaryProfileAuthority?.profileDirectory.canonicalPath ??
+    resolved.manualLoginProfileDir ??
+    path.join(os.homedir(), ".oracle", "browser-profile");
   if (manualLogin) await mkdir(userDataDir, { recursive: true });
-  const fallbackProfileIdentity = await captureProfileDirectoryIdentity(userDataDir);
+  const fallbackProfileIdentity =
+    temporaryProfileAuthority?.profileDirectory ??
+    (await captureProfileDirectoryIdentity(userDataDir));
 
   const acquisitionGenerationId = randomUUID();
   const resourceOwnerId = deps.sessionId?.trim() || randomUUID();
@@ -232,6 +240,7 @@ export async function resumeBrowserSessionViaNewChrome(
     baseRuntime: runtime,
     userDataDir,
     profileIdentity: fallbackProfileIdentity,
+    ...(temporaryProfileAuthority ? { temporaryProfileAuthority } : {}),
     manualLogin,
     keepBrowser: Boolean(resolved.keepBrowser),
     generationId: acquisitionGenerationId,
@@ -273,10 +282,10 @@ export async function resumeBrowserSessionViaNewChrome(
           );
           return { kind: "manual" as const, owner };
         }
-        if (!temporaryProfileGeneration) {
+        if (!temporaryProfileAuthority) {
           throw new Error("Temporary recovery profile authority is unavailable.");
         }
-        await assertPrivateTempGeneration(temporaryProfileGeneration);
+        await assertTemporaryProfileAuthority(temporaryProfileAuthority);
         const chrome = await (deps.launchChrome ?? launchChrome)(resolved, userDataDir, logger, {
           launchClaim: acquisitionLaunchClaim,
         });

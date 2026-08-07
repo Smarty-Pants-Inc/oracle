@@ -4,7 +4,10 @@ import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { retryBrowserRecoveryCleanup, __test__ } from "../../src/browser/reattach.js";
 import { acquireReattachRecoveryLock } from "../../src/browser/reattachLock.js";
-import { establishPrivateRuntimeAuthority } from "../../src/privateTempRoot.js";
+import {
+  createTemporaryProfileAuthority,
+  establishPrivateRuntimeAuthority,
+} from "../../src/privateTempRoot.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 import type { RemoteRecoverySettlementOptions } from "../../src/remote/types.js";
 import { acquireBrowserTabLease } from "../../src/browser/tabLeaseRegistry.js";
@@ -238,7 +241,11 @@ describe("remote recovery cleanup", { timeout: 15_000 }, () => {
   test("retries no-target cleanup through exact endpoint shutdown under the recovery lock", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-recovery-retry-test-"));
     const lockAuthority = await establishPrivateRuntimeAuthority({ tempDirectory: root });
-    const profileDir = await mkdtemp(path.join(root, "oracle-browser-retry-cleanup-"));
+    const temporaryProfileAuthority = await createTemporaryProfileAuthority(
+      "oracle-browser-retry-cleanup-",
+      { tempDirectory: root },
+    );
+    const profileDir = temporaryProfileAuthority.profileDirectory.canonicalPath;
     const processIdentity = await physicalChromeProcessIdentity(profileDir);
     const events: string[] = [];
     const terminateRecordedChromeForProfile = vi.fn(async () => stopped);
@@ -260,6 +267,8 @@ describe("remote recovery cleanup", { timeout: 15_000 }, () => {
             profileKind: "temporary",
             keepBrowser: false,
           },
+          undefined,
+          { temporaryProfileAuthority },
         ),
         createBrowserLogger(),
         {

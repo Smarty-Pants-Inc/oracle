@@ -1,7 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { resumeBrowserSession, __test__ } from "../../src/browser/reattach.js";
 import type { SessionBoundChromeClient } from "../../src/browser/chromeSessionTransport.js";
 import {
@@ -93,10 +93,6 @@ describe("resumeBrowserSession fallback acquisition", { timeout: 15_000 }, () =>
       pid: 4321,
       reason: "persisted owner lookup cannot safely terminate the still-live launch",
     }));
-    const removeProfile = vi.fn(async () => {
-      cleanupOrder.push("remove-profile");
-      return true;
-    });
 
     try {
       const result = await resumeBrowserSession(
@@ -121,7 +117,6 @@ describe("resumeBrowserSession fallback acquisition", { timeout: 15_000 }, () =>
           recoveryCleanup: {
             ...exactCleanupDeps,
             terminateRecordedChromeForProfile,
-            removeProfile,
           },
         },
       );
@@ -156,7 +151,9 @@ describe("resumeBrowserSession fallback acquisition", { timeout: 15_000 }, () =>
       );
       expect(kill).toHaveBeenCalledOnce();
       expect(terminateRecordedChromeForProfile).not.toHaveBeenCalled();
-      expect(cleanupOrder).toEqual(["target", "kill", "remove-profile"]);
+      expect(cleanupOrder).toEqual(["target", "kill"]);
+      if (!profileDir) throw new Error("Temporary fallback profile was not captured");
+      await expect(stat(profileDir)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       if (profileDir) await rm(profileDir, { recursive: true, force: true });
     }

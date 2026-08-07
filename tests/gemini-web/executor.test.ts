@@ -7,7 +7,9 @@ import type {
   RecordedChromeTerminationOutcome,
 } from "../../src/browser/profileState.js";
 import type { cleanupStaleProfileState as cleanupStaleProfileStateApi } from "../../src/browser/profileState.js";
-import { createGeminiWebExecutor } from "../../src/gemini-web/executor.js";
+import type * as ProfileStateModule from "../../src/browser/profileState.js";
+import { createGeminiWebExecutor } from "../../src/gemini-web/index.js";
+import { createGeminiWebTransactionExecutor } from "../../src/gemini-web/executor.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionStore.js";
 import type { RetainedChromeEndpointAuthority } from "../../src/browser/chromeLifecycle.js";
 import type { ManualChromeOwner } from "../../src/browser/manualChromeOwner.js";
@@ -136,7 +138,8 @@ vi.mock("../../src/browser/chromeProcessLaunchClaim.js", async (importOriginal) 
     nonce: "70000000-0000-4000-8000-000000000007",
   }),
 }));
-vi.mock("../../src/browser/profileState.js", () => ({
+vi.mock("../../src/browser/profileState.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof ProfileStateModule>()),
   parseProfileDirectoryIdentity: (identity: unknown) => identity,
   verifyProfileDirectoryIdentity: vi.fn(async () => true),
   captureProfileDirectoryIdentity,
@@ -442,7 +445,7 @@ describe("gemini-web executor", () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "oracle-gemini-exec-"));
     const outPath = path.join(tempDir, "gen.jpg");
 
-    const exec = createGeminiWebExecutor({
+    const exec = createGeminiWebTransactionExecutor({
       generateImage: outPath,
       aspectRatio: "1:1",
       showThoughts: true,
@@ -494,7 +497,7 @@ describe("gemini-web executor", () => {
         effectiveModel: "gemini-3.1-pro",
       });
 
-    const exec = createGeminiWebExecutor({ editImage: inPath, outputPath: outPath });
+    const exec = createGeminiWebTransactionExecutor({ editImage: inPath, outputPath: outPath });
     await exec({
       prompt: "add sunglasses",
       attachments: [],
@@ -523,7 +526,7 @@ describe("gemini-web executor", () => {
   });
 
   it("uses chromeCookiePath when provided", async () => {
-    const exec = createGeminiWebExecutor({});
+    const exec = createGeminiWebTransactionExecutor({});
     await exec({
       prompt: "hello",
       attachments: [],
@@ -536,7 +539,7 @@ describe("gemini-web executor", () => {
   });
 
   it("uses inline cookies when cookie sync is disabled", async () => {
-    const exec = createGeminiWebExecutor({});
+    const exec = createGeminiWebTransactionExecutor({});
     await exec({
       prompt: "hello",
       attachments: [],
@@ -584,7 +587,7 @@ describe("gemini-web executor", () => {
       };
     });
 
-    const result = await createGeminiWebExecutor({})({
+    const result = await createGeminiWebTransactionExecutor({})({
       prompt: "hello",
       attachments: [],
       sessionId: "gemini-cookie-owner",
@@ -630,7 +633,7 @@ describe("gemini-web executor", () => {
       pid: 12345,
       reason: "termination failed",
     });
-    const exec = createGeminiWebExecutor({});
+    const exec = createGeminiWebTransactionExecutor({});
 
     await expect(
       exec({
@@ -677,7 +680,7 @@ describe("gemini-web executor", () => {
       ],
     }));
 
-    const exec = createGeminiWebExecutor({});
+    const exec = createGeminiWebTransactionExecutor({});
 
     await expect(
       exec({
@@ -702,7 +705,7 @@ describe("gemini-web executor", () => {
       const settlement = runtime.recoveryCleanupResult?.settlementMode;
       events.push(`persist:${epoch}${settlement ? `:${settlement}` : ""}`);
     });
-    const exec = createGeminiWebExecutor({});
+    const exec = createGeminiWebTransactionExecutor({});
     const result = await exec({
       prompt: "hello",
       attachments: [],
@@ -797,7 +800,7 @@ describe("gemini-web executor", () => {
         }
         return evaluateNormally(input);
       });
-      const exec = createGeminiWebExecutor({});
+      const exec = createGeminiWebTransactionExecutor({});
 
       await expect(
         exec({
@@ -877,7 +880,7 @@ describe("gemini-web executor", () => {
       return evaluateNormally(input);
     });
 
-    const error = await createGeminiWebExecutor({})({
+    const error = await createGeminiWebTransactionExecutor({})({
       prompt: "hello",
       attachments: [],
       sessionId,
@@ -992,7 +995,7 @@ describe("gemini-web executor", () => {
     });
     const promptSha256 = promptIdentitySha256("hello");
     const verifiedUserTurnId = `gemini-dom-turn:0:${promptSha256}`;
-    const exec = createGeminiWebExecutor({});
+    const exec = createGeminiWebTransactionExecutor({});
 
     await expect(
       exec({
@@ -1035,7 +1038,7 @@ describe("gemini-web executor", () => {
         exception: { description: "ReferenceError: visibleSpinners is not defined" },
       },
     });
-    const exec = createGeminiWebExecutor({});
+    const exec = createGeminiWebTransactionExecutor({});
 
     await expect(
       exec({
@@ -1060,13 +1063,63 @@ describe("gemini-web executor", () => {
     expect(closeChromeTargetWithExactAuthority).not.toHaveBeenCalled();
     expect(killChrome).not.toHaveBeenCalled();
   });
+
+  it("exposes the packed Gemini executor as a finalized result-only API", async () => {
+    const result = await createGeminiWebExecutor({})({
+      prompt: "hello",
+      attachments: [],
+      config: { desiredModel: "gemini-3-deep-think", keepBrowser: false },
+      log: () => {},
+    });
+
+    expect(result).toMatchObject({ answerText: "deep-think answer" });
+    expect(result).not.toHaveProperty("runtime");
+    expect(result).not.toHaveProperty("bindSettlement");
+    expect(result).not.toHaveProperty("finalize");
+    expect(result).not.toHaveProperty("abort");
+    expect(closeChromeTargetWithExactAuthority).toHaveBeenCalledTimes(1);
+    expect(killChrome).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns the captured answer with a cleanup-pending warning from the result-only API", async () => {
+    killChrome.mockResolvedValueOnce({
+      status: "unsafe",
+      pid: 12345,
+      reason: "termination failed",
+    });
+    teardownSettle.mockImplementationOnce(async (teardown: () => Promise<boolean>) => {
+      teardownState.leaseReleased = true;
+      expect(await teardown()).toBe(false);
+      return { status: "preserved", reason: "teardown-unsafe" };
+    });
+
+    const result = await createGeminiWebExecutor({})({
+      prompt: "hello",
+      attachments: [],
+      config: { desiredModel: "gemini-3-deep-think", keepBrowser: false },
+      log: () => {},
+    });
+
+    expect(result).toMatchObject({
+      answerText: "deep-think answer",
+      warnings: [
+        expect.objectContaining({
+          code: "direct-finalize-cleanup-pending",
+          severity: "warning",
+        }),
+      ],
+    });
+    expect(result).not.toHaveProperty("runtime");
+    expect(result).not.toHaveProperty("finalize");
+    expect(killChrome).toHaveBeenCalledTimes(1);
+  });
   it.each([
     { first: "finalize" as const, second: "finalize" as const },
     { first: "abort" as const, second: "abort" as const },
     { first: "finalize" as const, second: "abort" as const },
     { first: "abort" as const, second: "finalize" as const },
   ])("settles HTTP Gemini transactions $first→$second", async ({ first, second }) => {
-    const exec = createGeminiWebExecutor({});
+    const exec = createGeminiWebTransactionExecutor({});
     const transaction = await exec({
       prompt: "hello",
       attachments: [],
@@ -1091,7 +1144,7 @@ describe("gemini-web executor", () => {
   });
 
   it("binds abort mode and rejects later finalize without duplicate teardown", async () => {
-    const exec = createGeminiWebExecutor({});
+    const exec = createGeminiWebTransactionExecutor({});
     const result = await exec({
       prompt: "hello",
       attachments: [],
@@ -1127,7 +1180,7 @@ describe("gemini-web executor", () => {
         expect(await teardown()).toBe(true);
         return { status: "completed", disposition: "teardown-completed" };
       });
-    const exec = createGeminiWebExecutor({});
+    const exec = createGeminiWebTransactionExecutor({});
 
     const result = await exec({
       prompt: "hello",
@@ -1152,7 +1205,7 @@ describe("gemini-web executor", () => {
   });
 
   it("falls back to HTTP/header path for gemini deep-think when attachments are present", async () => {
-    const exec = createGeminiWebExecutor({});
+    const exec = createGeminiWebTransactionExecutor({});
     await exec({
       prompt: "summarize this file",
       attachments: [{ path: "/tmp/attach.txt", displayPath: "attach.txt" }],
@@ -1170,7 +1223,7 @@ describe("gemini-web executor", () => {
   });
 
   it("keeps the launched browser alive when Deep Think uses the keep-browser default", async () => {
-    const exec = createGeminiWebExecutor({});
+    const exec = createGeminiWebTransactionExecutor({});
     const result = await exec({
       prompt: "hello",
       attachments: [],

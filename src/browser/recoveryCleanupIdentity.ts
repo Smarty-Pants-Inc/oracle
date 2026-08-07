@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 import { access } from "node:fs/promises";
 import path from "node:path";
-import { establishPrivateRuntimeAuthority } from "../privateTempRoot.js";
+import {
+  establishPrivateRuntimeAuthority,
+  parseTemporaryProfileAuthority,
+} from "../privateTempRoot.js";
 import type { BrowserRecoveryCleanupResourceMetadata } from "../sessionManager.js";
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
 import {
@@ -35,8 +38,11 @@ export function groupRecoveryCleanupResources(
 export function recoveryCleanupGroupKey(resource: BrowserRecoveryCleanupResourceMetadata): string {
   if (!resource.remoteRecovery) {
     const processIdentity = resource.chromeProcessIdentity;
+    const temporaryProfile = parseTemporaryProfileAuthority(resource.temporaryProfileAuthority);
     const persistedProfileIdentity = profileDirectoryIdentityKey(
-      processIdentity?.profileDirectory ?? resource.profileDirectoryIdentity,
+      temporaryProfile?.profileDirectory ??
+        processIdentity?.profileDirectory ??
+        resource.profileDirectoryIdentity,
     );
     const profilePath = resource.chromeProfileRoot ?? resource.userDataDir;
     const profileIdentity =
@@ -51,7 +57,12 @@ export function recoveryCleanupGroupKey(resource: BrowserRecoveryCleanupResource
               resource.chromePort ?? null,
             ]
           : ["missing-physical-profile", null]);
-    return JSON.stringify(["local", chromeProcessIdentityKey(processIdentity), profileIdentity]);
+    return JSON.stringify([
+      "local",
+      chromeProcessIdentityKey(processIdentity),
+      profileIdentity,
+      temporaryProfileAuthorityKey(resource.temporaryProfileAuthority),
+    ]);
   }
   const remoteIdentity = remoteRecoveryIdentityKey(resource.remoteRecovery);
   return JSON.stringify(
@@ -77,6 +88,7 @@ export function recoveryCleanupResourceKey(
     resource.chromeBrowserWSEndpoint ?? null,
     resource.chromeProcessIdentity?.launchNonce ?? null,
     profileDirectoryIdentityKey(resource.profileDirectoryIdentity) ?? null,
+    temporaryProfileAuthorityKey(resource.temporaryProfileAuthority),
     browserTabLeaseAuthorityKey(resource.tabLease),
     [
       resource.targetCloseCapability?.version ?? null,
@@ -138,6 +150,25 @@ function profileDirectoryIdentityKey(identity: unknown): readonly unknown[] | nu
     physicalProfile.device,
     physicalProfile.inode,
     physicalProfile.birthtimeNs,
+  ];
+}
+
+export function temporaryProfileAuthorityKey(authority: unknown): readonly unknown[] | null {
+  const parsed = parseTemporaryProfileAuthority(authority);
+  if (!parsed) return null;
+  return [
+    parsed.version,
+    parsed.kind,
+    parsed.generation.platform,
+    parsed.generation.path,
+    parsed.generation.identity.device,
+    parsed.generation.identity.inode,
+    parsed.generation.identity.birthtimeNs,
+    parsed.generation.parent.path,
+    parsed.generation.parent.identity.device,
+    parsed.generation.parent.identity.inode,
+    parsed.generation.parent.identity.birthtimeNs,
+    profileDirectoryIdentityKey(parsed.profileDirectory),
   ];
 }
 
@@ -209,19 +240,37 @@ export async function validateGroupTeardownInvariants(
   const first = entries[0]?.resource;
   if (!first) return "Cleanup group has no teardown authority";
   const firstProcessIdentity = first.chromeProcessIdentity;
+  const firstTemporaryProfile = parseTemporaryProfileAuthority(first.temporaryProfileAuthority);
   const firstProfileDirectory = physicalProfileDirectoryIdentity(
-    firstProcessIdentity?.profileDirectory ?? first.profileDirectoryIdentity,
+    firstTemporaryProfile?.profileDirectory ??
+      firstProcessIdentity?.profileDirectory ??
+      first.profileDirectoryIdentity,
   );
   const fallbackProfileSource = firstProcessIdentity
     ? null
     : (first.chromeProfileRoot ?? first.userDataDir);
   const fallbackProfile = fallbackProfileSource ? path.resolve(fallbackProfileSource) : null;
+  const firstTemporaryProfileAuthority = temporaryProfileAuthorityKey(
+    first.temporaryProfileAuthority,
+  );
+  const requiresTemporaryProfileAuthority =
+    first.recoveryCleanup.profileKind === "temporary" ||
+    first.recoveryCleanup.profileKind === "copied";
+  if (requiresTemporaryProfileAuthority && !firstTemporaryProfileAuthority) {
+    return "Cleanup group has no exact temporary-profile authority";
+  }
   for (const { resource } of entries) {
     if (recoveryCleanupGroupKey(resource) !== recoveryCleanupGroupKey(first)) {
       return "Cleanup group contains conflicting Chrome process identities";
     }
     if (resource.recoveryCleanup.profileKind !== first.recoveryCleanup.profileKind) {
       return "Cleanup group contains conflicting profile teardown metadata";
+    }
+    if (
+      JSON.stringify(temporaryProfileAuthorityKey(resource.temporaryProfileAuthority)) !==
+      JSON.stringify(firstTemporaryProfileAuthority)
+    ) {
+      return "Cleanup group contains conflicting temporary-profile authorities";
     }
     if (firstProfileDirectory) {
       if (

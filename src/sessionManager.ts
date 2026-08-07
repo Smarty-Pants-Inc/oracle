@@ -31,6 +31,7 @@ import { formatElapsed } from "./oracle/format.js";
 import { safeModelSlug } from "./oracle/modelResolver.js";
 import { getOracleHomeDir } from "./oracleHome.js";
 import { syncDirectory } from "./fsDurability.js";
+import type { TemporaryProfileAuthority } from "./privateTempRoot.js";
 
 export type SessionMode = "api" | "browser";
 
@@ -167,6 +168,7 @@ export interface BrowserRecoveryCleanupResourceMetadata {
   chromePid?: number;
   chromeProcessIdentity?: ChromeProcessIdentity;
   profileDirectoryIdentity?: ProfileDirectoryIdentity;
+  temporaryProfileAuthority?: TemporaryProfileAuthority;
   chromePort?: number;
   chromeHost?: string;
   chromeBrowserWSEndpoint?: string;

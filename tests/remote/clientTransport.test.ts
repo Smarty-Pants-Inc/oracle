@@ -32,6 +32,11 @@ import {
   RemoteRequestAuthenticator,
   createRemoteHealthAuthenticationProof,
 } from "../../src/remote/auth.js";
+import {
+  establishWindowsPrivateDirectories,
+  initializeWindowsPrivateFile,
+  verifyWindowsPrivateFile,
+} from "../../src/remote/windowsPrivateTreeAcl.js";
 
 function committedPromptEpoch(prompt: string) {
   return {
@@ -251,6 +256,23 @@ const deadlines = {
   socketIdleTimeoutMs: 40,
   recoveryWindowMs: 120,
 };
+
+async function writeCachedArtifactFixture(filePath: string, contents: string): Promise<void> {
+  const artifactsDirectory = path.dirname(filePath);
+  if (process.platform === "win32") {
+    const sessionDirectory = path.dirname(artifactsDirectory);
+    const sessionsRoot = path.dirname(sessionDirectory);
+    await establishWindowsPrivateDirectories([sessionsRoot, sessionDirectory, artifactsDirectory]);
+    if (!(await initializeWindowsPrivateFile(filePath))) {
+      throw new Error("Expected a fresh Windows private cached-artifact fixture");
+    }
+    await fsPromises.writeFile(filePath, contents);
+    await verifyWindowsPrivateFile(filePath);
+    return;
+  }
+  await fsPromises.mkdir(artifactsDirectory, { recursive: true });
+  await fsPromises.writeFile(filePath, contents);
+}
 
 describe("remote client transport deadlines", () => {
   it("rejects malformed modern and legacy executor credentials before use", () => {
@@ -493,6 +515,67 @@ describe("remote client transport deadlines", () => {
       await close(server);
     }
   });
+
+  it.each(["bind", "finalize"] as const)(
+    "returns a captured public answer when controller drain defers %s",
+    async (settlementStep) => {
+      const server = createAuthenticatedServer(
+        async (req, res) => {
+          const transactionToken = runTransactionToken(req);
+          if (transactionToken) {
+            const request = await readJson(req);
+            res.setHeader("content-type", "application/x-ndjson");
+            res.end(
+              `${JSON.stringify(transactionEvent(transactionToken, String(request.prompt)))}\n`,
+            );
+            return;
+          }
+          const bind = /^\/transactions\/([a-f0-9]{64})\/bind$/u.exec(req.url ?? "");
+          if (req.method === "POST" && bind) {
+            await readJson(req);
+            if (settlementStep === "bind") {
+              res.writeHead(503, { "content-type": "application/json" });
+              res.end(JSON.stringify({ error: "server_closing" }));
+            } else {
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(
+                JSON.stringify({
+                  transactionToken: bind[1],
+                  settlementAuthority: { mode: "finalize", outcome: "bound", state: "pending" },
+                  runtime: { cleanup: { status: "pending" } },
+                }),
+              );
+            }
+            return;
+          }
+          if (req.method === "POST" && req.url?.endsWith("/finalize")) {
+            await readJson(req);
+            res.writeHead(503, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "server_closing" }));
+            return;
+          }
+          res.statusCode = 404;
+          res.end();
+        },
+        { handleBind: false },
+      );
+      const port = await listen(server);
+      try {
+        const result = await createRemoteBrowserExecutor({
+          host: `127.0.0.1:${port}`,
+          token: "a".repeat(64),
+          deadlines,
+        })({ prompt: "draining capture", config: {} });
+        expect(result).toMatchObject({
+          answerText: "answer",
+          warnings: [expect.objectContaining({ code: "direct-finalize-cleanup-pending" })],
+        });
+        expect(result).not.toHaveProperty("runtime");
+      } finally {
+        await close(server);
+      }
+    },
+  );
 
   it("auto-finalizes only after preserving artifact publication on download failure", async () => {
     const artifact = Buffer.from("artifact");
@@ -1962,8 +2045,7 @@ describe("remote client transport deadlines", () => {
     );
     const artifactsDirectory = path.dirname(finalPath);
     const sessionDirectory = path.dirname(artifactsDirectory);
-    await fsPromises.mkdir(artifactsDirectory, { recursive: true });
-    await fsPromises.writeFile(finalPath, "corrupt artifact");
+    await writeCachedArtifactFixture(finalPath, "corrupt artifact");
     const durabilityEvents: string[] = [];
     const originalSyncDirectory = fsDurability.syncDirectory;
     const syncDirectory = vi
@@ -2081,8 +2163,7 @@ describe("remote client transport deadlines", () => {
       "artifact-artifact-io.bin",
     );
     const artifactsDirectory = path.dirname(finalPath);
-    await fsPromises.mkdir(artifactsDirectory, { recursive: true });
-    await fsPromises.writeFile(finalPath, "corrupt!");
+    await writeCachedArtifactFixture(finalPath, "corrupt!");
     let artifactGets = 0;
     let settlementRequests = 0;
     let waiverRequests = 0;

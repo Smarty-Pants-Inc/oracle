@@ -97,7 +97,7 @@ const eventsPath = process.env.ORACLE_GEMINI_WIRING_EVENTS;
 if (!eventsPath) throw new Error("ORACLE_GEMINI_WIRING_EVENTS is required");
 const record = (event) => appendFileSync(eventsPath, JSON.stringify(event) + "\\n");
 
-export function createGeminiWebExecutor() {
+export function createGeminiWebTransactionExecutor() {
   record({ type: "factory" });
   return async function executeBrowser(options) {
     const conversationId = "gemini-cli-wiring-" + options.sessionId;

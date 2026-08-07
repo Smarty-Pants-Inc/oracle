@@ -1,7 +1,7 @@
 import type { BrowserRunResult } from "../browserMode.js";
 import type { BrowserRuntimeMetadata, BrowserSessionConfig } from "../sessionStore.js";
 import type { resumeRemoteBrowserTransaction } from "../remote/client.js";
-import type { createPrivateTempGeneration } from "../privateTempRoot.js";
+import type { createTemporaryProfileAuthority } from "../privateTempRoot.js";
 import type {
   captureAssistantMarkdown,
   verifyCommittedPromptTurn,
@@ -38,7 +38,7 @@ export interface ReattachDeps {
   waitForConversationHydration?: typeof waitForResumedConversationHydration;
   verifyCommittedPromptTurn?: typeof verifyCommittedPromptTurn;
   launchChrome?: typeof launchChrome;
-  createPrivateTempGeneration?: typeof createPrivateTempGeneration;
+  createTemporaryProfileAuthority?: typeof createTemporaryProfileAuthority;
   acquireBrowserTabLease?: typeof acquireBrowserTabLease;
   acquireManualChromeOwner?: typeof acquireManualChromeOwner;
   connectRecoveryTargetWithExactAuthority?: typeof connectToChromeTargetWithExactAuthority;

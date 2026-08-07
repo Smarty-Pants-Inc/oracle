@@ -1,6 +1,9 @@
 import { describe, expect, test, vi } from "vitest";
 import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
-import { captureProfileDirectoryIdentity } from "../../src/browser/profileState.js";
+import {
+  captureProfileDirectoryIdentity,
+  sameProfileDirectoryIdentity,
+} from "../../src/browser/profileState.js";
 import { hasRecoverableChatGptConversation } from "../../src/browser/reattachability.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import type * as PromptComposerModule from "../../src/browser/actions/promptComposer.js";
@@ -268,6 +271,7 @@ async function runTwoTurnResetFailure(transport: Transport) {
   }));
   vi.doMock("../../src/browser/profileState.js", () => ({
     captureProfileDirectoryIdentity,
+    sameProfileDirectoryIdentity,
     cleanupStaleProfileState: vi.fn().mockResolvedValue(undefined),
     acquireProfileRunLock: vi.fn(),
     isSafeChromeTerminationOutcome: vi.fn(() => true),

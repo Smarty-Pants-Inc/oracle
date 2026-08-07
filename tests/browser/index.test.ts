@@ -1,6 +1,6 @@
 import path from "node:path";
 import os from "node:os";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { describe, expect, test, vi } from "vitest";
 import type * as ManualLoginProfileModule from "../../src/browser/manualLoginProfile.js";
 import type * as TabLeaseRegistryModule from "../../src/browser/tabLeaseRegistry.js";
@@ -181,7 +181,6 @@ describe("local acquisition durability", () => {
     const runtimeHints: BrowserRuntimeMetadata[] = [];
     const events: string[] = [];
     let profileDir: string | undefined;
-    const removeProfile = vi.fn(async () => true);
     const launchChrome = vi.fn();
     const copyChromeProfile = vi.fn(async (_source: string, destination: string) => {
       profileDir = destination;
@@ -202,7 +201,6 @@ describe("local acquisition durability", () => {
       ...(await importOriginal<typeof ProfileStateModule>()),
       verifyProfileDirectoryIdentity: vi.fn(async () => true),
       readOracleChromeOwner: vi.fn(async () => null),
-      removeProfileDirectoryIfIdentityMatches: removeProfile,
     }));
     vi.doMock("../../src/browser/chromeProcessDiscovery.js", async (importOriginal) => ({
       ...(await importOriginal<typeof ChromeProcessDiscoveryModule>()),
@@ -245,6 +243,11 @@ describe("local acquisition durability", () => {
       expect(initialResource).toMatchObject({
         acquisition: { pendingResource: "chrome-process" },
         recoveryCleanup: { profileKind: "copied", keepBrowser: false },
+        temporaryProfileAuthority: {
+          kind: "private-generation",
+          generation: { path: expect.any(String), parent: expect.any(Object) },
+          profileDirectory: { canonicalPath: expect.any(String) },
+        },
       });
       const abortRuntime = runtimeHints.find(
         (runtime) => runtime.recoveryCleanupResult?.settlementMode === "abort",
@@ -266,13 +269,13 @@ describe("local acquisition durability", () => {
       expect(launchChrome).not.toHaveBeenCalled();
       expect(runtimeHints.at(-1)?.recoveryCleanupResources).toBeUndefined();
       expect(runtimeHints.at(-1)?.recoveryCleanupResult).toBeUndefined();
-      if (!profileDir || !initialResource?.profileDirectoryIdentity) {
-        throw new Error("Copy-profile acquisition identity was not journaled");
+      if (!profileDir || !initialResource?.temporaryProfileAuthority) {
+        throw new Error("Copy-profile temporary authority was not journaled");
       }
-      expect(removeProfile).toHaveBeenCalledWith(
+      expect(initialResource.temporaryProfileAuthority.profileDirectory.canonicalPath).toBe(
         profileDir,
-        initialResource.profileDirectoryIdentity,
       );
+      await expect(stat(profileDir)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       vi.doUnmock("../../src/browser/profileCopy.js");
       vi.doUnmock("../../src/browser/chromeLifecycle.js");
@@ -296,10 +299,6 @@ describe("local acquisition durability", () => {
         pid: 515_151,
         signal: "CONTROL_CHANNEL" as const,
       };
-    });
-    const removeProfile = vi.fn(async () => {
-      events.push("effect:remove-profile");
-      return true;
     });
 
     vi.resetModules();
@@ -350,10 +349,6 @@ describe("local acquisition durability", () => {
         },
       ),
     }));
-    vi.doMock("../../src/browser/profileState.js", async (importOriginal) => ({
-      ...(await importOriginal<typeof ProfileStateModule>()),
-      removeProfileDirectoryIfIdentityMatches: removeProfile,
-    }));
 
     try {
       // This test intentionally reloads the runner so the post-owner journal can fail.
@@ -388,7 +383,6 @@ describe("local acquisition durability", () => {
         "persist:chrome-target:abort",
         "persist:acquired:abort",
         "effect:kill",
-        "effect:remove-profile",
         "persist:acquired",
       ]);
       const abortRuntime = runtimeHints.find(
@@ -402,11 +396,10 @@ describe("local acquisition durability", () => {
       expect(kill).toHaveBeenCalledOnce();
       if (!profileDir || !ownerIdentity)
         throw new Error("Published owner authority was not captured");
-      expect(removeProfile).toHaveBeenCalledWith(profileDir, ownerIdentity.profileDirectory);
+      await expect(stat(profileDir)).rejects.toMatchObject({ code: "ENOENT" });
       expect(runtimeHints.at(-1)?.recoveryCleanupResources).toBeUndefined();
     } finally {
       vi.doUnmock("../../src/browser/chromeLifecycle.js");
-      vi.doUnmock("../../src/browser/profileState.js");
       vi.resetModules();
       if (profileDir) await rm(profileDir, { recursive: true, force: true });
     }
@@ -431,7 +424,6 @@ describe("local acquisition durability", () => {
     };
     const retainChromeEndpointAuthority = vi.fn(async () => retainedEndpointAuthority);
     const writeOracleChromeOwner = vi.fn(async () => undefined);
-    const removeProfile = vi.fn(async () => true);
 
     vi.resetModules();
     vi.doMock("../../src/browser/chromeLifecycle.js", async (importOriginal) => ({
@@ -475,7 +467,6 @@ describe("local acquisition durability", () => {
       readOracleChromeOwner: vi.fn(async () => null),
       writeOracleChromeOwner,
       verifyChromeProcessIdentity: vi.fn(async () => true),
-      removeProfileDirectoryIfIdentityMatches: removeProfile,
     }));
     vi.doMock("../../src/browser/chromeProcessDiscovery.js", async (importOriginal) => ({
       ...(await importOriginal<typeof ChromeProcessDiscoveryModule>()),
@@ -572,7 +563,7 @@ describe("local acquisition durability", () => {
       expect(releaseEndpointAuthority).toHaveBeenCalledTimes(2);
       expect(completedRuntime.recoveryCleanupResources).toBeUndefined();
       expect(completedRuntime.recoveryCleanupResult).toBeUndefined();
-      expect(removeProfile).toHaveBeenCalledWith(profileDir, ownerIdentity.profileDirectory);
+      await expect(stat(profileDir)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       vi.doUnmock("../../src/browser/chromeLifecycle.js");
       vi.doUnmock("../../src/browser/profileState.js");

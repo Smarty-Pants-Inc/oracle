@@ -18,9 +18,11 @@ import {
 import { describe, expect, test, vi } from "vitest";
 import {
   createPrivateTempGeneration,
+  createTemporaryProfileAuthority,
   establishPrivateRuntimeAuthority,
   privateRuntimeRootPathCandidates,
   removePrivateTempGeneration,
+  removeTemporaryProfileAuthority,
   type PrivateTempRootOptions,
 } from "../src/privateTempRoot.js";
 import { resolveWindowsPowerShellExecutable } from "../src/windowsSystemExecutable.js";
@@ -231,6 +233,34 @@ describe("private temporary root authority", () => {
         await expect(removePrivateTempGeneration(substituted)).resolves.toBe(false);
         expect((await lstat(substituted.path)).isDirectory()).toBe(true);
         await expect(readFile(path.join(moved, "secret"), "utf8")).resolves.toBe("retained");
+      } finally {
+        await rm(ambient, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "removes only the persisted profile authority after ambient roots change",
+    async () => {
+      const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-temp-authority-roots-"));
+      const acquiredRoot = path.join(ambient, "acquired");
+      const replacementRoot = path.join(ambient, "replacement");
+      const environment: NodeJS.ProcessEnv = { XDG_RUNTIME_DIR: acquiredRoot };
+      try {
+        await mkdir(acquiredRoot, { mode: 0o700 });
+        const authority = await createTemporaryProfileAuthority("oracle-browser-", {
+          environment,
+          oracleStateDirectory: path.join(ambient, "fallback-state"),
+        });
+        await writeFile(path.join(authority.profileDirectory.canonicalPath, "secret"), "owned");
+        await mkdir(replacementRoot, { mode: 0o700 });
+        environment.XDG_RUNTIME_DIR = replacementRoot;
+
+        await expect(removeTemporaryProfileAuthority(authority)).resolves.toBe(true);
+        await expect(lstat(authority.profileDirectory.canonicalPath)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+        expect((await lstat(replacementRoot)).isDirectory()).toBe(true);
       } finally {
         await rm(ambient, { recursive: true, force: true });
       }
