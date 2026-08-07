@@ -27,6 +27,7 @@ import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.
 import { __test__ as targetCloseAuthorityTest } from "../../src/browser/targetCloseAuthority.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 import { createTemporaryProfileAuthority } from "../../src/privateTempRoot.js";
+import { testWindowsPrivateDirectoryAuthority } from "../privateAuthorityTestHelpers.js";
 
 const logger = vi.fn<(message: string) => void>();
 
@@ -131,7 +132,7 @@ async function settleLocalOwnedTarget(options: {
 }) {
   const [
     { createLocalRunSettlementCoordinator },
-    { LocalOwnedBrowserResourceAuthority },
+    { LocalOwnedBrowserResourceAuthority, OwnedBrowserResourceTransaction },
     { retainChromeTargetCloseCapability, __test__: localTargetCloseAuthorityTest },
   ] = await Promise.all([
     import("../../src/browser/localRunSettlement.js"),
@@ -141,6 +142,7 @@ async function settleLocalOwnedTarget(options: {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "oracle-local-target-authority-"));
   const temporaryProfileAuthority = await createTemporaryProfileAuthority("profile-", {
     tempDirectory: temporaryRoot,
+    windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
   });
   const profileDir = temporaryProfileAuthority.profileDirectory.canonicalPath;
   const profileDirectory = temporaryProfileAuthority.profileDirectory;
@@ -196,12 +198,16 @@ async function settleLocalOwnedTarget(options: {
       return { status: "completed", disposition: "terminated" };
     },
   });
-  await resourceAuthority.journalAcquisition({
+  const resourceTransaction = new OwnedBrowserResourceTransaction(
+    resourceAuthority.transactionAdapters(),
+    resourceAuthority.runtime(),
+  );
+  await resourceAuthority.journalAcquisition(resourceTransaction, {
     resource: "chrome-process",
     acquire: async () => owner.chrome,
     authority: (chrome) => ({ kind: "temporary", chrome }),
   });
-  await resourceAuthority.journalAcquisition({
+  await resourceAuthority.journalAcquisition(resourceTransaction, {
     resource: "chrome-target",
     acquire: async () => ({ targetId }),
     authority: () => ({ targetId, capability: targetCloseCapability }),
@@ -213,6 +219,7 @@ async function settleLocalOwnedTarget(options: {
     userDataDir: profileDir,
     effectiveKeepBrowser: options.keepBrowser,
     resourceAuthority,
+    resourceTransaction,
     chrome: owner.chrome,
     chromeOwnerDisposition: "close-on-last-lease",
     chromeHost: "127.0.0.1",
@@ -263,6 +270,7 @@ async function settleLocalOwnedTarget(options: {
       return await transaction[options.mode]();
     })();
     if (!result) throw new Error("Expected local browser resource settlement");
+    expect(resourceTransaction.runtime()).toEqual(result.runtime);
     const profileExists = await stat(profileDir).then(
       () => true,
       () => false,
@@ -411,11 +419,13 @@ describe("local manual Chrome owner settlement", () => {
       retainBrowserTabLeaseTeardownAuthority: vi.fn(() => lastLeaseTeardownAuthority(lease)),
     }));
     // The subjects must load after the manual-owner and lease settlement mocks are installed.
-    const [{ createLocalRunSettlementCoordinator }, { LocalOwnedBrowserResourceAuthority }] =
-      await Promise.all([
-        import("../../src/browser/localRunSettlement.js"),
-        import("../../src/browser/ownedBrowserResources.js"),
-      ]);
+    const [
+      { createLocalRunSettlementCoordinator },
+      { LocalOwnedBrowserResourceAuthority, OwnedBrowserResourceTransaction },
+    ] = await Promise.all([
+      import("../../src/browser/localRunSettlement.js"),
+      import("../../src/browser/ownedBrowserResources.js"),
+    ]);
     const generationId = "10000000-0000-4000-8000-000000000001";
     const resourceAuthority = new LocalOwnedBrowserResourceAuthority({
       ownerId: "test-owner",
@@ -434,12 +444,16 @@ describe("local manual Chrome owner settlement", () => {
       targetMarkerUrl: "about:blank#oracle-acquisition=mixed-owner",
       logger,
     });
-    await resourceAuthority.journalAcquisition({
+    const resourceTransaction = new OwnedBrowserResourceTransaction(
+      resourceAuthority.transactionAdapters(),
+      resourceAuthority.runtime(),
+    );
+    await resourceAuthority.journalAcquisition(resourceTransaction, {
       resource: "tab-lease",
       acquire: async () => lease,
       authority: (acquiredLease) => acquiredLease,
     });
-    await resourceAuthority.journalAcquisition({
+    await resourceAuthority.journalAcquisition(resourceTransaction, {
       resource: "chrome-process",
       acquire: async () => owner,
       authority: (acquiredOwner) => ({ kind: "manual", owner: acquiredOwner }),
@@ -459,6 +473,7 @@ describe("local manual Chrome owner settlement", () => {
       userDataDir: profileDirectory.canonicalPath,
       effectiveKeepBrowser: scenario.keepBrowser,
       resourceAuthority,
+      resourceTransaction,
       chrome: owner.chrome,
       chromeOwnerDisposition: scenario.ownerDisposition,
       chromeHost: "127.0.0.1",

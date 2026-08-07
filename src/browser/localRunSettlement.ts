@@ -115,46 +115,49 @@ export function createLocalRunSettlementCoordinator({
     });
   };
 
-  resourceAuthority.configureSettlementAdapters({
-    beforeProcessSettlement: async () => {
-      if (
-        !shouldCleanupBlankTabsAfterLastLease({
-          runStatus: capturedResultRunStatus(state),
-          ownsTarget: state.ownsTarget,
-          connectionClosedUnexpectedly: state.connectionClosedUnexpectedly,
-          manualLogin,
-          keepBrowser: effectiveKeepBrowser,
-          chromePort: chrome.port,
-        })
-      ) {
-        return;
-      }
-      const endpointAuthority = resourceAuthority.endpointAuthority();
-      if (!endpointAuthority) {
-        throw new Error("Blank-tab cleanup has no retained exact endpoint authority");
-      }
-      const cleanup = await closeBlankChromeTabsWithExactAuthority(endpointAuthority, logger, {
-        excludeTargetIds: [state.isolatedTargetId, state.lastTargetId],
-        preserveOneBlank: true,
-      });
-      if (cleanup.status === "unsafe") {
-        throw new Error(`Blank-tab cleanup failed: ${cleanup.reason}`);
-      }
+  resourceAuthority.configureSettlementAdapters(
+    {
+      beforeProcessSettlement: async () => {
+        if (
+          !shouldCleanupBlankTabsAfterLastLease({
+            runStatus: capturedResultRunStatus(state),
+            ownsTarget: state.ownsTarget,
+            connectionClosedUnexpectedly: state.connectionClosedUnexpectedly,
+            manualLogin,
+            keepBrowser: effectiveKeepBrowser,
+            chromePort: chrome.port,
+          })
+        ) {
+          return;
+        }
+        const endpointAuthority = resourceAuthority.endpointAuthority();
+        if (!endpointAuthority) {
+          throw new Error("Blank-tab cleanup has no retained exact endpoint authority");
+        }
+        const cleanup = await closeBlankChromeTabsWithExactAuthority(endpointAuthority, logger, {
+          excludeTargetIds: [state.isolatedTargetId, state.lastTargetId],
+          preserveOneBlank: true,
+        });
+        if (cleanup.status === "unsafe") {
+          throw new Error(`Blank-tab cleanup failed: ${cleanup.reason}`);
+        }
+      },
+      onActiveLeaseHandoff: () => {
+        logger("[browser] Other ChatGPT tab leases still active; leaving shared Chrome running.");
+      },
+      onLeaseSettled: () => {
+        state.tabLease = null;
+      },
     },
-    onActiveLeaseHandoff: () => {
-      logger("[browser] Other ChatGPT tab leases still active; leaving shared Chrome running.");
-    },
-    onLeaseSettled: () => {
-      state.tabLease = null;
-    },
-  });
+    projectSettlementRuntime,
+  );
 
   const settleLocalResources = async (
     mode: BrowserCaptureSettlementMode,
     pendingRuntime: BrowserRuntimeMetadata,
   ) => {
     const keepBrowserOpen = keepBrowserOpenForSettlement(mode);
-    const result = await resourceAuthority.settleAfterDurableBinding(mode, pendingRuntime);
+    const result = await resourceAuthority.settleResources(mode, pendingRuntime);
     state.tabLease = resourceAuthority.acquiredLease();
     if (result.status === "completed" && !keepBrowserOpen && !state.connectionClosedUnexpectedly) {
       const totalSeconds = (Date.now() - timing.startedAt) / 1000;
@@ -163,22 +166,26 @@ export function createLocalRunSettlementCoordinator({
     return result;
   };
 
-  const lifecycle = new BrowserRunLifecycleController({
-    getRuntime: () => buildRuntimeBase(),
-    projectSettlementRuntime,
-    persistRuntime: async (runtime) => {
-      if (!chrome.port || !options.runtimeHintCb) return;
-      await options.runtimeHintCb(runtime, state.modelSelectionEvidence);
+  const lifecycle = new BrowserRunLifecycleController(
+    {
+      ...(options.runtimeHintCb ? { ownerId: resourceAuthority.ownerIdValue() } : {}),
+      getRuntime: () => buildRuntimeBase(),
+      projectSettlementRuntime,
+      persistRuntime: async (runtime) => {
+        if (!chrome.port || !options.runtimeHintCb) return;
+        await options.runtimeHintCb(runtime, state.modelSelectionEvidence);
+      },
+      persistSettlementResult: async (runtime) => {
+        if (!chrome.port || !options.runtimeHintCb) return;
+        await options.runtimeHintCb(runtime, state.modelSelectionEvidence);
+      },
+      settleResources: settleLocalResources,
+      onPromptCommitted: () => {
+        void state.conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000);
+      },
     },
-    persistSettlementResult: async (runtime) => {
-      if (!chrome.port || !options.runtimeHintCb) return;
-      await options.runtimeHintCb(runtime, state.modelSelectionEvidence);
-    },
-    settleResources: settleLocalResources,
-    onPromptCommitted: () => {
-      void state.conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000);
-    },
-  });
+    acquisition.resourceTransaction,
+  );
   const buildRuntimeMetadata = (tabUrl = state.lastUrl): BrowserRuntimeMetadata =>
     lifecycle.runtime(buildRuntimeBase(tabUrl));
   const emitRuntimeHint = async (): Promise<void> => {

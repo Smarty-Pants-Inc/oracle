@@ -25,7 +25,8 @@ import {
   establishWindowsPrivateDirectories,
   establishWindowsPrivateDirectory,
   type WindowsPrivateDirectoryAuthority,
-} from "./remote/windowsPrivateTreeAcl.js";
+} from "./windowsPrivateFileAcl.js";
+import { physicalFileGenerationFromStats } from "./physicalFileIdentity.js";
 
 const PRIVATE_TEMP_ROOT_NAME = "oracle-private";
 
@@ -112,14 +113,7 @@ async function assertPosixPrivateDirectory(
     !entry.isDirectory() ||
     entry.isSymbolicLink() ||
     (entry.mode & 0o777n) !== 0o700n ||
-    !samePhysicalDirectoryIdentity(
-      {
-        device: entry.dev.toString(),
-        inode: entry.ino.toString(),
-        birthtimeNs: entry.birthtimeNs.toString(),
-      },
-      authority.identity,
-    )
+    !samePhysicalDirectoryIdentity(physicalFileGenerationFromStats(entry), authority.identity)
   ) {
     throw new Error(`Private temporary directory authority changed: ${authority.path}`);
   }

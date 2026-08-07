@@ -18,6 +18,7 @@ import {
 } from "../../src/browser/profileState.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import { createTemporaryProfileAuthority } from "../../src/privateTempRoot.js";
+import { testWindowsPrivateDirectoryAuthority } from "../privateAuthorityTestHelpers.js";
 import {
   authenticatedLocalTargetCleanupDeps,
   createBrowserLogger,
@@ -259,7 +260,10 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
     const runtime = withCommittedPromptEpoch({ tabUrl: "https://chatgpt.com/c/private-profile" });
     const acquisitionError = new Error("stop after private profile proof");
     const establishProfile = vi.fn((prefix: string) =>
-      createTemporaryProfileAuthority(prefix, { tempDirectory: ambient }),
+      createTemporaryProfileAuthority(prefix, {
+        tempDirectory: ambient,
+        windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+      }),
     );
     const kill = vi.fn(async () => ({
       status: "stopped" as const,

@@ -21,6 +21,8 @@ import {
 } from "../../src/browser/profileState.js";
 import type { ExactChromeTargetCleanupResult } from "../../src/browser/chromeLifecycle.js";
 import { createTemporaryProfileAuthority } from "../../src/privateTempRoot.js";
+import { testWindowsPrivateDirectoryAuthority } from "../privateAuthorityTestHelpers.js";
+
 export function createBrowserLogger(): BrowserLogger {
   return vi.fn<(message: string) => void>();
 }
@@ -28,6 +30,7 @@ export async function createTemporaryProfileFixture(prefix: string) {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), prefix));
   const temporaryProfileAuthority = await createTemporaryProfileAuthority("profile-", {
     tempDirectory: rootDir,
+    windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
   });
   return {
     profileDir: temporaryProfileAuthority.profileDirectory.canonicalPath,

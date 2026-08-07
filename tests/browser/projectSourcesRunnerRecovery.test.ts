@@ -27,6 +27,8 @@ import {
   __test__ as targetCloseAuthority,
 } from "../../src/browser/targetCloseAuthority.js";
 import * as recovery from "../../src/browser/projectSourcesRecovery.js";
+import { testWindowsPrivateDirectoryAuthority } from "../privateAuthorityTestHelpers.js";
+import { testProcessIdentityProvider } from "./filesystemLockTestHelpers.js";
 
 interface TemporaryAuthority {
   oracleHome: string;
@@ -147,7 +149,9 @@ function cleanupRuntime(
 
 async function temporaryAuthority(): Promise<TemporaryAuthority> {
   const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-project-sources-proof-home-"));
-  const storage = await recovery.establishProjectSourcesCleanupStorage(oracleHome);
+  const storage = await recovery.establishProjectSourcesCleanupStorage(oracleHome, {
+    windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+  });
   const parent = await captureProfileDirectoryIdentity(storage.runtimeRoot.path);
   const plannedIntent = recovery.createProjectSourcesProfileCreateIntent(
     storage,
@@ -160,7 +164,10 @@ async function temporaryAuthority(): Promise<TemporaryAuthority> {
   const temporaryProfileAuthority = await createTemporaryProfileChildAuthority(
     storage.runtimeRoot,
     "oracle-browser-",
-    { randomId: () => plannedIntent.generationId },
+    {
+      randomId: () => plannedIntent.generationId,
+      windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+    },
   );
   const intent = { ...plannedIntent, temporaryProfileAuthority };
   await recovery.persistProjectSourcesCleanupRuntime({}, storage, { profileCreate: intent });
@@ -172,7 +179,9 @@ async function manualAuthority(): Promise<ManualAuthority> {
   const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-project-sources-manual-home-"));
   const requestedProfileDir = path.join(oracleHome, "manual-profile");
   await mkdir(requestedProfileDir);
-  const storage = await recovery.establishProjectSourcesCleanupStorage(oracleHome);
+  const storage = await recovery.establishProjectSourcesCleanupStorage(oracleHome, {
+    windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+  });
   const profileDirectory = await captureProfileDirectoryIdentity(requestedProfileDir);
   const profileDir = profileDirectory.canonicalPath;
   const generationId = randomUUID();
@@ -192,10 +201,10 @@ async function manualAuthority(): Promise<ManualAuthority> {
     ),
     lease: { id: leaseId, generationId, state: "active" },
   };
-  const proof = await recovery.updateProjectSourcesCleanupProofForPersistence(
-    cleanupRuntime(initialProof, { owner }),
+  const proof = await recovery.transitionProjectSourcesCleanupProof(
     initialProof,
     storage,
+    { type: "persist", runtime: cleanupRuntime(initialProof, { owner }) },
     {
       hasExactBrowserTabLease: vi.fn(async () => true),
       readOracleChromeOwner: vi.fn(async () => owner),
@@ -335,7 +344,9 @@ test("retains the proof across partial target settlement and later converges", a
 test("never moves an occupied create intent without its exact marker", async () => {
   const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-project-sources-create-home-"));
   try {
-    const storage = await recovery.establishProjectSourcesCleanupStorage(oracleHome);
+    const storage = await recovery.establishProjectSourcesCleanupStorage(oracleHome, {
+      windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+    });
     const parent = await captureProfileDirectoryIdentity(storage.runtimeRoot.path);
     const intent = recovery.createProjectSourcesProfileCreateIntent(storage, parent, randomUUID());
     await recovery.persistProjectSourcesCleanupRuntime({}, storage, { profileCreate: intent });
@@ -357,7 +368,9 @@ test("removes only the exact private pre-marker generation and preserves substit
   const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-project-sources-private-child-"));
   const retainedPaths: string[] = [];
   try {
-    const storage = await recovery.establishProjectSourcesCleanupStorage(oracleHome);
+    const storage = await recovery.establishProjectSourcesCleanupStorage(oracleHome, {
+      windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+    });
     const parent = await captureProfileDirectoryIdentity(storage.runtimeRoot.path);
     const createPrivateIntent = async () => {
       const planned = recovery.createProjectSourcesProfileCreateIntent(
@@ -368,7 +381,10 @@ test("removes only the exact private pre-marker generation and preserves substit
       const temporaryProfileAuthority = await createTemporaryProfileChildAuthority(
         storage.runtimeRoot,
         "oracle-browser-",
-        { randomId: () => planned.generationId },
+        {
+          randomId: () => planned.generationId,
+          windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+        },
       );
       const established = { ...planned, temporaryProfileAuthority };
       await recovery.persistProjectSourcesCleanupRuntime({}, storage, {
@@ -462,14 +478,18 @@ test("same-controller retry closes and releases the exact manual resources", asy
   const authority = await manualAuthority();
   let lease: BrowserTabLease | undefined;
   try {
-    lease = await acquireBrowserTabLease(authority.profileDir, {
-      maxConcurrentTabs: 1,
-      timeoutMs: 100,
-      pollMs: 50,
-      sessionId: authority.proof.storageOwnerId,
-      generationId: authority.generationId,
-      leaseId: authority.leaseId,
-    });
+    lease = await acquireBrowserTabLease(
+      authority.profileDir,
+      {
+        maxConcurrentTabs: 1,
+        timeoutMs: 100,
+        pollMs: 50,
+        sessionId: authority.proof.storageOwnerId,
+        generationId: authority.generationId,
+        leaseId: authority.leaseId,
+      },
+      testProcessIdentityProvider,
+    );
     const closeTarget = vi.fn(async () => ({ status: "completed" as const }));
     const capability = retainChromeTargetCloseCapability({
       ownerId: authority.proof.storageOwnerId,
@@ -506,14 +526,18 @@ test("restart capability loss preserves the manual target and durable proof", as
   const authority = await manualAuthority();
   let lease: BrowserTabLease | undefined;
   try {
-    lease = await acquireBrowserTabLease(authority.profileDir, {
-      maxConcurrentTabs: 1,
-      timeoutMs: 100,
-      pollMs: 50,
-      sessionId: authority.proof.storageOwnerId,
-      generationId: authority.generationId,
-      leaseId: authority.leaseId,
-    });
+    lease = await acquireBrowserTabLease(
+      authority.profileDir,
+      {
+        maxConcurrentTabs: 1,
+        timeoutMs: 100,
+        pollMs: 50,
+        sessionId: authority.proof.storageOwnerId,
+        generationId: authority.generationId,
+        leaseId: authority.leaseId,
+      },
+      testProcessIdentityProvider,
+    );
     const runtime = cleanupRuntime(authority.proof, {
       owner: authority.owner,
       targetId: "project-sources-restart-target",
@@ -887,10 +911,10 @@ test("rejects a partial pre-existing manual admission receipt before it can publ
     await rm(proof.admission.path);
     await writeFile(proof.admission.path, "{\n");
     await expect(
-      recovery.updateProjectSourcesCleanupProofForPersistence(
-        cleanupRuntime(proof, { owner: authority.owner }),
+      recovery.transitionProjectSourcesCleanupProof(
         proof,
         authority.storage,
+        { type: "persist", runtime: cleanupRuntime(proof, { owner: authority.owner }) },
         {
           hasExactBrowserTabLease: vi.fn(async () => true),
           readOracleChromeOwner: vi.fn(async () => authority.owner),

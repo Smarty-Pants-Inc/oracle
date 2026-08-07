@@ -28,6 +28,8 @@ import {
   withRecoveryCleanup,
   withRetainedTargetCapability,
 } from "./reattachTestHelpers.js";
+import { testWindowsPrivateDirectoryAuthority } from "../privateAuthorityTestHelpers.js";
+import { testProcessIdentityProvider } from "./filesystemLockTestHelpers.js";
 
 describe("recovery settlement retries", { timeout: 15_000 }, () => {
   const { finalizeRecoveredRuntime } = __test__;
@@ -494,7 +496,10 @@ describe("recovery settlement retries", { timeout: 15_000 }, () => {
 
   test("serializes concurrent recovery for one session", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-recovery-lock-test-"));
-    const lockAuthority = await establishPrivateRuntimeAuthority({ tempDirectory: root });
+    const lockAuthority = await establishPrivateRuntimeAuthority({
+      tempDirectory: root,
+      windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+    });
     const recoveryLockPath = path.join(lockAuthority.path, "browser-recovery.lock");
     const logger = createBrowserLogger();
     const recoverSession = vi.fn(async () => ({ answerText: "ok", answerMarkdown: "ok" }));
@@ -503,20 +508,29 @@ describe("recovery settlement retries", { timeout: 15_000 }, () => {
       const first = await resumeBrowserSession(runtime, {}, logger, {
         recoverSession,
         recoveryLockPath,
-        acquireRecoveryLock: (lockPath) => acquireReattachRecoveryLock(lockPath, lockAuthority),
+        acquireRecoveryLock: (lockPath) =>
+          acquireReattachRecoveryLock(lockPath, lockAuthority, {
+            processIdentityProvider: testProcessIdentityProvider,
+          }),
       });
       await expect(
         resumeBrowserSession(runtime, {}, logger, {
           recoverSession,
           recoveryLockPath,
-          acquireRecoveryLock: (lockPath) => acquireReattachRecoveryLock(lockPath, lockAuthority),
+          acquireRecoveryLock: (lockPath) =>
+            acquireReattachRecoveryLock(lockPath, lockAuthority, {
+              processIdentityProvider: testProcessIdentityProvider,
+            }),
         }),
       ).rejects.toThrow(/already in progress/i);
       await first.abort();
       const next = await resumeBrowserSession(runtime, {}, logger, {
         recoverSession,
         recoveryLockPath,
-        acquireRecoveryLock: (lockPath) => acquireReattachRecoveryLock(lockPath, lockAuthority),
+        acquireRecoveryLock: (lockPath) =>
+          acquireReattachRecoveryLock(lockPath, lockAuthority, {
+            processIdentityProvider: testProcessIdentityProvider,
+          }),
       });
       await next.abort();
     } finally {

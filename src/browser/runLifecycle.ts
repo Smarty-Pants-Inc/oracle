@@ -149,8 +149,15 @@ export class BrowserRunLifecycleController {
   private state: BrowserRunLifecycleState = { kind: "acquiring" };
   private promptCommitPersistenceFailure: BrowserAutomationError | null = null;
   private promptResetPersistenceFailure: BrowserAutomationError | null = null;
+  private settlement: OwnedBrowserResourceTransaction | null;
 
-  constructor(private readonly adapters: BrowserRunLifecycleAdapters) {}
+  constructor(
+    private readonly adapters: BrowserRunLifecycleAdapters,
+    settlement?: OwnedBrowserResourceTransaction,
+  ) {
+    settlement?.replaceAdapters(adapters);
+    this.settlement = settlement ?? null;
+  }
 
   markAcquired(): void {
     if (this.state.kind !== "acquiring") {
@@ -380,7 +387,7 @@ export class BrowserRunLifecycleController {
     if (this.state.kind !== "capturing") {
       throw this.illegalTransition("issue captured result for caller publication");
     }
-    const settlement = new OwnedBrowserResourceTransaction(this.adapters, this.runtime(base));
+    const settlement = this.prepareSettlement(this.runtime(base));
     const publishedResult = this.promptCommitPersistenceFailure
       ? {
           ...result,
@@ -411,7 +418,7 @@ export class BrowserRunLifecycleController {
     if (this.state.kind !== "capturing") {
       throw this.illegalTransition("publish committed recovery authority");
     }
-    const settlement = new OwnedBrowserResourceTransaction(this.adapters, this.runtime(base));
+    const settlement = this.prepareSettlement(this.runtime(base));
     this.state = { kind: "published", settlement };
     return settlement.runtime();
   }
@@ -426,16 +433,25 @@ export class BrowserRunLifecycleController {
           "Pending prompt dispatch must be reconciled before browser resources can be aborted.",
       };
     }
-    const settlement = new OwnedBrowserResourceTransaction(
-      this.adapters,
-      this.runtime(this.adapters.getRuntime()),
-    );
+    const settlement = this.prepareSettlement(this.runtime(this.adapters.getRuntime()));
     this.state = { kind: "published", settlement };
     return settlement.settle("abort");
   }
 
   private async persistRuntime(): Promise<void> {
-    await this.adapters.persistRuntime?.(this.runtime());
+    const runtime = this.runtime();
+    await this.ensureSettlement(runtime).persist(runtime);
+  }
+
+  private prepareSettlement(runtime: BrowserRuntimeMetadata): OwnedBrowserResourceTransaction {
+    const existing = this.settlement;
+    const settlement = this.ensureSettlement(runtime);
+    if (existing) settlement.replaceRuntime(runtime);
+    return settlement;
+  }
+
+  private ensureSettlement(runtime: BrowserRuntimeMetadata): OwnedBrowserResourceTransaction {
+    return (this.settlement ??= new OwnedBrowserResourceTransaction(this.adapters, runtime));
   }
 
   private promptAuthorityPersistenceError(cause: unknown): BrowserAutomationError {

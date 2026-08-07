@@ -12,15 +12,17 @@ import {
   buildWindowsPrivateDirectoriesCommand,
   buildWindowsPrivateDirectoryCommand,
   buildWindowsPrivateFileInitializationCommand,
+  buildWindowsPrivateFileProtectionCommand,
   buildWindowsPrivateFileVerificationCommand,
   buildWindowsPrivateTreeAclCommand,
   establishWindowsPrivateDirectories,
   establishWindowsPrivateDirectory,
   initializeWindowsPrivateFile,
+  protectWindowsPrivateFile,
   protectWindowsPrivateTreeAcl,
   verifyWindowsPrivateFile,
   type WindowsPrivateTreeScope,
-} from "../../src/remote/windowsPrivateTreeAcl.js";
+} from "../../src/windowsPrivateFileAcl.js";
 import { resolveWindowsPowerShellExecutable } from "../../src/windowsSystemExecutable.js";
 import { testWindowsPrivateTreeAuthority } from "./testTransactionStore.js";
 
@@ -75,7 +77,7 @@ function beginAclTestRecord(
   });
 }
 
-describe("Windows remote transaction private ACL authority", () => {
+describe.sequential("Windows private ACL authority (serialized native cohort)", () => {
   test("uses one bounded native command with one exact completion marker", async () => {
     const execute = vi.fn(async () => ({ stdout: WINDOWS_PRIVATE_TREE_ACL_COMPLETE_MARKER }));
 
@@ -108,7 +110,7 @@ describe("Windows remote transaction private ACL authority", () => {
     expect(execute).toHaveBeenCalledWith(command.file, command.args, command.options);
     expect(decodedCommand).toContain("[System.IO.Directory]::CreateDirectory(");
     expect(decodedCommand).toContain("Assert-PrivateAcl");
-    expect(decodedCommand).toContain("Refusing to promote an existing file");
+    expect(decodedCommand).toContain("Private directory path is an existing file");
     expect(decodedCommand).not.toContain(".SetAccessControl(");
     expect(command.args.join("\0")).not.toContain(directoryPath);
   });
@@ -141,19 +143,25 @@ describe("Windows remote transaction private ACL authority", () => {
     ]).toHaveLength(2);
   });
 
-  test("creates or verifies one private file through exact native completion markers", async () => {
+  test("creates, protects, and verifies one private file through exact native completion markers", async () => {
     const filePath = String.raw`C:\Users\Oracle\.oracle\sessions\remote\artifacts\result.bin`;
     const create = vi.fn(async () => ({ stdout: "oracle.windows-private-file.v1:created" }));
     const exists = vi.fn(async () => ({ stdout: "oracle.windows-private-file.v1:exists" }));
+    const protect = vi.fn(async () => ({ stdout: "oracle.windows-private-file.v1:protected" }));
     const verify = vi.fn(async () => ({ stdout: "oracle.windows-private-file.v1:verified" }));
 
     await expect(initializeWindowsPrivateFile(filePath, create)).resolves.toBe(true);
     await expect(initializeWindowsPrivateFile(filePath, exists)).resolves.toBe(false);
+    await expect(protectWindowsPrivateFile(filePath, protect)).resolves.toBeUndefined();
     await expect(verifyWindowsPrivateFile(filePath, verify)).resolves.toBeUndefined();
 
     const createCommand = buildWindowsPrivateFileInitializationCommand(filePath);
+    const protectCommand = buildWindowsPrivateFileProtectionCommand(filePath);
     const verifyCommand = buildWindowsPrivateFileVerificationCommand(filePath);
     const decodedCreate = Buffer.from(createCommand.args.at(-1) ?? "", "base64").toString(
+      "utf16le",
+    );
+    const decodedProtect = Buffer.from(protectCommand.args.at(-1) ?? "", "base64").toString(
       "utf16le",
     );
     const decodedVerify = Buffer.from(verifyCommand.args.at(-1) ?? "", "base64").toString(
@@ -164,11 +172,29 @@ describe("Windows remote transaction private ACL authority", () => {
       createCommand.args,
       createCommand.options,
     );
+    expect(protect).toHaveBeenCalledWith(
+      protectCommand.file,
+      protectCommand.args,
+      protectCommand.options,
+    );
     expect(decodedCreate).toContain("New-PrivateFile $FilePath");
     expect(decodedCreate).toContain("Assert-PrivateAcl (Get-PhysicalItem $ParentPath $true) $true");
     expect(decodedCreate).not.toContain(".SetAccessControl(");
+    expect(decodedCreate).not.toContain("Set-CanonicalPrivateAcl");
+    expect(decodedCreate).not.toContain("Establish-PrivateDirectory");
+    expect(decodedProtect).toContain("try { Assert-PrivateAcl $Item $false } catch");
+    expect(decodedProtect).toContain("Set-CanonicalPrivateAcl $Item $false");
+    expect(decodedProtect).toContain("$Item.SetAccessControl((New-PrivateAcl $Directory))");
+    expect(decodedProtect).not.toContain("New-PrivateFile");
+    expect(decodedProtect).not.toContain("[System.IO.FileMode]::CreateNew");
+    expect(decodedProtect).not.toContain("Establish-PrivateDirectory");
     expect(decodedVerify).toContain("Assert-PrivateAcl (Get-PhysicalItem $FilePath $false) $false");
+    expect(decodedVerify).not.toContain("Set-CanonicalPrivateAcl");
+    expect(decodedVerify).not.toContain(".SetAccessControl(");
+    expect(decodedVerify).not.toContain("New-PrivateFile");
+    expect(decodedVerify).not.toContain("Establish-PrivateDirectory");
     expect(createCommand.args.join("\0")).not.toContain(filePath);
+    expect(protectCommand.args.join("\0")).not.toContain(filePath);
     expect(verifyCommand.args.join("\0")).not.toContain(filePath);
   });
 

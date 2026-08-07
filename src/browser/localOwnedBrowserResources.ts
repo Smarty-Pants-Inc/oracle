@@ -1,11 +1,11 @@
 import type { BrowserRuntimeMetadata } from "../sessionManager.js";
-import { BrowserAutomationError } from "../oracle/errors.js";
 import type { ChromeLaunchResult, RetainedChromeEndpointAuthority } from "./chromeLifecycle.js";
 import type { BrowserTabLease } from "./tabLeaseRegistry.js";
 import type { BrowserCaptureFinalizationResult } from "./types.js";
-import {
+import type {
+  BrowserCaptureSettlementMode,
   OwnedBrowserResourceTransaction,
-  type BrowserCaptureSettlementMode,
+  OwnedBrowserResourceTransactionAdapters,
 } from "./ownedBrowserResourceTransaction.js";
 import { journalLocalOwnedBrowserAcquisition } from "./localOwnedBrowserResourceAcquisition.js";
 import { LocalOwnedBrowserResourceSettlementAdapter } from "./localOwnedBrowserResourceSettlement.js";
@@ -29,35 +29,27 @@ export type {
 } from "./localOwnedBrowserResourceState.js";
 
 /**
- * Canonical local target, lease, and process authority shared by every owned-browser feature lane.
- * The state owner projects durable authority; focused adapters execute acquisition and settlement
- * effects without owning a second resource representation.
+ * Local target, lease, and process runtime/effect adapter. It owns live resource handles and their
+ * projection, while OwnedBrowserResourceTransaction exclusively owns transition and retry state.
  */
 export class LocalOwnedBrowserResourceAuthority {
   private readonly state: LocalOwnedBrowserResourceStateOwner;
   private readonly settlement: LocalOwnedBrowserResourceSettlementAdapter;
-  private readonly transaction: OwnedBrowserResourceTransaction;
+
+  private projectSettlementRuntime:
+    | ((
+        mode: BrowserCaptureSettlementMode,
+        runtime: BrowserRuntimeMetadata,
+      ) => BrowserRuntimeMetadata)
+    | undefined;
 
   constructor(options: LocalOwnedBrowserResourceAuthorityOptions) {
     this.state = new LocalOwnedBrowserResourceStateOwner(options);
     this.settlement = new LocalOwnedBrowserResourceSettlementAdapter(this.state);
-    this.transaction = new OwnedBrowserResourceTransaction(
-      {
-        ownerId: this.state.ownerId,
-        ...(this.state.options.persistRuntime
-          ? { persistRuntime: this.state.options.persistRuntime }
-          : {}),
-        ...(this.state.options.persistSettlementResult
-          ? { persistSettlementResult: this.state.options.persistSettlementResult }
-          : {}),
-        settleResources: (mode, runtime) => this.settlement.settle(mode, runtime),
-      },
-      this.state.buildRuntime(),
-    );
   }
 
   runtime(): BrowserRuntimeMetadata {
-    return this.transaction.runtime();
+    return this.state.buildRuntime();
   }
 
   acquiredLease(): BrowserTabLease | null {
@@ -91,17 +83,45 @@ export class LocalOwnedBrowserResourceAuthority {
     return this.state.projectRuntime(authoritativeRuntime, projection);
   }
 
-  configureSettlementAdapters(adapters: LocalOwnedBrowserSettlementAdapters): void {
+  configureSettlementAdapters(
+    adapters: LocalOwnedBrowserSettlementAdapters,
+    projectSettlementRuntime?: (
+      mode: BrowserCaptureSettlementMode,
+      runtime: BrowserRuntimeMetadata,
+    ) => BrowserRuntimeMetadata,
+  ): void {
     this.settlement.configure(adapters);
+    this.projectSettlementRuntime = projectSettlementRuntime;
   }
 
-  journalAcquisition<T>(step: LocalOwnedBrowserAcquisitionStep<T>): Promise<T> {
-    return journalLocalOwnedBrowserAcquisition(this.state, this.transaction, this.settlement, step);
+  transactionAdapters(): OwnedBrowserResourceTransactionAdapters {
+    return {
+      ownerId: this.state.ownerId,
+      ...(this.state.options.persistRuntime
+        ? { persistRuntime: this.state.options.persistRuntime }
+        : {}),
+      ...(this.state.options.persistSettlementResult
+        ? { persistSettlementResult: this.state.options.persistSettlementResult }
+        : {}),
+      projectSettlementRuntime: (mode, runtime) =>
+        this.projectSettlementRuntime?.(mode, runtime) ?? runtime,
+      settleResources: (mode, runtime) => this.settlement.settle(mode, runtime),
+    };
   }
 
-  async persistProjection(projection: LocalOwnedBrowserRuntimeProjection): Promise<void> {
+  journalAcquisition<T>(
+    transaction: OwnedBrowserResourceTransaction,
+    step: LocalOwnedBrowserAcquisitionStep<T>,
+  ): Promise<T> {
+    return journalLocalOwnedBrowserAcquisition(this.state, transaction, this.settlement, step);
+  }
+
+  async persistProjection(
+    transaction: OwnedBrowserResourceTransaction,
+    projection: LocalOwnedBrowserRuntimeProjection,
+  ): Promise<void> {
     this.state.updateProjection(projection);
-    await this.transaction.persist(this.state.buildRuntime());
+    await transaction.persist(this.state.buildRuntime());
   }
 
   closeTargetForRetry(): Promise<void> {
@@ -112,41 +132,10 @@ export class LocalOwnedBrowserResourceAuthority {
     return this.settlement.disconnect();
   }
 
-  settle(
-    mode: BrowserCaptureSettlementMode,
-    authoritativeRuntime?: BrowserRuntimeMetadata,
-  ): Promise<BrowserCaptureFinalizationResult> {
-    const current = this.transaction.runtime();
-    if (
-      authoritativeRuntime &&
-      current.recoveryCleanupResources?.length &&
-      !current.recoveryCleanupResult?.settlementMode
-    ) {
-      this.state.replaceAuthoritativeRuntime(authoritativeRuntime);
-      this.transaction.replaceRuntime(this.state.buildRuntime());
-    }
-    return this.transaction.settle(mode);
-  }
-
-  /**
-   * Settle effects only after an enclosing publication transaction has durably bound the mode.
-   * Acquisition rollback uses settle(); local run publication uses this path to avoid nesting two
-   * persistence state machines around the same resource authority.
-   */
-  settleAfterDurableBinding(
+  settleResources(
     mode: BrowserCaptureSettlementMode,
     pendingRuntime: BrowserRuntimeMetadata,
   ): Promise<BrowserCaptureFinalizationResult> {
-    if (pendingRuntime.recoveryCleanupResult?.settlementMode !== mode) {
-      throw new BrowserAutomationError(
-        `${this.state.options.purpose} browser resource effects require durably bound ${mode} authority.`,
-        {
-          stage: "browser-run-lifecycle",
-          code: "browser-resource-effects-before-settlement-binding",
-          requestedMode: mode,
-        },
-      );
-    }
     return this.settlement.settle(mode, pendingRuntime);
   }
 }

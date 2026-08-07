@@ -2,7 +2,6 @@ import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { describe, expect, test } from "vitest";
-import { createRemoteBrowserTransactionExecutor } from "../../src/remote/client.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import type { BrowserRunResult, BrowserRunTransaction } from "../../src/browser/types.js";
 import { RemoteLegacyTextResultSchema } from "../../src/remote/legacyProtocol.js";
@@ -11,7 +10,11 @@ import {
   projectRemotePublicResult,
 } from "../../src/remote/transactionCapture.js";
 import { httpPostJson } from "./serverTestHttp.js";
-import { CAN_LISTEN_LOCALHOST, createTestRemoteServer } from "./serverTestBuilders.js";
+import {
+  CAN_LISTEN_LOCALHOST,
+  createTestRemoteBrowserTransactionExecutor as createRemoteBrowserTransactionExecutor,
+  createTestRemoteServer,
+} from "./serverTestBuilders.js";
 
 // This exercises Node's actual TCP response-idle timer; fake timers cannot advance socket I/O.
 const wait = (milliseconds: number) =>

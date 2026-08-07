@@ -3,13 +3,14 @@ import {
   applyRemoteTransactionTransition,
   createRemoteTransactionRecord,
 } from "../../src/remote/transactionReducer.js";
+import { remoteTransactionSettlementPhase } from "../../src/remote/transactionModel.js";
 import type {
   DurableRemoteArtifactRegistration,
   RemoteTransactionRecord,
+  RemoteRunningTransactionRecord,
   RemoteTransactionReducerContext,
 } from "../../src/remote/transactionModel.js";
 import {
-  remoteTransactionSettlementPhase,
   validateRemoteStagedCapture,
   validateRemoteTerminalAudit,
   validateRemoteTransactionRecord,
@@ -62,7 +63,7 @@ const result = {
   answerChars: 8,
 };
 
-function initialRecord(): RemoteTransactionRecord {
+function initialRecord(): RemoteRunningTransactionRecord {
   return createRemoteTransactionRecord(
     {
       protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
@@ -106,8 +107,25 @@ function artifact(): DurableRemoteArtifactRegistration {
 }
 
 function restarted(record: RemoteTransactionRecord): RemoteTransactionRecord {
-  return JSON.parse(JSON.stringify(record)) as RemoteTransactionRecord;
+  const persisted: unknown = JSON.parse(JSON.stringify(record));
+  validateRemoteTransactionRecord(persisted);
+  return persisted;
 }
+
+function assertRemoteTransactionTypeRejections(): void {
+  const running = initialRecord();
+  // @ts-expect-error pending captures require result, runtime, and artifact authority
+  const pendingWithoutCaptureAuthority: RemoteTransactionRecord = { ...running, state: "pending" };
+  // @ts-expect-error terminal records cannot retain nonterminal request or lease authority
+  const terminalWithLiveAuthority: RemoteTransactionRecord = {
+    ...running,
+    state: "failed",
+    terminalAudit: { redactedAt: new Date(now).toISOString(), artifacts: [] },
+  };
+  void pendingWithoutCaptureAuthority;
+  void terminalWithLiveAuthority;
+}
+void assertRemoteTransactionTypeRejections;
 
 describe("remote transaction model validation", () => {
   test("persists an artifact namespace derived from exact transaction identity", () => {

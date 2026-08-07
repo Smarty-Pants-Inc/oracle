@@ -1,13 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  normalizePromptForIdentity,
-  promptIdentitySha256,
-} from "../../src/browser/actions/committedPrompt.js";
-import type { PromptCommitVerification } from "../../src/browser/actions/promptCommitVerification.js";
+import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import type { CommittedPromptEpochLocator } from "../../src/browser/reattachability.js";
 import {
+  createGeminiDeepThinkDomProviderState,
   geminiDeepThinkDomProvider,
   recoverCommittedGeminiDeepThinkResponse,
+  type GeminiDeepThinkDomProviderState,
 } from "../../src/browser/providers/geminiDeepThinkDomProvider.js";
 
 type FixtureStableIdAttribute = "data-message-id" | "data-query-id" | "data-turn-id";
@@ -26,19 +24,7 @@ type FixtureTurn = {
   toggleClicks?: number;
 };
 
-type GeminiState = Record<string, unknown> & {
-  inputTimeoutMs?: number;
-  timeoutMs?: number;
-  geminiConversationId?: string;
-  geminiPromptBaseline?: {
-    userQueryCount: number;
-    responseCount: number;
-    normalizedPrompt: string;
-    userStableId: string | null;
-  };
-  geminiPromptCommitVerification?: PromptCommitVerification;
-  geminiResponseStableId?: string;
-};
+type GeminiState = GeminiDeepThinkDomProviderState;
 
 class FixtureHTMLElement {}
 class FixtureStableIdNode extends FixtureHTMLElement {
@@ -224,16 +210,16 @@ function createContext(
 function responseState(
   overrides: Partial<NonNullable<GeminiState["geminiPromptBaseline"]>> = {},
 ): GeminiState {
-  return {
+  return createGeminiDeepThinkDomProviderState({
     timeoutMs: 1_000,
     geminiPromptBaseline: {
       userQueryCount: 0,
       responseCount: 0,
-      normalizedPrompt: "new request",
+      promptSha256: promptIdentitySha256("new request"),
       userStableId: "data-message-id:user-current",
       ...overrides,
     },
-  };
+  });
 }
 
 function committedGeminiPromptLocator(): CommittedPromptEpochLocator {
@@ -276,7 +262,7 @@ describe("geminiDeepThinkDomProvider", () => {
         delay: async (ms) => {
           now += ms;
         },
-        state: { inputTimeoutMs: 2_000 },
+        state: createGeminiDeepThinkDomProviderState({ inputTimeoutMs: 2_000 }),
       }),
     ).rejects.toThrow("Timed out waiting for Gemini UI prompt input to become ready.");
   });
@@ -284,7 +270,7 @@ describe("geminiDeepThinkDomProvider", () => {
   it("installs its observer before Send and awaits an asynchronously mounted stable user turn", async () => {
     const turns: FixtureTurn[] = [];
     let observerWasActiveAtSend = false;
-    const state: GeminiState = { inputTimeoutMs: 1_000 };
+    const state = createGeminiDeepThinkDomProviderState({ inputTimeoutMs: 1_000 });
     const ctx = createContext(turns, state, (notify, observerActive) => {
       observerWasActiveAtSend = observerActive();
       queueMicrotask(() => {
@@ -308,7 +294,7 @@ describe("geminiDeepThinkDomProvider", () => {
     expect(state.geminiPromptBaseline).toEqual({
       userQueryCount: 0,
       responseCount: 0,
-      normalizedPrompt: "new request",
+      promptSha256: promptIdentitySha256("New request"),
       userStableId: "data-message-id:user-current",
     });
     expect(state.geminiPromptCommitVerification).toEqual(
@@ -321,7 +307,10 @@ describe("geminiDeepThinkDomProvider", () => {
 
   it("recovers the exact dispatched turn after DOM replacement by stable provider identity", async () => {
     const turns: FixtureTurn[] = [];
-    const state: GeminiState = { inputTimeoutMs: 1_000, timeoutMs: 1_000 };
+    const state = createGeminiDeepThinkDomProviderState({
+      inputTimeoutMs: 1_000,
+      timeoutMs: 1_000,
+    });
     const ctx = createContext(turns, state, (notify) => {
       queueMicrotask(() => {
         turns.push({ kind: "user", order: 1, text: "new request", stableId: "user-current" });
@@ -347,13 +336,17 @@ describe("geminiDeepThinkDomProvider", () => {
 
   it("fails closed when Send mounts more than one post-baseline user turn", async () => {
     const turns: FixtureTurn[] = [];
-    const ctx = createContext(turns, { inputTimeoutMs: 1_000 }, (notify) => {
-      turns.push(
-        { kind: "user", order: 1, text: "new request", stableId: "user-a" },
-        { kind: "user", order: 2, text: "new request", stableId: "user-b" },
-      );
-      notify();
-    });
+    const ctx = createContext(
+      turns,
+      createGeminiDeepThinkDomProviderState({ inputTimeoutMs: 1_000 }),
+      (notify) => {
+        turns.push(
+          { kind: "user", order: 1, text: "new request", stableId: "user-a" },
+          { kind: "user", order: 2, text: "new request", stableId: "user-b" },
+        );
+        notify();
+      },
+    );
 
     await expect(geminiDeepThinkDomProvider.submitPrompt(ctx)).rejects.toThrow(
       "exact dispatch ownership is ambiguous",
@@ -362,7 +355,10 @@ describe("geminiDeepThinkDomProvider", () => {
 
   it("commits a provider-id-less turn but refuses live publication after history shift", async () => {
     const turns: FixtureTurn[] = [];
-    const state: GeminiState = { inputTimeoutMs: 1_000, timeoutMs: 1_000 };
+    const state = createGeminiDeepThinkDomProviderState({
+      inputTimeoutMs: 1_000,
+      timeoutMs: 1_000,
+    });
     const ctx = createContext(turns, state, (notify) => {
       turns.push({ kind: "user", order: 1, text: "new request" });
       notify();
@@ -384,7 +380,7 @@ describe("geminiDeepThinkDomProvider", () => {
     expect(state.geminiPromptBaseline).toEqual({
       userQueryCount: 0,
       responseCount: 0,
-      normalizedPrompt: "new request",
+      promptSha256,
       userStableId: null,
     });
 
@@ -540,7 +536,7 @@ describe("geminiDeepThinkDomProvider", () => {
         { kind: "user", order: 1, text: "New request", stableId: "user-current" },
         { kind: "response", order: 2, text: "answer", complete: true },
       ],
-      {},
+      createGeminiDeepThinkDomProviderState(),
     );
 
     await expect(
@@ -573,7 +569,7 @@ describe("geminiDeepThinkDomProvider", () => {
           complete: true,
         },
       ],
-      {},
+      createGeminiDeepThinkDomProviderState(),
     );
 
     await expect(
@@ -606,7 +602,7 @@ describe("geminiDeepThinkDomProvider", () => {
           complete: true,
         },
       ],
-      {},
+      createGeminiDeepThinkDomProviderState(),
     );
 
     await expect(
@@ -674,7 +670,7 @@ describe("geminiDeepThinkDomProvider", () => {
         complete: true,
       },
     ];
-    const state = responseState({ normalizedPrompt: normalizePromptForIdentity(prompt) });
+    const state = responseState({ promptSha256: promptIdentitySha256(prompt) });
     const ctx = createContext(turns, state, undefined, prompt);
 
     await expect(geminiDeepThinkDomProvider.waitForResponse(ctx)).resolves.toEqual({

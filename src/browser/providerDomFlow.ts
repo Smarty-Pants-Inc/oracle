@@ -6,6 +6,13 @@ export type DomEvaluate = <T>(expression: string) => Promise<T | undefined>;
 export type PromptCommitEvidence =
   | { status: "committed"; verification: PromptCommitVerification }
   | { status: "attempted" };
+
+export type ProviderDomProviderId = "chatgpt" | "gemini";
+
+export interface ProviderDomState<Provider extends ProviderDomProviderId> {
+  readonly provider: Provider;
+}
+
 export interface PendingPromptEpochAuthority {
   promptSha256: string;
   baselineTurns: number;
@@ -33,18 +40,17 @@ export type PendingPromptEpochReconciliation =
   | { status: "not-committed" }
   | { status: "ambiguous"; reason: string };
 
-export type PendingPromptReconciliationContext = Pick<
-  ProviderDomFlowContext,
-  "evaluate" | "delay" | "log" | "state"
->;
-
-export interface ProviderDomFlowContext {
+export interface ProviderDomFlowContext<State extends ProviderDomState<ProviderDomProviderId>> {
   prompt: string;
   evaluate: DomEvaluate;
   delay: (ms: number) => Promise<void>;
   log?: BrowserLogger;
-  state?: Record<string, unknown>;
+  state: State;
 }
+
+export type PendingPromptReconciliationContext<
+  State extends ProviderDomState<ProviderDomProviderId>,
+> = Pick<ProviderDomFlowContext<State>, "evaluate" | "delay" | "log" | "state">;
 
 export interface ProviderDomResponse {
   text: string;
@@ -52,28 +58,40 @@ export interface ProviderDomResponse {
   meta?: { turnId?: string | null; messageId?: string | null };
 }
 
-export interface ProviderDomAdapter {
-  providerName: string;
-  waitForUi: (ctx: ProviderDomFlowContext) => Promise<void>;
-  selectMode?: (ctx: ProviderDomFlowContext) => Promise<void>;
-  typePrompt: (ctx: ProviderDomFlowContext) => Promise<void>;
-  submitPrompt: (ctx: ProviderDomFlowContext) => Promise<PromptCommitEvidence>;
+export interface ProviderDomAdapter<
+  State extends ProviderDomState<ProviderDomProviderId>,
+  Response extends ProviderDomResponse,
+> {
+  readonly provider: State["provider"];
+  readonly providerName: string;
+  waitForUi: (ctx: ProviderDomFlowContext<State>) => Promise<void>;
+  selectMode?: (ctx: ProviderDomFlowContext<State>) => Promise<void>;
+  typePrompt: (ctx: ProviderDomFlowContext<State>) => Promise<void>;
+  submitPrompt: (ctx: ProviderDomFlowContext<State>) => Promise<PromptCommitEvidence>;
   reconcilePendingPrompt?: (
-    ctx: PendingPromptReconciliationContext,
+    ctx: PendingPromptReconciliationContext<State>,
     authority: PendingPromptEpochAuthority,
   ) => Promise<PendingPromptEpochReconciliation>;
-  waitForResponse: (ctx: ProviderDomFlowContext) => Promise<ProviderDomResponse>;
-  extractThoughts?: (ctx: ProviderDomFlowContext) => Promise<string | null>;
+  waitForResponse: (ctx: ProviderDomFlowContext<State>) => Promise<Response>;
+  extractThoughts?: (ctx: ProviderDomFlowContext<State>) => Promise<string | null>;
 }
 
-export interface ProviderDomFlowResult extends ProviderDomResponse {
+export type ProviderDomFlowResult<Response extends ProviderDomResponse> = Response & {
   thoughts: string | null;
-}
+};
 
-export async function runProviderSubmissionFlow(
-  adapter: ProviderDomAdapter,
-  ctx: ProviderDomFlowContext,
+export async function runProviderSubmissionFlow<
+  State extends ProviderDomState<ProviderDomProviderId>,
+  Response extends ProviderDomResponse,
+>(
+  adapter: ProviderDomAdapter<State, Response>,
+  ctx: ProviderDomFlowContext<State>,
 ): Promise<PromptCommitEvidence> {
+  if (adapter.provider !== ctx.state.provider) {
+    throw new Error(
+      `${adapter.providerName} cannot run with ${ctx.state.provider} provider state.`,
+    );
+  }
   await adapter.waitForUi(ctx);
   if (adapter.selectMode) {
     await adapter.selectMode(ctx);
@@ -82,10 +100,13 @@ export async function runProviderSubmissionFlow(
   return await adapter.submitPrompt(ctx);
 }
 
-export async function runProviderDomFlow(
-  adapter: ProviderDomAdapter,
-  ctx: ProviderDomFlowContext,
-): Promise<ProviderDomFlowResult> {
+export async function runProviderDomFlow<
+  State extends ProviderDomState<ProviderDomProviderId>,
+  Response extends ProviderDomResponse,
+>(
+  adapter: ProviderDomAdapter<State, Response>,
+  ctx: ProviderDomFlowContext<State>,
+): Promise<ProviderDomFlowResult<Response>> {
   await runProviderSubmissionFlow(adapter, ctx);
   const response = await adapter.waitForResponse(ctx);
   const thoughts = adapter.extractThoughts ? await adapter.extractThoughts(ctx) : null;
@@ -143,6 +164,7 @@ function committedPendingPrompt(
     },
   };
 }
+
 function sameObservedTurns(
   first: PendingPromptObservation,
   second: PendingPromptObservation,

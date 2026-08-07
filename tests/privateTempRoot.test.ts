@@ -267,12 +267,13 @@ describe("private temporary root authority", () => {
     },
   );
 
-  test.skipIf(process.platform !== "win32")(
-    "uses the default production Windows ACL authority and blocks hostile TEMP inheritance",
-    async () => {
-      const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-private-temp-windows-"));
-      const encodedAmbient = Buffer.from(ambient, "utf8").toString("base64");
-      const hostileScript = String.raw`
+  describe.sequential("Windows native private temporary authority cohort", () => {
+    test.skipIf(process.platform !== "win32")(
+      "uses the default production Windows ACL authority and blocks hostile TEMP inheritance",
+      async () => {
+        const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-private-temp-windows-"));
+        const encodedAmbient = Buffer.from(ambient, "utf8").toString("base64");
+        const hostileScript = String.raw`
 $Ambient = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedAmbient}'))
 $CurrentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 $Acl = [System.Security.AccessControl.DirectorySecurity]::new()
@@ -283,38 +284,38 @@ $Acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($Cu
 $Acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'), [System.Security.AccessControl.FileSystemRights]::FullControl, $Inheritance, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow))
 [System.IO.DirectoryInfo]::new($Ambient).SetAccessControl($Acl)
 `;
-      await execFileAsync(
-        resolveWindowsPowerShellExecutable(),
-        [
-          "-NoLogo",
-          "-NoProfile",
-          "-NonInteractive",
-          "-EncodedCommand",
-          Buffer.from(hostileScript, "utf16le").toString("base64"),
-        ],
-        { encoding: "utf8", windowsHide: true },
-      );
+        await execFileAsync(
+          resolveWindowsPowerShellExecutable(),
+          [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+            Buffer.from(hostileScript, "utf16le").toString("base64"),
+          ],
+          { encoding: "utf8", windowsHide: true },
+        );
 
-      try {
-        const generation = await createPrivateTempGeneration("reattach-", {
-          tempDirectory: ambient,
-        });
-        const defaultDirectory = path.join(generation.path, "Default");
-        const activePortPath = path.join(generation.path, "DevToolsActivePort");
-        const cookiesPath = path.join(defaultDirectory, "Cookies");
-        await mkdir(defaultDirectory);
-        await writeFile(activePortPath, "9222\n/devtools/browser/private\n");
-        await writeFile(cookiesPath, "cookie-secret");
+        try {
+          const generation = await createPrivateTempGeneration("reattach-", {
+            tempDirectory: ambient,
+          });
+          const defaultDirectory = path.join(generation.path, "Default");
+          const activePortPath = path.join(generation.path, "DevToolsActivePort");
+          const cookiesPath = path.join(defaultDirectory, "Cookies");
+          await mkdir(defaultDirectory);
+          await writeFile(activePortPath, "9222\n/devtools/browser/private\n");
+          await writeFile(cookiesPath, "cookie-secret");
 
-        const encodedPaths = [
-          ambient,
-          generation.parent.path,
-          generation.path,
-          defaultDirectory,
-          activePortPath,
-          cookiesPath,
-        ].map((entry) => Buffer.from(entry, "utf8").toString("base64"));
-        const verifyScript = String.raw`
+          const encodedPaths = [
+            ambient,
+            generation.parent.path,
+            generation.path,
+            defaultDirectory,
+            activePortPath,
+            cookiesPath,
+          ].map((entry) => Buffer.from(entry, "utf8").toString("base64"));
+          const verifyScript = String.raw`
 $Paths = @(${encodedPaths.map((entry) => `'${entry}'`).join(",")}) | ForEach-Object { [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($_)) }
 $CurrentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 $Allowed = @($CurrentSid.Value, 'S-1-5-18', 'S-1-5-32-544')
@@ -338,21 +339,22 @@ foreach ($Index in 1..5) {
 }
 [Console]::Out.Write('oracle.private-temp.inheritance:complete')
 `;
-        const { stdout } = await execFileAsync(
-          resolveWindowsPowerShellExecutable(),
-          [
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-EncodedCommand",
-            Buffer.from(verifyScript, "utf16le").toString("base64"),
-          ],
-          { encoding: "utf8", windowsHide: true },
-        );
-        expect(stdout).toBe("oracle.private-temp.inheritance:complete");
-      } finally {
-        await rm(ambient, { recursive: true, force: true });
-      }
-    },
-  );
+          const { stdout } = await execFileAsync(
+            resolveWindowsPowerShellExecutable(),
+            [
+              "-NoLogo",
+              "-NoProfile",
+              "-NonInteractive",
+              "-EncodedCommand",
+              Buffer.from(verifyScript, "utf16le").toString("base64"),
+            ],
+            { encoding: "utf8", windowsHide: true },
+          );
+          expect(stdout).toBe("oracle.private-temp.inheritance:complete");
+        } finally {
+          await rm(ambient, { recursive: true, force: true });
+        }
+      },
+    );
+  });
 });

@@ -10,7 +10,11 @@ import {
   looksLikePath,
 } from "../../bridge/connection.js";
 import type { BridgeTunnelInfo } from "../../bridge/connection.js";
-import { readUserConfigFile, writeUserConfigFile } from "../../bridge/userConfigFile.js";
+import {
+  readUserConfigFile,
+  writeUserConfigFile,
+  type UserConfigFileAuthorities,
+} from "../../bridge/userConfigFile.js";
 import { checkRemoteHealth } from "../../remote/health.js";
 import { assertRemoteCredential } from "../../remote/auth.js";
 import { parsePlaintextRemoteEndpoint } from "../../remote/remoteServiceConfig.js";
@@ -25,7 +29,14 @@ export interface BridgeClientCliOptions {
   allowLegacyTextProtocol?: boolean;
 }
 
-export async function runBridgeClient(options: BridgeClientCliOptions): Promise<void> {
+export interface BridgeClientCliDeps {
+  readonly userConfigFileAuthorities?: UserConfigFileAuthorities;
+}
+
+export async function runBridgeClient(
+  options: BridgeClientCliOptions,
+  deps: BridgeClientCliDeps = {},
+): Promise<void> {
   const connectRaw = options.connect;
   if (!connectRaw) {
     throw new Error(
@@ -85,9 +96,10 @@ export async function runBridgeClient(options: BridgeClientCliOptions): Promise<
     );
   }
 
-  const configFilePath = options.config?.trim() || defaultConfigPath();
+  const configuredPath = options.config?.trim();
+  const configFilePath = configuredPath ? path.resolve(configuredPath) : defaultConfigPath();
   if (options.writeConfig !== false) {
-    const { config } = await readUserConfigFile(configFilePath);
+    const { config } = await readUserConfigFile(configFilePath, deps.userConfigFileAuthorities);
     const next: UserConfig = { ...config, browser: { ...config.browser } };
     next.browser = { ...next.browser };
     next.browser.remoteHost = remoteHost;
@@ -103,7 +115,7 @@ export async function runBridgeClient(options: BridgeClientCliOptions): Promise<
         extraArgs: tunnel.extraArgs,
       };
     }
-    await writeUserConfigFile(configFilePath, next);
+    await writeUserConfigFile(configFilePath, next, deps.userConfigFileAuthorities);
     console.log(chalk.green(`Wrote remote config to ${configFilePath}`));
   }
 

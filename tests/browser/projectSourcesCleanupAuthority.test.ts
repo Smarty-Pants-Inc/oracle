@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, expect, test } from "vitest";
+import { expect, test } from "vitest";
 import {
   __test__,
   authenticateProjectSourcesManualAdmission,
@@ -11,13 +11,14 @@ import {
   type ProjectSourcesCleanupStorage,
   type ProjectSourcesManualCleanupProof,
 } from "../../src/browser/projectSourcesCleanupAuthority.js";
-import { establishProjectSourcesCleanupStorage } from "../../src/browser/projectSourcesRecovery.js";
 import { createChromeProcessLaunchClaim } from "../../src/browser/chromeProcessLaunchClaim.js";
+import { establishProjectSourcesCleanupStorage } from "../../src/browser/projectSourcesRecovery.js";
 import {
   captureProfileDirectoryIdentity,
   parseOracleChromeOwnerRecord,
   type OracleChromeOwnerRecord,
 } from "../../src/browser/profileState.js";
+import { testWindowsPrivateDirectoryAuthority } from "../privateAuthorityTestHelpers.js";
 
 interface ManualPublicationAuthority {
   readonly oracleHome: string;
@@ -28,7 +29,9 @@ interface ManualPublicationAuthority {
 
 async function manualPublicationAuthority(): Promise<ManualPublicationAuthority> {
   const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-project-sources-publication-"));
-  const storage = await establishProjectSourcesCleanupStorage(oracleHome);
+  const storage = await establishProjectSourcesCleanupStorage(oracleHome, {
+    windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+  });
   const profilePath = path.join(oracleHome, "manual-profile");
   await mkdir(profilePath);
   const profileDirectory = await captureProfileDirectoryIdentity(profilePath);
@@ -81,10 +84,6 @@ async function fileIdentity(receiptPath: string) {
   };
 }
 
-afterEach(() => {
-  __test__.setBeforeManualAdmissionPublication(undefined);
-  __test__.setBeforeManualAdmissionPreparationCleanup(undefined);
-});
 test("requires persisted disposition while delegating owner validation to the canonical parser", async () => {
   const authority = await manualPublicationAuthority();
   const withoutDisposition: Record<string, unknown> = { ...authority.owner };
@@ -111,10 +110,6 @@ test("does not publish a manual admission until its synced preparation can be li
   const authority = await manualPublicationAuthority();
   let preparationPath = "";
   try {
-    __test__.setBeforeManualAdmissionPublication((pathname) => {
-      preparationPath = pathname;
-      throw new Error("simulated hard interruption before receipt publication");
-    });
     await expect(
       authenticateProjectSourcesManualAdmission(
         authority.proof,
@@ -122,6 +117,10 @@ test("does not publish a manual admission until its synced preparation can be li
         authority.owner,
         {
           create: true,
+          beforePublication: (pathname) => {
+            preparationPath = pathname;
+            throw new Error("simulated hard interruption before receipt publication");
+          },
         },
       ),
     ).rejects.toThrow(/interruption/i);
@@ -132,7 +131,6 @@ test("does not publish a manual admission until its synced preparation can be li
       "project-sources-manual-cleanup-admission",
     );
 
-    __test__.setBeforeManualAdmissionPublication(undefined);
     const authenticated = await authenticateProjectSourcesManualAdmission(
       authority.proof,
       authority.storage,
@@ -165,10 +163,6 @@ test("removes the staged hard-link alias when retrying an interrupted publicatio
   const authority = await manualPublicationAuthority();
   let preparationPath = "";
   try {
-    __test__.setBeforeManualAdmissionPreparationCleanup((pathname) => {
-      preparationPath = pathname;
-      throw new Error("simulated hard interruption after receipt publication");
-    });
     await expect(
       authenticateProjectSourcesManualAdmission(
         authority.proof,
@@ -176,21 +170,22 @@ test("removes the staged hard-link alias when retrying an interrupted publicatio
         authority.owner,
         {
           create: true,
+          beforePreparationCleanup: (pathname) => {
+            preparationPath = pathname;
+            throw new Error("simulated hard interruption after receipt publication");
+          },
         },
       ),
     ).rejects.toThrow(/interruption/i);
     expect((await lstat(authority.proof.admission.path, { bigint: true })).nlink).toBe(2n);
     expect((await lstat(preparationPath, { bigint: true })).nlink).toBe(2n);
 
-    __test__.setBeforeManualAdmissionPreparationCleanup(undefined);
     await expect(
       authenticateProjectSourcesManualAdmission(
         authority.proof,
         authority.storage,
         authority.owner,
-        {
-          create: true,
-        },
+        { create: true },
       ),
     ).resolves.toMatchObject({ authenticated: true });
     expect((await lstat(authority.proof.admission.path, { bigint: true })).nlink).toBe(1n);
@@ -250,9 +245,7 @@ test.each(["foreign", "malformed"] as const)(
           authority.proof,
           authority.storage,
           authority.owner,
-          {
-            create: true,
-          },
+          { create: true },
         ),
       ).rejects.toThrow();
       await expect(readFile(authority.proof.admission.path, "utf8")).resolves.toBe(finalContent);

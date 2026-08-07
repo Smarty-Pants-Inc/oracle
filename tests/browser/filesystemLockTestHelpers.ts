@@ -17,3 +17,23 @@ export function createProcessIdentityProvider(
 ): FilesystemLockProcessIdentityProvider {
   return { platform, pid, readProcessLiveness, readProcessStartIdentity };
 }
+
+export function createTestProcessIdentityProvider(
+  pid = process.pid,
+): FilesystemLockProcessIdentityProvider {
+  return {
+    platform: process.platform,
+    pid,
+    readProcessLiveness: (candidatePid) => {
+      try {
+        process.kill(candidatePid, 0);
+        return "alive";
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "ESRCH" ? "dead" : "unknown";
+      }
+    },
+    readProcessStartIdentity: async (candidatePid) => `test-process:${candidatePid}`,
+  };
+}
+
+export const testProcessIdentityProvider = createTestProcessIdentityProvider();

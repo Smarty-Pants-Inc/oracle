@@ -8,6 +8,7 @@ import {
   establishPrivateRuntimeAuthority,
   removeTemporaryProfileAuthority,
 } from "../privateTempRoot.js";
+import type { WindowsPrivateDirectoryAuthority } from "../windowsPrivateFileAcl.js";
 import {
   type BrowserRecoveryTargetCloseCapabilityMetadata,
   type BrowserRuntimeMetadata,
@@ -23,8 +24,7 @@ import {
   isProjectSourcesProfileCreateIntent,
   parseProjectSourcesCleanupProof,
   projectSourcesCleanupOwnerId,
-  removeProjectSourcesCleanupProofArtifacts,
-  updateProjectSourcesCleanupProofForPersistence,
+  transitionProjectSourcesCleanupProof,
   type ProjectSourcesCleanupProof,
   type ProjectSourcesCleanupStorage,
   type ProjectSourcesProfileCreateIntent,
@@ -55,10 +55,10 @@ export {
   createProjectSourcesManualCleanupProof,
   createProjectSourcesProfileCreateIntent,
   createProjectSourcesTemporaryCleanupProof,
+  transitionProjectSourcesCleanupProof,
   projectSourcesCleanupOwnerId,
-  removeProjectSourcesCleanupProofArtifacts,
-  updateProjectSourcesCleanupProofForPersistence,
   type ProjectSourcesCleanupProof,
+  type ProjectSourcesCleanupProofTransition,
   type ProjectSourcesCleanupStorage,
   type ProjectSourcesManualCleanupProof,
   type ProjectSourcesProfileCreateIntent,
@@ -79,20 +79,26 @@ export interface ProjectSourcesCleanupJournal {
 export interface ProjectSourcesRecoveryDeps extends ProjectSourcesPendingTargetDeps {
   retryCleanup?: typeof retryBrowserRecoveryCleanup;
 }
+export interface ProjectSourcesCleanupStorageOptions {
+  readonly windowsPrivateDirectoryAuthority?: WindowsPrivateDirectoryAuthority;
+}
 
 export async function establishProjectSourcesCleanupStorage(
   oracleHomeDirectory = getOracleHomeDir(),
+  options: ProjectSourcesCleanupStorageOptions = {},
 ): Promise<ProjectSourcesCleanupStorage> {
   const requestedRoot = path.resolve(oracleHomeDirectory);
   const root = await captureProfileDirectoryIdentity(requestedRoot, { create: true });
   const runtimeRoot = await establishPrivateRuntimeAuthority({
     oracleStateDirectory: requestedRoot,
+    windowsPrivateDirectoryAuthority: options.windowsPrivateDirectoryAuthority,
   });
   const journalPath = path.join(root.canonicalPath, PROJECT_SOURCES_CLEANUP_JOURNAL);
   return {
     requestedRoot,
     root,
     runtimeRoot,
+    windowsPrivateDirectoryAuthority: options.windowsPrivateDirectoryAuthority,
     journalPath,
     lockPath: path.join(runtimeRoot.path, "project-sources-recovery.lock"),
   };
@@ -105,7 +111,9 @@ export async function assertProjectSourcesCleanupStorage(
   if (!sameProfileDirectoryIdentity(current, storage.root)) {
     throw new Error("Project Sources cleanup Oracle-home physical authority changed.");
   }
-  await assertPrivateDirectoryAuthority(storage.runtimeRoot);
+  await assertPrivateDirectoryAuthority(storage.runtimeRoot, {
+    windowsPrivateDirectoryAuthority: storage.windowsPrivateDirectoryAuthority,
+  });
 }
 
 export function projectSourcesCleanupJournalPath(oracleHomeDirectory = getOracleHomeDir()): string {
@@ -226,7 +234,7 @@ export async function retireProjectSourcesCleanupJournal(
     throw retirementError;
   }
   try {
-    await removeProjectSourcesCleanupProofArtifacts(proof, storage);
+    await transitionProjectSourcesCleanupProof(proof, storage, { type: "remove-artifacts" });
   } catch (error) {
     logger(
       `[browser] Project Sources cleanup journal retired; retained its admission receipt after removal failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -326,7 +334,9 @@ export async function recoverPendingProjectSourcesProfileCreate(
     await assertProjectSourcesTemporaryProof(proof, storage);
   } else {
     try {
-      proof = await authenticateProjectSourcesTemporaryMarker(intent);
+      proof = await authenticateProjectSourcesTemporaryMarker(intent, {
+        windowsPrivateDirectoryAuthority: storage.windowsPrivateDirectoryAuthority,
+      });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         throw new Error(
@@ -336,13 +346,16 @@ export async function recoverPendingProjectSourcesProfileCreate(
       }
       const removedPrivateChild = await removeTemporaryProfileAuthority(
         intent.temporaryProfileAuthority,
+        { windowsPrivateDirectoryAuthority: storage.windowsPrivateDirectoryAuthority },
       );
       if (!removedPrivateChild) {
         throw new Error(
           `Project Sources private pre-marker profile removal was not confirmed: ${intent.userDataDir}`,
         );
       }
-      await assertPrivateDirectoryAuthority(intent.temporaryProfileAuthority.generation.parent);
+      await assertPrivateDirectoryAuthority(intent.temporaryProfileAuthority.generation.parent, {
+        windowsPrivateDirectoryAuthority: storage.windowsPrivateDirectoryAuthority,
+      });
       await persistProjectSourcesCleanupRuntime({}, storage);
       logger(
         `[browser] Removed interrupted Project Sources private profile ${intent.userDataDir}.`,
@@ -402,10 +415,10 @@ export async function retryPendingProjectSourcesCleanup(
   }
   if (acquisition.runtime !== runtime || acquisition.proof !== proof) {
     runtime = acquisition.runtime;
-    proof = await updateProjectSourcesCleanupProofForPersistence(
-      runtime,
+    proof = await transitionProjectSourcesCleanupProof(
       acquisition.proof,
       resolvedStorage,
+      { type: "persist", runtime },
       deps,
     );
     await persistProjectSourcesCleanupRuntime(runtime, resolvedStorage, { proof });
@@ -456,15 +469,17 @@ export async function retryPendingProjectSourcesCleanup(
           ) {
             return false;
           }
-          return await removeTemporaryProfileAuthority(durableProof.temporaryProfileAuthority);
+          return await removeTemporaryProfileAuthority(durableProof.temporaryProfileAuthority, {
+            windowsPrivateDirectoryAuthority: resolvedStorage.windowsPrivateDirectoryAuthority,
+          });
         },
       },
       persistFinalizationResult: async (result) => {
         if (hasProjectSourcesCleanupAuthority(result.runtime)) {
-          durableProof = await updateProjectSourcesCleanupProofForPersistence(
-            result.runtime,
+          durableProof = await transitionProjectSourcesCleanupProof(
             durableProof,
             resolvedStorage,
+            { type: "persist", runtime: result.runtime },
             deps,
           );
           await persistProjectSourcesCleanupRuntime(result.runtime, resolvedStorage, {

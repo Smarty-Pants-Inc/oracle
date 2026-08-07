@@ -21,7 +21,10 @@ import { installJavaScriptDialogAutoDismissal, navigateToChatGPT } from "./pageA
 import type { BrowserLogger, ChromeClient, ResolvedBrowserConfig } from "./types.js";
 import type { BrowserRuntimeMetadata } from "../sessionManager.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import { LocalOwnedBrowserResourceAuthority } from "./ownedBrowserResources.js";
+import {
+  LocalOwnedBrowserResourceAuthority,
+  OwnedBrowserResourceTransaction,
+} from "./ownedBrowserResources.js";
 import { acquireBrowserTabLease, type BrowserTabLease } from "./tabLeaseRegistry.js";
 import { createChromeProcessLaunchClaim } from "./chromeProcessLaunchClaim.js";
 import { captureProfileDirectoryIdentity, type ProfileDirectoryIdentity } from "./profileState.js";
@@ -46,10 +49,9 @@ import {
   establishProjectSourcesCleanupStorage,
   persistProjectSourcesCleanupRuntime,
   projectSourcesCleanupOwnerId,
-  removeProjectSourcesCleanupProofArtifacts,
   retireProjectSourcesCleanupJournal,
   retryPendingProjectSourcesCleanup,
-  updateProjectSourcesCleanupProofForPersistence,
+  transitionProjectSourcesCleanupProof,
   type ProjectSourcesCleanupProof,
   type ProjectSourcesCleanupStorage,
 } from "./projectSourcesRecovery.js";
@@ -146,6 +148,7 @@ async function runBrowserProjectSourcesUnlocked(
       keepBrowser: effectiveKeepBrowser,
     });
     profileDirectoryIdentity = await captureProfileDirectoryIdentity(userDataDir);
+    userDataDir = profileDirectoryIdentity.canonicalPath;
     cleanupProof = createProjectSourcesManualCleanupProof(
       cleanupStorage,
       targetGenerationId,
@@ -167,7 +170,10 @@ async function runBrowserProjectSourcesUnlocked(
     const temporaryProfileAuthority = await createTemporaryProfileChildAuthority(
       cleanupStorage.runtimeRoot,
       "oracle-browser-",
-      { randomId: () => targetGenerationId },
+      {
+        randomId: () => targetGenerationId,
+        windowsPrivateDirectoryAuthority: cleanupStorage.windowsPrivateDirectoryAuthority,
+      },
     );
     const establishedIntent = { ...profileCreateIntent, temporaryProfileAuthority };
     await assertProjectSourcesProfileParent(establishedIntent, cleanupStorage);
@@ -196,11 +202,10 @@ async function runBrowserProjectSourcesUnlocked(
     runtimeToPersist: BrowserRuntimeMetadata,
   ): Promise<BrowserRuntimeMetadata> => {
     if (runtimeToPersist.recoveryCleanupResources?.length) {
-      cleanupProof = await updateProjectSourcesCleanupProofForPersistence(
-        runtimeToPersist,
-        cleanupProof,
-        cleanupStorage,
-      );
+      cleanupProof = await transitionProjectSourcesCleanupProof(cleanupProof, cleanupStorage, {
+        type: "persist",
+        runtime: runtimeToPersist,
+      });
       await persistProjectSourcesCleanupRuntime(runtimeToPersist, cleanupStorage, {
         proof: cleanupProof,
       });
@@ -214,7 +219,9 @@ async function runBrowserProjectSourcesUnlocked(
       );
     } else {
       await persistProjectSourcesCleanupRuntime({}, cleanupStorage);
-      await removeProjectSourcesCleanupProofArtifacts(cleanupProof, cleanupStorage);
+      await transitionProjectSourcesCleanupProof(cleanupProof, cleanupStorage, {
+        type: "remove-artifacts",
+      });
     }
     return runtimeToPersist;
   };
@@ -244,6 +251,10 @@ async function runBrowserProjectSourcesUnlocked(
       await persistOwnedResources(runtimeToPersist);
     },
   });
+  const resourceTransaction = new OwnedBrowserResourceTransaction(
+    resources.transactionAdapters(),
+    resources.runtime(),
+  );
   resources.configureSettlementAdapters({
     beforeProcessSettlement: assertTemporaryProfileAuthority,
     beforeTemporaryProfileRemoval: assertTemporaryProfileAuthority,
@@ -256,7 +267,7 @@ async function runBrowserProjectSourcesUnlocked(
   try {
     let acquiredTabLease: BrowserTabLease | undefined;
     if (manualLogin) {
-      acquiredTabLease = await resources.journalAcquisition({
+      acquiredTabLease = await resources.journalAcquisition(resourceTransaction, {
         resource: "tab-lease",
         acquire: () =>
           acquireBrowserTabLease(userDataDir, {
@@ -270,7 +281,7 @@ async function runBrowserProjectSourcesUnlocked(
         authority: (lease) => lease,
       });
     }
-    const acquiredProcess = await resources.journalAcquisition({
+    const acquiredProcess = await resources.journalAcquisition(resourceTransaction, {
       resource: "chrome-process",
       acquire: async () => {
         if (manualLogin) {
@@ -328,7 +339,7 @@ async function runBrowserProjectSourcesUnlocked(
     );
 
     const devtoolsRetries = manualLogin ? 6 : 0;
-    const connection = await resources.journalAcquisition({
+    const connection = await resources.journalAcquisition(resourceTransaction, {
       resource: "chrome-target",
       acquire: async () => {
         const opened = await connectOwnedProjectSourcesTarget(
@@ -460,24 +471,23 @@ async function runBrowserProjectSourcesUnlocked(
   removeTerminationHooks?.();
   let finalization;
   try {
-    const runtimeBeforeSettlement = resources.runtime();
+    const runtimeBeforeSettlement = resourceTransaction.runtime();
     if (runtimeBeforeSettlement.recoveryCleanupResources?.length) {
-      cleanupProof = await updateProjectSourcesCleanupProofForPersistence(
-        runtimeBeforeSettlement,
-        cleanupProof,
-        cleanupStorage,
-      );
+      cleanupProof = await transitionProjectSourcesCleanupProof(cleanupProof, cleanupStorage, {
+        type: "persist",
+        runtime: runtimeBeforeSettlement,
+      });
       await persistProjectSourcesCleanupRuntime(runtimeBeforeSettlement, cleanupStorage, {
         proof: cleanupProof,
       });
       cleanupRetryRuntime = runtimeBeforeSettlement;
       await assertProjectSourcesCleanupProof(runtimeBeforeSettlement, cleanupProof, cleanupStorage);
     }
-    finalization = await resources.settle(completed ? "finalize" : "abort");
+    finalization = await resourceTransaction.settle(completed ? "finalize" : "abort");
   } catch (error) {
     const cleanupError = new BrowserAutomationError(
       `Project Sources browser cleanup proof is unavailable; exact resources remain durably journaled: ${error instanceof Error ? error.message : String(error)}`,
-      { stage: "project-sources-cleanup", runtime: resources.runtime() },
+      { stage: "project-sources-cleanup", runtime: resourceTransaction.runtime() },
       error,
     );
     if (primaryError !== undefined) {

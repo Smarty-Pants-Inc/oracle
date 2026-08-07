@@ -15,11 +15,25 @@ import {
 } from "node:fs/promises";
 import { describe, expect, test, vi } from "vitest";
 import type { SessionArtifact } from "../../src/sessionManager.js";
-import { RemoteArtifactStore } from "../../src/remote/artifactStore.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import { missingRequiredArtifactDeliveries } from "../../src/remote/transactionValidation.js";
 import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
-import { openTestRemoteTransactionStore } from "./testTransactionStore.js";
+import {
+  createTestRemoteArtifactStore,
+  openTestRemoteTransactionStore,
+} from "./testTransactionStore.js";
+import {
+  establishWindowsPrivateDirectories,
+  initializeWindowsPrivateFile,
+  protectWindowsPrivateFile,
+  verifyWindowsPrivateFile,
+} from "../../src/windowsPrivateFileAcl.js";
+import {
+  testWindowsPrivateDirectoriesAuthority,
+  testWindowsPrivateFileProtectionAuthority,
+  testWindowsPrivateFileVerificationAuthority,
+} from "../privateAuthorityTestHelpers.js";
+
 function openTransactionStore(
   options: Omit<Parameters<typeof RemoteTransactionStore.open>[0], "integrityKeyPath">,
 ) {
@@ -76,9 +90,39 @@ async function begin(store: RemoteTransactionStore, transactionToken: string, ru
   return record;
 }
 
-async function writeArtifact(filePath: string, payload: Buffer): Promise<SessionArtifact> {
-  await mkdir(path.dirname(filePath), { recursive: true });
-  await writeFile(filePath, payload);
+async function writePrivateArtifactFixture(
+  filePath: string,
+  payload: Buffer | string,
+): Promise<void> {
+  const directory = path.dirname(filePath);
+  if (process.platform !== "win32") {
+    await mkdir(directory, { recursive: true });
+    await writeFile(filePath, payload);
+    return;
+  }
+  await establishWindowsPrivateDirectories([directory]);
+  if (!(await initializeWindowsPrivateFile(filePath))) {
+    throw new Error("Expected a fresh Windows private artifact fixture");
+  }
+  const handle = await open(filePath, "r+");
+  try {
+    await handle.writeFile(payload);
+  } finally {
+    await handle.close();
+  }
+  await verifyWindowsPrivateFile(filePath);
+}
+
+async function writeArtifact(
+  filePath: string,
+  payload: Buffer,
+  nativeWindowsAuthority = false,
+): Promise<SessionArtifact> {
+  if (nativeWindowsAuthority) await writePrivateArtifactFixture(filePath, payload);
+  else {
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, payload);
+  }
   const handle = await open(filePath, "r");
   try {
     const fileStat = await handle.stat({ bigint: true });
@@ -119,7 +163,7 @@ describe("RemoteArtifactStore", () => {
         now: () => now,
       });
       const record = await begin(firstTransactionStore, transactionToken, "run-1");
-      const firstArtifactStore = new RemoteArtifactStore({
+      const firstArtifactStore = createTestRemoteArtifactStore({
         transactionStore: firstTransactionStore,
         sessionsRoot,
         now: () => now,
@@ -169,7 +213,7 @@ describe("RemoteArtifactStore", () => {
         controllerGeneration: "controller-generation-2",
         now: () => now,
       });
-      const restartedArtifactStore = new RemoteArtifactStore({
+      const restartedArtifactStore = createTestRemoteArtifactStore({
         transactionStore: restartedTransactionStore,
         sessionsRoot,
         now: () => now,
@@ -232,7 +276,7 @@ describe("RemoteArtifactStore", () => {
       const secondToken = "b".repeat(64);
       await begin(store, firstToken, "run-a");
       await begin(store, secondToken, "run-b");
-      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      const artifacts = createTestRemoteArtifactStore({ transactionStore: store, sessionsRoot });
       await artifacts.createArtifactWriteAuthority({
         transactionToken: firstToken,
         runId: "run-a",
@@ -267,7 +311,7 @@ describe("RemoteArtifactStore", () => {
       });
       const transactionToken = "1".repeat(64);
       await begin(store, transactionToken, "run-boundary");
-      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      const artifacts = createTestRemoteArtifactStore({ transactionStore: store, sessionsRoot });
       await artifacts.createArtifactWriteAuthority({ transactionToken, runId: "run-boundary" });
       const outsideArtifact = await writeArtifact(
         path.join(root, "outside.txt"),
@@ -295,7 +339,7 @@ describe("RemoteArtifactStore", () => {
       });
       const transactionToken = "2".repeat(64);
       await begin(store, transactionToken, "run-boundary");
-      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      const artifacts = createTestRemoteArtifactStore({ transactionStore: store, sessionsRoot });
       const writeAuthority = await artifacts.createArtifactWriteAuthority({
         transactionToken,
         runId: "run-boundary",
@@ -326,7 +370,7 @@ describe("RemoteArtifactStore", () => {
       });
       const transactionToken = "3".repeat(64);
       await begin(store, transactionToken, "run-boundary");
-      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      const artifacts = createTestRemoteArtifactStore({ transactionStore: store, sessionsRoot });
       const writeAuthority = await artifacts.createArtifactWriteAuthority({
         transactionToken,
         runId: "run-boundary",
@@ -378,7 +422,7 @@ describe("RemoteArtifactStore", () => {
       });
       const transactionToken = "d".repeat(64);
       await begin(store, transactionToken, "run-evidence");
-      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      const artifacts = createTestRemoteArtifactStore({ transactionStore: store, sessionsRoot });
       const writeAuthority = await artifacts.createArtifactWriteAuthority({
         transactionToken,
         runId: "run-evidence",
@@ -400,76 +444,90 @@ describe("RemoteArtifactStore", () => {
     }
   });
 
-  test("rejects a replacement made after producer evidence", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-producer-race-"));
-    try {
-      const sessionsRoot = path.join(root, "sessions");
-      const store = await openTransactionStore({
-        directory: path.join(root, "transactions"),
-      });
-      const transactionToken = "e".repeat(64);
-      await begin(store, transactionToken, "run-producer-race");
-      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
-      const writeAuthority = await artifacts.createArtifactWriteAuthority({
-        transactionToken,
-        runId: "run-producer-race",
-      });
-      const artifactPath = path.join(writeAuthority.artifactsDirectory, "result.txt");
-      const artifact = await writeArtifact(artifactPath, Buffer.from("same-length-a"));
-      await rm(artifactPath);
-      await writeFile(artifactPath, "same-length-a");
-
-      await expect(
-        artifacts.prepareRequiredArtifacts({
+  describe.sequential("Windows-native artifact mutation authority cohort", () => {
+    test("rejects a replacement made after producer evidence", async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-producer-race-"));
+      try {
+        const sessionsRoot = path.join(root, "sessions");
+        const store = await openTransactionStore({
+          directory: path.join(root, "transactions"),
+        });
+        const transactionToken = "e".repeat(64);
+        await begin(store, transactionToken, "run-producer-race");
+        const artifacts = createTestRemoteArtifactStore({
+          transactionStore: store,
+          sessionsRoot,
+          windowsPrivateDirectoriesAuthority: establishWindowsPrivateDirectories,
+          windowsPrivateFileProtectionAuthority: protectWindowsPrivateFile,
+          windowsPrivateFileVerificationAuthority: verifyWindowsPrivateFile,
+        });
+        const writeAuthority = await artifacts.createArtifactWriteAuthority({
           transactionToken,
           runId: "run-producer-race",
+        });
+        const artifactPath = path.join(writeAuthority.artifactsDirectory, "result.txt");
+        const artifact = await writeArtifact(artifactPath, Buffer.from("same-length-a"), true);
+        await rm(artifactPath);
+        await writePrivateArtifactFixture(artifactPath, "same-length-a");
+
+        await expect(
+          artifacts.prepareRequiredArtifacts({
+            transactionToken,
+            runId: "run-producer-race",
+            artifacts: [artifact],
+          }),
+        ).rejects.toThrow("physical identity does not match producer evidence");
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    test("rejects a replacement made after durable registration", async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-delivery-race-"));
+      try {
+        const sessionsRoot = path.join(root, "sessions");
+        const store = await openTransactionStore({
+          directory: path.join(root, "transactions"),
+        });
+        const transactionToken = "f".repeat(64);
+        await begin(store, transactionToken, "run-delivery-race");
+        const artifacts = createTestRemoteArtifactStore({
+          transactionStore: store,
+          sessionsRoot,
+          windowsPrivateDirectoriesAuthority: establishWindowsPrivateDirectories,
+          windowsPrivateFileProtectionAuthority: protectWindowsPrivateFile,
+          windowsPrivateFileVerificationAuthority: verifyWindowsPrivateFile,
+        });
+        const writeAuthority = await artifacts.createArtifactWriteAuthority({
+          transactionToken,
+          runId: "run-delivery-race",
+        });
+        const artifactPath = path.join(writeAuthority.artifactsDirectory, "result.txt");
+        const artifact = await writeArtifact(artifactPath, Buffer.from("first generation"), true);
+        const registrations = await artifacts.prepareRequiredArtifacts({
+          transactionToken,
+          runId: "run-delivery-race",
           artifacts: [artifact],
-        }),
-      ).rejects.toThrow("physical identity does not match producer evidence");
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
+        });
+        await store.publishCapture({
+          transactionToken,
+          runId: "run-delivery-race",
+          result: capturedResult,
+          runtime,
+          artifacts: registrations,
+        });
+        const [registration] = registrations;
+        if (!registration) throw new Error("Expected a durable artifact registration");
+        await rm(artifactPath);
+        await writePrivateArtifactFixture(artifactPath, "second generation");
 
-  test("rejects a replacement made after durable registration", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-delivery-race-"));
-    try {
-      const sessionsRoot = path.join(root, "sessions");
-      const store = await openTransactionStore({
-        directory: path.join(root, "transactions"),
-      });
-      const transactionToken = "f".repeat(64);
-      await begin(store, transactionToken, "run-delivery-race");
-      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
-      const writeAuthority = await artifacts.createArtifactWriteAuthority({
-        transactionToken,
-        runId: "run-delivery-race",
-      });
-      const artifactPath = path.join(writeAuthority.artifactsDirectory, "result.txt");
-      const artifact = await writeArtifact(artifactPath, Buffer.from("first generation"));
-      const registrations = await artifacts.prepareRequiredArtifacts({
-        transactionToken,
-        runId: "run-delivery-race",
-        artifacts: [artifact],
-      });
-      await store.publishCapture({
-        transactionToken,
-        runId: "run-delivery-race",
-        result: capturedResult,
-        runtime,
-        artifacts: registrations,
-      });
-      const [registration] = registrations;
-      if (!registration) throw new Error("Expected a durable artifact registration");
-      await rm(artifactPath);
-      await writeFile(artifactPath, "second generation");
-
-      await expect(
-        artifacts.openForDelivery(transactionToken, registration.descriptor.artifactId),
-      ).rejects.toMatchObject({ code: "artifact_identity_changed" });
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
+        await expect(
+          artifacts.openForDelivery(transactionToken, registration.descriptor.artifactId),
+        ).rejects.toMatchObject({ code: "artifact_identity_changed" });
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
   });
 
   test("rolls back an empty fresh namespace when physical identity capture fails", async () => {
@@ -497,7 +555,13 @@ describe("RemoteArtifactStore", () => {
         now: () => now,
       });
       const begun = await begin(store, transactionToken, "run-capture-failure");
-      const artifacts = new IsolatedRemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      const artifacts = new IsolatedRemoteArtifactStore({
+        transactionStore: store,
+        sessionsRoot,
+        windowsPrivateDirectoriesAuthority: testWindowsPrivateDirectoriesAuthority,
+        windowsPrivateFileProtectionAuthority: testWindowsPrivateFileProtectionAuthority,
+        windowsPrivateFileVerificationAuthority: testWindowsPrivateFileVerificationAuthority,
+      });
 
       await expect(
         artifacts.createArtifactWriteAuthority({
@@ -555,7 +619,13 @@ describe("RemoteArtifactStore", () => {
         directory: path.join(root, "transactions"),
       });
       const begun = await begin(store, transactionToken, "run-zero-birth");
-      const artifacts = new IsolatedRemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      const artifacts = new IsolatedRemoteArtifactStore({
+        transactionStore: store,
+        sessionsRoot,
+        windowsPrivateDirectoriesAuthority: testWindowsPrivateDirectoriesAuthority,
+        windowsPrivateFileProtectionAuthority: testWindowsPrivateFileProtectionAuthority,
+        windowsPrivateFileVerificationAuthority: testWindowsPrivateFileVerificationAuthority,
+      });
 
       await expect(
         artifacts.createArtifactWriteAuthority({
@@ -603,7 +673,7 @@ describe("RemoteArtifactStore", () => {
       });
     try {
       const begun = await begin(store, transactionToken, "run-bind-failure");
-      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      const artifacts = createTestRemoteArtifactStore({ transactionStore: store, sessionsRoot });
 
       await expect(
         artifacts.createArtifactWriteAuthority({
@@ -633,32 +703,34 @@ describe("RemoteArtifactStore", () => {
     }
   });
 
-  test("settles namespace initialization failure and removes only its exact fresh directory", async () => {
+  test("settles namespace authority failure and removes only its exact fresh directory", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-artifact-init-failure-"));
     const transactionToken = "2".repeat(64);
-    const actualFs = await vi.importActual<Record<string, unknown> & { mkdir: typeof mkdir }>(
-      "node:fs/promises",
-    );
     const mkdirFailure = Object.assign(new Error("simulated artifacts directory failure"), {
       code: "EIO",
     });
-    const mockedMkdir = vi.fn(async (...args: unknown[]) => {
-      const [directoryPath] = args;
-      if (path.basename(String(directoryPath)) === "artifacts") throw mkdirFailure;
-      return await Reflect.apply(actualFs.mkdir, actualFs, args);
+    const windowsPrivateDirectoriesAuthority = vi.fn(async (directoryPaths: readonly string[]) => {
+      for (const directoryPath of directoryPaths) {
+        await mkdir(directoryPath, { recursive: true });
+      }
+      if (directoryPaths.some((directoryPath) => path.basename(directoryPath) === "artifacts")) {
+        throw mkdirFailure;
+      }
     });
-    vi.resetModules();
-    vi.doMock("node:fs/promises", () => ({ ...actualFs, mkdir: mockedMkdir }));
-    // Test-isolated reload is required because the built-in ESM bindings predate vi.doMock.
-    const { RemoteArtifactStore: IsolatedRemoteArtifactStore } =
-      await import("../../src/remote/artifactStore.js");
     try {
       const sessionsRoot = path.join(root, "sessions");
       const store = await openTransactionStore({
         directory: path.join(root, "transactions"),
       });
       const begun = await begin(store, transactionToken, "run-init-failure");
-      const artifacts = new IsolatedRemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      const namespaceDirectory = path.join(sessionsRoot, begun.artifactNamespace);
+      const artifactsDirectory = path.join(namespaceDirectory, "artifacts");
+      const artifacts = createTestRemoteArtifactStore({
+        transactionStore: store,
+        sessionsRoot,
+        platform: "win32",
+        windowsPrivateDirectoriesAuthority,
+      });
 
       await expect(
         artifacts.createArtifactWriteAuthority({
@@ -666,6 +738,10 @@ describe("RemoteArtifactStore", () => {
           runId: "run-init-failure",
         }),
       ).rejects.toBe(mkdirFailure);
+      expect(windowsPrivateDirectoriesAuthority.mock.calls).toEqual([
+        [[namespaceDirectory]],
+        [[namespaceDirectory, artifactsDirectory]],
+      ]);
       const failed = await store.read(transactionToken);
       expect(failed).toMatchObject({
         state: "failed",
@@ -676,12 +752,8 @@ describe("RemoteArtifactStore", () => {
         },
       });
       expect(failed).not.toHaveProperty("artifactNamespaceIdentity");
-      await expect(access(path.join(sessionsRoot, begun.artifactNamespace))).rejects.toMatchObject({
-        code: "ENOENT",
-      });
+      await expect(access(namespaceDirectory)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
-      vi.doUnmock("node:fs/promises");
-      vi.resetModules();
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -698,7 +770,7 @@ describe("RemoteArtifactStore", () => {
         terminalRetentionMs: 1_000,
         now: () => now,
       });
-      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      const artifacts = createTestRemoteArtifactStore({ transactionStore: store, sessionsRoot });
       const cleaned = await begin(store, cleanedToken, "run-cleaned");
       await artifacts.createArtifactWriteAuthority({
         transactionToken: cleanedToken,
@@ -792,7 +864,7 @@ describe("RemoteArtifactStore", () => {
           hadRuntimeAuthority: false,
         },
       ]);
-      new RemoteArtifactStore({ transactionStore: restarted, sessionsRoot });
+      createTestRemoteArtifactStore({ transactionStore: restarted, sessionsRoot });
 
       now += 1_001;
       await expect(restarted.list()).resolves.toEqual([
@@ -829,7 +901,7 @@ describe("RemoteArtifactStore", () => {
       await mkdir(sessionsRoot, { recursive: true });
       await mkdir(foreignDirectory, { recursive: true });
       await symlink(foreignDirectory, aliasPath, "dir");
-      const artifacts = new RemoteArtifactStore({ transactionStore: store, sessionsRoot });
+      const artifacts = createTestRemoteArtifactStore({ transactionStore: store, sessionsRoot });
 
       await expect(
         artifacts.createArtifactWriteAuthority({ transactionToken, runId: "run-alias" }),

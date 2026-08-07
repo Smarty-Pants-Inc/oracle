@@ -1,25 +1,29 @@
-import { mkdir, open } from "node:fs/promises";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
-import type { WindowsPrivateTreeAuthority } from "../../src/remote/windowsPrivateTreeAcl.js";
-
-export const testWindowsPrivateTreeAuthority: WindowsPrivateTreeAuthority = async (scope) => {
-  if (scope.initializeRoots) {
-    await mkdir(scope.integrityKeyDirectory, { recursive: true });
-    await mkdir(scope.storeDirectory, { recursive: true });
-    await mkdir(scope.authorityDirectory ?? scope.storeDirectory, { recursive: true });
-  }
-  const filePath = scope.initializeIntegrityKey ? scope.integrityKeyPath : scope.initializeFilePath;
-  if (filePath) {
-    const handle = await open(filePath, "wx");
-    await handle.close();
-  }
-};
+import { RemoteArtifactStore } from "../../src/remote/artifactStore.js";
+import {
+  testWindowsPrivateDirectoriesAuthority,
+  testWindowsPrivateFileProtectionAuthority,
+  testWindowsPrivateFileVerificationAuthority,
+  testWindowsPrivateTreeAuthority,
+} from "../privateAuthorityTestHelpers.js";
+export { testWindowsPrivateTreeAuthority } from "../privateAuthorityTestHelpers.js";
 
 export function openTestRemoteTransactionStore(
   options: Parameters<typeof RemoteTransactionStore.open>[0],
 ) {
   return RemoteTransactionStore.open({
     windowsPrivateTreeAuthority: testWindowsPrivateTreeAuthority,
+    ...options,
+  });
+}
+
+export function createTestRemoteArtifactStore(
+  options: ConstructorParameters<typeof RemoteArtifactStore>[0],
+) {
+  return new RemoteArtifactStore({
+    windowsPrivateDirectoriesAuthority: testWindowsPrivateDirectoriesAuthority,
+    windowsPrivateFileProtectionAuthority: testWindowsPrivateFileProtectionAuthority,
+    windowsPrivateFileVerificationAuthority: testWindowsPrivateFileVerificationAuthority,
     ...options,
   });
 }

@@ -73,8 +73,8 @@ describe("filesystem lock directory removal protocol", () => {
         JSON.stringify({
           type: "attested",
           token: "token",
-          rootIdentity: { ...identity, device: "01" },
-          generationIdentity: identity,
+          rootIdentity: identity,
+          generationIdentity: { ...identity, device: "01" },
         }),
       ),
     ).toThrow(/invalid root attestation/i);

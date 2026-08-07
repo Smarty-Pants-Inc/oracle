@@ -8,6 +8,7 @@ import {
 import {
   acquireCrashRecoverableFilesystemLock,
   FilesystemLockBusyError,
+  type CrashRecoverableFilesystemLockDeps,
 } from "./filesystemLock.js";
 import { canonicalFilesystemLockPath } from "./filesystemLockModel.js";
 import {
@@ -46,6 +47,7 @@ async function withReattachRecoveryAcquisitionGate<T>(
 export async function acquireReattachRecoveryLock(
   lockPath: string,
   parentAuthority?: PrivateDirectoryAuthority,
+  deps: CrashRecoverableFilesystemLockDeps = {},
 ): Promise<ReattachRecoveryLock> {
   const parent = parentAuthority ?? (await establishPrivateRuntimeAuthority());
   const canonicalPath = canonicalFilesystemLockPath(lockPath);
@@ -65,12 +67,16 @@ export async function acquireReattachRecoveryLock(
 
     const sessionId = `browser-recovery:${createHash("sha256").update(canonicalPath).digest("hex").slice(0, 24)}`;
     try {
-      const acquired = await acquireCrashRecoverableFilesystemLock(canonicalPath, {
-        sessionId,
-        adoptCurrentProcessGeneration: true,
-        createParent: false,
-        expectedParentIdentity: parent.identity,
-      });
+      const acquired = await acquireCrashRecoverableFilesystemLock(
+        canonicalPath,
+        {
+          sessionId,
+          adoptCurrentProcessGeneration: true,
+          createParent: false,
+          expectedParentIdentity: parent.identity,
+        },
+        deps,
+      );
       await assertParentAuthority();
       return {
         release: async (finalize) => {

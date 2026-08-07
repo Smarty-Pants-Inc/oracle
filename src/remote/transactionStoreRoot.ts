@@ -9,7 +9,7 @@ import { syncDirectory } from "../fsDurability.js";
 import {
   protectWindowsPrivateTreeAcl,
   type WindowsPrivateTreeAuthority,
-} from "./windowsPrivateTreeAcl.js";
+} from "../windowsPrivateFileAcl.js";
 
 const REMOTE_TRANSACTION_HEAD_DIRECTORY_NAME = ".remote-transaction-authority";
 

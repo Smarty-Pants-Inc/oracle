@@ -7,7 +7,7 @@ import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../s
 import {
   protectWindowsPrivateTreeAcl,
   type WindowsPrivateTreeAuthority,
-} from "./windowsPrivateTreeAcl.js";
+} from "../windowsPrivateFileAcl.js";
 import {
   assertRemoteTransactionStoreRootAuthority,
   prepareRemoteTransactionStoreRoot,
@@ -26,6 +26,7 @@ import type {
   DurableRemoteCaptureWarning,
   ExpiredRemoteTransactionSettlement,
   ReconcileRemoteTransactionResult,
+  RemoteNonterminalTransactionRecord,
   RemoteTransactionBeginRecord,
   RemoteTransactionControllerShutdownPlan,
   RemoteTransactionRecord,
@@ -33,12 +34,10 @@ import type {
   RemoteTransactionSettlementExecution,
   RemoteTransactionTransition,
   RemoteTransactionTransitionOutcome,
+  RemoteTransactionTransitionRecord,
   RemoteTransactionTransitionType,
 } from "./transactionModel.js";
-import {
-  isTerminalRemoteTransactionState,
-  validateRemoteTransactionRecord,
-} from "./transactionValidation.js";
+import { validateRemoteTransactionRecord } from "./transactionValidation.js";
 import {
   authenticateRemoteTransactionRecordEnvelope,
   serializeRemoteTransactionRecord,
@@ -370,7 +369,7 @@ export class RemoteTransactionStore {
   async beginArtifactNamespaceInitialization(params: {
     transactionToken: string;
     runId: string;
-  }): Promise<RemoteTransactionRecord> {
+  }): Promise<RemoteTransactionTransitionRecord<"begin-artifact-namespace-initialization">> {
     return (
       await this.transition(params.transactionToken, {
         type: "begin-artifact-namespace-initialization",
@@ -383,7 +382,7 @@ export class RemoteTransactionStore {
     transactionToken: string;
     runId: string;
     identity: NonNullable<RemoteTransactionRecord["artifactNamespaceIdentity"]>;
-  }): Promise<RemoteTransactionRecord> {
+  }): Promise<RemoteTransactionTransitionRecord<"bind-artifact-namespace-identity">> {
     return (
       await this.transition(params.transactionToken, {
         type: "bind-artifact-namespace-identity",
@@ -397,7 +396,7 @@ export class RemoteTransactionStore {
     transactionToken: string;
     runId: string;
     identity?: NonNullable<RemoteTransactionRecord["artifactNamespaceIdentity"]>;
-  }): Promise<RemoteTransactionRecord> {
+  }): Promise<RemoteTransactionTransitionRecord<"rollback-artifact-namespace-initialization">> {
     return (
       await this.transition(params.transactionToken, {
         type: "rollback-artifact-namespace-initialization",
@@ -410,7 +409,7 @@ export class RemoteTransactionStore {
   async completeArtifactNamespaceInitialization(params: {
     transactionToken: string;
     runId: string;
-  }): Promise<RemoteTransactionRecord> {
+  }): Promise<RemoteTransactionTransitionRecord<"complete-artifact-namespace-initialization">> {
     return (
       await this.transition(params.transactionToken, {
         type: "complete-artifact-namespace-initialization",
@@ -419,17 +418,19 @@ export class RemoteTransactionStore {
     ).record;
   }
 
-  async renewLease(transactionToken: string): Promise<RemoteTransactionRecord> {
+  async renewLease(
+    transactionToken: string,
+  ): Promise<RemoteTransactionTransitionRecord<"renew-lease">> {
     return (await this.transition(transactionToken, { type: "renew-lease" })).record;
   }
 
-  async listExpiredNonterminalRecords(): Promise<RemoteTransactionRecord[]> {
+  async listExpiredNonterminalRecords(): Promise<RemoteNonterminalTransactionRecord[]> {
     return await this.withWindowsPrivateTreeAuthority(async () => {
       await this.#maintenance.run();
       await this.assertIntegrityAuthority();
       const expiredAt = this.#now();
       const names = await readdir(this.directory);
-      const expired: RemoteTransactionRecord[] = [];
+      const expired: RemoteNonterminalTransactionRecord[] = [];
       for (const name of names.sort()) {
         const match = /^([a-f0-9]{64})\.json$/u.exec(name);
         if (!match?.[1]) continue;
@@ -437,8 +438,10 @@ export class RemoteTransactionStore {
           const record = await this.readUnlocked(match[1]);
           if (
             record &&
-            !isTerminalRemoteTransactionState(record.state) &&
-            Date.parse(record.leaseExpiresAt ?? "") <= expiredAt
+            (record.state === "running" ||
+              record.state === "pending" ||
+              record.state === "recoverable-error") &&
+            Date.parse(record.leaseExpiresAt) <= expiredAt
           ) {
             expired.push(record);
           }
@@ -468,7 +471,7 @@ export class RemoteTransactionStore {
     transactionToken: string,
     runtime: BrowserRuntimeMetadata,
     modelSelection?: BrowserModelSelectionEvidence,
-  ): Promise<RemoteTransactionRecord> {
+  ): Promise<RemoteTransactionTransitionRecord<"journal-runtime">> {
     return (
       await this.transition(transactionToken, {
         type: "journal-runtime",
@@ -486,7 +489,7 @@ export class RemoteTransactionStore {
   async journalRecoveryRuntime(
     transactionToken: string,
     runtime: BrowserRuntimeMetadata,
-  ): Promise<RemoteTransactionRecord> {
+  ): Promise<RemoteTransactionTransitionRecord<"journal-recovery-runtime">> {
     return (
       await this.transition(transactionToken, {
         type: "journal-recovery-runtime",
@@ -502,7 +505,7 @@ export class RemoteTransactionStore {
   async persistSettlementRuntime(
     transactionToken: string,
     runtime: BrowserRuntimeMetadata,
-  ): Promise<RemoteTransactionRecord> {
+  ): Promise<RemoteTransactionTransitionRecord<"persist-settlement-runtime">> {
     return (
       await this.transition(transactionToken, {
         type: "persist-settlement-runtime",
@@ -518,7 +521,7 @@ export class RemoteTransactionStore {
     runtime: BrowserRuntimeMetadata;
     modelSelection?: BrowserModelSelectionEvidence;
     artifacts?: DurableRemoteArtifactRegistration[];
-  }): Promise<RemoteTransactionRecord> {
+  }): Promise<RemoteTransactionTransitionRecord<"stage-capture">> {
     return (
       await this.transition(params.transactionToken, {
         type: "stage-capture",
@@ -537,7 +540,7 @@ export class RemoteTransactionStore {
     runtime?: BrowserRuntimeMetadata;
     warning?: DurableRemoteCaptureWarning;
     projectTargetSelectionLoss?: boolean;
-  }): Promise<RemoteTransactionRecord> {
+  }): Promise<RemoteTransactionTransitionRecord<"promote-staged-capture">> {
     return (
       await this.transition(params.transactionToken, {
         type: "promote-staged-capture",
@@ -556,7 +559,7 @@ export class RemoteTransactionStore {
     runtime: BrowserRuntimeMetadata;
     modelSelection?: BrowserModelSelectionEvidence;
     artifacts?: DurableRemoteArtifactRegistration[];
-  }): Promise<RemoteTransactionRecord> {
+  }): Promise<RemoteTransactionTransitionRecord<"publish-capture">> {
     return (
       await this.transition(params.transactionToken, {
         type: "publish-capture",
@@ -574,7 +577,7 @@ export class RemoteTransactionStore {
     runtime?: BrowserRuntimeMetadata;
     error: DurableRemoteAutomationError;
     settlementMode?: "abort";
-  }): Promise<RemoteTransactionRecord> {
+  }): Promise<RemoteTransactionTransitionRecord<"invalidate-staged-capture">> {
     return (
       await this.transition(params.transactionToken, {
         type: "invalidate-staged-capture",
@@ -590,7 +593,7 @@ export class RemoteTransactionStore {
     runtime?: BrowserRuntimeMetadata;
     error: DurableRemoteAutomationError;
     settlementMode?: "abort";
-  }): Promise<RemoteTransactionRecord> {
+  }): Promise<RemoteTransactionTransitionRecord<"record-failure">> {
     return (
       await this.transition(params.transactionToken, {
         type: "record-failure",
@@ -637,7 +640,10 @@ export class RemoteTransactionStore {
       mode: params.mode,
       durablePublication: params.durablePublication,
     });
-    return { record: transition.record, ...transition.outcome };
+    return {
+      record: transition.record,
+      ...transition.outcome,
+    } as RemoteTransactionSettlementBinding;
   }
 
   async beginSettlementExecution(params: {
@@ -648,14 +654,17 @@ export class RemoteTransactionStore {
       type: "begin-settlement-execution",
       mode: params.mode,
     });
-    return { record: transition.record, ...transition.outcome };
+    return {
+      record: transition.record,
+      ...transition.outcome,
+    } as RemoteTransactionSettlementExecution;
   }
 
   async completeSettlement(params: {
     transactionToken: string;
     mode: "finalize" | "abort";
     finalization: BrowserCaptureFinalizationResult;
-  }): Promise<RemoteTransactionRecord> {
+  }): Promise<RemoteTransactionTransitionRecord<"complete-settlement">> {
     return (
       await this.transition(params.transactionToken, {
         type: "complete-settlement",
@@ -718,10 +727,13 @@ export class RemoteTransactionStore {
     transactionToken: string,
     transition: RemoteTransactionTransition<Type>,
   ): Promise<{
-    record: RemoteTransactionRecord;
+    record: RemoteTransactionTransitionRecord<Type>;
     outcome: RemoteTransactionTransitionOutcome<Type>;
   }> {
-    return await this.withLock(transactionToken, async () => {
+    return await this.withLock<{
+      record: RemoteTransactionTransitionRecord<Type>;
+      outcome: RemoteTransactionTransitionOutcome<Type>;
+    }>(transactionToken, async () => {
       const record = await this.readUnlocked(transactionToken);
       if (!record) throw new Error(`Remote transaction ${transactionToken} does not exist`);
       const originalRunId = record.runId;

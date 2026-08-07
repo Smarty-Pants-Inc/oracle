@@ -24,6 +24,7 @@ import { BrowserAutomationError } from "../oracle/errors.js";
 import { delay } from "../browser/utils.js";
 import { runGeminiWebWithFallback, saveFirstGeminiImageFromOutput } from "./client.js";
 import {
+  createGeminiDeepThinkDomProviderState,
   geminiDeepThinkDomProvider,
   hasImmutableGeminiPromptIdentity,
 } from "../browser/providers/geminiDeepThinkDomProvider.js";
@@ -100,14 +101,14 @@ function combineGeminiSessionRuntime(sessions: GeminiBrowserSession[]): BrowserR
 async function settleGeminiSessions(
   sessions: GeminiBrowserSession[],
   mode: BrowserCaptureSettlementMode,
-  pendingRuntime: BrowserRuntimeMetadata,
+  pendingRuntime?: BrowserRuntimeMetadata,
 ): Promise<BrowserCaptureFinalizationResult> {
-  let authoritativeRuntime = pendingRuntime;
+  let authoritativeRuntime = pendingRuntime ?? combineGeminiSessionRuntime(sessions);
   const pendingResources = [] as NonNullable<BrowserRuntimeMetadata["recoveryCleanupResources"]>;
   const errors: string[] = [];
   for (const session of sessions) {
     try {
-      const result = await session.settle(mode, authoritativeRuntime);
+      const result = await session.settle(mode, pendingRuntime ? authoritativeRuntime : undefined);
       authoritativeRuntime = projectBrowserCaptureCleanupRuntime(
         authoritativeRuntime,
         result.runtime,
@@ -141,24 +142,32 @@ async function settleGeminiSessions(
 }
 
 function createGeminiRunLifecycle(
-  sessions: GeminiBrowserSession[],
+  session: GeminiBrowserSession,
   persistRuntime?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>,
 ): BrowserRunLifecycleController {
-  return new BrowserRunLifecycleController({
-    ...(persistRuntime
-      ? { persistRuntime: async (runtime: BrowserRuntimeMetadata) => persistRuntime(runtime) }
-      : {}),
-    settleResources: (mode, pendingRuntime) => settleGeminiSessions(sessions, mode, pendingRuntime),
-    getRuntime: () => combineGeminiSessionRuntime(sessions),
-  });
+  return new BrowserRunLifecycleController(
+    {
+      ...(persistRuntime
+        ? {
+            ownerId: session.resourceOwnerId,
+            persistRuntime: async (runtime: BrowserRuntimeMetadata) => persistRuntime(runtime),
+            persistSettlementResult: async (runtime: BrowserRuntimeMetadata) =>
+              persistRuntime(runtime),
+          }
+        : {}),
+      settleResources: (mode, pendingRuntime) =>
+        settleGeminiSessions([session], mode, pendingRuntime),
+      getRuntime: () => session.runtime(),
+    },
+    session.resourceTransaction,
+  );
 }
 
 async function throwAfterGeminiSessionCleanup(
   error: unknown,
   sessions: GeminiBrowserSession[],
 ): Promise<never> {
-  const runtime = combineGeminiSessionRuntime(sessions);
-  const cleanup = await settleGeminiSessions(sessions, "abort", runtime);
+  const cleanup = await settleGeminiSessions(sessions, "abort");
   if (cleanup.status === "completed") throw error;
   const message = error instanceof Error ? error.message : String(error);
   throw new BrowserAutomationError(
@@ -343,7 +352,7 @@ async function runGeminiDeepThinkViaBrowser(
     log,
     ...(options.persistRuntime ? { persistRuntime: options.persistRuntime } : {}),
   });
-  const lifecycle = createGeminiRunLifecycle([session], options.persistRuntime);
+  const lifecycle = createGeminiRunLifecycle(session, options.persistRuntime);
   lifecycle.markAcquired();
   try {
     await options.persistRuntime?.(lifecycle.runtime());
@@ -388,11 +397,11 @@ async function runGeminiDeepThinkViaBrowser(
       evaluate,
       delay,
       log,
-      state: {
+      state: createGeminiDeepThinkDomProviderState({
         inputTimeoutMs: browserConfig?.inputTimeoutMs,
         timeoutMs: browserConfig?.timeoutMs,
         geminiConversationId: session.targetId,
-      },
+      }),
     };
     const commitEvidence = await runProviderSubmissionFlow(
       geminiDeepThinkDomProvider,

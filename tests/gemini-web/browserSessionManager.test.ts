@@ -256,6 +256,7 @@ describe("openGeminiBrowserSession", () => {
     expect(session.profileDir).toBe(explicitDir);
     expect(session.targetId).toBe("target-1");
     expect(session.processIdentity).toBe(processIdentity);
+    expect(session.resourceTransaction.runtime()).toEqual(session.runtime());
     expect(acquireBrowserTabLease).toHaveBeenCalledWith(
       explicitDir,
       expect.objectContaining({
@@ -303,6 +304,7 @@ describe("openGeminiBrowserSession", () => {
       purpose: "Gemini trusted owner",
       sessionId: "  gemini-session-owner  ",
     });
+    expect(session.resourceOwnerId).toBe("gemini-session-owner");
 
     expect(acquireBrowserTabLease).toHaveBeenCalledWith(
       session.profileDir,

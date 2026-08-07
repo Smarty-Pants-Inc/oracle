@@ -9,6 +9,12 @@ import {
   samePhysicalDirectoryIdentity,
 } from "./filesystemLockDirectoryIdentity.js";
 import type { PhysicalDirectoryIdentity } from "./filesystemLockDirectoryIdentity.js";
+import {
+  physicalFileGenerationFromStats,
+  physicalFileSnapshotFromStats,
+  samePhysicalFileGeneration,
+  samePhysicalFileSnapshot,
+} from "../physicalFileIdentity.js";
 
 export const LOCK_OWNER_FILENAME = "owner.json";
 export const LOCK_MUTATION_DIRECTORY_SUFFIX = ".mutations";
@@ -190,10 +196,10 @@ async function inspectLegacyFilesystemLockFile(
   if (
     !after.isFile() ||
     after.isSymbolicLink() ||
-    initialEntry.dev !== after.dev ||
-    initialEntry.ino !== after.ino ||
-    initialEntry.birthtimeNs !== after.birthtimeNs ||
-    initialEntry.ctimeNs !== after.ctimeNs ||
+    !samePhysicalFileSnapshot(
+      physicalFileSnapshotFromStats(initialEntry),
+      physicalFileSnapshotFromStats(after),
+    ) ||
     initialEntry.size !== after.size
   ) {
     return { status: "active" };
@@ -206,9 +212,7 @@ async function inspectLegacyFilesystemLockFile(
       ownerRaw: null,
       legacyFile: {
         raw,
-        device: after.dev.toString(),
-        inode: after.ino.toString(),
-        birthtimeNs: after.birthtimeNs.toString(),
+        ...physicalFileGenerationFromStats(after),
         size: after.size.toString(),
       },
     },
@@ -323,15 +327,13 @@ export async function legacyFilesystemLockGenerationMatches(
   return (
     after.isFile() &&
     !after.isSymbolicLink() &&
-    before.dev === after.dev &&
-    before.ino === after.ino &&
-    before.birthtimeNs === after.birthtimeNs &&
-    before.ctimeNs === after.ctimeNs &&
+    samePhysicalFileSnapshot(
+      physicalFileSnapshotFromStats(before),
+      physicalFileSnapshotFromStats(after),
+    ) &&
     before.size === after.size &&
     raw === expected.raw &&
-    after.dev.toString() === expected.device &&
-    after.ino.toString() === expected.inode &&
-    after.birthtimeNs.toString() === expected.birthtimeNs &&
+    samePhysicalFileGeneration(physicalFileGenerationFromStats(after), expected) &&
     after.size.toString() === expected.size
   );
 }

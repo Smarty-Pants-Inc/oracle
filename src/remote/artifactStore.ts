@@ -18,6 +18,11 @@ import {
 } from "../browser/filesystemLockDirectoryRemoval.js";
 import type { BrowserArtifactWriteAuthority } from "../browser/types.js";
 import type { SessionArtifact } from "../sessionManager.js";
+import {
+  physicalFileSnapshotFromStats,
+  samePhysicalFileGeneration,
+  samePhysicalFileSnapshot,
+} from "../physicalFileIdentity.js";
 import { MAX_REMOTE_ARTIFACT_BYTES, type RemoteArtifactDescriptor } from "./types.js";
 import { deriveRemoteArtifactManualCopyWaiverId } from "./transactionModel.js";
 import type {
@@ -25,15 +30,17 @@ import type {
   DurableRemoteArtifactManualCopyWaiver,
   DurableRemoteArtifactNamespaceIdentity,
   DurableRemoteArtifactRegistration,
-  DurableRemoteFileIdentity,
   RemoteTransactionRecord,
 } from "./transactionModel.js";
 import type { RemoteTransactionStore } from "./transactionStore.js";
 import {
   establishWindowsPrivateDirectories,
+  protectWindowsPrivateFile,
   verifyWindowsPrivateFile,
   type WindowsPrivateDirectoriesAuthority,
-} from "./windowsPrivateTreeAcl.js";
+  type WindowsPrivateFileProtectionAuthority,
+  type WindowsPrivateFileVerificationAuthority,
+} from "../windowsPrivateFileAcl.js";
 
 export interface RemoteArtifactStoreOptions {
   transactionStore: RemoteTransactionStore;
@@ -42,6 +49,8 @@ export interface RemoteArtifactStoreOptions {
   now?: () => number;
   platform?: NodeJS.Platform;
   windowsPrivateDirectoriesAuthority?: WindowsPrivateDirectoriesAuthority;
+  windowsPrivateFileProtectionAuthority?: WindowsPrivateFileProtectionAuthority;
+  windowsPrivateFileVerificationAuthority?: WindowsPrivateFileVerificationAuthority;
 }
 
 export interface OpenRemoteArtifact {
@@ -56,6 +65,8 @@ export class RemoteArtifactStore {
   readonly #now: () => number;
   readonly #platform: NodeJS.Platform;
   readonly #windowsPrivateDirectoriesAuthority: WindowsPrivateDirectoriesAuthority;
+  readonly #windowsPrivateFileProtectionAuthority: WindowsPrivateFileProtectionAuthority;
+  readonly #windowsPrivateFileVerificationAuthority: WindowsPrivateFileVerificationAuthority;
 
   constructor(options: RemoteArtifactStoreOptions) {
     this.#transactionStore = options.transactionStore;
@@ -65,6 +76,10 @@ export class RemoteArtifactStore {
     this.#platform = options.platform ?? process.platform;
     this.#windowsPrivateDirectoriesAuthority =
       options.windowsPrivateDirectoriesAuthority ?? establishWindowsPrivateDirectories;
+    this.#windowsPrivateFileProtectionAuthority =
+      options.windowsPrivateFileProtectionAuthority ?? protectWindowsPrivateFile;
+    this.#windowsPrivateFileVerificationAuthority =
+      options.windowsPrivateFileVerificationAuthority ?? verifyWindowsPrivateFile;
     this.#transactionStore.registerArtifactNamespaceCleanup((record) =>
       this.cleanupArtifactNamespace(record),
     );
@@ -85,9 +100,12 @@ export class RemoteArtifactStore {
 
     const namespaceDirectory = this.namespaceDirectory(record.artifactNamespace);
     let namespaceCreated = false;
+    let initializationBegun = false;
+    let namespaceCreationAttempted = false;
     let namespaceIdentity: DurableRemoteArtifactNamespaceIdentity | undefined;
     try {
       await this.#transactionStore.beginArtifactNamespaceInitialization(params);
+      initializationBegun = true;
       const artifactsDirectory = path.join(namespaceDirectory, "artifacts");
       if (this.#platform === "win32") {
         const sessionsRoot = path.resolve(this.#sessionsRoot);
@@ -102,6 +120,7 @@ export class RemoteArtifactStore {
         if (existingNamespace) {
           throw new Error("Remote artifact namespace was not created exclusively");
         }
+        namespaceCreationAttempted = true;
         await this.#windowsPrivateDirectoriesAuthority([namespaceDirectory]);
         namespaceCreated = true;
         namespaceIdentity = await captureArtifactNamespaceIdentity(namespaceDirectory);
@@ -134,6 +153,7 @@ export class RemoteArtifactStore {
       } else {
         await mkdir(this.#sessionsRoot, { recursive: true, mode: 0o700 });
         try {
+          namespaceCreationAttempted = true;
           await mkdir(namespaceDirectory, { mode: 0o700 });
           namespaceCreated = true;
         } catch (error) {
@@ -161,23 +181,26 @@ export class RemoteArtifactStore {
         ...(this.#platform === "win32" ? { windowsPrivateFiles: true as const } : {}),
       };
     } catch (error) {
-      if (namespaceCreated) {
+      if (initializationBegun) {
         try {
-          const removed = namespaceIdentity
-            ? await this.cleanupArtifactNamespace({
-                ...record,
-                artifactNamespaceState: "initializing",
-                artifactNamespaceIdentity: namespaceIdentity,
-              })
-            : await this.removeFreshEmptyArtifactNamespace(namespaceDirectory);
-          if (removed) {
+          let rollbackSafe = !namespaceCreationAttempted;
+          if (namespaceCreated) {
+            rollbackSafe = namespaceIdentity
+              ? await this.cleanupArtifactNamespace({
+                  ...record,
+                  artifactNamespaceState: "initializing",
+                  artifactNamespaceIdentity: namespaceIdentity,
+                })
+              : await this.removeFreshEmptyArtifactNamespace(namespaceDirectory);
+          }
+          if (rollbackSafe) {
             await this.#transactionStore.rollbackArtifactNamespaceInitialization({
               ...params,
               identity: namespaceIdentity,
             });
           }
         } catch {
-          // Retain durable namespace authority below when immediate exact or empty-only rollback fails.
+          // Retain durable namespace authority below when exact or empty-only rollback fails.
         }
       }
 
@@ -266,19 +289,19 @@ export class RemoteArtifactStore {
     }
 
     if (this.#platform === "win32") {
-      await verifyWindowsPrivateFile(currentCanonicalPath);
+      await this.#windowsPrivateFileVerificationAuthority(currentCanonicalPath);
     }
     const handle = await open(currentCanonicalPath, "r").catch(() => null);
     if (!handle) throw new RemoteArtifactUnavailableError("artifact_unavailable");
     try {
       const fileStat = await handle.stat({ bigint: true });
-      const currentIdentity = fileIdentityFromStat(fileStat);
+      const currentIdentity = physicalFileSnapshotFromStats(fileStat);
       if (
         !fileStat.isFile() ||
         fileStat.size <= 0n ||
         fileStat.size > BigInt(this.#maximumArtifactBytes) ||
         Number(fileStat.size) !== registration.descriptor.byteSize ||
-        !sameFileSnapshotIdentity(currentIdentity, registration.fileIdentity)
+        !samePhysicalFileSnapshot(currentIdentity, registration.fileIdentity)
       ) {
         throw new RemoteArtifactUnavailableError("artifact_identity_changed");
       }
@@ -287,7 +310,7 @@ export class RemoteArtifactStore {
       if (
         !afterHashStat.isFile() ||
         afterHashStat.size !== fileStat.size ||
-        !sameFileSnapshotIdentity(fileIdentityFromStat(afterHashStat), currentIdentity)
+        !samePhysicalFileSnapshot(physicalFileSnapshotFromStats(afterHashStat), currentIdentity)
       ) {
         throw new RemoteArtifactUnavailableError("artifact_identity_changed");
       }
@@ -295,12 +318,12 @@ export class RemoteArtifactStore {
         throw new RemoteArtifactUnavailableError("artifact_content_changed");
       }
       if (this.#platform === "win32") {
-        await verifyWindowsPrivateFile(currentCanonicalPath);
+        await this.#windowsPrivateFileVerificationAuthority(currentCanonicalPath);
         const pathStat = await lstat(currentCanonicalPath, { bigint: true });
         if (
           pathStat.isSymbolicLink() ||
           !pathStat.isFile() ||
-          !sameFileSnapshotIdentity(fileIdentityFromStat(pathStat), currentIdentity)
+          !samePhysicalFileSnapshot(physicalFileSnapshotFromStats(pathStat), currentIdentity)
         ) {
           throw new RemoteArtifactUnavailableError("artifact_identity_changed");
         }
@@ -474,13 +497,10 @@ export class RemoteArtifactStore {
       params.artifactNamespace,
       params.artifactNamespaceIdentity,
     );
-    if (this.#platform === "win32") {
-      await verifyWindowsPrivateFile(canonicalPath);
-    }
     const handle = await open(canonicalPath, "r");
     try {
       const fileStat = await handle.stat({ bigint: true });
-      const fileIdentity = fileIdentityFromStat(fileStat);
+      const fileIdentity = physicalFileSnapshotFromStats(fileStat);
       if (
         !fileStat.isFile() ||
         fileStat.size <= 0n ||
@@ -490,7 +510,7 @@ export class RemoteArtifactStore {
       }
       if (
         Number(fileStat.size) !== params.artifact.sizeBytes ||
-        !sameFileSnapshotIdentity(fileIdentity, params.artifact.fileIdentity)
+        !samePhysicalFileSnapshot(fileIdentity, params.artifact.fileIdentity)
       ) {
         throw new Error("Remote artifact physical identity does not match producer evidence");
       }
@@ -503,25 +523,45 @@ export class RemoteArtifactStore {
       const afterHashStat = await handle.stat({ bigint: true });
       if (
         afterHashStat.size !== fileStat.size ||
-        !sameFileSnapshotIdentity(fileIdentityFromStat(afterHashStat), fileIdentity)
+        !samePhysicalFileSnapshot(physicalFileSnapshotFromStats(afterHashStat), fileIdentity)
       ) {
         throw new Error("Remote artifact physical identity changed during registration");
       }
       if (sha256 !== params.artifact.sha256) {
         throw new Error("Remote artifact sha256 does not match producer evidence");
       }
+      let registeredFileIdentity = fileIdentity;
       if (this.#platform === "win32") {
-        await verifyWindowsPrivateFile(canonicalPath);
-        const pathStat = await lstat(canonicalPath, { bigint: true });
+        await this.#windowsPrivateFileProtectionAuthority(canonicalPath);
+        const protectedStat = await handle.stat({ bigint: true });
+        const protectedIdentity = physicalFileSnapshotFromStats(protectedStat);
         if (
-          pathStat.isSymbolicLink() ||
-          !pathStat.isFile() ||
-          !sameFileSnapshotIdentity(fileIdentityFromStat(pathStat), fileIdentity)
+          !protectedStat.isFile() ||
+          protectedStat.size !== fileStat.size ||
+          !samePhysicalFileGeneration(protectedIdentity, fileIdentity)
         ) {
           throw new Error(
-            "Remote artifact physical identity changed during Windows ACL verification",
+            "Remote artifact physical identity changed during Windows ACL protection",
           );
         }
+        const protectedSha256 = await computeOpenFileSha256(handle);
+        const protectedAfterHash = await handle.stat({ bigint: true });
+        const pathStat = await lstat(canonicalPath, { bigint: true });
+        if (
+          protectedSha256 !== params.artifact.sha256 ||
+          !samePhysicalFileSnapshot(
+            physicalFileSnapshotFromStats(protectedAfterHash),
+            protectedIdentity,
+          ) ||
+          pathStat.isSymbolicLink() ||
+          !pathStat.isFile() ||
+          !samePhysicalFileSnapshot(physicalFileSnapshotFromStats(pathStat), protectedIdentity)
+        ) {
+          throw new Error(
+            "Remote artifact physical identity changed during Windows ACL protection",
+          );
+        }
+        registeredFileIdentity = protectedIdentity;
       }
       const descriptor: RemoteArtifactDescriptor & { required: boolean } = {
         artifactId: randomUUID(),
@@ -540,7 +580,7 @@ export class RemoteArtifactStore {
         descriptor,
         transactionToken: params.transactionToken,
         canonicalPath,
-        fileIdentity: params.artifact.fileIdentity,
+        fileIdentity: registeredFileIdentity,
       };
     } finally {
       await handle.close();
@@ -637,38 +677,6 @@ export class RemoteArtifactUnavailableError extends Error {
     super(code);
     this.name = "RemoteArtifactUnavailableError";
   }
-}
-
-function fileIdentityFromStat(fileStat: {
-  dev: bigint;
-  ino: bigint;
-  birthtimeNs: bigint;
-  ctimeNs: bigint;
-}): DurableRemoteFileIdentity {
-  return {
-    device: fileStat.dev.toString(),
-    inode: fileStat.ino.toString(),
-    birthtimeNs: fileStat.birthtimeNs.toString(),
-    ctimeNs: fileStat.ctimeNs.toString(),
-  };
-}
-
-function sameStableFileIdentity(
-  left: DurableRemoteFileIdentity,
-  right: DurableRemoteFileIdentity,
-): boolean {
-  return (
-    left.device === right.device &&
-    left.inode === right.inode &&
-    left.birthtimeNs === right.birthtimeNs
-  );
-}
-
-function sameFileSnapshotIdentity(
-  left: DurableRemoteFileIdentity,
-  right: DurableRemoteFileIdentity,
-): boolean {
-  return sameStableFileIdentity(left, right) && left.ctimeNs === right.ctimeNs;
 }
 
 async function computeOpenFileSha256(handle: FileHandle): Promise<string> {

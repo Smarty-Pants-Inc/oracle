@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { chmod, mkdir, mkdtemp, rename, rm, stat } from "node:fs/promises";
 import { retryBrowserRecoveryCleanup } from "../../src/browser/reattach.js";
-import { acquireReattachRecoveryLock } from "../../src/browser/reattachLock.js";
+import { acquireReattachRecoveryLock as acquireReattachRecoveryLockExact } from "../../src/browser/reattachLock.js";
 import {
   establishPrivateRuntimeAuthority,
   type PrivateDirectoryAuthority,
@@ -13,11 +13,24 @@ import {
   retainFilesystemLockRelease,
   __test__ as releaseJournalTest,
 } from "../../src/browser/filesystemLockReleaseJournal.js";
+import { testWindowsPrivateDirectoryAuthority } from "../privateAuthorityTestHelpers.js";
+import { testProcessIdentityProvider } from "./filesystemLockTestHelpers.js";
+
+const acquireReattachRecoveryLock = (
+  lockPath: string,
+  parentAuthority?: PrivateDirectoryAuthority,
+) =>
+  acquireReattachRecoveryLockExact(lockPath, parentAuthority, {
+    processIdentityProvider: testProcessIdentityProvider,
+  });
 
 describe("reattach recovery lock authority", () => {
   test("completes a retained pending release before the next acquisition", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-reattach-lock-"));
-    const authority = await establishPrivateRuntimeAuthority({ tempDirectory: root });
+    const authority = await establishPrivateRuntimeAuthority({
+      tempDirectory: root,
+      windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+    });
     const lockPath = path.join(authority.path, "recovery.lock");
     let attempts = 0;
     const retained = retainFilesystemLockRelease(
@@ -43,7 +56,10 @@ describe("reattach recovery lock authority", () => {
 
   test("retries retained durable completion without repeating physical release", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-reattach-lock-"));
-    const authority = await establishPrivateRuntimeAuthority({ tempDirectory: root });
+    const authority = await establishPrivateRuntimeAuthority({
+      tempDirectory: root,
+      windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+    });
     const lockPath = path.join(authority.path, "recovery.lock");
     let releaseAttempts = 0;
     let completionAttempts = 0;
@@ -76,7 +92,10 @@ describe("reattach recovery lock authority", () => {
 
   test("allows only one simultaneous same-process acquisition per canonical path", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-reattach-lock-"));
-    const authority = await establishPrivateRuntimeAuthority({ tempDirectory: root });
+    const authority = await establishPrivateRuntimeAuthority({
+      tempDirectory: root,
+      windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+    });
     const lockPath = path.join(authority.path, "recovery.lock");
 
     try {

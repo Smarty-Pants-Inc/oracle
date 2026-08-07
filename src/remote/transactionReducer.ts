@@ -3,10 +3,23 @@ import { projectRuntimeAfterChromeTargetLoss } from "../browser/publicationSettl
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
 import { markBrowserCaptureCleanupPending } from "../browser/ownedBrowserResources.js";
 import { hasRestartDurableChromeTargetCleanupAuthority } from "../browser/targetCloseAuthority.js";
-import { deriveRemoteArtifactNamespace } from "./transactionModel.js";
+import {
+  authoritativeRemoteSettlementMode,
+  deriveRemoteArtifactNamespace,
+  isTerminalRemoteTransactionState,
+  projectRemoteSettlementRuntime,
+  projectRemoteSettlementRuntimeForMode,
+} from "./transactionModel.js";
 import type {
   AppliedRemoteTransactionTransition,
   DurableRemoteStagedCapture,
+  RemoteMaterializedSettlementAuthorityTransactionRecord,
+  RemoteNonterminalTransactionRecord,
+  RemoteRunningTransactionRecord,
+  RemoteSettledTransactionRecord,
+  RemoteSettlementExecutingTransactionRecord,
+  RemoteSettlementPendingTransactionRecord,
+  RemoteTerminalTransactionRecord,
   RemoteTransactionBeginRecord,
   RemoteTransactionRecord,
   RemoteTransactionReducerContext,
@@ -22,16 +35,14 @@ import {
   commitCapture,
   mergeCaptureWarnings,
   projectRunningRecordToFailure,
+  projectRemoteSettlementFinalization,
   redactTerminalRecord,
   RemoteTransactionTransitionError,
   sameArtifactDeliveryReceipt,
   sameArtifactManualCopyWaiver,
 } from "./transactionReducerSupport.js";
 import {
-  authoritativeRemoteSettlementMode,
-  isTerminalRemoteTransactionState,
   missingRequiredArtifactDeliveries,
-  remoteTransactionSettlementPhase,
   validateRemoteArtifactDeliveryReceipt,
   validateRemoteArtifactManualCopyWaiver,
   validateRemoteArtifactOwnership,
@@ -148,7 +159,7 @@ const reducers: RemoteTransactionReducers = {
     if (record.settlementMode) {
       throw new Error("Cannot journal recovery runtime after cleanup settlement is bound");
     }
-    record.runtime = transition.runtime;
+    record.runtime = projectRemoteSettlementRuntime(transition.runtime);
     record.runtimeJournaledAt = context.nowIso();
     return { persist: true, outcome: undefined };
   },
@@ -175,7 +186,11 @@ const reducers: RemoteTransactionReducers = {
         },
       );
     }
-    record.runtime = transition.runtime;
+    if (record.settlementMode === "finalize") {
+      record.runtime = projectRemoteSettlementRuntimeForMode(transition.runtime, "finalize");
+    } else {
+      record.runtime = projectRemoteSettlementRuntimeForMode(transition.runtime, "abort");
+    }
     record.runtimeJournaledAt = context.nowIso();
     return { persist: true, outcome: undefined };
   },
@@ -313,8 +328,7 @@ const reducers: RemoteTransactionReducers = {
     record.controllerGeneration = context.controllerGeneration;
     record.runtime = transition.runtime;
     record.runtimeJournaledAt = transition.runtime ? context.nowIso() : undefined;
-    projectRunningRecordToFailure(record, transition.error, true);
-    record.settlementMode = transition.settlementMode;
+    projectRunningRecordToFailure(record, transition.error, true, transition.settlementMode);
     return { persist: true, outcome: undefined };
   },
   "publish-capture": (record, transition, context) => {
@@ -388,8 +402,7 @@ const reducers: RemoteTransactionReducers = {
     record.controllerGeneration = context.controllerGeneration;
     record.runtime = transition.runtime;
     record.runtimeJournaledAt = transition.runtime ? context.nowIso() : undefined;
-    projectRunningRecordToFailure(record, transition.error);
-    record.settlementMode = transition.settlementMode;
+    projectRunningRecordToFailure(record, transition.error, false, transition.settlementMode);
     return { persist: true, outcome: undefined };
   },
   "record-artifact-delivery": (record, transition, context) => {
@@ -562,11 +575,35 @@ const reducers: RemoteTransactionReducers = {
         );
       }
     }
-    const cleanupRuntime = markBrowserCaptureCleanupPending(record.runtime, transition.mode);
     const controllerChanged = record.controllerGeneration !== context.controllerGeneration;
     const executionStarted = !record.settlementExecutionStartedAt;
     record.controllerGeneration = context.controllerGeneration;
     record.settlementExecutionStartedAt ??= context.nowIso();
+    if (record.settlementMode === "finalize") {
+      const cleanupRuntime = projectRemoteSettlementRuntimeForMode(
+        markBrowserCaptureCleanupPending(record.runtime, "finalize"),
+        "finalize",
+      );
+      if (
+        isDeepStrictEqual(cleanupRuntime, record.runtime) &&
+        !controllerChanged &&
+        !executionStarted
+      ) {
+        return {
+          persist: false,
+          outcome: { status: "executing", cleanupRuntime: record.runtime },
+        };
+      }
+      record.runtime = cleanupRuntime;
+      return {
+        persist: true,
+        outcome: { status: "executing", cleanupRuntime },
+      };
+    }
+    const cleanupRuntime = projectRemoteSettlementRuntimeForMode(
+      markBrowserCaptureCleanupPending(record.runtime, "abort"),
+      "abort",
+    );
     if (
       isDeepStrictEqual(cleanupRuntime, record.runtime) &&
       !controllerChanged &&
@@ -593,7 +630,7 @@ const reducers: RemoteTransactionReducers = {
     if (!record.settlementMode) {
       throw new Error("Cannot complete cleanup without its exact durable settlement binding");
     }
-    if (remoteTransactionSettlementPhase(record) === "mode-bound") {
+    if (!record.settlementExecutionStartedAt) {
       throw new Error("Cannot complete cleanup before durable settlement execution begins");
     }
     if (!record.runtime) throw new Error("Bound transaction lacks runtime authority");
@@ -605,14 +642,7 @@ const reducers: RemoteTransactionReducers = {
       }
     }
     record.controllerGeneration = context.controllerGeneration;
-    record.runtime = transition.finalization.runtime;
-    record.finalization = transition.finalization;
-    if (transition.finalization.status === "completed") {
-      record.state = transition.mode === "finalize" ? "finalized" : "aborted";
-      if (record.error) record.error = { ...record.error, recoverableDisconnect: false };
-    } else {
-      record.state = record.error && !record.result ? "recoverable-error" : "pending";
-    }
+    projectRemoteSettlementFinalization(record, transition.mode, transition.finalization);
     return { persist: true, outcome: undefined };
   },
   "prepare-controller-shutdown": (record) => {
@@ -674,13 +704,7 @@ const reducers: RemoteTransactionReducers = {
       throw new Error("Controller reconciliation error does not match runtime authority");
     }
     record.controllerGeneration = context.controllerGeneration;
-    let state: "recoverable-error" | "failed";
-    if (staleRunning) {
-      state = projectRunningRecordToFailure(record, error);
-    } else {
-      record.error = error;
-      state = "recoverable-error";
-    }
+    const state = projectRunningRecordToFailure(record, error);
     record.restartRecovery = {
       previousControllerGeneration,
       reconciledAt: context.nowIso(),
@@ -735,9 +759,9 @@ const reducers: RemoteTransactionReducers = {
 export function createRemoteTransactionRecord(
   begin: RemoteTransactionBeginRecord,
   context: RemoteTransactionReducerContext,
-): RemoteTransactionRecord {
+): RemoteRunningTransactionRecord {
   const updatedAt = context.nowIso();
-  const record: RemoteTransactionRecord = {
+  const record: RemoteRunningTransactionRecord = {
     ...begin,
     artifactNamespace: deriveRemoteArtifactNamespace(begin),
     artifactNamespaceState: "uninitialized",
@@ -754,11 +778,42 @@ export function createRemoteTransactionRecord(
   return record;
 }
 
+export function applyRemoteTransactionTransition(
+  record: RemoteNonterminalTransactionRecord,
+  transition: RemoteTransactionTransition<"bind-settlement">,
+  context: RemoteTransactionReducerContext,
+): AppliedRemoteTransactionTransition<
+  "bind-settlement",
+  RemoteMaterializedSettlementAuthorityTransactionRecord
+>;
+export function applyRemoteTransactionTransition(
+  record: RemoteTerminalTransactionRecord,
+  transition: RemoteTransactionTransition<"bind-settlement">,
+  context: RemoteTransactionReducerContext,
+): AppliedRemoteTransactionTransition<"bind-settlement", RemoteSettledTransactionRecord>;
+export function applyRemoteTransactionTransition(
+  record: RemoteNonterminalTransactionRecord,
+  transition: RemoteTransactionTransition<"begin-settlement-execution">,
+  context: RemoteTransactionReducerContext,
+): AppliedRemoteTransactionTransition<
+  "begin-settlement-execution",
+  RemoteSettlementExecutingTransactionRecord | RemoteSettlementPendingTransactionRecord
+>;
+export function applyRemoteTransactionTransition(
+  record: RemoteTerminalTransactionRecord,
+  transition: RemoteTransactionTransition<"begin-settlement-execution">,
+  context: RemoteTransactionReducerContext,
+): AppliedRemoteTransactionTransition<"begin-settlement-execution", RemoteSettledTransactionRecord>;
 export function applyRemoteTransactionTransition<Type extends RemoteTransactionTransitionType>(
   record: RemoteTransactionRecord,
   transition: RemoteTransactionTransition<Type>,
   context: RemoteTransactionReducerContext,
-): AppliedRemoteTransactionTransition<Type> {
+): AppliedRemoteTransactionTransition<Type>;
+export function applyRemoteTransactionTransition<Type extends RemoteTransactionTransitionType>(
+  record: RemoteTransactionRecord,
+  transition: RemoteTransactionTransition<Type>,
+  context: RemoteTransactionReducerContext,
+): AppliedRemoteTransactionTransition<Type, RemoteTransactionRecord> {
   validateRemoteTransactionRecord(record, {
     expectedTransactionToken: record.transactionToken,
     maximumLeaseDurationMs: context.leaseDurationMs,
@@ -774,7 +829,6 @@ export function applyRemoteTransactionTransition<Type extends RemoteTransactionT
   });
   return { record: nextRecord, ...reduction };
 }
-
 function finalizeRemoteTransactionTransition(
   record: RemoteTransactionRecord,
   context: RemoteTransactionReducerContext,
@@ -818,9 +872,11 @@ function settlementAuthorityConflict(
 function completedSettlement(
   record: RemoteTransactionRecord,
   requestedMode: "finalize" | "abort",
-): BrowserCaptureFinalizationResult | null {
-  if (!isTerminalRemoteTransactionState(record.state)) return null;
-  const settledMode = record.terminalAudit?.settlementMode;
+): Extract<BrowserCaptureFinalizationResult, { status: "completed" }> | null {
+  if (record.state !== "finalized" && record.state !== "aborted" && record.state !== "failed") {
+    return null;
+  }
+  const settledMode = record.terminalAudit.settlementMode;
   if (!settledMode) {
     if (record.state === "failed") return null;
     throw new Error("Terminal remote transaction lacks authoritative settlement mode");

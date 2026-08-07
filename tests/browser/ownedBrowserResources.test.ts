@@ -441,6 +441,10 @@ describe("OwnedBrowserResourceTransaction", () => {
           code: "browser-run-lifecycle-settlement-conflict",
           requestedMode: "finalize",
           boundMode: "abort",
+          runtime: {
+            ...acquisitionRuntime(),
+            recoveryCleanupResult: { status: "pending", settlementMode: "finalize" },
+          },
         }),
       );
     const settleResources = vi.fn(
@@ -566,7 +570,11 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
       logger: vi.fn<(message: string) => void>(),
       persistRuntime,
     });
-    await authority.journalAcquisition({
+    const transaction = new OwnedBrowserResourceTransaction(
+      authority.transactionAdapters(),
+      authority.runtime(),
+    );
+    await authority.journalAcquisition(transaction, {
       resource: "chrome-target",
       acquire: async () => ({ targetId: "persistence-gated-target" }),
       authority: ({ targetId }) => ({
@@ -651,7 +659,11 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
         return runtime;
       },
     });
-    await authority.journalAcquisition({
+    const transaction = new OwnedBrowserResourceTransaction(
+      authority.transactionAdapters(),
+      authority.runtime(),
+    );
+    await authority.journalAcquisition(transaction, {
       resource: "tab-lease",
       acquire: async () => ({
         id: "shared-lease",
@@ -667,7 +679,7 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
       }),
       authority: (lease) => lease,
     });
-    await authority.journalAcquisition({
+    await authority.journalAcquisition(transaction, {
       resource: "chrome-process",
       acquire: async () => ({
         pid: processIdentity.pid,
@@ -694,7 +706,7 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
       }),
       authority: (chrome) => ({ kind: "temporary", chrome }),
     });
-    await authority.journalAcquisition({
+    await authority.journalAcquisition(transaction, {
       resource: "chrome-target",
       acquire: async () => ({ targetId: "shared-target" }),
       authority: ({ targetId }) => ({
@@ -714,7 +726,7 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
       }),
     });
 
-    await expect(authority.settle("abort")).resolves.toMatchObject({
+    await expect(transaction.settle("abort")).resolves.toMatchObject({
       status: "pending",
       runtime: {
         chromeTargetId: undefined,
@@ -743,9 +755,9 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
       }),
     );
 
-    await expect(authority.settle("abort")).resolves.toMatchObject({ status: "completed" });
+    await expect(transaction.settle("abort")).resolves.toMatchObject({ status: "completed" });
     expect(events).toEqual(["target", "disconnect", "lease", "lease", "process"]);
-    expect(authority.runtime().recoveryCleanupResources).toBeUndefined();
+    expect(transaction.runtime().recoveryCleanupResources).toBeUndefined();
   });
 
   it("keeps an unretained target pending when active leases preserve its process", async () => {
@@ -801,7 +813,11 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
         await options?.onRelease?.({ isLastLease: false });
       },
     });
-    await authority.journalAcquisition({
+    const transaction = new OwnedBrowserResourceTransaction(
+      authority.transactionAdapters(),
+      authority.runtime(),
+    );
+    await authority.journalAcquisition(transaction, {
       resource: "tab-lease",
       acquire: async () => ({
         id: "active-handoff-lease",
@@ -813,7 +829,7 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
       }),
       authority: (lease) => lease,
     });
-    await authority.journalAcquisition({
+    await authority.journalAcquisition(transaction, {
       resource: "chrome-process",
       acquire: async () => ({
         chrome: {
@@ -833,7 +849,7 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
       authority: (owner) => ({ kind: "manual", owner }),
     });
     await expect(
-      authority.journalAcquisition({
+      authority.journalAcquisition(transaction, {
         resource: "chrome-target",
         acquire: async () => {
           throw new Error("target authority interrupted");
@@ -844,7 +860,7 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
       }),
     ).rejects.toThrow("target authority interrupted");
 
-    await expect(authority.settle("abort")).resolves.toMatchObject({
+    await expect(transaction.settle("abort")).resolves.toMatchObject({
       status: "pending",
       error: expect.stringContaining("handoff unavailable"),
       runtime: {
@@ -860,13 +876,13 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
     });
     expect(events).toEqual(["lease", "endpoint"]);
 
-    await expect(authority.settle("abort")).resolves.toMatchObject({
+    await expect(transaction.settle("abort")).resolves.toMatchObject({
       status: "pending",
       error: expect.stringContaining("active-lease handoff"),
     });
     expect(events).toEqual(["lease", "endpoint", "endpoint"]);
 
-    await expect(authority.settle("abort")).resolves.toMatchObject({ status: "pending" });
+    await expect(transaction.settle("abort")).resolves.toMatchObject({ status: "pending" });
     expect(events).toEqual(["lease", "endpoint", "endpoint"]);
   });
 
@@ -943,7 +959,11 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
           events.push("prepare");
         },
       });
-      await authority.journalAcquisition({
+      const transaction = new OwnedBrowserResourceTransaction(
+        authority.transactionAdapters(),
+        authority.runtime(),
+      );
+      await authority.journalAcquisition(transaction, {
         resource: "tab-lease",
         acquire: async () => ({
           id: "runtime-projection-lease",
@@ -955,7 +975,7 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
         }),
         authority: (lease) => lease,
       });
-      await authority.journalAcquisition({
+      await authority.journalAcquisition(transaction, {
         resource: "chrome-process",
         acquire: async () => ({
           chrome: {
@@ -974,7 +994,7 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
         }),
         authority: (owner) => ({ kind: "manual", owner }),
       });
-      await authority.journalAcquisition({
+      await authority.journalAcquisition(transaction, {
         resource: "chrome-target",
         acquire: async () => ({ targetId: "runtime-projection-target" }),
         authority: ({ targetId }) => ({
@@ -993,20 +1013,22 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
           },
         }),
       });
-      return { authority, events };
+      return { authority, transaction, events };
     };
 
     const constructorLane = await createAuthority(authoritativeRuntime);
     const localLane = await createAuthority();
-    const projectedRuntime = localLane.authority.projectRuntime(authoritativeRuntime, {
-      keepBrowser: false,
-      closeOwnedTargetOnComplete: true,
-      tabUrl: "https://chatgpt.com/c/shared-conversation",
-    });
+    localLane.transaction.replaceRuntime(
+      localLane.authority.projectRuntime(authoritativeRuntime, {
+        keepBrowser: false,
+        closeOwnedTargetOnComplete: true,
+        tabUrl: "https://chatgpt.com/c/shared-conversation",
+      }),
+    );
 
     const [constructorPending, localPending] = await Promise.all([
-      constructorLane.authority.settle("abort"),
-      localLane.authority.settle("abort", projectedRuntime),
+      constructorLane.transaction.settle("abort"),
+      localLane.transaction.settle("abort"),
     ]);
     expect(localPending).toEqual(constructorPending);
     expect(localPending).toMatchObject({
@@ -1024,8 +1046,8 @@ describe("LocalOwnedBrowserResourceAuthority", () => {
     expect(constructorLane.events).toEqual(localLane.events);
 
     const [constructorCompleted, localCompleted] = await Promise.all([
-      constructorLane.authority.settle("abort"),
-      localLane.authority.settle("abort"),
+      constructorLane.transaction.settle("abort"),
+      localLane.transaction.settle("abort"),
     ]);
     expect(localCompleted).toEqual(constructorCompleted);
     expect(localCompleted).toMatchObject({

@@ -13,11 +13,11 @@ import {
   __test__,
   classifyPreservedBrowserErrorForTest,
   formatBrowserTurnTranscript,
-  isLocalChromeHostForTest,
+  isLocalChromeHost,
   redactBrowserConfigForDebugLogForTest,
-  resolveRemoteTabLeaseProfileDirForTest,
+  resolveRemoteTabLeaseProfileDir,
   runBrowserMode,
-  runSubmissionWithRecoveryForTest,
+  runSubmissionWithRecovery,
   shouldPreferSystemTmpDirForTest,
   shouldPreserveBrowserOnErrorForTest,
 } from "../../src/browser/index.js";
@@ -1540,7 +1540,7 @@ describe("shouldPreferSystemTmpDirForTest", () => {
   });
 });
 
-describe("runSubmissionWithRecoveryForTest", () => {
+describe("runSubmissionWithRecovery", () => {
   test("preserves prompt-too-large fallback after a dead-composer retry", async () => {
     const promptLocator = {
       epoch: {
@@ -1581,7 +1581,7 @@ describe("runSubmissionWithRecoveryForTest", () => {
     const logger = vi.fn<(message: string) => void>();
 
     await expect(
-      runSubmissionWithRecoveryForTest({
+      runSubmissionWithRecovery({
         prompt: "inline prompt",
         attachments: [],
         fallbackSubmission: {
@@ -1619,7 +1619,7 @@ describe("runSubmissionWithRecoveryForTest", () => {
     const prepareFallbackSubmission = vi.fn().mockResolvedValue(undefined);
 
     await expect(
-      runSubmissionWithRecoveryForTest({
+      runSubmissionWithRecovery({
         prompt: "inline prompt",
         attachments: [],
         fallbackSubmission: { prompt: "fallback prompt", attachments: [] },
@@ -1650,7 +1650,7 @@ describe("runSubmissionWithRecoveryForTest", () => {
       );
 
     await expect(
-      runSubmissionWithRecoveryForTest({
+      runSubmissionWithRecovery({
         prompt: "inline prompt",
         attachments: [],
         fallbackSubmission: {
@@ -1666,38 +1666,36 @@ describe("runSubmissionWithRecoveryForTest", () => {
   });
 });
 
-describe("resolveRemoteTabLeaseProfileDirForTest", () => {
+describe("resolveRemoteTabLeaseProfileDir", () => {
   test("coordinates remote Chrome only when a manual-login profile is configured", () => {
     const coordinated = resolveBrowserConfig({
       remoteChrome: { host: "127.0.0.1", port: 9222 },
       manualLogin: true,
       manualLoginProfileDir: "/tmp/oracle-profile",
     });
-    expect(resolveRemoteTabLeaseProfileDirForTest(coordinated)).toBe(
-      path.resolve("/tmp/oracle-profile"),
-    );
+    expect(resolveRemoteTabLeaseProfileDir(coordinated)).toBe(path.resolve("/tmp/oracle-profile"));
 
     const uncoordinated = resolveBrowserConfig({
       remoteChrome: { host: "127.0.0.1", port: 9222 },
       manualLogin: false,
       manualLoginProfileDir: "/tmp/oracle-profile",
     });
-    expect(resolveRemoteTabLeaseProfileDirForTest(uncoordinated)).toBeNull();
+    expect(resolveRemoteTabLeaseProfileDir(uncoordinated)).toBeNull();
   });
 });
 
-describe("isLocalChromeHostForTest", () => {
+describe("isLocalChromeHost", () => {
   test.each(["localhost", "LOCALHOST", "127.0.0.1", "127.12.34.56", "::1", "[::1]"])(
     "accepts loopback host %s",
     (host) => {
-      expect(isLocalChromeHostForTest(host)).toBe(true);
+      expect(isLocalChromeHost(host)).toBe(true);
     },
   );
 
   test.each(["remote-host", "192.168.1.5", "10.0.0.2", "2001:db8::1"])(
     "rejects remote host %s",
     (host) => {
-      expect(isLocalChromeHostForTest(host)).toBe(false);
+      expect(isLocalChromeHost(host)).toBe(false);
     },
   );
 });

@@ -3,16 +3,15 @@ import type { BrowserLogger } from "../browser/types.js";
 import { resumeBrowserSession, type ReattachResult } from "../browser/reattach.js";
 import { requiresCleanupOnlyCommittedPromptRecovery } from "../browser/reattachability.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import type { BrowserRuntimeMetadata, SessionArtifact } from "../sessionManager.js";
-import { RemoteArtifactStore } from "./artifactStore.js";
+import type { RemoteArtifactStore } from "./artifactStore.js";
 import {
   assertCapturedPromptIdentity,
   browserRunResultFromTransaction,
   browserRuntimeFromError,
   browserTransactionFromRecoveredSession,
-  projectRemotePublicResult,
   remoteArtifactManualCopyWarning,
   serializeDurableBrowserAutomationError,
+  stageRemoteCaptureWithArtifactFallback,
 } from "./transactionCapture.js";
 import {
   RemoteTransactionConflictError,
@@ -26,24 +25,18 @@ import {
 } from "./transactionProtocol.js";
 import { settleExpiredRemoteTransaction } from "./transactionServer.js";
 import { readRequestBody, RemoteRequestError, sendJson } from "./serverHttp.js";
-import type { RemoteTransactionRecord } from "./transactionModel.js";
-import { RemoteTransactionStore } from "./transactionStore.js";
+import type {
+  RemoteRecoverableTransactionRecord,
+  RemoteSettlementPendingTransactionRecord,
+  RemoteSettledTransactionRecord,
+  RemoteTransactionRecord,
+} from "./transactionModel.js";
+import type { RemoteTransactionStore } from "./transactionStore.js";
 import {
   isAbortWorthyRemoteCaptureMismatch,
   isTerminalRemoteBrowserAutomationError,
 } from "./serverTransactionRuntime.js";
 import { RemoteRetryRequestSchema, type RemoteTransactionRetryResponse } from "./types.js";
-
-type RecoverableRemoteTransactionRecord = RemoteTransactionRecord & {
-  state: "recoverable-error";
-  runtime: BrowserRuntimeMetadata;
-};
-
-function isRecoverableRemoteTransactionRecord(
-  record: RemoteTransactionRecord,
-): record is RecoverableRemoteTransactionRecord {
-  return record.state === "recoverable-error" && record.runtime !== undefined;
-}
 
 export interface RemoteTransactionRetryRouteParams {
   req: http.IncomingMessage;
@@ -135,7 +128,7 @@ export async function serveRemoteTransactionRetry(
       sendJson(params.res, 200, response);
       return;
     }
-    if (record.result) {
+    if (record.state === "pending") {
       const response: RemoteTransactionRetryResponse = {
         status: "transaction",
         transaction: remoteTransactionPayload(record),
@@ -150,12 +143,9 @@ export async function serveRemoteTransactionRetry(
         runId: record.runId,
         result: {
           ...staged.result,
-          warnings: [
-            ...(staged.result.warnings ?? []),
-            remoteArtifactManualCopyWarning(
-              "Automatic remote artifact transfer could not be prepared. The captured text is preserved; open the ChatGPT browser on the remote host and copy the generated files manually.",
-            ),
-          ].slice(-64),
+          warnings: [...(staged.result.warnings ?? []), remoteArtifactManualCopyWarning()].slice(
+            -64,
+          ),
         },
         runtime: staged.runtime,
         modelSelection: staged.modelSelection,
@@ -189,15 +179,10 @@ export async function serveRemoteTransactionRetry(
       sendJson(params.res, 200, response);
       return;
     }
-    if (!isRecoverableRemoteTransactionRecord(record)) {
-      const response: RemoteTransactionRetryResponse = {
-        status: "error",
-        error: remoteBrowserAutomationError(record),
-      };
-      sendJson(params.res, 200, response);
-      return;
-    }
 
+    if (record.state !== "recoverable-error") {
+      throw new Error(`Cannot retry browser recovery from transaction state ${record.state}`);
+    }
     const outcome = await params.runTransactionRetryWork(
       params.transactionToken,
       async () => await params.runBrowserWork(async () => await recoverTransaction(params, record)),
@@ -243,7 +228,7 @@ async function loadRetryRecord(
 
 async function recoverTransaction(
   params: RemoteTransactionRetryRouteParams,
-  record: RecoverableRemoteTransactionRecord,
+  record: RemoteRecoverableTransactionRecord,
 ): Promise<{ statusCode: number; body: RemoteTransactionRetryResponse }> {
   const recoveryRuntime = record.runtime;
   const recoveryStartedAt = Date.now();
@@ -282,7 +267,13 @@ async function recoverTransaction(
         settlementMode: terminalFailure ? "abort" : undefined,
       });
       if (!terminalFailure) {
-        return { statusCode: 200, body: retryFailureResponse(failed) };
+        if (failed.state !== "recoverable-error") {
+          throw new Error("Recoverable browser recovery failure became terminal unexpectedly");
+        }
+        return {
+          statusCode: 200,
+          body: { status: "error", error: remoteBrowserAutomationError(failed) },
+        };
       }
       const settled = (
         await params.transactionCoordinator.settle({
@@ -302,30 +293,21 @@ async function recoverTransaction(
     const result = browserRunResultFromTransaction(capture);
     try {
       assertCapturedPromptIdentity(record.requestIdentity, result, capture.runtime);
-      const fileArtifacts: SessionArtifact[] = [
-        ...(result.savedFiles ?? []),
-        ...(result.artifacts ?? []).filter((artifact) => artifact.kind === "file"),
-      ];
-      const registrations = await params.artifactStore.prepareRequiredArtifacts({
+      const staged = await stageRemoteCaptureWithArtifactFallback({
+        transactionStore: params.transactionStore,
+        artifactStore: params.artifactStore,
         transactionToken: record.transactionToken,
         runId: record.runId,
-        artifacts: fileArtifacts,
-      });
-      await params.transactionStore.stageCapture({
-        transactionToken: record.transactionToken,
-        runId: record.runId,
-        result: projectRemotePublicResult(result),
+        result,
         runtime: capture.runtime,
-        modelSelection: result.modelSelection,
-        artifacts: registrations,
       });
-      const published = await params.transactionStore.publishCapture({
+      if (staged.artifactFallback) {
+        params.serverLogger(
+          `[serve] Retry for run ${record.runId} preserved its captured text with manual artifact copy fallback (${staged.artifactFallback.stage}).`,
+        );
+      }
+      const published = await params.transactionStore.promoteStagedCapture({
         transactionToken: record.transactionToken,
-        runId: record.runId,
-        result: projectRemotePublicResult(result),
-        runtime: capture.runtime,
-        modelSelection: result.modelSelection,
-        artifacts: registrations,
       });
       params.transactionCoordinator.registerActive(record.transactionToken, capture);
       coordinatorOwnsSettlement = true;
@@ -355,7 +337,13 @@ async function recoverTransaction(
         settlementMode: terminalFailure ? "abort" : undefined,
       });
       if (!terminalFailure) {
-        return { statusCode: 200, body: retryFailureResponse(failed) };
+        if (failed.state !== "recoverable-error") {
+          throw new Error("Recoverable capture publication failure became terminal unexpectedly");
+        }
+        return {
+          statusCode: 200,
+          body: { status: "error", error: remoteBrowserAutomationError(failed) },
+        };
       }
       params.transactionCoordinator.registerActive(record.transactionToken, capture);
       coordinatorOwnsSettlement = true;
@@ -375,7 +363,9 @@ async function recoverTransaction(
   }
 }
 
-function retryFailureResponse(record: RemoteTransactionRecord): RemoteTransactionRetryResponse {
+function retryFailureResponse(
+  record: RemoteSettlementPendingTransactionRecord | RemoteSettledTransactionRecord,
+): RemoteTransactionRetryResponse {
   if (record.state === "finalized" || record.state === "aborted" || record.state === "failed") {
     return terminalTransactionRetryResponse(record);
   }

@@ -31,9 +31,9 @@ export {
   type BrowserConversationTurn,
 } from "./responseCaptureCoordinator.js";
 export {
-  isLocalChromeHostForTest,
-  resolveRemoteTabLeaseProfileDirForTest,
-  runSubmissionWithRecoveryForTest,
+  isLocalChromeHost,
+  resolveRemoteTabLeaseProfileDir,
+  runSubmissionWithRecovery,
 } from "./promptSubmissionCoordinator.js";
 export { shouldPreferSystemTmpDirForTest } from "./localExecutionContext.js";
 export { resolveBrowserConfig, DEFAULT_BROWSER_CONFIG } from "./config.js";

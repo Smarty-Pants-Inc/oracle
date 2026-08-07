@@ -2,7 +2,6 @@ import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
-import { createRemoteBrowserTransactionExecutor } from "../../src/remote/client.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import type { BrowserRunResult } from "../../src/browserMode.js";
 import type { BrowserRunTransaction } from "../../src/browser/types.js";
@@ -18,6 +17,7 @@ import {
   CAN_LISTEN_LOCALHOST,
   browserTransaction,
   createTestRemoteServer,
+  createTestRemoteBrowserTransactionExecutor as createRemoteBrowserTransactionExecutor,
   committedPromptEpoch,
   remoteRunPayload,
 } from "./serverTestBuilders.js";

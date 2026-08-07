@@ -6,7 +6,9 @@ import {
 } from "../browser/ownedBrowserResources.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import type {
-  RemoteTransactionRecord,
+  RemoteMaterializedSettlementAuthorityTransactionRecord,
+  RemoteSettlementPendingTransactionRecord,
+  RemoteSettledTransactionRecord,
   RemoteTransactionSettlementAuthority,
   RemoteTransactionSettlementBinding,
 } from "./transactionModel.js";
@@ -26,15 +28,26 @@ export class RemoteTransactionConflictError extends Error {
 }
 
 export interface RemoteTransactionSettlementOutcome {
-  record: RemoteTransactionRecord;
+  record: RemoteSettlementPendingTransactionRecord | RemoteSettledTransactionRecord;
   finalization: BrowserCaptureFinalizationResult;
 }
 
-export interface RemoteTransactionSettlementBindingOutcome {
-  record: RemoteTransactionRecord;
-  settlementAuthority: RemoteTransactionSettlementAuthority;
-  finalization?: BrowserCaptureFinalizationResult;
-}
+export type RemoteTransactionSettlementBindingOutcome =
+  | {
+      record: RemoteMaterializedSettlementAuthorityTransactionRecord;
+      settlementAuthority: RemoteTransactionSettlementAuthority & {
+        outcome: "bound";
+        state: RemoteMaterializedSettlementAuthorityTransactionRecord["state"];
+      };
+    }
+  | {
+      record: RemoteSettledTransactionRecord;
+      settlementAuthority: RemoteTransactionSettlementAuthority & {
+        outcome: "completed";
+        state: RemoteSettledTransactionRecord["state"];
+      };
+      finalization: Extract<BrowserCaptureFinalizationResult, { status: "completed" }>;
+    };
 
 export interface RemoteTransactionCoordinatorOptions {
   transactionStore: RemoteTransactionStore;
@@ -95,14 +108,24 @@ export class RemoteTransactionCoordinator {
       }
       throw error;
     }
+    if (binding.status === "completed") {
+      return {
+        record: binding.record,
+        settlementAuthority: {
+          mode: binding.record.terminalAudit.settlementMode,
+          outcome: "completed",
+          state: binding.record.state,
+        },
+        finalization: binding.finalization,
+      };
+    }
     return {
       record: binding.record,
       settlementAuthority: {
-        mode: binding.record.settlementMode ?? params.mode,
-        outcome: binding.status === "completed" ? "completed" : "bound",
+        mode: binding.record.settlementMode,
+        outcome: "bound",
         state: binding.record.state,
       },
-      ...(binding.status === "completed" ? { finalization: binding.finalization } : {}),
     };
   }
 
@@ -112,10 +135,7 @@ export class RemoteTransactionCoordinator {
     durablePublication: boolean;
   }): Promise<RemoteTransactionSettlementOutcome> {
     const binding = await this.bindSettlement(params);
-    if (binding.settlementAuthority.outcome === "completed") {
-      if (!binding.finalization) {
-        throw new Error("Completed remote transaction lacks finalization result");
-      }
+    if ("finalization" in binding) {
       return { record: binding.record, finalization: binding.finalization };
     }
 
@@ -141,7 +161,6 @@ export class RemoteTransactionCoordinator {
     }
     const runtime = execution.cleanupRuntime;
     const mode = execution.record.settlementMode;
-    if (!mode) throw new Error("Executing transaction lacks exact runtime authority");
 
     const active = this.#activeTransactions.get(params.transactionToken);
     const rawFinalization = active

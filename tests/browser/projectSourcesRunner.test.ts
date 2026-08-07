@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { expect, test, vi } from "vitest";
 import type * as PrivateTempRootModule from "../../src/privateTempRoot.js";
 import { captureProfileDirectoryIdentity } from "../../src/browser/profileDirectoryAuthority.js";
+import { testWindowsPrivateDirectoryAuthority } from "../privateAuthorityTestHelpers.js";
 
 const { generationBAttachTarget, generationBCloseTarget, generationBCreateTarget } = vi.hoisted(
   () => ({
@@ -69,22 +70,38 @@ test("persists and resolves Project Sources cleanup while discarding successful 
       "../../src/privateTempRoot.js",
     );
     mocks.removeProfile.mockImplementation((authority) =>
-      actual.removeTemporaryProfileAuthority(authority),
+      actual.removeTemporaryProfileAuthority(authority, {
+        windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+      }),
     );
     return {
       ...actual,
+      assertPrivateDirectoryAuthority: (
+        authority: PrivateTempRootModule.PrivateDirectoryAuthority,
+      ) =>
+        actual.assertPrivateDirectoryAuthority(authority, {
+          windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+        }),
+      assertTemporaryProfileAuthority: (
+        authority: PrivateTempRootModule.TemporaryProfileAuthority,
+      ) =>
+        actual.assertTemporaryProfileAuthority(authority, {
+          windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+        }),
       establishPrivateRuntimeAuthority: () =>
-        actual.establishPrivateRuntimeAuthority({ tempDirectory: temporaryBase }),
+        actual.establishPrivateRuntimeAuthority({
+          tempDirectory: temporaryBase,
+          windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+        }),
       createTemporaryProfileChildAuthority: async (
         parent: PrivateTempRootModule.PrivateDirectoryAuthority,
         prefix: string,
         options?: PrivateTempRootModule.PrivateTempRootOptions,
       ) => {
-        const authority = await actual.createTemporaryProfileChildAuthority(
-          parent,
-          prefix,
-          options,
-        );
+        const authority = await actual.createTemporaryProfileChildAuthority(parent, prefix, {
+          ...options,
+          windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+        });
         await mocks.afterPrivateGeneration(authority.generation);
         return authority;
       },
@@ -149,7 +166,10 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     await import("../../src/browser/targetCloseAuthority.js");
   try {
     const profileState = await import("../../src/browser/profileState.js");
-    const cleanupStorage = await projectSourcesRecovery.establishProjectSourcesCleanupStorage();
+    const cleanupStorage = await projectSourcesRecovery.establishProjectSourcesCleanupStorage(
+      undefined,
+      { windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority },
+    );
     const temporaryParent = await profileState.captureProfileDirectoryIdentity(
       cleanupStorage.runtimeRoot.path,
     );

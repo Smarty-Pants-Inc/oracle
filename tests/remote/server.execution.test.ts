@@ -16,7 +16,6 @@ import {
 import type * as FsPromises from "node:fs/promises";
 import type { RemoteServerInstance } from "../../src/remote/server.js";
 import { bootstrapRemoteManualChromeOwner } from "../../src/remote/serverLifecycle.js";
-import { createRemoteBrowserTransactionExecutor } from "../../src/remote/client.js";
 import type { BrowserLogger, BrowserRunTransaction } from "../../src/browser/types.js";
 import type { BrowserRunResult } from "../../src/browserMode.js";
 import { writeBinaryBrowserArtifact } from "../../src/browser/artifacts.js";
@@ -36,10 +35,12 @@ import {
   CAN_LISTEN_LOCALHOST,
   browserTransaction,
   createTestRemoteServer,
+  createTestRemoteBrowserTransactionExecutor as createRemoteBrowserTransactionExecutor,
   remoteRunPayload,
 } from "./serverTestBuilders.js";
 import { httpGetJson, httpPostJson } from "./serverTestHttp.js";
 import { readAuthenticatedTransactionRecord } from "./serverTestTransactions.js";
+import { testWindowsPrivateDirectoryAuthority } from "../privateAuthorityTestHelpers.js";
 
 describe("remote browser service", { timeout: 15_000 }, () => {
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
@@ -685,6 +686,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-scratch-file-"));
     const run = await serverExecutionTest.createRemoteScratchRun("run-", {
       tempDirectory: ambient,
+      windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
     });
     const generation = await serverExecutionTest.createRemoteScratchGeneration(run, "attachments-");
     const attachment = {
@@ -776,6 +778,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     try {
       const run = await isolatedServerExecutionTest.createRemoteScratchRun("run-", {
         tempDirectory: ambient,
+        windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
       });
       const generation = await isolatedServerExecutionTest.createRemoteScratchGeneration(
         run,

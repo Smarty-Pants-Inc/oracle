@@ -10,7 +10,12 @@ import {
   establishWindowsPrivateDirectory,
   initializeWindowsPrivateFile,
   verifyWindowsPrivateFile,
-} from "../remote/windowsPrivateTreeAcl.js";
+} from "../windowsPrivateFileAcl.js";
+import {
+  physicalFileSnapshotFromStats,
+  samePhysicalFileGeneration,
+  samePhysicalFileSnapshot,
+} from "../physicalFileIdentity.js";
 
 const ARTIFACTS_DIRNAME = "artifacts";
 const ZIP_EOCD_SIGNATURE = 0x06054b50;
@@ -115,7 +120,7 @@ async function openExclusiveArtifact(
             "Windows private browser artifact was not created as an empty regular file",
           );
         }
-        createdIdentity = fileIdentityFromStat(createdStat);
+        createdIdentity = physicalFileSnapshotFromStats(createdStat);
         handle = await fs.open(targetPath, "r+");
         await assertOpenArtifactIdentity(handle, targetPath, createdIdentity);
         await verifyWindowsPrivateFile(targetPath);
@@ -135,31 +140,6 @@ async function openExclusiveArtifact(
   }
 }
 
-function fileIdentityFromStat(fileStat: {
-  dev: bigint;
-  ino: bigint;
-  birthtimeNs: bigint;
-  ctimeNs: bigint;
-}): SessionArtifactFileIdentity {
-  return {
-    device: fileStat.dev.toString(),
-    inode: fileStat.ino.toString(),
-    birthtimeNs: fileStat.birthtimeNs.toString(),
-    ctimeNs: fileStat.ctimeNs.toString(),
-  };
-}
-
-function sameStableFileIdentity(
-  left: SessionArtifactFileIdentity,
-  right: SessionArtifactFileIdentity,
-): boolean {
-  return (
-    left.device === right.device &&
-    left.inode === right.inode &&
-    left.birthtimeNs === right.birthtimeNs
-  );
-}
-
 async function assertOpenArtifactIdentity(
   handle: FileHandle,
   targetPath: string,
@@ -175,8 +155,8 @@ async function assertOpenArtifactIdentity(
     pathStat.isSymbolicLink() ||
     !pathStat.isFile() ||
     pathStat.nlink !== 1n ||
-    !sameStableFileIdentity(fileIdentityFromStat(openStat), expectedIdentity) ||
-    !sameStableFileIdentity(fileIdentityFromStat(pathStat), expectedIdentity)
+    !samePhysicalFileGeneration(physicalFileSnapshotFromStats(openStat), expectedIdentity) ||
+    !samePhysicalFileGeneration(physicalFileSnapshotFromStats(pathStat), expectedIdentity)
   ) {
     throw new Error("Windows private browser artifact physical identity changed");
   }
@@ -191,7 +171,7 @@ async function removeExactArtifactPath(
     current &&
     !current.isSymbolicLink() &&
     current.isFile() &&
-    sameStableFileIdentity(fileIdentityFromStat(current), expectedIdentity)
+    samePhysicalFileGeneration(physicalFileSnapshotFromStats(current), expectedIdentity)
   ) {
     await fs.rm(targetPath, { force: true }).catch(() => undefined);
   }
@@ -214,12 +194,12 @@ async function writeExclusiveArtifact(
     if (!fileStat.isFile() || fileStat.size !== BigInt(contents.length)) {
       throw new Error("Browser artifact write did not preserve exact byte size");
     }
-    const fileIdentity = fileIdentityFromStat(fileStat);
+    const fileIdentity = physicalFileSnapshotFromStats(fileStat);
     const sha256 = await computeOpenFileSha256(handle);
     const afterHashStat = await handle.stat({ bigint: true });
     if (
       afterHashStat.size !== fileStat.size ||
-      !sameFileIdentity(fileIdentityFromStat(afterHashStat), fileIdentity)
+      !samePhysicalFileSnapshot(physicalFileSnapshotFromStats(afterHashStat), fileIdentity)
     ) {
       throw new Error("Browser artifact physical identity changed during write");
     }
@@ -274,12 +254,12 @@ export async function readBrowserArtifactFileEvidence(targetPath: string): Promi
     if (!fileStat.isFile() || fileStat.size > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new Error("Browser artifact evidence requires a bounded regular file");
     }
-    const fileIdentity = fileIdentityFromStat(fileStat);
+    const fileIdentity = physicalFileSnapshotFromStats(fileStat);
     const sha256 = await computeOpenFileSha256(handle);
     const afterHashStat = await handle.stat({ bigint: true });
     if (
       afterHashStat.size !== fileStat.size ||
-      !sameFileIdentity(fileIdentityFromStat(afterHashStat), fileIdentity)
+      !samePhysicalFileSnapshot(physicalFileSnapshotFromStats(afterHashStat), fileIdentity)
     ) {
       throw new Error("Browser artifact physical identity changed while collecting evidence");
     }
@@ -291,18 +271,6 @@ export async function readBrowserArtifactFileEvidence(targetPath: string): Promi
   } finally {
     await handle.close();
   }
-}
-
-function sameFileIdentity(
-  left: SessionArtifactFileIdentity,
-  right: SessionArtifactFileIdentity,
-): boolean {
-  return (
-    left.device === right.device &&
-    left.inode === right.inode &&
-    left.birthtimeNs === right.birthtimeNs &&
-    left.ctimeNs === right.ctimeNs
-  );
 }
 
 export async function computeFileSha256(targetPath: string): Promise<string> {

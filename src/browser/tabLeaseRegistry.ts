@@ -221,6 +221,13 @@ export async function acquireBrowserTabLease(
     generationId,
     profileDirectory: authority.profileDirectory,
   });
+  // Release must judge this record with the same process-generation observer that admitted it.
+  const leaseLivenessDeps: BrowserLeaseLivenessDeps = {
+    ...(deps.readProcessLiveness ? { readProcessLiveness: deps.readProcessLiveness } : {}),
+    ...(deps.readProcessStartIdentity
+      ? { readProcessStartIdentity: deps.readProcessStartIdentity }
+      : {}),
+  };
   let waitingSince: number | undefined;
   let warned = false;
   let lastHeartbeatAt = 0;
@@ -270,6 +277,7 @@ export async function acquireBrowserTabLease(
             leaseIdentity,
             options.logger,
             releaseOptions,
+            leaseLivenessDeps,
           ),
         update: async (patch: Partial<BrowserTabLeaseRecord>) =>
           updateBrowserTabLeaseWithAuthority(authority, leaseIdentity, patch),
@@ -350,6 +358,15 @@ export function retainBrowserTabLeaseTeardownAuthority(
       try {
         const result = await withRegistryLock(authority, async () => {
           const { registry, requiresMigration } = await readRegistryStrict(authority);
+          if (
+            registry.leases.some(
+              (entry) =>
+                entry.id === leaseIdentity.id &&
+                !matchesBrowserTabLeaseIdentity(entry, leaseIdentity),
+            )
+          ) {
+            throw new Error("Browser tab lease owner or acquisition generation does not match.");
+          }
           const active = await pruneStaleLeases(registry.leases, options);
           if (requiresMigration || active.length !== registry.leases.length) {
             await writeRegistry(authority, { version: CURRENT_REGISTRY_VERSION, leases: active });
@@ -375,9 +392,6 @@ export function retainBrowserTabLeaseTeardownAuthority(
           }
 
           const activeLease = active.find((entry) => entry.id === leaseIdentity.id);
-          if (activeLease && !matchesBrowserTabLeaseIdentity(activeLease, leaseIdentity)) {
-            throw new Error("Browser tab lease owner or acquisition generation does not match.");
-          }
           const leaseWasActive = Boolean(activeLease);
           const remaining = active.filter(
             (entry) => !matchesBrowserTabLeaseIdentity(entry, leaseIdentity),
@@ -518,14 +532,20 @@ async function releaseBrowserTabLeaseWithAuthority(
   leaseIdentity: BrowserTabLeaseIdentity,
   logger?: BrowserLogger,
   options: BrowserTabLeaseReleaseOptions = {},
+  livenessDeps: BrowserLeaseLivenessDeps = {},
 ): Promise<void> {
   const released = await withRegistryLock(authority, async () => {
     const { registry, requiresMigration } = await readRegistryStrict(authority);
-    const active = await pruneStaleLeases(registry.leases, {});
-    const activeLease = active.find((lease) => lease.id === leaseIdentity.id);
-    if (activeLease && !matchesBrowserTabLeaseIdentity(activeLease, leaseIdentity)) {
+    if (
+      registry.leases.some(
+        (lease) =>
+          lease.id === leaseIdentity.id && !matchesBrowserTabLeaseIdentity(lease, leaseIdentity),
+      )
+    ) {
       throw new Error("Browser tab lease owner or acquisition generation does not match.");
     }
+    const active = await pruneStaleLeases(registry.leases, livenessDeps);
+    const activeLease = active.find((lease) => lease.id === leaseIdentity.id);
     const leaseWasActive = Boolean(activeLease);
     const leases = active.filter((lease) => !matchesBrowserTabLeaseIdentity(lease, leaseIdentity));
     if (requiresMigration || leases.length !== registry.leases.length) {
@@ -552,11 +572,15 @@ export async function hasOtherActiveBrowserTabLeases(
   });
   return withRegistryLock(authority, async () => {
     const { registry, requiresMigration } = await readRegistryStrict(authority);
-    const active = await pruneStaleLeases(registry.leases, options);
-    const activeLease = active.find((entry) => entry.id === leaseIdentity.id);
-    if (activeLease && !matchesBrowserTabLeaseIdentity(activeLease, leaseIdentity)) {
+    if (
+      registry.leases.some(
+        (entry) =>
+          entry.id === leaseIdentity.id && !matchesBrowserTabLeaseIdentity(entry, leaseIdentity),
+      )
+    ) {
       return true;
     }
+    const active = await pruneStaleLeases(registry.leases, options);
     if (requiresMigration || active.length !== registry.leases.length) {
       await writeRegistry(authority, { version: CURRENT_REGISTRY_VERSION, leases: active });
     }

@@ -15,17 +15,18 @@ import {
   applyWindowsPrivateFileAcl,
   type WindowsPrivateFileAuthority,
 } from "../../windowsPrivateFileAcl.js";
+import {
+  physicalFileGenerationFromStats,
+  samePhysicalFileGeneration,
+  type PhysicalFileGeneration,
+} from "../../physicalFileIdentity.js";
 
 export type ConnectionInput = Pick<
   BridgeConnectionArtifact,
   "remoteHost" | "remoteToken" | "tunnel"
 >;
 
-export interface PhysicalFileIdentity {
-  readonly device: string;
-  readonly inode: string;
-  readonly birthtimeNs: string;
-}
+export type PhysicalFileIdentity = PhysicalFileGeneration;
 
 export interface FileSnapshot {
   contents: Buffer | null;
@@ -76,42 +77,23 @@ class BridgePrivateFilePublicationError extends Error {
   }
 }
 
-function physicalFileIdentityFromStats(entry: BigIntStats): PhysicalFileIdentity {
-  return {
-    device: entry.dev.toString(),
-    inode: entry.ino.toString(),
-    birthtimeNs: entry.birthtimeNs.toString(),
-  };
-}
-
 async function capturePhysicalFileIdentity(filePath: string): Promise<PhysicalFileIdentity | null> {
   try {
     const entry = await fs.lstat(filePath, { bigint: true });
     if (!entry.isFile() || entry.isSymbolicLink()) {
       throw new Error(`Bridge connection artifact is not a physical file: ${filePath}`);
     }
-    return physicalFileIdentityFromStats(entry);
+    return physicalFileGenerationFromStats(entry);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
   }
 }
 
-function samePhysicalFileIdentity(
-  left: PhysicalFileIdentity,
-  right: PhysicalFileIdentity,
-): boolean {
-  return (
-    left.device === right.device &&
-    left.inode === right.inode &&
-    left.birthtimeNs === right.birthtimeNs
-  );
-}
-
 function samePublishedFile(left: PublishedFile, right: PublishedFile): boolean {
   return (
     samePhysicalDirectoryIdentity(left.directoryIdentity, right.directoryIdentity) &&
-    samePhysicalFileIdentity(left.fileIdentity, right.fileIdentity)
+    samePhysicalFileGeneration(left.fileIdentity, right.fileIdentity)
   );
 }
 
@@ -193,13 +175,13 @@ async function assertOpenFileIdentity(
   expected: PhysicalFileIdentity,
 ): Promise<void> {
   const [handleIdentity, pathIdentity] = await Promise.all([
-    handle.stat({ bigint: true }).then(physicalFileIdentityFromStats),
+    handle.stat({ bigint: true }).then(physicalFileGenerationFromStats),
     capturePhysicalFileIdentity(filePath),
   ]);
   if (
     pathIdentity === null ||
-    !samePhysicalFileIdentity(handleIdentity, expected) ||
-    !samePhysicalFileIdentity(pathIdentity, expected)
+    !samePhysicalFileGeneration(handleIdentity, expected) ||
+    !samePhysicalFileGeneration(pathIdentity, expected)
   ) {
     throw new Error(`Bridge connection temporary file changed before publication: ${filePath}`);
   }
@@ -249,7 +231,7 @@ async function writePrivateConnectionFileAtomicDurable(
     } else {
       handle = await fs.open(temporaryPath, "wx", 0o600);
     }
-    temporaryIdentity = physicalFileIdentityFromStats(await handle.stat({ bigint: true }));
+    temporaryIdentity = physicalFileGenerationFromStats(await handle.stat({ bigint: true }));
     await assertOpenFileIdentity(handle, temporaryPath, temporaryIdentity);
     if (platform === "win32") {
       await windowsPrivateFileAuthority({ filePath: temporaryPath, repair: false });
@@ -272,7 +254,7 @@ async function writePrivateConnectionFileAtomicDurable(
     if (
       closedTemporaryIdentity === null ||
       !samePhysicalDirectoryIdentity(currentDirectoryIdentity, directoryIdentity) ||
-      !samePhysicalFileIdentity(closedTemporaryIdentity, temporaryIdentity)
+      !samePhysicalFileGeneration(closedTemporaryIdentity, temporaryIdentity)
     ) {
       throw new Error("Bridge connection destination changed before atomic publication.");
     }
@@ -327,7 +309,7 @@ async function writePrivateConnectionFileAtomicDurable(
         }
       } else if (
         currentTemporaryIdentity !== null &&
-        samePhysicalFileIdentity(currentTemporaryIdentity, temporaryIdentity)
+        samePhysicalFileGeneration(currentTemporaryIdentity, temporaryIdentity)
       ) {
         await fs.rm(temporaryPath);
         await syncDirectoryIfPresent(directory);
@@ -390,7 +372,7 @@ export async function captureFileSnapshot(filePath: string): Promise<FileSnapsho
   if (
     fileAfter === null ||
     !samePhysicalDirectoryIdentity(directoryBefore, directoryAfter) ||
-    !samePhysicalFileIdentity(fileBefore, fileAfter)
+    !samePhysicalFileGeneration(fileBefore, fileAfter)
   ) {
     throw new Error(`Bridge connection artifact changed while capturing prior state: ${filePath}`);
   }

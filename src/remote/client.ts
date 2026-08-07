@@ -7,7 +7,6 @@ import { lstat, open } from "node:fs/promises";
 import type { BrowserRunOptions } from "../browserMode.js";
 import type {
   BrowserAttachment,
-  BrowserCaptureFinalizationResult,
   BrowserLogger,
   BrowserRunResult,
   BrowserRunTransaction,
@@ -37,7 +36,8 @@ import {
 import { RemoteLegacyRunPayloadSchema, type RemoteLegacyTextResult } from "./legacyProtocol.js";
 import { checkRemoteHealth } from "./health.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import { pendingBrowserCaptureCleanup } from "../browser/ownedBrowserResources.js";
+import { OwnedBrowserResourceTransaction } from "../browser/ownedBrowserResources.js";
+import { createBrowserRunTransaction } from "../browser/runLifecycle.js";
 import {
   findRemoteRecoveryAuthority,
   projectRemoteRecoveryRuntime,
@@ -58,16 +58,21 @@ import {
   bindRemoteBrowserSettlement,
   recoverRemoteRunTransaction,
   rehydrateRemoteBrowserError,
-  settlementModeConflict,
   settleRemoteBrowserTransaction,
+  settlementModeConflict as remoteSettlementModeConflict,
   unresolvedRemoteTransactionRuntime,
 } from "./clientRecovery.js";
 import {
   mergeTransferredArtifacts,
   transferRemoteArtifact,
   waiveRemoteArtifactDelivery,
+  type TransferRemoteArtifactDeps,
 } from "./clientArtifacts.js";
 import { assertRemoteTransactionToken } from "./transactionToken.js";
+import {
+  physicalFileSnapshotFromStats,
+  samePhysicalFileSnapshot,
+} from "../physicalFileIdentity.js";
 
 export { settleRemoteBrowserRecovery } from "./clientRecovery.js";
 
@@ -79,14 +84,21 @@ export interface RemoteExecutorOptions {
   deadlines?: RemoteTransportDeadlines;
 }
 
+export interface RemoteExecutorDeps {
+  readonly artifactTransferDeps?: TransferRemoteArtifactDeps;
+}
+
 export type RemoteBrowserExecutor = (options: BrowserRunOptions) => Promise<BrowserRunResult>;
 
 export type RemoteBrowserTransactionExecutor = (
   options: BrowserRunOptions,
 ) => Promise<BrowserRunTransaction>;
 
-export function createRemoteBrowserExecutor(options: RemoteExecutorOptions): RemoteBrowserExecutor {
-  const executeTransaction = createRemoteBrowserTransactionExecutor(options);
+export function createRemoteBrowserExecutor(
+  options: RemoteExecutorOptions,
+  deps: RemoteExecutorDeps = {},
+): RemoteBrowserExecutor {
+  const executeTransaction = createRemoteBrowserTransactionExecutor(options, deps);
   return async (runOptions) => {
     const transaction = await executeTransaction(runOptions);
     const finalization = await transaction.finalize();
@@ -117,13 +129,10 @@ interface RemoteAttachmentBudget {
   bytes: number;
 }
 
-export function createRemoteBrowserTransactionExecutor({
-  host,
-  token,
-  legacyToken,
-  allowLegacyTextProtocol = false,
-  deadlines,
-}: RemoteExecutorOptions): RemoteBrowserTransactionExecutor {
+export function createRemoteBrowserTransactionExecutor(
+  { host, token, legacyToken, allowLegacyTextProtocol = false, deadlines }: RemoteExecutorOptions,
+  deps: RemoteExecutorDeps = {},
+): RemoteBrowserTransactionExecutor {
   if (token !== undefined) assertRemoteCredential(token, "Remote v3 HMAC root key");
   if (legacyToken !== undefined) {
     assertRemoteCredential(legacyToken, "Remote legacy bearer credential");
@@ -340,6 +349,7 @@ export function createRemoteBrowserTransactionExecutor({
       authoritativeRuntime: preReceiptRuntime,
       options,
       deadlines: resolvedDeadlines,
+      artifactTransferDeps: deps.artifactTransferDeps,
     });
   };
 }
@@ -377,10 +387,10 @@ function isSerializableAttachment(entry: BigIntStats): boolean {
 
 function sameSerializableAttachment(left: BigIntStats, right: BigIntStats): boolean {
   return (
-    left.dev === right.dev &&
-    left.ino === right.ino &&
-    left.birthtimeNs === right.birthtimeNs &&
-    left.ctimeNs === right.ctimeNs &&
+    samePhysicalFileSnapshot(
+      physicalFileSnapshotFromStats(left),
+      physicalFileSnapshotFromStats(right),
+    ) &&
     left.size === right.size &&
     left.mode === right.mode &&
     left.nlink === right.nlink
@@ -495,6 +505,7 @@ export async function resumeRemoteBrowserTransaction(params: {
   sessionId?: string;
   log?: BrowserLogger;
   runtimeHintCb?: BrowserRunOptions["runtimeHintCb"];
+  artifactTransferDeps?: TransferRemoteArtifactDeps;
 }): Promise<BrowserRunTransaction> {
   const authority = findRemoteRecoveryAuthority(params.runtime);
   if (!authority || authority.protocolVersion !== REMOTE_TRANSACTION_PROTOCOL_VERSION) {
@@ -555,6 +566,7 @@ export async function resumeRemoteBrowserTransaction(params: {
       runtimeHintCb: params.runtimeHintCb,
     },
     deadlines,
+    artifactTransferDeps: params.artifactTransferDeps,
   });
 }
 
@@ -569,6 +581,7 @@ async function buildRemoteBrowserTransaction(params: {
   authoritativeRuntime?: BrowserRuntimeMetadata;
   options: Pick<BrowserRunOptions, "sessionId" | "log" | "runtimeHintCb">;
   deadlines: ResolvedRemoteTransportDeadlines;
+  artifactTransferDeps?: TransferRemoteArtifactDeps;
 }): Promise<BrowserRunTransaction> {
   const remoteRecovery: BrowserRemoteRecoveryMetadata | null =
     params.receipt.state === "pending"
@@ -580,21 +593,16 @@ async function buildRemoteBrowserTransaction(params: {
           requestIdentity: params.requestIdentity,
         }
       : null;
-  let runtime = projectRemoteRecoveryRuntime(
+  const runtime = projectRemoteRecoveryRuntime(
     params.receipt.runtime,
     remoteRecovery,
     params.authoritativeRuntime,
   );
-  let selectedSettlementMode = params.settlementMode;
-  if (selectedSettlementMode) runtime = bindRemoteSettlementMode(runtime, selectedSettlementMode);
-  let settlementBindingPersisted = selectedSettlementMode !== undefined;
+  const initialRuntime = params.settlementMode
+    ? bindRemoteSettlementMode(runtime, params.settlementMode)
+    : runtime;
   const pendingManualCopyWaivers = new Map<string, RemoteArtifactDescriptor>();
-  let transaction!: BrowserRunTransaction;
-  let settlementInFlight: {
-    mode: "finalize" | "abort";
-    promise: Promise<BrowserCaptureFinalizationResult>;
-  } | null = null;
-  let completedSettlement: BrowserCaptureFinalizationResult | null = null;
+  let settlement!: OwnedBrowserResourceTransaction;
   const persistManualCopyWaiver = async (descriptor: RemoteArtifactDescriptor): Promise<void> => {
     await waiveRemoteArtifactDelivery({
       hostname: params.hostname,
@@ -623,150 +631,80 @@ async function buildRemoteBrowserTransaction(params: {
         code: "remote-artifact-manual-copy-waiver-pending",
         recoverableDisconnect: true,
         transactionToken: params.receipt.transactionToken,
-        runtime,
+        runtime: settlement.runtime(),
       },
       lastError,
     );
   };
-  const persistSettlementBinding = async (
-    mode: "finalize" | "abort",
-  ): Promise<BrowserRuntimeMetadata> => {
-    if (mode === "finalize" && pendingManualCopyWaivers.size > 0) {
-      await persistPendingManualCopyWaivers();
-    }
-    const authoritativeMode =
-      runtime.recoveryCleanupResult?.settlementMode ?? selectedSettlementMode;
-    if (authoritativeMode && authoritativeMode !== mode) {
-      throw settlementModeConflict(mode, authoritativeMode, runtime);
-    }
-    if (!authoritativeMode) {
-      try {
-        runtime = await bindRemoteBrowserSettlement({
+  settlement = new OwnedBrowserResourceTransaction(
+    {
+      settlementModeConflict: (requestedMode, boundMode, runtime) =>
+        remoteSettlementModeConflict(requestedMode, boundMode, runtime),
+      bindSettlementAuthority: async (mode, pendingRuntime) => {
+        if (mode === "finalize" && pendingManualCopyWaivers.size > 0) {
+          await persistPendingManualCopyWaivers();
+        }
+        return params.settlementMode
+          ? pendingRuntime
+          : await bindRemoteBrowserSettlement({
+              hostname: params.hostname,
+              port: params.port,
+              token: params.token,
+              host: params.host,
+              transactionToken: params.receipt.transactionToken,
+              recoveryState: findRemoteRecoveryAuthority(pendingRuntime)?.state ?? "pending",
+              mode,
+              runtime: pendingRuntime,
+              deadlines: params.deadlines,
+            });
+      },
+      persistSettlementBinding: async (mode, boundRuntime) => {
+        try {
+          await params.options.runtimeHintCb?.(boundRuntime, params.receipt.result.modelSelection);
+        } catch (error) {
+          throw new BrowserAutomationError(
+            `Failed to persist remote ${mode} settlement authority.`,
+            {
+              stage: "remote-runtime-persistence",
+              code: "settlement-authority-persistence-failed",
+              recoverableDisconnect: true,
+              runtime: boundRuntime,
+            },
+            error,
+          );
+        }
+        return boundRuntime;
+      },
+      settleResources: async (mode, pendingRuntime) => {
+        if (mode === "finalize" && pendingManualCopyWaivers.size > 0) {
+          await persistPendingManualCopyWaivers();
+        }
+        return await settleRemoteBrowserTransaction({
           hostname: params.hostname,
           port: params.port,
           token: params.token,
           host: params.host,
           transactionToken: params.receipt.transactionToken,
-          recoveryState: findRemoteRecoveryAuthority(runtime)?.state ?? "pending",
+          recoveryState: findRemoteRecoveryAuthority(pendingRuntime)?.state ?? "pending",
           mode,
-          runtime,
+          runtime: pendingRuntime,
           deadlines: params.deadlines,
         });
-        selectedSettlementMode = mode;
-        transaction.runtime = runtime;
-      } catch (error) {
-        if (error instanceof BrowserAutomationError && error.details?.runtime) {
-          runtime = error.details.runtime as BrowserRuntimeMetadata;
-          transaction.runtime = runtime;
-          selectedSettlementMode =
-            runtime.recoveryCleanupResult?.settlementMode ??
-            (error.details.settlementAuthority as { mode?: "finalize" | "abort" } | undefined)
-              ?.mode ??
-            selectedSettlementMode;
-        }
-        throw error;
-      }
-    }
-    if (settlementBindingPersisted) return runtime;
-    try {
-      await params.options.runtimeHintCb?.(runtime, params.receipt.result.modelSelection);
-    } catch (error) {
-      throw new BrowserAutomationError(
-        `Failed to persist remote ${mode} settlement authority.`,
-        {
-          stage: "remote-runtime-persistence",
-          code: "settlement-authority-persistence-failed",
-          recoverableDisconnect: true,
-          runtime,
-        },
-        error,
-      );
-    }
-    settlementBindingPersisted = true;
-    return runtime;
-  };
-  const retryableBindingFailure = (
-    error: unknown,
-    mode: "finalize" | "abort",
-  ): BrowserCaptureFinalizationResult => {
-    if (
-      error instanceof BrowserAutomationError &&
-      (error.details?.code === "settlement-authority-persistence-failed" ||
-        error.details?.code === "remote-settlement-binding-transport-failed" ||
-        error.details?.code === "remote-settlement-contention-pending" ||
-        error.details?.code === "remote-artifact-manual-copy-waiver-pending")
-    ) {
-      return pendingBrowserCaptureCleanup(runtime, error.message, mode);
-    }
-    throw error;
-  };
-  const settle = async (mode: "finalize" | "abort"): Promise<BrowserCaptureFinalizationResult> => {
-    const authoritativeMode =
-      runtime.recoveryCleanupResult?.settlementMode ?? selectedSettlementMode;
-    if (authoritativeMode && authoritativeMode !== mode) {
-      throw settlementModeConflict(mode, authoritativeMode, runtime);
-    }
-    if (completedSettlement) return completedSettlement;
-    if (settlementInFlight) {
-      if (settlementInFlight.mode !== mode) {
-        throw settlementModeConflict(mode, settlementInFlight.mode, runtime);
-      }
-      return settlementInFlight.promise;
-    }
-    const attempt = (async (): Promise<BrowserCaptureFinalizationResult> => {
-      try {
-        await persistSettlementBinding(mode);
-      } catch (error) {
-        return retryableBindingFailure(error, mode);
-      }
-      const finalization = await settleRemoteBrowserTransaction({
-        hostname: params.hostname,
-        port: params.port,
-        token: params.token,
-        host: params.host,
-        transactionToken: params.receipt.transactionToken,
-        recoveryState: findRemoteRecoveryAuthority(runtime)?.state ?? "pending",
-        mode,
-        runtime,
-        deadlines: params.deadlines,
-      });
-      runtime = finalization.runtime;
-      transaction.runtime = runtime;
-      if (finalization.status === "completed") completedSettlement = finalization;
-      return finalization;
-    })();
-    settlementInFlight = { mode, promise: attempt };
-    try {
-      return await attempt;
-    } finally {
-      if (settlementInFlight?.promise === attempt) settlementInFlight = null;
-    }
-  };
-  transaction = {
-    ...params.receipt.result,
-    runtime,
-    bindSettlement: persistSettlementBinding,
-    finalize: async () => {
-      const authoritativeMode =
-        runtime.recoveryCleanupResult?.settlementMode ?? selectedSettlementMode;
-      if (authoritativeMode && authoritativeMode !== "finalize") {
-        throw settlementModeConflict("finalize", authoritativeMode, runtime);
-      }
-      if (completedSettlement) return completedSettlement;
-      return await settle("finalize");
+      },
     },
-    abort: () => settle("abort"),
-  };
+    initialRuntime,
+  );
+  const transaction = createBrowserRunTransaction(params.receipt.result, settlement);
 
   try {
-    await params.options.runtimeHintCb?.(runtime, params.receipt.result.modelSelection);
+    await params.options.runtimeHintCb?.(initialRuntime, params.receipt.result.modelSelection);
   } catch (error) {
     throw new BrowserAutomationError(
       "Failed to persist the received remote transaction authority; the pre-receipt authority remains recoverable.",
       {
         stage: "remote-runtime-persistence",
         recoverableDisconnect: true,
-        runtime,
+        runtime: initialRuntime,
       },
       error,
     );
@@ -776,16 +714,19 @@ async function buildRemoteBrowserTransaction(params: {
   const transferFailures: string[] = [];
   for (const descriptor of params.receipt.artifacts) {
     try {
-      const transferred = await transferRemoteArtifact({
-        hostname: params.hostname,
-        port: params.port,
-        token: params.token,
-        descriptor,
-        transactionToken: params.receipt.transactionToken,
-        sessionId: artifactSessionId,
-        log: params.options.log,
-        deadlines: params.deadlines,
-      });
+      const transferred = await transferRemoteArtifact(
+        {
+          hostname: params.hostname,
+          port: params.port,
+          token: params.token,
+          descriptor,
+          transactionToken: params.receipt.transactionToken,
+          sessionId: artifactSessionId,
+          log: params.options.log,
+          deadlines: params.deadlines,
+        },
+        params.artifactTransferDeps,
+      );
       transferredFiles.push(transferred);
     } catch (error) {
       const filename = sanitizeArtifactFilename(descriptor.filename, "artifact.bin");
@@ -821,18 +762,11 @@ async function buildRemoteBrowserTransaction(params: {
 }
 
 function legacyTextTransaction(result: RemoteLegacyTextResult): BrowserRunTransaction {
-  let mode: "finalize" | "abort" | undefined;
-  const runtime: BrowserRuntimeMetadata = {};
-  const bindSettlement = async (requested: "finalize" | "abort") => {
-    if (mode && mode !== requested) throw settlementModeConflict(requested, mode, runtime);
-    mode = requested;
-    return runtime;
-  };
-  return {
-    ...result,
-    runtime,
-    bindSettlement,
-    finalize: async () => ({ status: "completed", runtime: await bindSettlement("finalize") }),
-    abort: async () => ({ status: "completed", runtime: await bindSettlement("abort") }),
-  };
+  const settlement = new OwnedBrowserResourceTransaction(
+    {
+      settleResources: async (_mode, runtime) => ({ status: "completed", runtime }),
+    },
+    {},
+  );
+  return createBrowserRunTransaction(result, settlement);
 }

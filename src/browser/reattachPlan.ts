@@ -15,14 +15,19 @@ import type {
 import { selectPendingPromptTarget, selectTarget } from "./reattachTargetSelection.js";
 import type { ExplicitTargetSelectionFailure, TargetSelection } from "./reattachTargetSelection.js";
 import type { TargetInfoLite } from "./reattachHelpers.js";
+import type { ProviderDomProviderId } from "./providerDomFlow.js";
 
 export type ReattachRecoveryClassification = "stale-runtime" | "recoverable-transport";
 
-export type ReattachCaptureKind = "gemini" | "chatgpt";
+export type ReattachCaptureKind = ProviderDomProviderId;
+
+export type PendingPromptReattachPlan =
+  | { kind: "pending-prompt"; authority: PendingPromptEpochAuthority; capture: "gemini" }
+  | { kind: "pending-prompt"; authority: PendingPromptEpochAuthority; capture: "chatgpt" };
 
 export type ReattachPlan =
   | { kind: "remote"; promptLocator: CommittedPromptEpochLocator | null }
-  | { kind: "pending-prompt"; authority: PendingPromptEpochAuthority; capture: ReattachCaptureKind }
+  | PendingPromptReattachPlan
   | { kind: "committed-gemini"; promptLocator: CommittedPromptEpochLocator }
   | { kind: "committed-chatgpt"; promptLocator: CommittedPromptEpochLocator };
 
@@ -203,7 +208,11 @@ export function createReattachPlan(
     throw pendingPromptRecoveryError(runtime, "the exact recovering session owner is unavailable");
   }
   const authority = resolvePendingPromptEpochAuthority(runtime, sessionId?.trim());
-  if (authority) return { kind: "pending-prompt", authority, capture };
+  if (authority) {
+    return capture === "gemini"
+      ? { kind: "pending-prompt", authority, capture: "gemini" }
+      : { kind: "pending-prompt", authority, capture: "chatgpt" };
+  }
   if (hasPendingPromptEpoch(runtime)) {
     throw pendingPromptRecoveryError(
       runtime,

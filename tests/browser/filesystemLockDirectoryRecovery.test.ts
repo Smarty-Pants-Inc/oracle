@@ -25,7 +25,11 @@ import {
 import type { BrowserTabLease } from "../../src/browser/tabLeaseRegistry.js";
 import type * as FilesystemLockIoModule from "../../src/browser/filesystemLockIo.js";
 import { retryPendingFilesystemLockReleases } from "../../src/browser/filesystemLockReleaseJournal.js";
-import { agePath, createProcessIdentityProvider } from "./filesystemLockTestHelpers.js";
+import {
+  agePath,
+  createProcessIdentityProvider,
+  testProcessIdentityProvider,
+} from "./filesystemLockTestHelpers.js";
 
 describe("crash-recoverable filesystem lock", () => {
   test("reclaims a crash-left lock directory after the incomplete-state grace period", async () => {
@@ -61,9 +65,13 @@ describe("crash-recoverable filesystem lock", () => {
     let child: ReturnType<typeof spawn> | undefined;
     try {
       const moduleUrl = new URL("../../src/browser/filesystemLock.ts", import.meta.url).href;
+      const helperUrl = new URL("./filesystemLockTestHelpers.ts", import.meta.url).href;
       const source = `
         import { acquireCrashRecoverableFilesystemLock } from ${JSON.stringify(moduleUrl)};
-        const lock = await acquireCrashRecoverableFilesystemLock(process.argv[1]);
+        import { createTestProcessIdentityProvider } from ${JSON.stringify(helperUrl)};
+        const lock = await acquireCrashRecoverableFilesystemLock(process.argv[1], {}, {
+          processIdentityProvider: createTestProcessIdentityProvider(),
+        });
         void lock;
         process.stdout.write("ready\\n");
         setInterval(() => undefined, 1_000);
@@ -84,10 +92,11 @@ describe("crash-recoverable filesystem lock", () => {
       await childExited;
       child = undefined;
 
-      const replacement = await acquireCrashRecoverableFilesystemLock(lockPath, {
-        timeoutMs: 5_000,
-        pollMs: 10,
-      });
+      const replacement = await acquireCrashRecoverableFilesystemLock(
+        lockPath,
+        { timeoutMs: 5_000, pollMs: 10 },
+        { processIdentityProvider: testProcessIdentityProvider },
+      );
       expect(replacement.owner.pid).toBe(process.pid);
       await replacement.release();
       await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });

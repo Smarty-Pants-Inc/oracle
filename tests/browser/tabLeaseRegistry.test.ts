@@ -5,7 +5,6 @@ import { mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:
 import {
   acquireCrashRecoverableFilesystemLock,
   FilesystemLockBusyError,
-  readProcessStartIdentity,
 } from "../../src/browser/filesystemLock.js";
 import {
   captureProfileDirectoryIdentity,
@@ -29,8 +28,13 @@ import {
   pendingBrowserCaptureCleanup,
 } from "../../src/browser/ownedBrowserResources.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
+import { testProcessIdentityProvider } from "./filesystemLockTestHelpers.js";
 
 const CANONICAL_TEMP_ROOT = await realpath(os.tmpdir());
+const TEST_LEASE_LIVENESS_DEPS = {
+  readProcessLiveness: testProcessIdentityProvider.readProcessLiveness,
+  readProcessStartIdentity: testProcessIdentityProvider.readProcessStartIdentity,
+};
 
 function makeTempDir(prefix: string): Promise<string> {
   return mkdtemp(path.join(CANONICAL_TEMP_ROOT, prefix));
@@ -52,7 +56,10 @@ function acquireBrowserTabLease(
       generationId: `test-generation-${testLeaseOrdinal}`,
       ...options,
     },
-    deps,
+    {
+      ...TEST_LEASE_LIVENESS_DEPS,
+      ...deps,
+    },
   );
 }
 
@@ -623,10 +630,12 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
         sessionId: "second-session",
       });
 
-      expect(await hasOtherActiveBrowserTabLeases(dir, first)).toBe(true);
+      expect(await hasOtherActiveBrowserTabLeases(dir, first, TEST_LEASE_LIVENESS_DEPS)).toBe(true);
 
       await second.release();
-      expect(await hasOtherActiveBrowserTabLeases(dir, first)).toBe(false);
+      expect(await hasOtherActiveBrowserTabLeases(dir, first, TEST_LEASE_LIVENESS_DEPS)).toBe(
+        false,
+      );
 
       await first.release();
     } finally {
@@ -775,7 +784,7 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
         {
           readProcessStartIdentity: async (pid) => {
             markNextAttempted();
-            return readProcessStartIdentity(pid);
+            return testProcessIdentityProvider.readProcessStartIdentity(pid);
           },
         },
       ).then((lease) => {
@@ -801,7 +810,9 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
       const dir = await makeTempDir("oracle-tab-lease-teardown-retry-");
       try {
         const lease = await acquireBrowserTabLease(dir, { timeoutMs: 500 });
-        const teardownAuthority = retainBrowserTabLeaseTeardownAuthority(dir, lease);
+        const teardownAuthority = retainBrowserTabLeaseTeardownAuthority(dir, lease, {
+          ...TEST_LEASE_LIVENESS_DEPS,
+        });
         let teardownAttempts = 0;
         const runtime = {
           userDataDir: dir,
@@ -899,6 +910,7 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
         .mockResolvedValueOnce(undefined);
       const teardown = vi.fn(async () => true);
       const authority = retainBrowserTabLeaseTeardownAuthority(dir, first, {
+        ...TEST_LEASE_LIVENESS_DEPS,
         onActiveLeaseHandoff: handoff,
       });
 
@@ -944,6 +956,7 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
       });
       const teardown = vi.fn(async () => true);
       const authority = retainBrowserTabLeaseTeardownAuthority(dir, first, {
+        ...TEST_LEASE_LIVENESS_DEPS,
         onActiveLeaseHandoff: handoff,
       });
 
@@ -967,7 +980,9 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
     const dir = await makeTempDir("oracle-tab-lease-exact-exit-");
     try {
       const lease = await acquireBrowserTabLease(dir, { timeoutMs: 500 });
-      const teardownAuthority = retainBrowserTabLeaseTeardownAuthority(dir, lease);
+      const teardownAuthority = retainBrowserTabLeaseTeardownAuthority(dir, lease, {
+        ...TEST_LEASE_LIVENESS_DEPS,
+      });
       const exactControlKill = vi
         .fn()
         .mockResolvedValueOnce({
@@ -1026,7 +1041,9 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
     const dir = await makeTempDir("oracle-tab-lease-teardown-race-");
     try {
       const first = await acquireBrowserTabLease(dir, { timeoutMs: 500 });
-      const teardownAuthority = retainBrowserTabLeaseTeardownAuthority(dir, first);
+      const teardownAuthority = retainBrowserTabLeaseTeardownAuthority(dir, first, {
+        ...TEST_LEASE_LIVENESS_DEPS,
+      });
       let teardownAttempts = 0;
       await expect(
         teardownAuthority.settle(async () => {
@@ -1107,7 +1124,9 @@ describe("tabLeaseRegistry", { timeout: 15_000 }, () => {
     try {
       const lease = await acquireBrowserTabLease(dir, { timeoutMs: 500 });
       const teardown = vi.fn(async () => true);
-      await expect(teardownBrowserResourcesIfNoActiveLeases(dir, teardown)).resolves.toEqual({
+      await expect(
+        teardownBrowserResourcesIfNoActiveLeases(dir, teardown, TEST_LEASE_LIVENESS_DEPS),
+      ).resolves.toEqual({
         status: "preserved",
         reason: "active-leases",
       });

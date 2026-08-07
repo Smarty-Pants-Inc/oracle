@@ -25,6 +25,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveCommittedPromptEpochLocator } from "../dist/src/browser/reattachability.js";
+import { readDurableBrowserAnswer } from "../dist/src/cli/durableAnswer.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
@@ -295,28 +296,33 @@ async function main() {
       label: "session status=completed after disconnect",
     });
 
-    const answer =
-      completed?.response?.text || completed?.response?.markdown || completed?.answer || "";
-    const answerPreview = String(answer).slice(0, 120).replace(/\s+/g, " ");
+    const durableAnswerArtifact = completed.artifacts?.find(
+      (artifact) => artifact?.label === "Durable browser answer",
+    );
+    if (!durableAnswerArtifact) {
+      throw new Error("completed session has no persisted durable browser answer artifact");
+    }
+    const answer = await readDurableBrowserAnswer({ artifact: durableAnswerArtifact });
+    if (answer === null) {
+      throw new Error("completed session durable browser answer payload is missing");
+    }
+    const finalNonEmptyAnswer = answer
+      .split(/\r?\n/u)
+      .map((line) => line.trim())
+      .findLast((line) => line.length > 0);
+    const answerPreview = answer.slice(0, 120).replace(/\s+/g, " ");
     log(`session completed; answerPreview=${JSON.stringify(answerPreview)}`);
 
-    // Drain a moment so late auto-reattach log lines land.
+    // Drain a moment so late auto-reattach log lines land for diagnostics.
     await new Promise((r) => setTimeout(r, 1500));
     const fullLog = await readFile(logPath, "utf8");
     const signals = proofSignals(fullLog, completed);
-    const harvested =
-      fullLog.includes(token) || String(answer).includes(token) || signals.sawAutoReattach;
 
     if (!forcedDetach) {
       throw new Error("forced CDP detach never ran");
     }
-    if (!signals.sawAutoReattach && !signals.sawRecoverableMessage && !signals.sawRecoverableMeta) {
-      throw new Error(
-        "completed without recoverable-disconnect / auto-reattach evidence (run finished before detach?)",
-      );
-    }
-    if (!harvested) {
-      throw new Error("completed without harvest evidence (token missing from answer/log)");
+    if (finalNonEmptyAnswer !== token) {
+      throw new Error("persisted durable answer does not end with the exact recovery token");
     }
 
     console.log("\nE2E_PROOF_OK");
@@ -329,7 +335,7 @@ async function main() {
           forcedDetach,
           ...signals,
           tokenPresentInLog: fullLog.includes(token),
-          tokenPresentInAnswer: String(answer).includes(token),
+          exactTokenIsFinalNonEmptyAnswer: finalNonEmptyAnswer === token,
         },
         null,
         2,

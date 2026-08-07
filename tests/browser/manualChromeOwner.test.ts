@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { resolveBrowserConfig } from "../../src/browser/config.js";
 import {
-  acquireManualChromeOwner,
+  acquireManualChromeOwner as acquireManualChromeOwnerWithAuthority,
   releaseManualChromeOwnerEndpointAuthority,
   settleManualChromeOwner,
   type ManualChromeOwner,
@@ -18,7 +18,7 @@ import {
   writeOracleChromeOwner,
 } from "../../src/browser/profileState.js";
 import {
-  acquireBrowserTabLease,
+  acquireBrowserTabLease as acquireBrowserTabLeaseWithAuthority,
   retainBrowserTabLeaseTeardownAuthority,
   type BrowserTabLease,
 } from "../../src/browser/tabLeaseRegistry.js";
@@ -26,6 +26,38 @@ import type {
   ChromeLaunchResult,
   RetainedChromeEndpointAuthority,
 } from "../../src/browser/chromeLifecycle.js";
+import { testProcessIdentityProvider } from "./filesystemLockTestHelpers.js";
+
+const TEST_LEASE_LIVENESS_DEPS = {
+  readProcessLiveness: testProcessIdentityProvider.readProcessLiveness,
+  readProcessStartIdentity: testProcessIdentityProvider.readProcessStartIdentity,
+};
+
+async function acquireBrowserTabLease(
+  profileDir: Parameters<typeof acquireBrowserTabLeaseWithAuthority>[0],
+  options: Parameters<typeof acquireBrowserTabLeaseWithAuthority>[1],
+  deps: Parameters<typeof acquireBrowserTabLeaseWithAuthority>[2] = {},
+) {
+  return acquireBrowserTabLeaseWithAuthority(profileDir, options, {
+    ...TEST_LEASE_LIVENESS_DEPS,
+    ...deps,
+  });
+}
+async function acquireManualChromeOwner(
+  profileDir: Parameters<typeof acquireManualChromeOwnerWithAuthority>[0],
+  config: Parameters<typeof acquireManualChromeOwnerWithAuthority>[1],
+  logger: Parameters<typeof acquireManualChromeOwnerWithAuthority>[2],
+  sessionId: Parameters<typeof acquireManualChromeOwnerWithAuthority>[3],
+  deps: Parameters<typeof acquireManualChromeOwnerWithAuthority>[4] = {},
+) {
+  return acquireManualChromeOwnerWithAuthority(profileDir, config, logger, sessionId, {
+    acquireProfileLock: (userDataDir, options) =>
+      acquireProfileRunLock(userDataDir, options, {
+        processIdentityProvider: testProcessIdentityProvider,
+      }),
+    ...deps,
+  });
+}
 
 const logger = vi.fn<(message: string) => void>();
 
@@ -770,6 +802,7 @@ describe("manual Chrome owner acquisition", () => {
         generationId: "normal-generation",
       });
       const firstTeardown = retainBrowserTabLeaseTeardownAuthority(profileDir, firstLease, {
+        ...TEST_LEASE_LIVENESS_DEPS,
         onActiveLeaseHandoff: () => releaseManualChromeOwnerEndpointAuthority(bootstrap),
       });
       await expect(firstTeardown.settle(async () => true)).resolves.toMatchObject({
@@ -777,7 +810,9 @@ describe("manual Chrome owner acquisition", () => {
       });
       expect(normalAuthority.kill).not.toHaveBeenCalled();
 
-      const finalTeardown = retainBrowserTabLeaseTeardownAuthority(profileDir, finalLease);
+      const finalTeardown = retainBrowserTabLeaseTeardownAuthority(profileDir, finalLease, {
+        ...TEST_LEASE_LIVENESS_DEPS,
+      });
       await expect(
         finalTeardown.settle(async () => {
           const settlement = await settleManualChromeOwner(profileDir, normal, logger);
@@ -1133,9 +1168,12 @@ describe("manual Chrome owner settlement", () => {
       expect(ownerB.disposition).toBe("close-on-last-lease");
 
       const firstAuthority = retainBrowserTabLeaseTeardownAuthority(profileDir, firstLease, {
+        ...TEST_LEASE_LIVENESS_DEPS,
         onActiveLeaseHandoff: () => releaseManualChromeOwnerEndpointAuthority(ownerA),
       });
-      const secondAuthority = retainBrowserTabLeaseTeardownAuthority(profileDir, secondLease);
+      const secondAuthority = retainBrowserTabLeaseTeardownAuthority(profileDir, secondLease, {
+        ...TEST_LEASE_LIVENESS_DEPS,
+      });
       const firstTeardown = vi.fn(async () => true);
       await expect(firstAuthority.settle(firstTeardown)).resolves.toEqual({
         status: "completed",

@@ -14,6 +14,7 @@ import type {
 import type { ChromeProcessIdentity } from "./browser/chromeProcessIdentity.js";
 import type { ChromeProcessLaunchClaim } from "./browser/chromeProcessLaunchClaim.js";
 import type { ChromeOwnerDisposition, ProfileDirectoryIdentity } from "./browser/profileState.js";
+import type { PhysicalFileSnapshot } from "./physicalFileIdentity.js";
 import type {
   TransportFailureReason,
   ApiProviderMode,
@@ -306,12 +307,7 @@ export interface SessionArtifactOrigin {
   mode: "local" | "bridge";
   host?: string;
 }
-export interface SessionArtifactFileIdentity {
-  device: string;
-  inode: string;
-  birthtimeNs: string;
-  ctimeNs: string;
-}
+export type SessionArtifactFileIdentity = PhysicalFileSnapshot;
 
 export interface SessionArtifact {
   kind: "transcript" | "deep-research-report" | "image" | "file";

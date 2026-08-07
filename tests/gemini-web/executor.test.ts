@@ -206,7 +206,12 @@ describe("gemini-web executor", () => {
     writeOracleChromeOwner.mockClear();
     cleanupStaleProfileState.mockClear();
     verifyDevToolsReachable.mockReset();
-    delay.mockClear();
+    delay.mockReset();
+    delay.mockImplementation(async () => {
+      if (delay.mock.calls.length > 20) {
+        throw new Error("Gemini executor test exceeded its expected polling bound.");
+      }
+    });
     killChrome.mockClear();
     captureProfileDirectoryIdentity.mockClear();
     acquireManualChromeOwner.mockReset();
@@ -351,6 +356,10 @@ describe("gemini-web executor", () => {
         return {
           result: {
             value: JSON.stringify({
+              ready: true,
+              composerText: "",
+              canSubmit: true,
+              active: false,
               entries: [
                 {
                   kind: "user",

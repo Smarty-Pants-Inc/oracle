@@ -13,7 +13,13 @@ export { readErrorCode };
 import type {
   WindowsPrivateTreeAuthority,
   WindowsPrivateTreeScope,
-} from "./windowsPrivateTreeAcl.js";
+} from "../windowsPrivateFileAcl.js";
+import {
+  physicalFileGenerationFromStats,
+  physicalFileSnapshotFromStats,
+  samePhysicalFileGeneration,
+  samePhysicalFileSnapshot,
+} from "../physicalFileIdentity.js";
 import {
   authenticateRemoteTransactionHeadAuthority,
   remoteTransactionIntegrityKeyId,
@@ -565,15 +571,18 @@ export function sameQuarantineEvidence(
 }
 
 export function sameFileGeneration(left: BigIntStats, right: BigIntStats): boolean {
-  return left.dev === right.dev && left.ino === right.ino && left.birthtimeNs === right.birthtimeNs;
+  return samePhysicalFileGeneration(
+    physicalFileGenerationFromStats(left),
+    physicalFileGenerationFromStats(right),
+  );
 }
 
 export function samePhysicalFile(left: BigIntStats, right: BigIntStats): boolean {
   return (
-    left.dev === right.dev &&
-    left.ino === right.ino &&
-    left.birthtimeNs === right.birthtimeNs &&
-    left.ctimeNs === right.ctimeNs &&
+    samePhysicalFileSnapshot(
+      physicalFileSnapshotFromStats(left),
+      physicalFileSnapshotFromStats(right),
+    ) &&
     left.size === right.size &&
     left.mode === right.mode &&
     left.nlink === right.nlink

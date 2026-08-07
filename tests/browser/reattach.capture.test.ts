@@ -259,6 +259,10 @@ describe("resumeBrowserSession", { timeout: 15_000 }, () => {
         return {
           result: {
             value: JSON.stringify({
+              ready: true,
+              composerText: "",
+              canSubmit: false,
+              active: false,
               entries: [
                 {
                   kind: "user",

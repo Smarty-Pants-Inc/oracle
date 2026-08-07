@@ -79,18 +79,6 @@ export async function runSubmissionWithRecovery({
   }
 }
 
-export async function runSubmissionWithRecoveryForTest(args: {
-  prompt: string;
-  attachments: BrowserAttachment[];
-  fallbackSubmission?: BrowserSubmissionFallback;
-  submit: (prompt: string, attachments: BrowserAttachment[]) => Promise<BrowserSubmissionResult>;
-  reloadPromptComposer: () => Promise<void>;
-  prepareFallbackSubmission: () => Promise<void>;
-  logger: BrowserLogger;
-}): Promise<BrowserSubmissionResult> {
-  return runSubmissionWithRecovery(args);
-}
-
 export function resolveRemoteTabLeaseProfileDir(
   config: ReturnType<typeof resolveBrowserConfig>,
 ): string | null {
@@ -98,12 +86,6 @@ export function resolveRemoteTabLeaseProfileDir(
     return null;
   }
   return path.resolve(config.manualLoginProfileDir);
-}
-
-export function resolveRemoteTabLeaseProfileDirForTest(
-  config: ReturnType<typeof resolveBrowserConfig>,
-): string | null {
-  return resolveRemoteTabLeaseProfileDir(config);
 }
 
 export function isLocalChromeHost(host: string): boolean {
@@ -115,10 +97,6 @@ export function isLocalChromeHost(host: string): boolean {
     return true;
   }
   return net.isIPv4(normalized) && normalized.startsWith("127.");
-}
-
-export function isLocalChromeHostForTest(host: string): boolean {
-  return isLocalChromeHost(host);
 }
 
 export async function closeRemoteConnectionAfterRun(options: {

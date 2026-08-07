@@ -10,11 +10,23 @@ import {
 } from "../../src/browser/ownedBrowserResources.js";
 import { createRemoteServer } from "../../src/remote/server.js";
 import {
+  createRemoteBrowserExecutor,
+  createRemoteBrowserTransactionExecutor,
+  resumeRemoteBrowserTransaction,
+} from "../../src/remote/client.js";
+import {
   REMOTE_TRANSACTION_PROTOCOL_VERSION,
   type RemoteArtifactDescriptor,
   type RemoteRunPayload,
 } from "../../src/remote/types.js";
 import { testWindowsPrivateTreeAuthority } from "./testTransactionStore.js";
+import {
+  testWindowsPrivateDirectoriesAuthority,
+  testWindowsPrivateFileInitializationAuthority,
+  testWindowsPrivateFileProtectionAuthority,
+  testWindowsPrivateFileVerificationAuthority,
+} from "../privateAuthorityTestHelpers.js";
+import { testProcessIdentityProvider } from "../browser/filesystemLockTestHelpers.js";
 
 export function createTestRemoteServer(
   options: Parameters<typeof createRemoteServer>[0] = {},
@@ -22,7 +34,43 @@ export function createTestRemoteServer(
 ) {
   return createRemoteServer(options, {
     windowsPrivateTreeAuthority: testWindowsPrivateTreeAuthority,
+    windowsPrivateDirectoriesAuthority: testWindowsPrivateDirectoriesAuthority,
+    windowsPrivateFileProtectionAuthority: testWindowsPrivateFileProtectionAuthority,
+    windowsPrivateFileVerificationAuthority: testWindowsPrivateFileVerificationAuthority,
     ...deps,
+    controllerLockDeps: {
+      processIdentityProvider: testProcessIdentityProvider,
+      ...deps.controllerLockDeps,
+    },
+  });
+}
+
+const testArtifactTransferDeps = {
+  windowsPrivateDirectoriesAuthority: testWindowsPrivateDirectoriesAuthority,
+  windowsPrivateFileInitializationAuthority: testWindowsPrivateFileInitializationAuthority,
+  windowsPrivateFileVerificationAuthority: testWindowsPrivateFileVerificationAuthority,
+};
+
+export function createTestRemoteBrowserTransactionExecutor(
+  options: Parameters<typeof createRemoteBrowserTransactionExecutor>[0],
+) {
+  return createRemoteBrowserTransactionExecutor(options, {
+    artifactTransferDeps: testArtifactTransferDeps,
+  });
+}
+
+export function createTestRemoteBrowserExecutor(
+  options: Parameters<typeof createRemoteBrowserExecutor>[0],
+) {
+  return createRemoteBrowserExecutor(options, { artifactTransferDeps: testArtifactTransferDeps });
+}
+
+export function resumeTestRemoteBrowserTransaction(
+  params: Parameters<typeof resumeRemoteBrowserTransaction>[0],
+) {
+  return resumeRemoteBrowserTransaction({
+    ...params,
+    artifactTransferDeps: testArtifactTransferDeps,
   });
 }
 

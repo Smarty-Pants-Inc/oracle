@@ -23,7 +23,7 @@ import { ensureThinkingTime } from "./actions/thinkingTime.js";
 import { activateDeepResearch } from "./actions/deepResearch.js";
 import { acquireProfileRunLock, type ProfileRunLock } from "./profileState.js";
 import { runProviderSubmissionFlow } from "./providerDomFlow.js";
-import { chatgptDomProvider } from "./providers/index.js";
+import { chatgptDomProvider, createChatgptDomProviderState } from "./providers/index.js";
 import { createConversationUrlMonitor } from "./conversationUrlMonitor.js";
 import { extractStableConversationIdFromUrl as extractConversationIdFromUrl } from "./conversationUrl.js";
 import {
@@ -503,7 +503,7 @@ export async function executeLocalPrompt({
         `Prompt textarea ready (after Deep Research activation, ${prompt.length.toLocaleString()} chars queued)`,
       );
     }
-    const providerState: Record<string, unknown> = {
+    const providerState = createChatgptDomProviderState({
       runtime: Runtime,
       input: Input,
       logger,
@@ -512,7 +512,7 @@ export async function executeLocalPrompt({
       attachmentTimeoutMs: config.attachmentTimeoutMs ?? undefined,
       baselineTurns: dispatchBaselineTurns,
       attachmentNames: attachmentExpectations,
-    };
+    });
     const deepResearchTargetBaseline =
       deepResearch && client ? await captureDeepResearchTargetBaseline(client, logger) : undefined;
     const commitEvidence = await raceWithDisconnect(

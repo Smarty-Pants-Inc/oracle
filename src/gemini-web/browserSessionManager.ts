@@ -10,6 +10,7 @@ import type { SessionBoundChromeClient } from "../browser/chromeSessionTransport
 import type { BrowserRuntimeMetadata } from "../sessionStore.js";
 import {
   LocalOwnedBrowserResourceAuthority,
+  OwnedBrowserResourceTransaction,
   type BrowserCaptureSettlementMode,
 } from "../browser/ownedBrowserResources.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
@@ -30,6 +31,8 @@ export interface GeminiBrowserSession {
   client: SessionBoundChromeClient;
   targetId: string;
   processIdentity: ManualChromeOwner["processIdentity"];
+  resourceOwnerId: string;
+  resourceTransaction: OwnedBrowserResourceTransaction;
   runtime: () => BrowserRuntimeMetadata;
   settle: (
     mode: BrowserCaptureSettlementMode,
@@ -95,12 +98,16 @@ export async function openGeminiBrowserSession(
         }
       : {}),
   });
+  const resourceTransaction = new OwnedBrowserResourceTransaction(
+    resources.transactionAdapters(),
+    resources.runtime(),
+  );
   let owner: ManualChromeOwner | null = null;
   let client: SessionBoundChromeClient | null = null;
   let targetId: string | null = null;
 
   try {
-    const tabLease = await resources.journalAcquisition({
+    const tabLease = await resources.journalAcquisition(resourceTransaction, {
       resource: "tab-lease",
       acquire: () =>
         acquireBrowserTabLease(profileDir, {
@@ -113,7 +120,7 @@ export async function openGeminiBrowserSession(
         }),
       authority: (lease) => lease,
     });
-    owner = await resources.journalAcquisition({
+    owner = await resources.journalAcquisition(resourceTransaction, {
       resource: "chrome-process",
       acquire: () =>
         acquireManualChromeOwner(profileDir, resolvedConfig, logger, purpose, { launchClaim }),
@@ -126,7 +133,7 @@ export async function openGeminiBrowserSession(
     }
     const host = chrome.host ?? "127.0.0.1";
     await tabLease.update({ chromeHost: host, chromePort: chrome.port });
-    const connection = await resources.journalAcquisition({
+    const connection = await resources.journalAcquisition(resourceTransaction, {
       resource: "chrome-target",
       acquire: async () => {
         const opened = await connectWithNewTabWithExactAuthority(
@@ -167,7 +174,7 @@ export async function openGeminiBrowserSession(
       tabUrl: targetMarkerUrl,
     });
   } catch (error) {
-    const cleanup = await resources.settle("abort");
+    const cleanup = await resourceTransaction.settle("abort");
     if (cleanup.status === "pending") {
       throw new BrowserAutomationError(
         `${error instanceof Error ? error.message : String(error)}; Gemini browser cleanup remains retryable: ${cleanup.error}`,
@@ -185,7 +192,10 @@ export async function openGeminiBrowserSession(
   const settle = (
     mode: BrowserCaptureSettlementMode,
     pendingRuntime?: BrowserRuntimeMetadata,
-  ): Promise<BrowserCaptureFinalizationResult> => resources.settle(mode, pendingRuntime);
+  ): Promise<BrowserCaptureFinalizationResult> =>
+    pendingRuntime
+      ? resources.settleResources(mode, pendingRuntime)
+      : resourceTransaction.settle(mode);
 
   return {
     profileDir,
@@ -193,7 +203,9 @@ export async function openGeminiBrowserSession(
     processIdentity: owner.processIdentity,
     client,
     targetId,
-    runtime: () => resources.runtime(),
+    resourceOwnerId,
+    resourceTransaction,
+    runtime: () => resourceTransaction.runtime(),
     settle,
     close: async () => {
       const result = await settle("abort");

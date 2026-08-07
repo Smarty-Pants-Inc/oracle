@@ -1,6 +1,15 @@
 import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
 import type { BrowserRuntimeMetadata } from "../sessionManager.js";
-import type { DurableRemoteAutomationError, RemoteTransactionRecord } from "./transactionModel.js";
+import type {
+  DurableRemoteAutomationError,
+  RemoteMaterializedSettlementAuthorityTransactionRecord,
+  RemotePendingCaptureTransactionRecord,
+  RemoteRecoverableTransactionRecord,
+  RemoteSettlementPendingTransactionRecord,
+  RemoteSettledTransactionRecord,
+  RemoteTerminalTransactionRecord,
+  RemoteTransactionSettlementBinding,
+} from "./transactionModel.js";
 import {
   REMOTE_TRANSACTION_PROTOCOL_VERSION,
   RemoteBrowserAutomationErrorSchema,
@@ -33,16 +42,8 @@ export function projectRemotePublicRuntime(
 }
 
 export function remoteTransactionPayload(
-  record: RemoteTransactionRecord,
+  record: RemotePendingCaptureTransactionRecord,
 ): RemoteRunTransactionPayload {
-  if (
-    !record.result ||
-    !record.runtime ||
-    !Array.isArray(record.artifacts) ||
-    record.state !== "pending"
-  ) {
-    throw new Error("Remote transaction record is not publishable");
-  }
   return RemoteRunTransactionPayloadSchema.parse({
     protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
     transactionToken: record.transactionToken,
@@ -55,11 +56,14 @@ export function remoteTransactionPayload(
 }
 
 export function settlementResponse(
-  record: RemoteTransactionRecord,
+  record: RemoteSettlementPendingTransactionRecord | RemoteSettledTransactionRecord,
   finalization: BrowserCaptureFinalizationResult,
 ): RemoteTransactionSettlementResponse {
   const cleanupStatus = finalization.status === "completed" ? "completed" : "pending";
-  const mode = record.settlementMode ?? record.terminalAudit?.settlementMode;
+  const mode =
+    record.state === "finalized" || record.state === "aborted" || record.state === "failed"
+      ? record.terminalAudit.settlementMode
+      : record.settlementMode;
   if (!mode) throw new Error("Remote settlement response lacks bound mode authority");
   const state = finalization.status === "completed" ? record.state : "pending";
   return RemoteTransactionSettlementResponseSchema.parse({
@@ -79,13 +83,13 @@ export function settlementResponse(
 }
 
 export function settlementBindingResponse(
-  record: RemoteTransactionRecord,
+  record: RemoteTransactionSettlementBinding["record"],
   settlementAuthority: {
     mode: "finalize" | "abort";
     outcome: "bound" | "completed";
-    state: RemoteTransactionRecord["state"];
+    state: RemoteTransactionSettlementBinding["record"]["state"];
   },
-  finalization?: BrowserCaptureFinalizationResult,
+  finalization?: Extract<BrowserCaptureFinalizationResult, { status: "completed" }>,
 ): RemoteSettlementBindResponse {
   const runtime = finalization?.runtime ?? record.runtime;
   if (!runtime) throw new Error("Remote settlement binding lacks durable runtime authority");
@@ -100,9 +104,9 @@ export function settlementBindingResponse(
 }
 
 export function remoteBrowserAutomationError(
-  record: RemoteTransactionRecord,
+  record: RemoteRecoverableTransactionRecord | RemoteTerminalTransactionRecord,
 ): RemoteBrowserAutomationErrorPayload {
-  if (record.error) {
+  if (record.state === "recoverable-error") {
     return projectRemoteBrowserAutomationError(
       record.error,
       record.runtime,
@@ -116,11 +120,8 @@ export function remoteBrowserAutomationError(
 }
 
 export function remotePendingSettlementError(
-  record: RemoteTransactionRecord,
+  record: RemoteMaterializedSettlementAuthorityTransactionRecord,
 ): RemoteBrowserAutomationErrorPayload {
-  if (!record.runtime || !record.settlementMode || record.state === "running") {
-    throw new Error("Remote transaction does not retain bound cleanup authority");
-  }
   return RemoteBrowserAutomationErrorSchema.parse({
     name: "BrowserAutomationError",
     category: "browser-automation",
@@ -135,12 +136,9 @@ export function remotePendingSettlementError(
 }
 
 export function terminalTransactionRetryResponse(
-  record: RemoteTransactionRecord,
+  record: RemoteTerminalTransactionRecord,
 ): Extract<RemoteTransactionRetryResponse, { status: "terminal" }> {
   if (record.state === "finalized" || record.state === "aborted") {
-    if (!record.finalization || record.finalization.status !== "completed") {
-      throw new Error("Terminal remote settlement lacks completed finalization metadata");
-    }
     const error = terminalRemoteBrowserAutomationError(record);
     return parseTerminalRetryResponse({
       status: "terminal",
@@ -155,16 +153,13 @@ export function terminalTransactionRetryResponse(
       },
     });
   }
-  if (record.state === "failed") {
-    const error = terminalRemoteBrowserAutomationError(record);
-    if (!error) throw new Error("Terminal failed transaction lacks redacted error metadata");
-    return parseTerminalRetryResponse({
-      status: "terminal",
-      transactionToken: record.transactionToken,
-      outcome: { state: "failed", error },
-    });
-  }
-  throw new Error("Nonterminal remote transaction cannot produce a terminal retry response");
+  const error = terminalRemoteBrowserAutomationError(record);
+  if (!error) throw new Error("Terminal failed transaction lacks redacted error metadata");
+  return parseTerminalRetryResponse({
+    status: "terminal",
+    transactionToken: record.transactionToken,
+    outcome: { state: "failed", error },
+  });
 }
 
 function parseTerminalRetryResponse(
@@ -207,9 +202,8 @@ function projectRemoteBrowserAutomationError(
 }
 
 function terminalRemoteBrowserAutomationError(
-  record: RemoteTransactionRecord,
+  record: RemoteTerminalTransactionRecord,
 ): RemoteBrowserAutomationErrorPayload | undefined {
-  if (!record.terminalAudit) return undefined;
   const failed = record.state === "failed";
   const abortedFailure =
     record.state === "aborted" &&

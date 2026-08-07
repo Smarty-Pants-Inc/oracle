@@ -22,7 +22,8 @@ export async function acquireExactLocalBrowserTarget({
   logger,
   publishRuntime,
 }: LocalTargetAcquisitionContext): Promise<void> {
-  const { chrome, chromeHost, config, manualLogin, resourceAuthority } = acquisition;
+  const { chrome, chromeHost, config, manualLogin, resourceAuthority, resourceTransaction } =
+    acquisition;
   const endpointAuthority = resourceAuthority.endpointAuthority();
   try {
     if (!endpointAuthority) {
@@ -46,7 +47,7 @@ export async function acquireExactLocalBrowserTarget({
       );
     } else {
       const devtoolsRetries = manualLogin ? 6 : 0;
-      await resourceAuthority.journalAcquisition({
+      await resourceAuthority.journalAcquisition(resourceTransaction, {
         resource: "chrome-target",
         acquire: async () => {
           const opened = await connectWithNewTabWithExactAuthority(

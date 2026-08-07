@@ -11,6 +11,7 @@ import {
 } from "./manualLoginProfile.js";
 import {
   LocalOwnedBrowserResourceAuthority,
+  OwnedBrowserResourceTransaction,
   type LocalOwnedBrowserProcessAuthority,
 } from "./ownedBrowserResources.js";
 import { createChromeProcessLaunchClaim } from "./chromeProcessLaunchClaim.js";
@@ -39,6 +40,7 @@ export interface LocalBrowserAcquisition {
   userDataDir: string;
   effectiveKeepBrowser: boolean;
   resourceAuthority: LocalOwnedBrowserResourceAuthority;
+  resourceTransaction: OwnedBrowserResourceTransaction;
   chrome: ChromeLaunchResult;
   chromeOwnerDisposition: ChromeOwnerDisposition;
   chromeHost: string;
@@ -80,6 +82,7 @@ export async function acquireLocalBrowserResources({
   const leaseId = manualLogin ? randomUUID() : undefined;
   const targetMarkerUrl = `about:blank#oracle-acquisition=${generationId}`;
   let resourceAuthority: LocalOwnedBrowserResourceAuthority | null = null;
+  let resourceTransaction: OwnedBrowserResourceTransaction | null = null;
   let processAuthority: LocalOwnedBrowserProcessAuthority | null = null;
 
   try {
@@ -126,9 +129,13 @@ export async function acquireLocalBrowserResources({
       settleRemainingResources: (mode, runtime) =>
         finalizeRecoveredRuntime(runtime, logger, { ownerId: resourceOwnerId }, mode),
     });
+    resourceTransaction = new OwnedBrowserResourceTransaction(
+      resourceAuthority.transactionAdapters(),
+      resourceAuthority.runtime(),
+    );
 
     if (manualLogin) {
-      await resourceAuthority.journalAcquisition({
+      await resourceAuthority.journalAcquisition(resourceTransaction, {
         resource: "tab-lease",
         acquire: () =>
           acquireBrowserTabLease(userDataDir, {
@@ -143,7 +150,7 @@ export async function acquireLocalBrowserResources({
       });
     }
 
-    processAuthority = await resourceAuthority.journalAcquisition({
+    processAuthority = await resourceAuthority.journalAcquisition(resourceTransaction, {
       resource: "chrome-process",
       acquire: async () => {
         if (config.copyProfileSource) {
@@ -199,16 +206,17 @@ export async function acquireLocalBrowserResources({
       userDataDir,
       effectiveKeepBrowser,
       resourceAuthority,
+      resourceTransaction,
       chrome,
       chromeOwnerDisposition,
       chromeHost,
       tabLease,
     };
   } catch (error) {
-    if (!resourceAuthority) throw error;
+    if (!resourceAuthority || !resourceTransaction) throw error;
     let cleanup: BrowserCaptureFinalizationResult;
     try {
-      cleanup = await resourceAuthority.settle("abort");
+      cleanup = await resourceTransaction.settle("abort");
     } catch (cleanupError) {
       const cleanupMessage =
         cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
@@ -218,7 +226,7 @@ export async function acquireLocalBrowserResources({
         {
           stage: "browser-acquisition",
           code: "local-acquisition-cleanup-pending",
-          runtime: resourceAuthority.runtime(),
+          runtime: resourceTransaction.runtime(),
           cleanupError: cleanupMessage,
         },
         new AggregateError([error, cleanupError], "Local browser acquisition cleanup failed"),

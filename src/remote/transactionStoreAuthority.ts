@@ -14,7 +14,7 @@ import {
 import type {
   WindowsPrivateTreeAuthority,
   WindowsPrivateTreeScope,
-} from "./windowsPrivateTreeAcl.js";
+} from "../windowsPrivateFileAcl.js";
 
 type RemoteTransactionStoreAuthorityOptions = {
   rootAuthority: RemoteTransactionStoreRootAuthority;

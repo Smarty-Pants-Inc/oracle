@@ -5,10 +5,8 @@ import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile, stat } from "node:fs/promises";
 import { RemoteArtifactStore } from "../../src/remote/artifactStore.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
-import {
-  createRemoteBrowserTransactionExecutor,
-  settleRemoteBrowserRecovery,
-} from "../../src/remote/client.js";
+import type { DurableRemoteArtifactRegistration } from "../../src/remote/transactionModel.js";
+import { settleRemoteBrowserRecovery } from "../../src/remote/client.js";
 import type { BrowserLogger, BrowserRunTransaction } from "../../src/browser/types.js";
 import {
   resumeBrowserSession,
@@ -16,7 +14,10 @@ import {
   type retryBrowserRecoveryCleanup,
 } from "../../src/browser/reattach.js";
 import type { BrowserSessionConfig } from "../../src/sessionManager.js";
-import { REMOTE_TRANSACTION_PROTOCOL_VERSION } from "../../src/remote/types.js";
+import {
+  MAX_REMOTE_ATTACHMENTS,
+  REMOTE_TRANSACTION_PROTOCOL_VERSION,
+} from "../../src/remote/types.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
 import {
@@ -36,6 +37,8 @@ import { completedBrowserCaptureCleanup } from "../../src/browser/ownedBrowserRe
 import {
   CAN_LISTEN_LOCALHOST,
   createTestRemoteServer,
+  createTestRemoteBrowserTransactionExecutor as createRemoteBrowserTransactionExecutor,
+  browserTransaction,
   committedPromptEpoch,
   lifecycleBrowserTransaction,
 } from "./serverTestBuilders.js";
@@ -45,8 +48,13 @@ import {
   remoteRecoveryTransactionToken,
   seedRemoteTransaction,
 } from "./serverTestTransactions.js";
-import { openTestRemoteTransactionStore } from "./testTransactionStore.js";
+import {
+  createTestRemoteArtifactStore,
+  openTestRemoteTransactionStore,
+} from "./testTransactionStore.js";
 import { processIdentity } from "../browser/chromeLifecycleTestHelpers.js";
+import { testWindowsPrivateDirectoryAuthority } from "../privateAuthorityTestHelpers.js";
+import { testProcessIdentityProvider } from "../browser/filesystemLockTestHelpers.js";
 
 describe("remote browser service", { timeout: 15_000 }, () => {
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
@@ -446,6 +454,228 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     15_000,
   );
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "publishes recovered text without recapture when artifact staging falls back",
+    async () => {
+      const scenarios = [
+        {
+          name: "33 recovered files",
+          mode: "attachment-limit",
+          tokenDigit: "4",
+          fileCount: MAX_REMOTE_ATTACHMENTS + 1,
+        },
+        {
+          name: "artifact preparation failure",
+          mode: "preparation",
+          tokenDigit: "5",
+          fileCount: 1,
+        },
+        {
+          name: "artifact manifest enrichment failure",
+          mode: "enrichment",
+          tokenDigit: "6",
+          fileCount: 1,
+        },
+      ] as const;
+
+      for (const scenario of scenarios) {
+        const tmpDir = await mkdtemp(
+          path.join(os.tmpdir(), `oracle-remote-recovered-${scenario.mode}-`),
+        );
+        const transactionStoreDir = path.join(tmpDir, "transactions");
+        const transactionToken = scenario.tokenDigit.repeat(64);
+        const runId = `run-${transactionToken.slice(0, 8)}`;
+        const prompt = `recover with ${scenario.name}`;
+        const runtime: BrowserRunTransaction["runtime"] = {
+          conversationId: "remote-conversation",
+          promptEpoch: committedPromptEpoch(prompt),
+          recoveryCleanupResources: [
+            {
+              conversationId: "remote-conversation",
+              promptEpoch: committedPromptEpoch(prompt),
+              recoveryCleanup: {
+                ownsTarget: false,
+                profileKind: "none",
+                keepBrowser: true,
+              },
+            },
+          ],
+        };
+        const seeded = await openTestRemoteTransactionStore({
+          directory: transactionStoreDir,
+          integrityKeyPath: path.join(
+            path.dirname(transactionStoreDir),
+            ".remote-transaction-integrity.key",
+          ),
+          controllerGeneration: `seed-${scenario.mode}`,
+        });
+        await seedRemoteTransaction(seeded, transactionToken, {
+          prompt,
+          state: "recoverable-error",
+          runtime,
+        });
+
+        const originalStageCapture = RemoteTransactionStore.prototype.stageCapture;
+        const stageCapture = vi
+          .spyOn(RemoteTransactionStore.prototype, "stageCapture")
+          .mockImplementation(function (
+            this: RemoteTransactionStore,
+            params: Parameters<RemoteTransactionStore["stageCapture"]>[0],
+          ) {
+            if (scenario.mode === "enrichment" && params.artifacts?.length) {
+              return Promise.reject(new Error("simulated recovered manifest enrichment failure"));
+            }
+            return originalStageCapture.call(this, params);
+          });
+        const prepareArtifacts = vi.spyOn(
+          RemoteArtifactStore.prototype,
+          "prepareRequiredArtifacts",
+        );
+        if (scenario.mode === "preparation") {
+          prepareArtifacts.mockRejectedValueOnce(
+            new Error("simulated recovered artifact preparation failure"),
+          );
+        } else if (scenario.mode === "enrichment") {
+          const registration = {
+            descriptor: {
+              artifactId: "recovered-artifact",
+              runId,
+              kind: "file",
+              filename: "recovered.zip",
+              byteSize: 1,
+              sha256: "0".repeat(64),
+              sourceUrlKind: "sandbox",
+              transferStatus: "ready",
+              required: true,
+            },
+            transactionToken,
+            canonicalPath: path.join(tmpDir, "recovered.zip"),
+            fileIdentity: {
+              device: "1",
+              inode: "1",
+              birthtimeNs: "1",
+              ctimeNs: "1",
+            },
+          } satisfies DurableRemoteArtifactRegistration;
+          prepareArtifacts.mockResolvedValueOnce([registration]);
+        }
+
+        const resumeBrowser = vi.fn(async () => {
+          const recovered = browserTransaction(
+            prompt,
+            {
+              answerText: `recovered answer for ${scenario.name}`,
+              answerMarkdown: `recovered answer for ${scenario.name}`,
+              tookMs: 1,
+              answerTokens: 4,
+              answerChars: `recovered answer for ${scenario.name}`.length,
+              savedFiles: Array.from({ length: scenario.fileCount }, (_, index) => ({
+                kind: "file" as const,
+                path: path.join(tmpDir, `recovered-${index}.zip`),
+                label: `recovered-${index}.zip`,
+                mimeType: "application/zip",
+                sizeBytes: 1,
+                sourceUrl: `sandbox:/mnt/data/recovered-${index}.zip`,
+                url: "browser-download",
+                finalUrl: "browser-download",
+                filename: `recovered-${index}.zip`,
+              })),
+            },
+            runtime,
+          );
+          return {
+            ...recovered,
+            releaseSettlementLock: vi.fn(async () => undefined),
+          };
+        });
+        const server = await createTestRemoteServer(
+          { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
+          {
+            transactionStoreDir,
+            controllerGeneration: `recover-${scenario.mode}`,
+            resumeBrowser,
+          },
+        );
+
+        try {
+          const retry = await httpPostJson({
+            hostname: "127.0.0.1",
+            port: server.port,
+            path: `/transactions/${transactionToken}/retry`,
+            token: "a".repeat(64),
+            body: {},
+          });
+          expect(retry).toMatchObject({
+            statusCode: 200,
+            json: {
+              status: "transaction",
+              transaction: {
+                state: "pending",
+                result: {
+                  answerText: `recovered answer for ${scenario.name}`,
+                  warnings: [
+                    {
+                      code: "remote-artifact-manual-copy-required",
+                      severity: "warning",
+                      message:
+                        "Oracle captured the browser text response, but automatic artifact transfer could not be completed. Open the ChatGPT conversation on the remote browser host and copy the generated files manually; no local artifact delivery is claimed.",
+                    },
+                  ],
+                },
+                artifacts: [],
+              },
+            },
+          });
+          const record = await readAuthenticatedTransactionRecord(
+            transactionStoreDir,
+            transactionToken,
+          );
+          expect(record).toMatchObject({
+            state: "pending",
+            result: { answerText: `recovered answer for ${scenario.name}` },
+            artifacts: [],
+          });
+          expect(record).not.toHaveProperty("stagedCapture");
+
+          await expect(
+            httpPostJson({
+              hostname: "127.0.0.1",
+              port: server.port,
+              path: `/transactions/${transactionToken}/retry`,
+              token: "a".repeat(64),
+              body: {},
+            }),
+          ).resolves.toMatchObject({
+            statusCode: 200,
+            json: { status: "transaction", transaction: { state: "pending", artifacts: [] } },
+          });
+          expect(resumeBrowser).toHaveBeenCalledOnce();
+          if (scenario.mode === "attachment-limit") {
+            expect(prepareArtifacts).not.toHaveBeenCalled();
+          } else {
+            expect(prepareArtifacts).toHaveBeenCalledOnce();
+          }
+
+          await expect(
+            httpPostJson({
+              hostname: "127.0.0.1",
+              port: server.port,
+              path: `/transactions/${transactionToken}/finalize`,
+              token: "a".repeat(64),
+              body: { durablePublication: true },
+            }),
+          ).resolves.toMatchObject({ statusCode: 200, json: { state: "finalized" } });
+        } finally {
+          prepareArtifacts.mockRestore();
+          stageCapture.mockRestore();
+          await server.close();
+          await rm(tmpDir, { recursive: true, force: true });
+        }
+      }
+    },
+    15_000,
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "releases the real recovery lock after publication failure and reacquires it on retry",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-recovery-lock-"));
@@ -481,7 +711,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         state: "running",
         runtime,
       });
-      const seededArtifacts = new RemoteArtifactStore({
+      const seededArtifacts = createTestRemoteArtifactStore({
         transactionStore: seeded,
         sessionsRoot: path.join(tmpDir, "sessions"),
       });
@@ -489,7 +719,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         transactionToken,
         runId: `run-${transactionToken.slice(0, 8)}`,
       });
-      const lockAuthority = await establishPrivateRuntimeAuthority({ tempDirectory: tmpDir });
+      const lockAuthority = await establishPrivateRuntimeAuthority({
+        tempDirectory: tmpDir,
+        windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+      });
       const recoveryLockPath = path.join(lockAuthority.path, "browser-recovery.lock");
       const recoverSession = vi.fn(async (recoveryRuntime: BrowserRunTransaction["runtime"]) => ({
         answerText: "recovered after lock release",
@@ -508,7 +741,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           await resumeBrowserSession(recoveryRuntime, browserConfig, logger, {
             ...deps,
             recoveryLockPath,
-            acquireRecoveryLock: (lockPath) => acquireReattachRecoveryLock(lockPath, lockAuthority),
+            acquireRecoveryLock: (lockPath) =>
+              acquireReattachRecoveryLock(lockPath, lockAuthority, {
+                processIdentityProvider: testProcessIdentityProvider,
+              }),
             recoverSession,
             persistFinalizationResult: async (result) => result,
             completeFinalizationAfterLockRelease: async (result) => result,
@@ -555,9 +791,11 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         });
         expect(resumeBrowser).toHaveBeenCalledTimes(2);
         expect(recoverSession).toHaveBeenCalledTimes(2);
-        await expect(acquireReattachRecoveryLock(recoveryLockPath, lockAuthority)).rejects.toThrow(
-          /already in progress/i,
-        );
+        await expect(
+          acquireReattachRecoveryLock(recoveryLockPath, lockAuthority, {
+            processIdentityProvider: testProcessIdentityProvider,
+          }),
+        ).rejects.toThrow(/already in progress/i);
 
         await expect(
           httpPostJson({
@@ -568,7 +806,9 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             body: { durablePublication: true },
           }),
         ).resolves.toMatchObject({ statusCode: 200, json: { state: "finalized" } });
-        const reacquired = await acquireReattachRecoveryLock(recoveryLockPath, lockAuthority);
+        const reacquired = await acquireReattachRecoveryLock(recoveryLockPath, lockAuthority, {
+          processIdentityProvider: testProcessIdentityProvider,
+        });
         await reacquired.release();
       } finally {
         stageCapture.mockRestore();
@@ -850,7 +1090,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         state: "running",
         runtime: preIntent,
       });
-      const seededArtifacts = new RemoteArtifactStore({
+      const seededArtifacts = createTestRemoteArtifactStore({
         transactionStore: previousController,
         sessionsRoot: path.join(tmpDir, "sessions"),
       });
@@ -1086,7 +1326,10 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const transactionStoreDir = path.join(tmpDir, "transactions");
       const temporaryProfileAuthority = await createTemporaryProfileAuthority(
         "oracle-browser-remote-restart-",
-        { tempDirectory: tmpDir },
+        {
+          tempDirectory: tmpDir,
+          windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+        },
       );
       const profileDir = temporaryProfileAuthority.profileDirectory.canonicalPath;
       const profileDirectory = temporaryProfileAuthority.profileDirectory;

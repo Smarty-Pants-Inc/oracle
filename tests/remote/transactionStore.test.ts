@@ -23,7 +23,7 @@ import {
 import { remoteTransactionIntegrityKeyId } from "../../src/remote/transactionRecordEnvelope.js";
 import { retireRemoteTransactionHeadAuthority } from "../../src/remote/transactionRecordStorage.js";
 import { remoteTransactionHeadDirectory } from "../../src/remote/transactionStoreRoot.js";
-import type { WindowsPrivateTreeScope } from "../../src/remote/windowsPrivateTreeAcl.js";
+import type { WindowsPrivateTreeScope } from "../../src/windowsPrivateFileAcl.js";
 import { processIdentity } from "../browser/chromeLifecycleTestHelpers.js";
 import {
   openTestRemoteTransactionStore,

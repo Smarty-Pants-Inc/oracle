@@ -2,13 +2,20 @@ import { createHash } from "node:crypto";
 import { describe, expect, test, vi } from "vitest";
 import { unpublishedCleanupPendingError } from "../../src/browser/archiveSettlementCoordinator.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
-import { chatgptDomProvider } from "../../src/browser/providers/chatgptDomProvider.js";
-import { geminiDeepThinkDomProvider } from "../../src/browser/providers/geminiDeepThinkDomProvider.js";
+import {
+  chatgptDomProvider,
+  createChatgptDomProviderState,
+  type ChatgptDomAdapter,
+} from "../../src/browser/providers/chatgptDomProvider.js";
+import {
+  createGeminiDeepThinkDomProviderState,
+  geminiDeepThinkDomProvider,
+} from "../../src/browser/providers/geminiDeepThinkDomProvider.js";
 import {
   reconcilePendingPromptObservations,
   type DomEvaluate,
   type PendingPromptObservation,
-  type ProviderDomAdapter,
+  type PendingPromptEpochAuthority,
 } from "../../src/browser/providerDomFlow.js";
 import { resumeBrowserSession, settleBrowserRecoveryCleanup } from "../../src/browser/reattach.js";
 import { resolvePendingPromptEpochAuthority } from "../../src/browser/reattachability.js";
@@ -95,9 +102,10 @@ function committedVerification() {
 }
 
 function pendingProvider(
-  reconcile: NonNullable<ProviderDomAdapter["reconcilePendingPrompt"]>,
-): ProviderDomAdapter {
+  reconcile: NonNullable<ChatgptDomAdapter["reconcilePendingPrompt"]>,
+): ChatgptDomAdapter {
   return {
+    provider: "chatgpt",
     providerName: "pending-test-provider",
     waitForUi: vi.fn(async () => undefined),
     typePrompt: vi.fn(async () => undefined),
@@ -113,8 +121,9 @@ function pendingProvider(
 function attachedClient() {
   const evaluate = vi.fn(async ({ expression }: { expression: string }) => ({
     result: {
-      value:
-        expression === "location.href"
+      value: expression.includes("const clearEditable =")
+        ? { cleared: true, remaining: [] }
+        : expression === "location.href"
           ? `https://chatgpt.com/c/${CONVERSATION_ID}`
           : expression === "1+1"
             ? 2
@@ -133,7 +142,7 @@ function attachedClient() {
 }
 
 async function resumePending(options: {
-  provider: ProviderDomAdapter;
+  provider: ChatgptDomAdapter;
   runtimeHintCb?: (runtime: BrowserRuntimeMetadata) => Promise<void>;
 }) {
   const runtime = pendingRuntime();
@@ -142,7 +151,7 @@ async function resumePending(options: {
   const result = await resumeBrowserSession(runtime, { timeoutMs: 2_000 }, createBrowserLogger(), {
     sessionId: OWNER_ID,
     pendingPromptCandidates: [PROMPT],
-    pendingPromptProvider: options.provider,
+    pendingPromptProviders: { chatgpt: options.provider },
     runtimeHintCb: options.runtimeHintCb ?? vi.fn(async () => undefined),
     acquireRecoveryLock: vi.fn(async () => ({ release })),
     listTargets: vi.fn(async () => [
@@ -219,6 +228,11 @@ describe("pending prompt epoch restart reconciliation", () => {
     });
 
     expect(provider.submitPrompt).not.toHaveBeenCalled();
+    expect(
+      client.Runtime.evaluate.mock.calls.some(([{ expression }]) =>
+        expression.includes("const clearEditable ="),
+      ),
+    ).toBe(false);
     expect(result.answerMarkdown).toBe("Recovered answer");
     expect(result.runtime.promptEpoch).toMatchObject({
       status: "committed",
@@ -279,12 +293,23 @@ describe("pending prompt epoch restart reconciliation", () => {
   test("replays once only after exact non-commit proof", async () => {
     const provider = pendingProvider(vi.fn(async () => ({ status: "not-committed" as const })));
 
-    const { result } = await resumePending({ provider });
+    const { result, client } = await resumePending({ provider });
 
     expect(provider.waitForUi).toHaveBeenCalledOnce();
     expect(provider.typePrompt).toHaveBeenCalledOnce();
     expect(provider.submitPrompt).toHaveBeenCalledOnce();
     expect(provider.submitPrompt).toHaveBeenCalledWith(expect.objectContaining({ prompt: PROMPT }));
+    expect(
+      client.Runtime.evaluate.mock.calls.filter(([{ expression }]) =>
+        expression.includes("const clearEditable ="),
+      ),
+    ).toHaveLength(1);
+    const clearCallIndex = client.Runtime.evaluate.mock.calls.findIndex(([{ expression }]) =>
+      expression.includes("const clearEditable ="),
+    );
+    expect(client.Runtime.evaluate.mock.invocationCallOrder[clearCallIndex]).toBeLessThan(
+      vi.mocked(provider.submitPrompt).mock.invocationCallOrder[0]!,
+    );
     expect(result.runtime.promptEpoch).toMatchObject({
       status: "committed",
       epochId: "pending-epoch",
@@ -375,28 +400,32 @@ describe("pending prompt epoch restart reconciliation", () => {
     expect(release).toHaveBeenCalledOnce();
   });
 
-  test.each([
-    ["ChatGPT", chatgptDomProvider, {}],
-    ["Gemini", geminiDeepThinkDomProvider, { geminiConversationId: CONVERSATION_ID }],
-  ])("%s adapter reconciles stable exact provider observations", async (_name, provider, state) => {
+  test("ChatGPT and Gemini adapters reconcile exact provider-bound observations", async () => {
     const exactObservation = observation();
-    const evaluations: string[] = [];
-    const evaluate: DomEvaluate = async <T>(expression: string) => {
-      evaluations.push(expression);
-      if (!expression.includes("oracle-pending-prompt-reconciliation")) {
-        throw new Error("Expected a pending prompt reconciliation expression.");
-      }
+    const authority: PendingPromptEpochAuthority = {
+      promptSha256: PROMPT_SHA256,
+      baselineTurns: 0,
+      conversationId: CONVERSATION_ID,
+    };
+    const chatgptEvaluations: string[] = [];
+    const chatgptEvaluate: DomEvaluate = async <T>(expression: string) => {
+      chatgptEvaluations.push(expression);
       return exactObservation as T;
     };
-
     await expect(
-      provider.reconcilePendingPrompt?.(
-        { evaluate, delay: vi.fn(async () => undefined), state },
+      chatgptDomProvider.reconcilePendingPrompt?.(
         {
-          promptSha256: PROMPT_SHA256,
-          baselineTurns: 0,
-          conversationId: CONVERSATION_ID,
+          evaluate: chatgptEvaluate,
+          delay: vi.fn(async () => undefined),
+          state: createChatgptDomProviderState({
+            runtime: {} as ChromeClient["Runtime"],
+            input: {} as ChromeClient["Input"],
+            logger: createBrowserLogger(),
+            timeoutMs: 2_000,
+            baselineTurns: 0,
+          }),
         },
+        authority,
       ),
     ).resolves.toMatchObject({
       status: "committed",
@@ -405,6 +434,59 @@ describe("pending prompt epoch restart reconciliation", () => {
         verifiedUserMessageId: "prompt-message",
       },
     });
-    expect(evaluations).toHaveLength(2);
+
+    const geminiEvaluations: string[] = [];
+    const geminiEvaluate: DomEvaluate = async <T>(expression: string) => {
+      geminiEvaluations.push(expression);
+      return JSON.stringify({
+        ready: true,
+        composerText: "",
+        canSubmit: false,
+        active: false,
+        entries: [
+          { kind: "user", text: PROMPT, stableId: "prompt-turn" },
+          {
+            kind: "response",
+            text: "Recovered answer",
+            stableId: "answer-turn",
+            completionMarked: true,
+            visibleSpinner: false,
+          },
+        ],
+      }) as T;
+    };
+    await expect(
+      geminiDeepThinkDomProvider.reconcilePendingPrompt?.(
+        {
+          evaluate: geminiEvaluate,
+          delay: vi.fn(async () => undefined),
+          state: createGeminiDeepThinkDomProviderState({
+            geminiConversationId: CONVERSATION_ID,
+          }),
+        },
+        authority,
+      ),
+    ).resolves.toMatchObject({
+      status: "committed",
+      verification: {
+        verifiedUserTurnId: "prompt-turn",
+        verifiedUserMessageId: "prompt-turn",
+      },
+    });
+    expect(chatgptEvaluations).toHaveLength(2);
+    expect(geminiEvaluations).toHaveLength(2);
+    expect(
+      chatgptEvaluations.every((expression) =>
+        expression.includes("oracle-pending-prompt-reconciliation"),
+      ),
+    ).toBe(true);
+    expect(
+      geminiEvaluations.every(
+        (expression) =>
+          expression.includes("oracle-gemini-conversation-snapshot") &&
+          expression.includes("model-response") &&
+          expression.includes("message-content"),
+      ),
+    ).toBe(true);
   });
 });

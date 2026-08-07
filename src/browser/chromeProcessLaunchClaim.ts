@@ -14,7 +14,7 @@ export interface ChromeProcessLaunchClaim {
 }
 
 export function createChromeProcessLaunchClaim(
-  generationId = randomUUID(),
+  generationId: string = randomUUID(),
 ): ChromeProcessLaunchClaim {
   const claim = parseChromeProcessLaunchClaim({ version: 1, generationId, nonce: randomUUID() });
   if (!claim) throw new Error("Chrome launch claim generation must be a UUID v4");

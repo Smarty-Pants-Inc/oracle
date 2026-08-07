@@ -19,6 +19,8 @@ import {
   withCommittedPromptEpoch,
   withRecoveryCleanup,
 } from "./reattachTestHelpers.js";
+import { testWindowsPrivateDirectoryAuthority } from "../privateAuthorityTestHelpers.js";
+import { testProcessIdentityProvider } from "./filesystemLockTestHelpers.js";
 
 describe("remote recovery cleanup", { timeout: 15_000 }, () => {
   const { finalizeRecoveredRuntime } = __test__;
@@ -240,10 +242,16 @@ describe("remote recovery cleanup", { timeout: 15_000 }, () => {
 
   test("retries no-target cleanup through exact endpoint shutdown under the recovery lock", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "oracle-recovery-retry-test-"));
-    const lockAuthority = await establishPrivateRuntimeAuthority({ tempDirectory: root });
+    const lockAuthority = await establishPrivateRuntimeAuthority({
+      tempDirectory: root,
+      windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+    });
     const temporaryProfileAuthority = await createTemporaryProfileAuthority(
       "oracle-browser-retry-cleanup-",
-      { tempDirectory: root },
+      {
+        tempDirectory: root,
+        windowsPrivateDirectoryAuthority: testWindowsPrivateDirectoryAuthority,
+      },
     );
     const profileDir = temporaryProfileAuthority.profileDirectory.canonicalPath;
     const processIdentity = await physicalChromeProcessIdentity(profileDir);
@@ -273,7 +281,10 @@ describe("remote recovery cleanup", { timeout: 15_000 }, () => {
         createBrowserLogger(),
         {
           recoveryLockPath: path.join(lockAuthority.path, "browser-recovery.lock"),
-          acquireRecoveryLock: (lockPath) => acquireReattachRecoveryLock(lockPath, lockAuthority),
+          acquireRecoveryLock: (lockPath) =>
+            acquireReattachRecoveryLock(lockPath, lockAuthority, {
+              processIdentityProvider: testProcessIdentityProvider,
+            }),
           recoveryCleanup: {
             ...authenticatedLocalTargetCleanupDeps({
               kill: (_profileDir, pid) => {
@@ -431,12 +442,16 @@ describe("remote recovery cleanup", { timeout: 15_000 }, () => {
     );
     const processIdentity = await physicalChromeProcessIdentity(profileDir);
     try {
-      const lease = await acquireBrowserTabLease(profileDir, {
-        maxConcurrentTabs: 1,
-        timeoutMs: 500,
-        sessionId: "test-owner",
-        generationId: "missing-lease-replay-generation",
-      });
+      const lease = await acquireBrowserTabLease(
+        profileDir,
+        {
+          maxConcurrentTabs: 1,
+          timeoutMs: 500,
+          sessionId: "test-owner",
+          generationId: "missing-lease-replay-generation",
+        },
+        testProcessIdentityProvider,
+      );
       const staleRuntime = withRecoveryCleanup(
         { chromePort: 9222, userDataDir: profileDir, chromeProcessIdentity: processIdentity },
         {

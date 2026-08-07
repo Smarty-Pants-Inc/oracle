@@ -6,19 +6,109 @@ import { BrowserAutomationError } from "../oracle/errors.js";
 import type {
   BrowserRemotePromptRequestIdentity,
   BrowserRuntimeMetadata,
+  SessionArtifact,
 } from "../sessionManager.js";
-import type { DurableRemoteAutomationError } from "./transactionModel.js";
-import { RemotePublicRunResultSchema, type RemotePublicRunResult } from "./types.js";
+import type { RemoteArtifactStore } from "./artifactStore.js";
+import type {
+  DurableRemoteArtifactRegistration,
+  DurableRemoteAutomationError,
+  RemoteTransactionRecord,
+} from "./transactionModel.js";
+import type { RemoteTransactionStore } from "./transactionStore.js";
+import {
+  MAX_REMOTE_ATTACHMENTS,
+  RemotePublicRunResultSchema,
+  type RemotePublicRunResult,
+} from "./types.js";
 
 export type RecoveredBrowserRunTransaction = BrowserRunTransaction &
   Pick<ReattachResult, "releaseSettlementLock">;
 
-export function remoteArtifactManualCopyWarning(message: string) {
+const remoteArtifactManualCopyWarningCode = "remote-artifact-manual-copy-required";
+const remoteArtifactManualCopyWarningMessage =
+  "Oracle captured the browser text response, but automatic artifact transfer could not be completed. Open the ChatGPT conversation on the remote browser host and copy the generated files manually; no local artifact delivery is claimed.";
+
+export function remoteArtifactManualCopyWarning() {
   return {
-    code: "remote-artifact-manual-copy-required",
+    code: remoteArtifactManualCopyWarningCode,
     severity: "warning" as const,
-    message,
+    message: remoteArtifactManualCopyWarningMessage,
   };
+}
+
+export interface RemoteCaptureArtifactFallback {
+  stage: "attachment-limit" | "preparation" | "enrichment";
+  error?: unknown;
+}
+
+export interface StagedRemoteCapture {
+  record: RemoteTransactionRecord;
+  artifactFallback?: RemoteCaptureArtifactFallback;
+}
+
+export async function stageRemoteCaptureWithArtifactFallback(params: {
+  transactionStore: Pick<RemoteTransactionStore, "stageCapture">;
+  artifactStore: Pick<RemoteArtifactStore, "prepareRequiredArtifacts">;
+  transactionToken: string;
+  runId: string;
+  result: BrowserRunResult;
+  runtime: BrowserRuntimeMetadata;
+}): Promise<StagedRemoteCapture> {
+  const fileArtifacts: SessionArtifact[] = [
+    ...(params.result.savedFiles ?? []),
+    ...(params.result.artifacts ?? []).filter((artifact) => artifact.kind === "file"),
+  ];
+  const stage = async (
+    result: RemotePublicRunResult,
+    artifacts?: DurableRemoteArtifactRegistration[],
+  ): Promise<RemoteTransactionRecord> =>
+    await params.transactionStore.stageCapture({
+      transactionToken: params.transactionToken,
+      runId: params.runId,
+      result,
+      runtime: params.runtime,
+      modelSelection: params.result.modelSelection,
+      artifacts,
+    });
+  const stageFallback = async (
+    artifactFallback: RemoteCaptureArtifactFallback,
+  ): Promise<StagedRemoteCapture> => ({
+    record: await stage(
+      projectRemotePublicResult({
+        ...params.result,
+        warnings: [...(params.result.warnings ?? []), remoteArtifactManualCopyWarning()].slice(-64),
+      }),
+      [],
+    ),
+    artifactFallback,
+  });
+
+  const publicResult = projectRemotePublicResult(params.result);
+  if (fileArtifacts.length === 0) return { record: await stage(publicResult, []) };
+  if (fileArtifacts.length > MAX_REMOTE_ATTACHMENTS) {
+    return await stageFallback({ stage: "attachment-limit" });
+  }
+
+  await stage(publicResult);
+  let registrations: DurableRemoteArtifactRegistration[];
+  try {
+    registrations = await params.artifactStore.prepareRequiredArtifacts({
+      transactionToken: params.transactionToken,
+      runId: params.runId,
+      artifacts: fileArtifacts,
+    });
+    if (registrations.length > MAX_REMOTE_ATTACHMENTS) {
+      throw new Error("Remote artifact manifest exceeds the public transaction limit");
+    }
+  } catch (error) {
+    return await stageFallback({ stage: "preparation", error });
+  }
+
+  try {
+    return { record: await stage(publicResult, registrations) };
+  } catch (error) {
+    return await stageFallback({ stage: "enrichment", error });
+  }
 }
 
 export function assertBrowserRunTransaction(
@@ -163,14 +253,20 @@ export function projectRemotePublicResult(result: BrowserRunResult): RemotePubli
         }
       : undefined,
     modelSelection: result.modelSelection,
-    warnings: result.warnings?.map((warning) => ({
-      code:
+    warnings: result.warnings?.map((warning) => {
+      const code =
         warning.code && /^[A-Za-z0-9_-]{1,128}$/u.test(warning.code)
           ? warning.code
-          : "remote-host-warning",
-      severity: warning.severity,
-      message: "Remote browser host reported a warning.",
-    })),
+          : "remote-host-warning";
+      return {
+        code,
+        severity: warning.severity,
+        message:
+          code === remoteArtifactManualCopyWarningCode
+            ? remoteArtifactManualCopyWarningMessage
+            : "Remote browser host reported a warning.",
+      };
+    }),
     tookMs: result.tookMs,
     answerTokens: result.answerTokens,
     answerChars: result.answerText.length,

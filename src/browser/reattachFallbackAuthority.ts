@@ -4,6 +4,7 @@ import type { ChromeLaunchResult, RetainedChromeEndpointAuthority } from "./chro
 import { settleManualChromeOwner, type ManualChromeOwner } from "./manualChromeOwner.js";
 import {
   LocalOwnedBrowserResourceAuthority,
+  OwnedBrowserResourceTransaction,
   type BrowserCaptureSettlementMode,
   type LocalOwnedBrowserAcquisitionStep,
   type LocalOwnedBrowserProcessSettlement,
@@ -38,6 +39,7 @@ export interface ReattachFallbackAuthorityOptions {
 
 export class ReattachFallbackAuthority {
   private readonly resources: LocalOwnedBrowserResourceAuthority;
+  private readonly transaction: OwnedBrowserResourceTransaction;
 
   constructor(options: ReattachFallbackAuthorityOptions) {
     const ownerId = options.ownerId.trim();
@@ -128,10 +130,14 @@ export class ReattachFallbackAuthority {
           mode,
         ),
     });
+    this.transaction = new OwnedBrowserResourceTransaction(
+      this.resources.transactionAdapters(),
+      this.resources.runtime(),
+    );
   }
 
   journalAcquisition<T>(step: LocalOwnedBrowserAcquisitionStep<T>): Promise<T> {
-    return this.resources.journalAcquisition(step);
+    return this.resources.journalAcquisition(this.transaction, step);
   }
 
   lease(): BrowserTabLease | null {
@@ -151,10 +157,10 @@ export class ReattachFallbackAuthority {
   }
 
   runtime(): BrowserRuntimeMetadata {
-    return this.resources.runtime();
+    return this.transaction.runtime();
   }
 
   settle(mode: BrowserCaptureSettlementMode): Promise<ReattachFinalizationResult> {
-    return this.resources.settle(mode);
+    return this.transaction.settle(mode);
   }
 }

@@ -454,19 +454,19 @@ function convergeRemoteSettlementAuthority(
   runtime: BrowserRuntimeMetadata,
   authority: RemoteSettlementAuthority,
 ): BrowserRuntimeMetadata {
+  const unboundRuntime = { ...runtime };
+  delete unboundRuntime.recoveryCleanupResult;
   if (authority.outcome === "completed") {
     const resourceRuntime = projectRemoteRecoveryRuntime(
       { cleanup: { status: "completed" } },
       null,
     );
     return projectBrowserCaptureFinalization(
-      runtime,
+      unboundRuntime,
       { status: "completed", runtime: resourceRuntime },
       authority.mode,
     ).runtime;
   }
-  const unboundRuntime = { ...runtime };
-  delete unboundRuntime.recoveryCleanupResult;
   return markBrowserCaptureCleanupPending(unboundRuntime, authority.mode);
 }
 

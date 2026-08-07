@@ -207,12 +207,17 @@ describe("bridge connection artifact privacy", () => {
       "-NonInteractive",
       "-EncodedCommand",
     ]);
-    expect(script).toContain("$CreateNew = $true");
+    expect(script).toContain("New-PrivateFile $FilePath $false");
     expect(script).toContain("[System.IO.FileMode]::CreateNew");
     expect(script).toContain("[System.IO.FileShare]::None");
-    expect(script).toMatch(/\[System\.IO\.FileStream\]::new\([\s\S]*?\$ExpectedAcl\s*\)/u);
+    expect(script).toMatch(
+      /\[System\.IO\.FileStream\]::new\([\s\S]*?\(New-PrivateAcl \$false\)\s*\)/u,
+    );
+    expect(script).not.toContain("Set-CanonicalPrivateAcl");
+    expect(script).not.toContain("Establish-PrivateDirectory");
+    expect(script).not.toContain(".SetAccessControl(");
 
-    const execute = vi.fn(async () => ({ stdout: "oracle.private-file.v1:complete" }));
+    const execute = vi.fn(async () => ({ stdout: "oracle.windows-private-file.v1:created" }));
     await expect(applyWindowsPrivateFileAcl(request, execute)).resolves.toBeUndefined();
     expect(execute).toHaveBeenCalledWith(command.file, command.args, command.options);
   });
@@ -318,83 +323,86 @@ describe("bridge connection artifact privacy", () => {
     }
   }, 60_000);
 
-  it.runIf(process.platform === "win32")(
-    "creates the temporary Windows credential with its exact ACL and leaves the inherited parent unchanged",
-    async () => {
-      const fixture = await createSiblingFixture();
-      await addWindowsParentReadInheritance(fixture.root);
-      const [parentAclBefore, ordinaryAclBefore, predecessorAcl] = await readWindowsAclSnapshots([
-        fixture.root,
-        fixture.ordinaryPath,
-        fixture.artifactPath,
-      ]);
-      expect(parentAclBefore?.everyoneRuleCount).toBeGreaterThan(0);
-      expect(predecessorAcl?.protected).toBe(false);
-      const ordinaryBefore = await captureEntryFingerprint(fixture.ordinaryPath);
-      const reparseBefore = await captureEntryFingerprint(fixture.reparsePath);
-      const fleetBefore = await captureEntryFingerprint(fixture.fleetSentinelPath);
-      const requests: WindowsPrivateFileAclRequest[] = [];
-      const contentsAtAuthority: string[] = [];
-      let temporaryAclAtCreation: WindowsAclSnapshot | undefined;
-      let parentAclAtCreation: WindowsAclSnapshot | undefined;
-      const windowsPrivateFileAuthority = async (
-        request: WindowsPrivateFileAclRequest,
-      ): Promise<void> => {
-        requests.push(request);
-        await applyWindowsPrivateFileAcl(request);
-        contentsAtAuthority.push(await fs.readFile(request.filePath, "utf8"));
-        if (request.createNew) {
-          [parentAclAtCreation, temporaryAclAtCreation] = await readWindowsAclSnapshots([
-            fixture.root,
-            request.filePath,
-          ]);
-        }
-      };
-      vi.spyOn(console, "log").mockImplementation(() => undefined);
-
-      try {
-        await runReadyForegroundHost(fixture.artifactPath, { windowsPrivateFileAuthority });
-        await applyWindowsPrivateFileAcl({ filePath: fixture.artifactPath, repair: false });
-        const artifact = JSON.parse(await fs.readFile(fixture.artifactPath, "utf8")) as {
-          remoteToken: string;
-        };
-        const [parentAclAfter, ordinaryAclAfter, artifactAclAfter] = await readWindowsAclSnapshots([
+  describe.sequential("Windows native bridge credential ACL cohort", () => {
+    it.runIf(process.platform === "win32")(
+      "creates the temporary Windows credential with its exact ACL and leaves the inherited parent unchanged",
+      async () => {
+        const fixture = await createSiblingFixture();
+        await addWindowsParentReadInheritance(fixture.root);
+        const [parentAclBefore, ordinaryAclBefore, predecessorAcl] = await readWindowsAclSnapshots([
           fixture.root,
           fixture.ordinaryPath,
           fixture.artifactPath,
         ]);
-        expect(
-          requests.map(({ createNew, repair }) => ({ createNew: createNew ?? false, repair })),
-        ).toEqual([
-          { createNew: true, repair: false },
-          { createNew: false, repair: false },
-          { createNew: false, repair: false },
-        ]);
-        expect(requests[0]?.filePath).toBe(requests[1]?.filePath);
-        expect(requests[0]?.filePath).not.toBe(fixture.artifactPath);
-        expect(requests[2]?.filePath).toBe(fixture.artifactPath);
-        expect(contentsAtAuthority.slice(0, 2)).toEqual(["", ""]);
-        expect(contentsAtAuthority[2]).toContain(artifact.remoteToken);
-        expect(artifact.remoteToken).toMatch(/^[0-9a-f]{64}$/u);
-        expect(artifact.remoteToken).not.toBe(PREDECESSOR_TOKEN);
-        expect(temporaryAclAtCreation?.protected).toBe(true);
-        expect(temporaryAclAtCreation?.everyoneRuleCount).toBe(0);
-        expect(artifactAclAfter?.sddl).toBe(temporaryAclAtCreation?.sddl);
-        expect(parentAclAtCreation).toEqual(parentAclBefore);
-        expect(parentAclAfter).toEqual(parentAclBefore);
-        expect(ordinaryAclAfter).toEqual(ordinaryAclBefore);
-        expect(await captureEntryFingerprint(fixture.ordinaryPath)).toEqual(ordinaryBefore);
-        expect(await captureEntryFingerprint(fixture.reparsePath)).toEqual(reparseBefore);
-        expect(await captureEntryFingerprint(fixture.fleetSentinelPath)).toEqual(fleetBefore);
-        expect(await fs.readlink(fixture.reparsePath)).toBe(fixture.reparseTarget);
-        expect((await fs.readdir(fixture.root)).sort()).toEqual(fixture.namesBefore);
-        expect(fixture.namesBefore).toHaveLength(FLEET_SIZE + 3);
-      } finally {
-        await removeSiblingFixture(fixture);
-      }
-    },
-    60_000,
-  );
+        expect(parentAclBefore?.everyoneRuleCount).toBeGreaterThan(0);
+        expect(predecessorAcl?.protected).toBe(false);
+        const ordinaryBefore = await captureEntryFingerprint(fixture.ordinaryPath);
+        const reparseBefore = await captureEntryFingerprint(fixture.reparsePath);
+        const fleetBefore = await captureEntryFingerprint(fixture.fleetSentinelPath);
+        const requests: WindowsPrivateFileAclRequest[] = [];
+        const contentsAtAuthority: string[] = [];
+        let temporaryAclAtCreation: WindowsAclSnapshot | undefined;
+        let parentAclAtCreation: WindowsAclSnapshot | undefined;
+        const windowsPrivateFileAuthority = async (
+          request: WindowsPrivateFileAclRequest,
+        ): Promise<void> => {
+          requests.push(request);
+          await applyWindowsPrivateFileAcl(request);
+          contentsAtAuthority.push(await fs.readFile(request.filePath, "utf8"));
+          if (request.createNew) {
+            [parentAclAtCreation, temporaryAclAtCreation] = await readWindowsAclSnapshots([
+              fixture.root,
+              request.filePath,
+            ]);
+          }
+        };
+        vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+        try {
+          await runReadyForegroundHost(fixture.artifactPath, { windowsPrivateFileAuthority });
+          await applyWindowsPrivateFileAcl({ filePath: fixture.artifactPath, repair: false });
+          const artifact = JSON.parse(await fs.readFile(fixture.artifactPath, "utf8")) as {
+            remoteToken: string;
+          };
+          const [parentAclAfter, ordinaryAclAfter, artifactAclAfter] =
+            await readWindowsAclSnapshots([
+              fixture.root,
+              fixture.ordinaryPath,
+              fixture.artifactPath,
+            ]);
+          expect(
+            requests.map(({ createNew, repair }) => ({ createNew: createNew ?? false, repair })),
+          ).toEqual([
+            { createNew: true, repair: false },
+            { createNew: false, repair: false },
+            { createNew: false, repair: false },
+          ]);
+          expect(requests[0]?.filePath).toBe(requests[1]?.filePath);
+          expect(requests[0]?.filePath).not.toBe(fixture.artifactPath);
+          expect(requests[2]?.filePath).toBe(fixture.artifactPath);
+          expect(contentsAtAuthority.slice(0, 2)).toEqual(["", ""]);
+          expect(contentsAtAuthority[2]).toContain(artifact.remoteToken);
+          expect(artifact.remoteToken).toMatch(/^[0-9a-f]{64}$/u);
+          expect(artifact.remoteToken).not.toBe(PREDECESSOR_TOKEN);
+          expect(temporaryAclAtCreation?.protected).toBe(true);
+          expect(temporaryAclAtCreation?.everyoneRuleCount).toBe(0);
+          expect(artifactAclAfter?.sddl).toBe(temporaryAclAtCreation?.sddl);
+          expect(parentAclAtCreation).toEqual(parentAclBefore);
+          expect(parentAclAfter).toEqual(parentAclBefore);
+          expect(ordinaryAclAfter).toEqual(ordinaryAclBefore);
+          expect(await captureEntryFingerprint(fixture.ordinaryPath)).toEqual(ordinaryBefore);
+          expect(await captureEntryFingerprint(fixture.reparsePath)).toEqual(reparseBefore);
+          expect(await captureEntryFingerprint(fixture.fleetSentinelPath)).toEqual(fleetBefore);
+          expect(await fs.readlink(fixture.reparsePath)).toBe(fixture.reparseTarget);
+          expect((await fs.readdir(fixture.root)).sort()).toEqual(fixture.namesBefore);
+          expect(fixture.namesBefore).toHaveLength(FLEET_SIZE + 3);
+        } finally {
+          await removeSiblingFixture(fixture);
+        }
+      },
+      60_000,
+    );
+  });
 
   it("rejects a background state collision before creating the parent", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-bridge-preflight-"));

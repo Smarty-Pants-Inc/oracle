@@ -47,7 +47,12 @@ import {
   protectRemoteTransactionStoreRoot,
   remoteTransactionHeadDirectory,
 } from "./transactionStoreRoot.js";
-import type { WindowsPrivateTreeAuthority } from "./windowsPrivateTreeAcl.js";
+import type {
+  WindowsPrivateDirectoriesAuthority,
+  WindowsPrivateFileProtectionAuthority,
+  WindowsPrivateFileVerificationAuthority,
+  WindowsPrivateTreeAuthority,
+} from "../windowsPrivateFileAcl.js";
 import {
   DEFAULT_REMOTE_CONTROL_OVERALL_TIMEOUT_MS,
   DEFAULT_REMOTE_RUN_OVERALL_TIMEOUT_MS,
@@ -80,6 +85,9 @@ interface RemoteServerDeps {
   controllerLockDeps?: CrashRecoverableFilesystemLockDeps;
   transactionStorePlatform?: NodeJS.Platform;
   windowsPrivateTreeAuthority?: WindowsPrivateTreeAuthority;
+  windowsPrivateDirectoriesAuthority?: WindowsPrivateDirectoriesAuthority;
+  windowsPrivateFileProtectionAuthority?: WindowsPrivateFileProtectionAuthority;
+  windowsPrivateFileVerificationAuthority?: WindowsPrivateFileVerificationAuthority;
 }
 
 export async function createRemoteServer(
@@ -176,6 +184,10 @@ export async function createRemoteServer(
   const artifactStore = new RemoteArtifactStore({
     transactionStore,
     sessionsRoot: path.join(getOracleHomeDir(), "sessions"),
+    platform: deps.transactionStorePlatform,
+    windowsPrivateDirectoriesAuthority: deps.windowsPrivateDirectoriesAuthority,
+    windowsPrivateFileProtectionAuthority: deps.windowsPrivateFileProtectionAuthority,
+    windowsPrivateFileVerificationAuthority: deps.windowsPrivateFileVerificationAuthority,
   });
   const activeTransactions = new Map<string, BrowserRunTransaction>();
   const admittedTransactions = new Map<string, { controllerGeneration: string }>();

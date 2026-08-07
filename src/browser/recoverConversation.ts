@@ -20,6 +20,7 @@ import { createChromeProcessLaunchClaim } from "./chromeProcessLaunchClaim.js";
 import { captureProfileDirectoryIdentity } from "./profileState.js";
 import {
   LocalOwnedBrowserResourceAuthority,
+  OwnedBrowserResourceTransaction,
   type BrowserCaptureSettlementMode,
 } from "./ownedBrowserResources.js";
 import {
@@ -349,8 +350,14 @@ export async function recoverConversationTab(
         }
       : {}),
   });
+  const resourceTransaction = new OwnedBrowserResourceTransaction(
+    resources.transactionAdapters(),
+    resources.runtime(),
+  );
   const settle: RecoveredConversationCleanup = (mode, pendingRuntime) =>
-    resources.settle(mode, pendingRuntime);
+    pendingRuntime
+      ? resources.settleResources(mode, pendingRuntime)
+      : resourceTransaction.settle(mode);
 
   const openRecoveredTarget = async (
     endpoint: RecoveryEndpoint,
@@ -360,7 +367,7 @@ export async function recoverConversationTab(
     if (!endpointAuthority && !nonOwned) {
       throw new Error("Owned recovered target acquisition requires exact endpoint authority.");
     }
-    const opened = await resources.journalAcquisition({
+    const opened = await resources.journalAcquisition(resourceTransaction, {
       resource: "chrome-target",
       acquire: async () => {
         let client: SessionBoundChromeClient;
@@ -429,7 +436,7 @@ export async function recoverConversationTab(
       const Page = opened.client.Page;
       await Page.enable();
       await Page.navigate({ url });
-      await resources.persistProjection({
+      await resources.persistProjection(resourceTransaction, {
         keepBrowser: config.keepBrowser,
         closeOwnedTargetOnComplete: true,
         tabUrl: url,
@@ -441,7 +448,7 @@ export async function recoverConversationTab(
   };
 
   try {
-    const lease = await resources.journalAcquisition({
+    const lease = await resources.journalAcquisition(resourceTransaction, {
       resource: "tab-lease",
       acquire: () =>
         acquireBrowserTabLease(userDataDir, {
@@ -499,7 +506,7 @@ export async function recoverConversationTab(
     logger(
       `[browser] Recovery: acquiring Chrome owner for profile ${userDataDir} and navigating to ${url}`,
     );
-    const owner = await resources.journalAcquisition({
+    const owner = await resources.journalAcquisition(resourceTransaction, {
       resource: "chrome-process",
       acquire: () =>
         acquireManualChromeOwner(userDataDir, config, logger, meta.id, { launchClaim }),
@@ -529,7 +536,7 @@ export async function recoverConversationTab(
     logger(`[browser] Recovery: Chrome listening on ${host}:${port}; tab loaded.`);
     return { host, port, url, ref: targetId, locator, endpointAuthority, cleanup: settle };
   } catch (error) {
-    const cleanup = await resources.settle("abort");
+    const cleanup = await resourceTransaction.settle("abort");
     if (cleanup.status === "pending") {
       throw new BrowserAutomationError(
         `Recovered browser cleanup remains pending: ${cleanup.error}`,

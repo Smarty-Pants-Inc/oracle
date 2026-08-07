@@ -4,12 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import * as fsPromises from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
-import {
-  createRemoteBrowserExecutor,
-  createRemoteBrowserTransactionExecutor,
-  resumeRemoteBrowserTransaction,
-  settleRemoteBrowserRecovery,
-} from "../../src/remote/client.js";
+import { settleRemoteBrowserRecovery } from "../../src/remote/client.js";
 import {
   bindRemoteBrowserSettlement,
   settleRemoteBrowserTransaction,
@@ -36,8 +31,18 @@ import {
   establishWindowsPrivateDirectories,
   initializeWindowsPrivateFile,
   verifyWindowsPrivateFile,
-} from "../../src/remote/windowsPrivateTreeAcl.js";
+} from "../../src/windowsPrivateFileAcl.js";
 import { transferRemoteArtifact } from "../../src/remote/clientArtifacts.js";
+import {
+  testWindowsPrivateDirectoriesAuthority,
+  testWindowsPrivateFileInitializationAuthority,
+  testWindowsPrivateFileVerificationAuthority,
+} from "../privateAuthorityTestHelpers.js";
+import {
+  createTestRemoteBrowserExecutor as createRemoteBrowserExecutor,
+  createTestRemoteBrowserTransactionExecutor as createRemoteBrowserTransactionExecutor,
+  resumeTestRemoteBrowserTransaction as resumeRemoteBrowserTransaction,
+} from "./serverTestBuilders.js";
 
 function committedPromptEpoch(prompt: string) {
   return {
@@ -266,7 +271,12 @@ async function writeCachedArtifactFixture(filePath: string, contents: string): P
     if (!(await initializeWindowsPrivateFile(filePath))) {
       throw new Error("Expected a fresh Windows private cached-artifact fixture");
     }
-    await fsPromises.writeFile(filePath, contents);
+    const handle = await fsPromises.open(filePath, "r+");
+    try {
+      await handle.writeFile(contents);
+    } finally {
+      await handle.close();
+    }
     await verifyWindowsPrivateFile(filePath);
     return;
   }
@@ -1726,6 +1736,7 @@ describe("remote client transport deadlines", () => {
         } else {
           expect(transaction.runtime).not.toHaveProperty("recoveryCleanupResult");
           expect(transaction.runtime).not.toHaveProperty("recoveryCleanupResources");
+          await expect(transaction.finalize()).resolves.toMatchObject({ status: "completed" });
         }
         expect(settlementRequests).toBe(0);
       } finally {
@@ -2019,351 +2030,524 @@ describe("remote client transport deadlines", () => {
     }
   });
 
-  it("replaces a corrupt cached artifact before posting its durable receipt", async () => {
-    const oracleHome = await fsPromises.mkdtemp(
-      path.join(os.tmpdir(), "oracle-remote-durable-artifact-"),
-    );
-    setOracleHomeDirOverrideForTest(oracleHome);
-    const payload = Buffer.from("durable artifact");
-    const descriptor = {
-      artifactId: "artifact-1",
-      runId: "run-1",
-      kind: "file" as const,
-      filename: "result.bin",
-      byteSize: payload.byteLength,
-      sha256: createHash("sha256").update(payload).digest("hex"),
-      sourceUrlKind: "browser-download" as const,
-      transferStatus: "ready" as const,
-      required: true,
-    };
-    const finalPath = path.join(
-      oracleHome,
-      "sessions",
-      "durable-artifact",
-      "artifacts",
-      "artifact-artifact-1.bin",
-    );
-    const artifactsDirectory = path.dirname(finalPath);
-    const sessionDirectory = path.dirname(artifactsDirectory);
-    await writeCachedArtifactFixture(finalPath, "corrupt artifact");
-    const durabilityEvents: string[] = [];
-    const originalSyncDirectory = fsDurability.syncDirectory;
-    const syncDirectory = vi
-      .spyOn(fsDurability, "syncDirectory")
-      .mockImplementation(async (directory) => {
-        durabilityEvents.push(`sync:${directory}`);
-        await originalSyncDirectory(directory);
-      });
-    let artifactGets = 0;
-    let receiptCount = 0;
-    let observedAtReceipt: { contents: Buffer; mode: number; partExists: boolean } | undefined;
-    const server = createAuthenticatedServer(async (req, res) => {
-      const transactionToken = runTransactionToken(req);
-      if (transactionToken) {
-        const request = await readJson(req);
-        res.setHeader("content-type", "application/x-ndjson");
-        res.end(
-          `${JSON.stringify(transactionEvent(transactionToken, String(request.prompt), [descriptor]))}\n`,
-        );
-        return;
-      }
-      if (req.method === "GET" && req.url?.includes("/artifacts/artifact-1")) {
-        artifactGets += 1;
-        res.setHeader("x-oracle-artifact-sha256", descriptor.sha256);
-        res.end(payload);
-        return;
-      }
-      if (req.method === "POST" && req.url?.endsWith("/artifacts/artifact-1/receipt")) {
-        durabilityEvents.push("receipt");
-        await readJson(req);
-        let partExists = true;
-        await fsPromises.access(`${finalPath}.part`).catch(() => {
-          partExists = false;
-        });
-        observedAtReceipt = {
-          contents: await fsPromises.readFile(finalPath),
-          mode: (await fsPromises.stat(finalPath)).mode & 0o777,
-          partExists,
-        };
-        receiptCount += 1;
-        res.statusCode = 204;
-        res.end();
-        return;
-      }
-      res.statusCode = 404;
-      res.end();
-    });
-    const port = await listen(server);
-    try {
-      const executor = createRemoteBrowserTransactionExecutor({
-        host: `127.0.0.1:${port}`,
-        token: "a".repeat(64),
-        deadlines: {
-          ...deadlines,
-          controlOverallTimeoutMs: 1_000,
-          artifactOverallTimeoutMs: 1_000,
-          socketIdleTimeoutMs: 500,
-        },
-      });
-      const transaction = await executor({
-        prompt: "artifact durable",
-        config: {},
-        sessionId: "durable-artifact",
-      });
-      expect(transaction).toMatchObject({
-        answerText: "answer",
-        artifacts: [{ path: finalPath, sizeBytes: payload.length, sha256: descriptor.sha256 }],
-        savedFiles: [{ path: finalPath, sizeBytes: payload.length, sha256: descriptor.sha256 }],
-      });
-      const publishedStat = await fsPromises.lstat(finalPath, { bigint: true });
-      const publishedIdentity = {
-        device: publishedStat.dev.toString(),
-        inode: publishedStat.ino.toString(),
-        birthtimeNs: publishedStat.birthtimeNs.toString(),
-        ctimeNs: publishedStat.ctimeNs.toString(),
+  describe.sequential("Windows-native cached artifact mutation cohort", () => {
+    it("replaces a corrupt cached artifact before posting its durable receipt", async () => {
+      const oracleHome = await fsPromises.mkdtemp(
+        path.join(os.tmpdir(), "oracle-remote-durable-artifact-"),
+      );
+      setOracleHomeDirOverrideForTest(oracleHome);
+      const payload = Buffer.from("durable artifact");
+      const descriptor = {
+        artifactId: "artifact-1",
+        runId: "run-1",
+        kind: "file" as const,
+        filename: "result.bin",
+        byteSize: payload.byteLength,
+        sha256: createHash("sha256").update(payload).digest("hex"),
+        sourceUrlKind: "browser-download" as const,
+        transferStatus: "ready" as const,
+        required: true,
       };
-      expect(transaction.artifacts?.[0]?.fileIdentity).toEqual(publishedIdentity);
-      expect(transaction.savedFiles?.[0]?.fileIdentity).toEqual(publishedIdentity);
-      expect(transaction.warnings).toBeUndefined();
-      expect(observedAtReceipt?.contents).toEqual(payload);
-      expect(observedAtReceipt?.partExists).toBe(false);
-      const receiptIndex = durabilityEvents.indexOf("receipt");
-      expect(receiptIndex).toBeGreaterThanOrEqual(0);
-      const parentSessionSyncIndex = durabilityEvents.indexOf(`sync:${sessionDirectory}`);
-      const artifactsSyncIndex = durabilityEvents.indexOf(`sync:${artifactsDirectory}`);
-      expect(parentSessionSyncIndex).toBeGreaterThanOrEqual(0);
-      expect(artifactsSyncIndex).toBeGreaterThanOrEqual(0);
-      expect(parentSessionSyncIndex).toBeLessThan(receiptIndex);
-      expect(artifactsSyncIndex).toBeLessThan(receiptIndex);
-      if (process.platform !== "win32") expect(observedAtReceipt?.mode).toBe(0o600);
-      await executor({ prompt: "artifact durable", config: {}, sessionId: "durable-artifact" });
-      expect(artifactGets).toBe(1);
-      expect(receiptCount).toBe(2);
-    } finally {
-      setOracleHomeDirOverrideForTest(null);
-      await close(server);
-      await fsPromises.rm(oracleHome, { recursive: true, force: true });
-      syncDirectory.mockRestore();
-    }
-  });
-
-  it("rejects a final-path replacement before posting the artifact receipt", async () => {
-    const oracleHome = await fsPromises.mkdtemp(
-      path.join(os.tmpdir(), "oracle-remote-artifact-generation-"),
-    );
-    setOracleHomeDirOverrideForTest(oracleHome);
-    const payload = Buffer.from("verified artifact");
-    const replacement = "replacement artifact";
-    const descriptor = {
-      artifactId: "artifact-generation",
-      runId: "run-1",
-      kind: "file" as const,
-      filename: "result.bin",
-      mimeType: "application/octet-stream",
-      byteSize: payload.byteLength,
-      sha256: createHash("sha256").update(payload).digest("hex"),
-      sourceUrlKind: "browser-download" as const,
-      transferStatus: "ready" as const,
-      required: true,
-    };
-    const transactionToken = "f".repeat(64);
-    const finalPath = path.join(
-      oracleHome,
-      "sessions",
-      "artifact-generation",
-      "artifacts",
-      "artifact-artifact-generation.bin",
-    );
-    let receiptCount = 0;
-    let replacementIdentity:
-      | { device: string; inode: string; birthtimeNs: string; ctimeNs: string }
-      | undefined;
-    const server = createAuthenticatedServer(async (req, res) => {
-      if (
-        req.method === "GET" &&
-        req.url === `/transactions/${transactionToken}/artifacts/${descriptor.artifactId}`
-      ) {
-        res.setHeader("content-length", String(payload.byteLength));
-        res.setHeader("x-oracle-artifact-sha256", descriptor.sha256);
-        res.end(payload);
-        return;
-      }
-      if (
-        req.method === "POST" &&
-        req.url === `/transactions/${transactionToken}/artifacts/${descriptor.artifactId}/receipt`
-      ) {
-        receiptCount += 1;
-        await readJson(req);
-        res.statusCode = 204;
-        res.end();
-        return;
-      }
-      res.statusCode = 404;
-      res.end();
-    });
-    const port = await listen(server);
-
-    try {
-      await expect(
-        transferRemoteArtifact(
-          {
-            hostname: "127.0.0.1",
-            port,
-            token: "a".repeat(64),
-            descriptor,
-            transactionToken,
-            sessionId: "artifact-generation",
-            deadlines: {
-              ...deadlines,
-              controlOverallTimeoutMs: 1_000,
-              artifactOverallTimeoutMs: 1_000,
-              socketIdleTimeoutMs: 500,
-            },
-          },
-          {
-            afterHashVerification: async (authenticatedPath) => {
-              expect(authenticatedPath).toBe(finalPath);
-              await fsPromises.rename(finalPath, `${finalPath}.verified`);
-              await writeCachedArtifactFixture(finalPath, replacement);
-              const replacementStat = await fsPromises.lstat(finalPath, { bigint: true });
-              replacementIdentity = {
-                device: replacementStat.dev.toString(),
-                inode: replacementStat.ino.toString(),
-                birthtimeNs: replacementStat.birthtimeNs.toString(),
-                ctimeNs: replacementStat.ctimeNs.toString(),
-              };
-            },
-          },
-        ),
-      ).rejects.toThrow("local artifact cache generation changed after validation");
-      expect(receiptCount).toBe(0);
-      const preservedStat = await fsPromises.lstat(finalPath, { bigint: true });
-      expect({
-        device: preservedStat.dev.toString(),
-        inode: preservedStat.ino.toString(),
-        birthtimeNs: preservedStat.birthtimeNs.toString(),
-        ctimeNs: preservedStat.ctimeNs.toString(),
-      }).toEqual(replacementIdentity);
-      await expect(fsPromises.readFile(finalPath, "utf8")).resolves.toBe(replacement);
-    } finally {
-      setOracleHomeDirOverrideForTest(null);
-      await close(server);
-      await fsPromises.rm(oracleHome, { recursive: true, force: true });
-    }
-  });
-
-  it("preserves text when local artifact publication fails before downloading", async () => {
-    const oracleHome = await fsPromises.mkdtemp(
-      path.join(os.tmpdir(), "oracle-remote-artifact-io-"),
-    );
-    setOracleHomeDirOverrideForTest(oracleHome);
-    const payload = Buffer.from("artifact");
-    const descriptor = {
-      artifactId: "artifact-io",
-      runId: "run-1",
-      kind: "file" as const,
-      filename: "result.bin",
-      byteSize: payload.byteLength,
-      sha256: createHash("sha256").update(payload).digest("hex"),
-      sourceUrlKind: "browser-download" as const,
-      transferStatus: "ready" as const,
-      required: true,
-    };
-    const finalPath = path.join(
-      oracleHome,
-      "sessions",
-      "artifact-io",
-      "artifacts",
-      "artifact-artifact-io.bin",
-    );
-    const artifactsDirectory = path.dirname(finalPath);
-    await writeCachedArtifactFixture(finalPath, "corrupt!");
-    let artifactGets = 0;
-    let settlementRequests = 0;
-    let waiverRequests = 0;
-    const server = createAuthenticatedServer(async (req, res) => {
-      const transactionToken = runTransactionToken(req);
-      if (transactionToken) {
-        const request = await readJson(req);
-        res.setHeader("content-type", "application/x-ndjson");
-        res.end(
-          `${JSON.stringify(transactionEvent(transactionToken, String(request.prompt), [descriptor]))}\n`,
-        );
-        return;
-      }
-      if (req.method === "GET" && req.url?.includes("/artifacts/artifact-io")) {
-        artifactGets += 1;
-        res.setHeader("x-oracle-artifact-sha256", descriptor.sha256);
-        res.end(payload);
-        return;
-      }
-      const waiver =
-        /^\/transactions\/([a-f0-9]{64})\/artifacts\/artifact-io\/manual-copy-waiver$/u.exec(
-          req.url ?? "",
-        );
-      if (req.method === "POST" && waiver) {
-        waiverRequests += 1;
-        expect(await readJson(req)).toEqual({
-          sha256: descriptor.sha256,
-          byteSize: descriptor.byteSize,
+      const finalPath = path.join(
+        oracleHome,
+        "sessions",
+        "durable-artifact",
+        "artifacts",
+        "artifact-artifact-1.bin",
+      );
+      const artifactsDirectory = path.dirname(finalPath);
+      const sessionDirectory = path.dirname(artifactsDirectory);
+      await writeCachedArtifactFixture(finalPath, "corrupt artifact");
+      const durabilityEvents: string[] = [];
+      const originalSyncDirectory = fsDurability.syncDirectory;
+      const syncDirectory = vi
+        .spyOn(fsDurability, "syncDirectory")
+        .mockImplementation(async (directory) => {
+          await originalSyncDirectory(directory);
+          const finalPathExists = await fsPromises.lstat(finalPath).then(
+            (entry) => entry.isFile(),
+            () => false,
+          );
+          durabilityEvents.push(
+            `sync:${directory}:${finalPathExists ? "final-present" : "final-absent"}`,
+          );
         });
-        res.setHeader("content-type", "application/json");
-        res.end(JSON.stringify({ ok: true, artifactId: descriptor.artifactId }));
-        return;
-      }
-      const finalize = /^\/transactions\/([a-f0-9]{64})\/finalize$/u.exec(req.url ?? "");
-      if (req.method === "POST" && finalize) {
-        settlementRequests += 1;
-        expect(await readJson(req)).toEqual({ durablePublication: true });
-        res.setHeader("content-type", "application/json");
-        res.end(JSON.stringify(finalizedSettlement(finalize[1]!, "artifact I/O")));
-        return;
-      }
-      res.statusCode = 404;
-      res.end();
-    });
-    const port = await listen(server);
-    const host = `127.0.0.1:${port}`;
-    const originalSyncDirectory = fsDurability.syncDirectory;
-    let injectedFailure = false;
-    const syncDirectory = vi
-      .spyOn(fsDurability, "syncDirectory")
-      .mockImplementation(async (directory) => {
-        await originalSyncDirectory(directory);
-        if (directory === artifactsDirectory && !injectedFailure) {
-          injectedFailure = true;
-          throw Object.assign(new Error("injected artifact cache I/O failure"), { code: "EIO" });
+      let artifactGets = 0;
+      let receiptCount = 0;
+      let observedAtReceipt: { contents: Buffer; mode: number; partExists: boolean } | undefined;
+      const server = createAuthenticatedServer(async (req, res) => {
+        const transactionToken = runTransactionToken(req);
+        if (transactionToken) {
+          const request = await readJson(req);
+          res.setHeader("content-type", "application/x-ndjson");
+          res.end(
+            `${JSON.stringify(transactionEvent(transactionToken, String(request.prompt), [descriptor]))}\n`,
+          );
+          return;
         }
+        if (req.method === "GET" && req.url?.includes("/artifacts/artifact-1")) {
+          artifactGets += 1;
+          res.setHeader("x-oracle-artifact-sha256", descriptor.sha256);
+          res.end(payload);
+          return;
+        }
+        if (req.method === "POST" && req.url?.endsWith("/artifacts/artifact-1/receipt")) {
+          durabilityEvents.push("receipt");
+          await readJson(req);
+          let partExists = true;
+          await fsPromises.access(`${finalPath}.part`).catch(() => {
+            partExists = false;
+          });
+          observedAtReceipt = {
+            contents: await fsPromises.readFile(finalPath),
+            mode: (await fsPromises.stat(finalPath)).mode & 0o777,
+            partExists,
+          };
+          receiptCount += 1;
+          res.statusCode = 204;
+          res.end();
+          return;
+        }
+        res.statusCode = 404;
+        res.end();
       });
-    try {
-      const transaction = await createRemoteBrowserTransactionExecutor({
-        host,
-        token: "a".repeat(64),
-        deadlines,
-      })({ prompt: "artifact I/O", config: {}, sessionId: "artifact-io" });
-      expect(transaction).toMatchObject({
-        answerText: "answer",
-        warnings: [
-          {
-            code: "remote-artifact-manual-copy-required",
-            severity: "warning",
-            message: expect.stringContaining("injected artifact cache I/O failure"),
+      const port = await listen(server);
+      try {
+        const executor = createRemoteBrowserTransactionExecutor({
+          host: `127.0.0.1:${port}`,
+          token: "a".repeat(64),
+          deadlines: {
+            ...deadlines,
+            controlOverallTimeoutMs: 1_000,
+            artifactOverallTimeoutMs: 1_000,
+            socketIdleTimeoutMs: 500,
           },
-        ],
+        });
+        const transaction = await executor({
+          prompt: "artifact durable",
+          config: {},
+          sessionId: "durable-artifact",
+        });
+        expect(transaction).toMatchObject({
+          answerText: "answer",
+          artifacts: [{ path: finalPath, sizeBytes: payload.length, sha256: descriptor.sha256 }],
+          savedFiles: [{ path: finalPath, sizeBytes: payload.length, sha256: descriptor.sha256 }],
+        });
+        const publishedStat = await fsPromises.lstat(finalPath, { bigint: true });
+        const publishedIdentity = {
+          device: publishedStat.dev.toString(),
+          inode: publishedStat.ino.toString(),
+          birthtimeNs: publishedStat.birthtimeNs.toString(),
+          ctimeNs: publishedStat.ctimeNs.toString(),
+        };
+        expect(transaction.artifacts?.[0]?.fileIdentity).toEqual(publishedIdentity);
+        expect(transaction.savedFiles?.[0]?.fileIdentity).toEqual(publishedIdentity);
+        expect(transaction.warnings).toBeUndefined();
+        expect(observedAtReceipt?.contents).toEqual(payload);
+        expect(observedAtReceipt?.partExists).toBe(false);
+        const receiptIndex = durabilityEvents.indexOf("receipt");
+        expect(receiptIndex).toBeGreaterThanOrEqual(0);
+        const parentSessionSyncIndex = durabilityEvents.findIndex((event) =>
+          event.startsWith(`sync:${sessionDirectory}:`),
+        );
+        expect(parentSessionSyncIndex).toBeGreaterThanOrEqual(0);
+        expect(parentSessionSyncIndex).toBeLessThan(receiptIndex);
+        expect(durabilityEvents).toContain(`sync:${artifactsDirectory}:final-absent`);
+        expect(durabilityEvents[receiptIndex - 1]).toBe(`sync:${artifactsDirectory}:final-present`);
+        if (process.platform !== "win32") expect(observedAtReceipt?.mode).toBe(0o600);
+        await executor({ prompt: "artifact durable", config: {}, sessionId: "durable-artifact" });
+        expect(artifactGets).toBe(1);
+        expect(receiptCount).toBe(2);
+      } finally {
+        setOracleHomeDirOverrideForTest(null);
+        await close(server);
+        await fsPromises.rm(oracleHome, { recursive: true, force: true });
+        syncDirectory.mockRestore();
+      }
+    });
+
+    it("rejects a same-inode same-size final-path overwrite before posting the artifact receipt", async () => {
+      const oracleHome = await fsPromises.mkdtemp(
+        path.join(os.tmpdir(), "oracle-remote-artifact-generation-"),
+      );
+      setOracleHomeDirOverrideForTest(oracleHome);
+      const payload = Buffer.from("verified artifact");
+      const replacement = Buffer.from("x".repeat(payload.byteLength));
+      const descriptor = {
+        artifactId: "artifact-generation",
+        runId: "run-1",
+        kind: "file" as const,
+        filename: "result.bin",
+        mimeType: "application/octet-stream",
+        byteSize: payload.byteLength,
+        sha256: createHash("sha256").update(payload).digest("hex"),
+        sourceUrlKind: "browser-download" as const,
+        transferStatus: "ready" as const,
+        required: true,
+      };
+      const transactionToken = "f".repeat(64);
+      const finalPath = path.join(
+        oracleHome,
+        "sessions",
+        "artifact-generation",
+        "artifacts",
+        "artifact-artifact-generation.bin",
+      );
+      let receiptCount = 0;
+      let authenticatedIdentity:
+        | { device: string; inode: string; birthtimeNs: string; ctimeNs: string; size: string }
+        | undefined;
+      let mutationPath: string | undefined;
+      let mutationBytesWritten: number | undefined;
+      let mutatedIdentity: typeof authenticatedIdentity;
+      const server = createAuthenticatedServer(async (req, res) => {
+        if (
+          req.method === "GET" &&
+          req.url === `/transactions/${transactionToken}/artifacts/${descriptor.artifactId}`
+        ) {
+          res.setHeader("content-length", String(payload.byteLength));
+          res.setHeader("x-oracle-artifact-sha256", descriptor.sha256);
+          res.end(payload);
+          return;
+        }
+        if (
+          req.method === "POST" &&
+          req.url === `/transactions/${transactionToken}/artifacts/${descriptor.artifactId}/receipt`
+        ) {
+          receiptCount += 1;
+          await readJson(req);
+          res.statusCode = 204;
+          res.end();
+          return;
+        }
+        res.statusCode = 404;
+        res.end();
       });
-      expect(transaction.warnings?.[0]?.message).toContain(`remote browser host ${host}`);
-      expect(transaction).not.toHaveProperty("artifacts");
-      expect(transaction).not.toHaveProperty("savedFiles");
-      expect(artifactGets).toBe(0);
-      await expect(transaction.finalize()).resolves.toMatchObject({ status: "completed" });
-      expect(settlementRequests).toBe(1);
-      expect(waiverRequests).toBe(1);
-    } finally {
-      syncDirectory.mockRestore();
-      setOracleHomeDirOverrideForTest(null);
-      await close(server);
-      await fsPromises.rm(oracleHome, { recursive: true, force: true });
-    }
+      const port = await listen(server);
+
+      try {
+        await expect(
+          transferRemoteArtifact(
+            {
+              hostname: "127.0.0.1",
+              port,
+              token: "a".repeat(64),
+              descriptor,
+              transactionToken,
+              sessionId: "artifact-generation",
+              deadlines: {
+                ...deadlines,
+                controlOverallTimeoutMs: 1_000,
+                artifactOverallTimeoutMs: 1_000,
+                socketIdleTimeoutMs: 500,
+              },
+            },
+            {
+              windowsPrivateDirectoriesAuthority: testWindowsPrivateDirectoriesAuthority,
+              windowsPrivateFileInitializationAuthority:
+                testWindowsPrivateFileInitializationAuthority,
+              windowsPrivateFileVerificationAuthority: testWindowsPrivateFileVerificationAuthority,
+              afterHashVerification: async (authenticatedPath) => {
+                mutationPath = authenticatedPath;
+                const authenticatedStat = await fsPromises.lstat(authenticatedPath, {
+                  bigint: true,
+                });
+                authenticatedIdentity = {
+                  device: authenticatedStat.dev.toString(),
+                  inode: authenticatedStat.ino.toString(),
+                  birthtimeNs: authenticatedStat.birthtimeNs.toString(),
+                  ctimeNs: authenticatedStat.ctimeNs.toString(),
+                  size: authenticatedStat.size.toString(),
+                };
+                const handle = await fsPromises.open(authenticatedPath, "r+");
+                try {
+                  ({ bytesWritten: mutationBytesWritten } = await handle.write(
+                    replacement,
+                    0,
+                    replacement.byteLength,
+                    0,
+                  ));
+                  await handle.sync();
+                } finally {
+                  await handle.close();
+                }
+                const mutatedStat = await fsPromises.lstat(authenticatedPath, { bigint: true });
+                mutatedIdentity = {
+                  device: mutatedStat.dev.toString(),
+                  inode: mutatedStat.ino.toString(),
+                  birthtimeNs: mutatedStat.birthtimeNs.toString(),
+                  ctimeNs: mutatedStat.ctimeNs.toString(),
+                  size: mutatedStat.size.toString(),
+                };
+              },
+            },
+          ),
+        ).rejects.toThrow("local artifact cache generation changed after validation");
+        expect(receiptCount).toBe(0);
+        expect(mutationPath).toBe(finalPath);
+        expect(mutationBytesWritten).toBe(replacement.byteLength);
+        expect({
+          device: mutatedIdentity?.device,
+          inode: mutatedIdentity?.inode,
+          birthtimeNs: mutatedIdentity?.birthtimeNs,
+          size: mutatedIdentity?.size,
+        }).toEqual({
+          device: authenticatedIdentity?.device,
+          inode: authenticatedIdentity?.inode,
+          birthtimeNs: authenticatedIdentity?.birthtimeNs,
+          size: authenticatedIdentity?.size,
+        });
+        expect(mutatedIdentity?.ctimeNs).not.toBe(authenticatedIdentity?.ctimeNs);
+        const preservedStat = await fsPromises.lstat(finalPath, { bigint: true });
+        expect({
+          device: preservedStat.dev.toString(),
+          inode: preservedStat.ino.toString(),
+          birthtimeNs: preservedStat.birthtimeNs.toString(),
+          size: preservedStat.size.toString(),
+        }).toEqual({
+          device: authenticatedIdentity?.device,
+          inode: authenticatedIdentity?.inode,
+          birthtimeNs: authenticatedIdentity?.birthtimeNs,
+          size: authenticatedIdentity?.size,
+        });
+        expect(preservedStat.ctimeNs.toString()).not.toBe(authenticatedIdentity?.ctimeNs);
+        await expect(fsPromises.readFile(finalPath)).resolves.toEqual(replacement);
+      } finally {
+        setOracleHomeDirOverrideForTest(null);
+        await close(server);
+        await fsPromises.rm(oracleHome, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects a final-path replacement before posting the artifact receipt", async () => {
+      const oracleHome = await fsPromises.mkdtemp(
+        path.join(os.tmpdir(), "oracle-remote-artifact-path-replacement-"),
+      );
+      setOracleHomeDirOverrideForTest(oracleHome);
+      const payload = Buffer.from("verified artifact");
+      const replacement = Buffer.from("replacement artifact");
+      const descriptor = {
+        artifactId: "artifact-path-replacement",
+        runId: "run-1",
+        kind: "file" as const,
+        filename: "result.bin",
+        mimeType: "application/octet-stream",
+        byteSize: payload.byteLength,
+        sha256: createHash("sha256").update(payload).digest("hex"),
+        sourceUrlKind: "browser-download" as const,
+        transferStatus: "ready" as const,
+        required: true,
+      };
+      const transactionToken = "e".repeat(64);
+      const finalPath = path.join(
+        oracleHome,
+        "sessions",
+        "artifact-path-replacement",
+        "artifacts",
+        "artifact-artifact-path-replacement.bin",
+      );
+      let receiptCount = 0;
+      let mutationPath: string | undefined;
+      let replacementIdentity:
+        | { device: string; inode: string; birthtimeNs: string; ctimeNs: string }
+        | undefined;
+      const server = createAuthenticatedServer(async (req, res) => {
+        if (
+          req.method === "GET" &&
+          req.url === `/transactions/${transactionToken}/artifacts/${descriptor.artifactId}`
+        ) {
+          res.setHeader("content-length", String(payload.byteLength));
+          res.setHeader("x-oracle-artifact-sha256", descriptor.sha256);
+          res.end(payload);
+          return;
+        }
+        if (
+          req.method === "POST" &&
+          req.url === `/transactions/${transactionToken}/artifacts/${descriptor.artifactId}/receipt`
+        ) {
+          receiptCount += 1;
+          await readJson(req);
+          res.statusCode = 204;
+          res.end();
+          return;
+        }
+        res.statusCode = 404;
+        res.end();
+      });
+      const port = await listen(server);
+
+      try {
+        await expect(
+          transferRemoteArtifact(
+            {
+              hostname: "127.0.0.1",
+              port,
+              token: "a".repeat(64),
+              descriptor,
+              transactionToken,
+              sessionId: "artifact-path-replacement",
+              deadlines: {
+                ...deadlines,
+                controlOverallTimeoutMs: 1_000,
+                artifactOverallTimeoutMs: 1_000,
+                socketIdleTimeoutMs: 500,
+              },
+            },
+            {
+              windowsPrivateDirectoriesAuthority: testWindowsPrivateDirectoriesAuthority,
+              windowsPrivateFileInitializationAuthority:
+                testWindowsPrivateFileInitializationAuthority,
+              windowsPrivateFileVerificationAuthority: testWindowsPrivateFileVerificationAuthority,
+              afterHashVerification: async (authenticatedPath) => {
+                mutationPath = authenticatedPath;
+                await fsPromises.rename(authenticatedPath, `${authenticatedPath}.verified`);
+                await fsPromises.writeFile(authenticatedPath, replacement, {
+                  flag: "wx",
+                  mode: 0o600,
+                });
+                const replacementStat = await fsPromises.lstat(authenticatedPath, {
+                  bigint: true,
+                });
+                replacementIdentity = {
+                  device: replacementStat.dev.toString(),
+                  inode: replacementStat.ino.toString(),
+                  birthtimeNs: replacementStat.birthtimeNs.toString(),
+                  ctimeNs: replacementStat.ctimeNs.toString(),
+                };
+              },
+            },
+          ),
+        ).rejects.toThrow("local artifact cache generation changed after validation");
+        expect(receiptCount).toBe(0);
+        expect(mutationPath).toBe(finalPath);
+        const preservedStat = await fsPromises.lstat(finalPath, { bigint: true });
+        expect({
+          device: preservedStat.dev.toString(),
+          inode: preservedStat.ino.toString(),
+          birthtimeNs: preservedStat.birthtimeNs.toString(),
+          ctimeNs: preservedStat.ctimeNs.toString(),
+        }).toEqual(replacementIdentity);
+        await expect(fsPromises.readFile(finalPath)).resolves.toEqual(replacement);
+      } finally {
+        setOracleHomeDirOverrideForTest(null);
+        await close(server);
+        await fsPromises.rm(oracleHome, { recursive: true, force: true });
+      }
+    });
+
+    it("preserves text when local artifact publication fails before downloading", async () => {
+      const oracleHome = await fsPromises.mkdtemp(
+        path.join(os.tmpdir(), "oracle-remote-artifact-io-"),
+      );
+      setOracleHomeDirOverrideForTest(oracleHome);
+      const payload = Buffer.from("artifact");
+      const descriptor = {
+        artifactId: "artifact-io",
+        runId: "run-1",
+        kind: "file" as const,
+        filename: "result.bin",
+        byteSize: payload.byteLength,
+        sha256: createHash("sha256").update(payload).digest("hex"),
+        sourceUrlKind: "browser-download" as const,
+        transferStatus: "ready" as const,
+        required: true,
+      };
+      const finalPath = path.join(
+        oracleHome,
+        "sessions",
+        "artifact-io",
+        "artifacts",
+        "artifact-artifact-io.bin",
+      );
+      const artifactsDirectory = path.dirname(finalPath);
+      await writeCachedArtifactFixture(finalPath, "corrupt!");
+      let artifactGets = 0;
+      let settlementRequests = 0;
+      let waiverRequests = 0;
+      const server = createAuthenticatedServer(async (req, res) => {
+        const transactionToken = runTransactionToken(req);
+        if (transactionToken) {
+          const request = await readJson(req);
+          res.setHeader("content-type", "application/x-ndjson");
+          res.end(
+            `${JSON.stringify(transactionEvent(transactionToken, String(request.prompt), [descriptor]))}\n`,
+          );
+          return;
+        }
+        if (req.method === "GET" && req.url?.includes("/artifacts/artifact-io")) {
+          artifactGets += 1;
+          res.setHeader("x-oracle-artifact-sha256", descriptor.sha256);
+          res.end(payload);
+          return;
+        }
+        const waiver =
+          /^\/transactions\/([a-f0-9]{64})\/artifacts\/artifact-io\/manual-copy-waiver$/u.exec(
+            req.url ?? "",
+          );
+        if (req.method === "POST" && waiver) {
+          waiverRequests += 1;
+          expect(await readJson(req)).toEqual({
+            sha256: descriptor.sha256,
+            byteSize: descriptor.byteSize,
+          });
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify({ ok: true, artifactId: descriptor.artifactId }));
+          return;
+        }
+        const finalize = /^\/transactions\/([a-f0-9]{64})\/finalize$/u.exec(req.url ?? "");
+        if (req.method === "POST" && finalize) {
+          settlementRequests += 1;
+          expect(await readJson(req)).toEqual({ durablePublication: true });
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify(finalizedSettlement(finalize[1]!, "artifact I/O")));
+          return;
+        }
+        res.statusCode = 404;
+        res.end();
+      });
+      const port = await listen(server);
+      const host = `127.0.0.1:${port}`;
+      const originalSyncDirectory = fsDurability.syncDirectory;
+      let injectedFailure = false;
+      const syncDirectory = vi
+        .spyOn(fsDurability, "syncDirectory")
+        .mockImplementation(async (directory) => {
+          await originalSyncDirectory(directory);
+          if (directory === artifactsDirectory && !injectedFailure) {
+            injectedFailure = true;
+            throw Object.assign(new Error("injected artifact cache I/O failure"), { code: "EIO" });
+          }
+        });
+      try {
+        const transaction = await createRemoteBrowserTransactionExecutor({
+          host,
+          token: "a".repeat(64),
+          deadlines,
+        })({ prompt: "artifact I/O", config: {}, sessionId: "artifact-io" });
+        expect(transaction).toMatchObject({
+          answerText: "answer",
+          warnings: [
+            {
+              code: "remote-artifact-manual-copy-required",
+              severity: "warning",
+              message: expect.stringContaining("injected artifact cache I/O failure"),
+            },
+          ],
+        });
+        expect(transaction.warnings?.[0]?.message).toContain(`remote browser host ${host}`);
+        expect(transaction).not.toHaveProperty("artifacts");
+        expect(transaction).not.toHaveProperty("savedFiles");
+        expect(artifactGets).toBe(0);
+        await expect(transaction.finalize()).resolves.toMatchObject({ status: "completed" });
+        expect(settlementRequests).toBe(1);
+        expect(waiverRequests).toBe(1);
+      } finally {
+        syncDirectory.mockRestore();
+        setOracleHomeDirOverrideForTest(null);
+        await close(server);
+        await fsPromises.rm(oracleHome, { recursive: true, force: true });
+      }
+    });
   });
   it("rejects route-confusion transaction tokens before remote transport", async () => {
     const validToken = "d".repeat(64);

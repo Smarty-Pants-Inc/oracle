@@ -16,11 +16,7 @@ import { CHATGPT_URL } from "../browser/constants.js";
 import { normalizeChatgptUrl } from "../browser/utils.js";
 import type { runBrowserModeTransaction } from "../browser/browserCoordinator.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import type {
-  BrowserRuntimeMetadata,
-  BrowserSessionConfig,
-  SessionArtifact,
-} from "../sessionManager.js";
+import type { BrowserRuntimeMetadata, BrowserSessionConfig } from "../sessionManager.js";
 import type { RemoteArtifactStore } from "./artifactStore.js";
 import { sanitizeArtifactFilename } from "../browser/artifacts.js";
 import {
@@ -29,9 +25,9 @@ import {
   browserRunResultFromTransaction,
   browserRuntimeFromError,
   hasBrowserCleanupAuthority,
-  remoteArtifactManualCopyWarning,
   projectRemotePublicResult,
   serializeDurableBrowserAutomationError,
+  stageRemoteCaptureWithArtifactFallback,
 } from "./transactionCapture.js";
 import {
   RemoteLegacyRunPayloadSchema,
@@ -39,20 +35,23 @@ import {
   type RemoteLegacyRunEvent,
   type RemoteLegacyRunPayload,
 } from "./legacyProtocol.js";
-import type { RemoteTransactionCoordinator } from "./transactionCoordinator.js";
+import type {
+  RemoteTransactionCoordinator,
+  RemoteTransactionSettlementOutcome,
+} from "./transactionCoordinator.js";
 import {
   remoteBrowserAutomationError,
   remotePendingSettlementError,
   remoteTransactionPayload,
 } from "./transactionProtocol.js";
 import type {
-  DurableRemoteArtifactRegistration,
+  RemotePendingCaptureTransactionRecord,
   RemoteTransactionRecord,
+  RemoteTransactionTransitionRecord,
 } from "./transactionModel.js";
 import { RemoteTransactionCapacityError, type RemoteTransactionStore } from "./transactionStore.js";
 import {
   buildRemotePromptRequestIdentity,
-  MAX_REMOTE_ATTACHMENTS,
   MAX_REMOTE_REQUEST_BYTES,
   REMOTE_TRANSACTION_PROTOCOL_VERSION,
   RemoteRunPayloadSchema,
@@ -66,6 +65,7 @@ import {
   isTerminalRemoteBrowserAutomationError,
   persistRemoteBrowserRuntime,
 } from "./serverTransactionRuntime.js";
+
 import type { RemoteServerOptions } from "./serverTypes.js";
 import { sameFileGeneration, samePhysicalFile } from "./transactionRecordStorage.js";
 import {
@@ -75,6 +75,11 @@ import {
   type PrivateTempGeneration,
   type PrivateTempRootOptions,
 } from "../privateTempRoot.js";
+
+type RemoteFailureRecord =
+  | RemoteTransactionTransitionRecord<"invalidate-staged-capture">
+  | RemoteTransactionTransitionRecord<"record-failure">
+  | RemoteTransactionSettlementOutcome["record"];
 
 type RemoteScratchGeneration = PrivateTempGeneration;
 
@@ -375,109 +380,61 @@ export async function handleRemoteRunRequest(params: {
       { ...result, conversationId: runtime.conversationId },
       runtime,
     );
-    const fileArtifacts: SessionArtifact[] = [
-      ...(result.savedFiles ?? []),
-      ...(result.artifacts ?? []).filter((artifact) => artifact.kind === "file"),
-    ];
-    const withManualCopyWarning = (
-      source: BrowserRunResult,
-      message: string,
-    ): BrowserRunResult => ({
-      ...source,
-      warnings: [...(source.warnings ?? []), remoteArtifactManualCopyWarning(message)].slice(-64),
-    });
-    let stagedResult = result;
-    let registrations: DurableRemoteArtifactRegistration[] | undefined =
-      fileArtifacts.length === 0 || params.protocol === "legacy-text-v1" ? [] : undefined;
-    if (params.protocol === "legacy-text-v1" && fileArtifacts.length > 0) {
-      stagedResult = {
-        ...result,
-        warnings: [
-          ...(result.warnings ?? []),
-          {
-            code: "legacy-remote-artifacts-host-only",
-            severity: "warning",
-            message:
-              "Generated files remain on the remote host and require explicit manual transfer; legacy text compatibility never claims artifact delivery.",
-          },
-        ],
-      };
-    } else if (fileArtifacts.length > MAX_REMOTE_ATTACHMENTS) {
-      registrations = [];
-      stagedResult = withManualCopyWarning(
-        result,
-        `Automatic remote transfer supports at most ${MAX_REMOTE_ATTACHMENTS} files. The captured text is preserved; open the ChatGPT browser on the remote host and copy the generated files manually.`,
-      );
+    if (params.protocol === "legacy-text-v1") {
+      const fileArtifacts = [
+        ...(result.savedFiles ?? []),
+        ...(result.artifacts ?? []).filter((artifact) => artifact.kind === "file"),
+      ];
+      const stagedResult =
+        fileArtifacts.length === 0
+          ? result
+          : {
+              ...result,
+              warnings: [
+                ...(result.warnings ?? []),
+                {
+                  code: "legacy-remote-artifacts-host-only",
+                  severity: "warning" as const,
+                  message:
+                    "Generated files remain on the remote host and require explicit manual transfer; legacy text compatibility never claims artifact delivery.",
+                },
+              ],
+            };
+      return await params.transactionStore.stageCapture({
+        transactionToken: params.transactionToken,
+        runId,
+        result: projectRemotePublicResult(stagedResult),
+        runtime,
+        modelSelection: result.modelSelection,
+        artifacts: [],
+      });
     }
-    let stagedRecord = await params.transactionStore.stageCapture({
+
+    const staged = await stageRemoteCaptureWithArtifactFallback({
+      transactionStore: params.transactionStore,
+      artifactStore: params.artifactStore,
       transactionToken: params.transactionToken,
       runId,
-      result: projectRemotePublicResult(stagedResult),
+      result,
       runtime,
-      modelSelection: result.modelSelection,
-      artifacts: registrations,
     });
-    if (
-      params.protocol === "transaction-v3" &&
-      fileArtifacts.length > 0 &&
-      registrations === undefined
-    ) {
-      try {
-        registrations = await params.artifactStore.prepareRequiredArtifacts({
-          transactionToken: params.transactionToken,
-          runId,
-          artifacts: fileArtifacts,
-        });
-        if (registrations.length > MAX_REMOTE_ATTACHMENTS) {
-          throw new Error("Remote artifact manifest exceeds the public transaction limit");
-        }
-      } catch (artifactError) {
-        const artifactMessage =
-          artifactError instanceof Error ? artifactError.message : String(artifactError);
-        registrations = [];
-        stagedResult = withManualCopyWarning(
-          result,
-          "Automatic remote artifact transfer could not be prepared. The captured text is preserved; open the ChatGPT browser on the remote host and copy the generated files manually.",
-        );
-        sendEvent({
-          type: "log",
-          message:
-            "[browser] Answer captured; generated files require manual copy from the remote host.",
-        });
-        log(
-          `[serve] Run ${runId} preserved its captured answer after artifact preparation failed: ${artifactMessage}`,
-        );
-      }
-      try {
-        stagedRecord = await params.transactionStore.stageCapture({
-          transactionToken: params.transactionToken,
-          runId,
-          result: projectRemotePublicResult(stagedResult),
-          runtime,
-          modelSelection: result.modelSelection,
-          artifacts: registrations,
-        });
-      } catch (enrichmentError) {
-        if (registrations.length === 0) throw enrichmentError;
-        stagedResult = withManualCopyWarning(
-          stagedResult,
-          "Automatic remote artifact transfer could not be published. The captured text is preserved; open the ChatGPT browser on the remote host and copy the generated files manually.",
-        );
-        registrations = [];
-        stagedRecord = await params.transactionStore.stageCapture({
-          transactionToken: params.transactionToken,
-          runId,
-          result: projectRemotePublicResult(stagedResult),
-          runtime,
-          modelSelection: result.modelSelection,
-          artifacts: registrations,
-        });
-        log(
-          `[serve] Run ${runId} published its captured text without artifact enrichment: ${enrichmentError instanceof Error ? enrichmentError.message : String(enrichmentError)}`,
-        );
-      }
+    if (staged.artifactFallback && staged.artifactFallback.stage !== "attachment-limit") {
+      sendEvent({
+        type: "log",
+        message:
+          "[browser] Answer captured; generated files require manual copy from the remote host.",
+      });
+      const reason =
+        staged.artifactFallback.error instanceof Error
+          ? staged.artifactFallback.error.message
+          : String(staged.artifactFallback.error);
+      log(
+        staged.artifactFallback.stage === "preparation"
+          ? `[serve] Run ${runId} preserved its captured answer after artifact preparation failed: ${reason}`
+          : `[serve] Run ${runId} published its captured text without artifact enrichment: ${reason}`,
+      );
     }
-    return stagedRecord;
+    return staged.record;
   };
 
   let capture: BrowserRunTransaction | null = null;
@@ -575,7 +532,7 @@ export async function handleRemoteRunRequest(params: {
     }
     const registrations = stagedCapture.artifacts;
     const publicResult = projectRemotePublicResult(result);
-    let record: RemoteTransactionRecord;
+    let record: RemotePendingCaptureTransactionRecord;
     try {
       record = await params.transactionStore.publishCapture({
         transactionToken: params.transactionToken,
@@ -588,7 +545,7 @@ export async function handleRemoteRunRequest(params: {
     } catch (publicationError) {
       if (isAbortWorthyRemoteCaptureMismatch(publicationError)) throw publicationError;
       const latest = await params.transactionStore.read(params.transactionToken);
-      if (latest?.state === "pending" && latest.result && latest.runtime) {
+      if (latest?.state === "pending") {
         record = latest;
       } else {
         record = await params.transactionStore.promoteStagedCapture({
@@ -621,15 +578,6 @@ export async function handleRemoteRunRequest(params: {
           message: "Remote answer was captured, but durable cleanup remains pending on the host.",
         });
         return;
-      }
-      if (!record.result) {
-        throw new BrowserAutomationError(
-          "Durably captured legacy result is missing its public answer.",
-          {
-            stage: "remote-publication",
-            code: "remote-result-missing",
-          },
-        );
       }
       sendEvent({
         type: "result",
@@ -687,7 +635,7 @@ export async function handleRemoteRunRequest(params: {
       new BrowserAutomationError(projectRemoteHostText(error.message), error.details, rawError),
       Boolean(recoverableRuntime) && !terminalFailure,
     );
-    let record = abortWorthyMismatch
+    let record: RemoteFailureRecord = abortWorthyMismatch
       ? await params.transactionStore.invalidateStagedCapture({
           transactionToken: params.transactionToken,
           runtime: recoverableRuntime,
@@ -721,12 +669,13 @@ export async function handleRemoteRunRequest(params: {
       sendEvent({
         type: "error",
         error:
-          record.settlementMode &&
-          record.error?.recoverableDisconnect === false &&
-          record.state !== "aborted" &&
-          record.state !== "failed"
-            ? remotePendingSettlementError(record)
-            : remoteBrowserAutomationError(record),
+          record.state === "recoverable-error"
+            ? record.error.recoverableDisconnect === false && record.settlementMode
+              ? remotePendingSettlementError(record)
+              : remoteBrowserAutomationError(record)
+            : record.state === "pending"
+              ? remotePendingSettlementError(record)
+              : remoteBrowserAutomationError(record),
       });
     }
     log(`[serve] Run ${runId} failed after ${Date.now() - runStartedAt}ms: ${error.message}`);

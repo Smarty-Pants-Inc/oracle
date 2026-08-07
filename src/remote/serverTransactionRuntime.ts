@@ -137,11 +137,15 @@ export async function serveRemoteTransactionBinding(params: {
       mode: request.mode,
       durablePublication: request.durablePublication,
     });
-    sendJson(
-      params.res,
-      200,
-      settlementBindingResponse(binding.record, binding.settlementAuthority, binding.finalization),
-    );
+    const response =
+      "finalization" in binding
+        ? settlementBindingResponse(
+            binding.record,
+            binding.settlementAuthority,
+            binding.finalization,
+          )
+        : settlementBindingResponse(binding.record, binding.settlementAuthority);
+    sendJson(params.res, 200, response);
   } catch (error) {
     if (error instanceof RemoteTransactionConflictError) {
       sendJson(params.res, error.statusCode, {

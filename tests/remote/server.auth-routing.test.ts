@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { mkdir, mkdtemp, readFile, readdir, rename, rm } from "node:fs/promises";
 import type { RemoteServerInstance } from "../../src/remote/server.js";
-import type { WindowsPrivateTreeScope } from "../../src/remote/windowsPrivateTreeAcl.js";
+import type { WindowsPrivateTreeScope } from "../../src/windowsPrivateFileAcl.js";
 import type { BrowserSessionConfig } from "../../src/sessionManager.js";
 import {
   CAN_LISTEN_LOCALHOST,

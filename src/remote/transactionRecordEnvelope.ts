@@ -159,7 +159,7 @@ export function authenticateRemoteTransactionRecordEnvelope(options: {
   if (actualMac.byteLength !== expectedMac.byteLength || !timingSafeEqual(expectedMac, actualMac)) {
     throw new Error("invalid envelope authentication");
   }
-  const record = JSON.parse(payload.toString("utf8")) as RemoteTransactionRecord;
+  const record: unknown = JSON.parse(payload.toString("utf8"));
   validateRemoteTransactionRecord(record, {
     expectedTransactionToken: options.transactionToken,
     maximumLeaseDurationMs: options.maximumLeaseDurationMs,

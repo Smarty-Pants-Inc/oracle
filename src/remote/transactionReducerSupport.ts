@@ -1,5 +1,10 @@
 import { isDeepStrictEqual } from "node:util";
+import type { BrowserCaptureFinalizationResult } from "../browser/types.js";
 import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionManager.js";
+import {
+  isTerminalRemoteTransactionState,
+  projectRemoteSettlementRuntime,
+} from "./transactionModel.js";
 import type {
   DurableRemoteArtifactDeliveryReceipt,
   DurableRemoteArtifactManualCopyWaiver,
@@ -7,12 +12,14 @@ import type {
   DurableRemoteAutomationError,
   DurableRemoteCaptureWarning,
   DurableRemoteStagedCapture,
+  DurableRemoteTerminalAudit,
+  RemoteNonterminalTransactionRecord,
+  RemoteTransactionPersistedEnvelope,
   RemoteTransactionRecord,
   RemoteTransactionReducerContext,
   RemoteTransactionSettlementAuthority,
 } from "./transactionModel.js";
 import {
-  isTerminalRemoteTransactionState,
   RemoteTransactionValidationError,
   validateRemoteStagedCapture,
 } from "./transactionValidation.js";
@@ -28,9 +35,8 @@ export class RemoteTransactionTransitionError extends Error {
     this.name = "RemoteTransactionTransitionError";
   }
 }
-
 export function assertValidRemoteStagedCapture(
-  record: RemoteTransactionRecord,
+  record: RemoteNonterminalTransactionRecord,
   staged: DurableRemoteStagedCapture,
 ): void {
   try {
@@ -50,7 +56,7 @@ export function assertValidRemoteStagedCapture(
 }
 
 export function assertPublishedPromptIdentity(
-  record: Pick<RemoteTransactionRecord, "requestIdentity">,
+  record: Pick<RemoteNonterminalTransactionRecord, "requestIdentity">,
   runtime: BrowserRuntimeMetadata,
 ): void {
   const epoch = runtime.promptEpoch;
@@ -138,6 +144,26 @@ export function mergeCaptureWarnings(
   };
 }
 
+type MutableTerminalProjectionRecord = RemoteTransactionPersistedEnvelope & {
+  capacityReservationBytes?: number;
+  requestIdentity?: NonNullable<RemoteTransactionRecord["requestIdentity"]>;
+  browserConfig?: NonNullable<RemoteTransactionRecord["browserConfig"]>;
+  leaseExpiresAt?: string;
+  result?: NonNullable<RemoteTransactionRecord["result"]>;
+  runtime?: BrowserRuntimeMetadata;
+  runtimeJournaledAt?: string;
+  modelSelection?: BrowserModelSelectionEvidence;
+  artifacts?: DurableRemoteArtifactRegistration[];
+  stagedCapture?: DurableRemoteStagedCapture;
+  error?: DurableRemoteAutomationError;
+  settlementMode?: "finalize" | "abort";
+  settlementExecutionStartedAt?: string;
+  publicationAcknowledgedAt?: string;
+  finalization?: NonNullable<RemoteTransactionRecord["finalization"]>;
+  restartRecovery?: NonNullable<RemoteTransactionRecord["restartRecovery"]>;
+  terminalAudit?: DurableRemoteTerminalAudit;
+};
+
 export function commitCapture(
   record: RemoteTransactionRecord,
   result: RemotePublicRunResult,
@@ -166,6 +192,7 @@ export function projectRunningRecordToFailure(
   record: RemoteTransactionRecord,
   error: DurableRemoteAutomationError,
   discardStagedCapture = false,
+  settlementMode?: "abort",
 ): "recoverable-error" | "failed" {
   const state = record.runtime ? "recoverable-error" : "failed";
   record.state = state;
@@ -176,48 +203,65 @@ export function projectRunningRecordToFailure(
   record.error = error;
   record.publicationAcknowledgedAt = undefined;
   record.finalization = undefined;
+  record.settlementMode = settlementMode;
   return state;
+}
+
+export function projectRemoteSettlementFinalization(
+  record: RemoteTransactionRecord,
+  mode: "finalize" | "abort",
+  finalization: BrowserCaptureFinalizationResult,
+): void {
+  record.runtime = projectRemoteSettlementRuntime(finalization.runtime);
+  record.finalization = finalization;
+  if (finalization.status === "completed") {
+    record.state = mode === "finalize" ? "finalized" : "aborted";
+    if (record.error) record.error = { ...record.error, recoverableDisconnect: false };
+  } else {
+    record.state = record.error && !record.result ? "recoverable-error" : "pending";
+  }
 }
 
 export function redactTerminalRecord(record: RemoteTransactionRecord, redactedAt: string): void {
   if (!isTerminalRemoteTransactionState(record.state)) return;
-  const promptEpoch = record.runtime?.promptEpoch ?? record.finalization?.runtime.promptEpoch;
-  record.terminalAudit ??= {
+  const mutable = record as MutableTerminalProjectionRecord;
+  const promptEpoch = mutable.runtime?.promptEpoch ?? mutable.finalization?.runtime.promptEpoch;
+  mutable.terminalAudit ??= {
     redactedAt,
-    settlementMode: record.settlementMode,
-    publicationAcknowledgedAt: record.publicationAcknowledgedAt,
-    artifacts: (record.artifacts ?? []).map((artifact) => ({
+    settlementMode: mutable.settlementMode,
+    publicationAcknowledgedAt: mutable.publicationAcknowledgedAt,
+    artifacts: (mutable.artifacts ?? []).map((artifact) => ({
       artifactId: artifact.descriptor.artifactId,
       runId: artifact.descriptor.runId,
       required: artifact.descriptor.required,
       deliveryReceipt: artifact.deliveryReceipt,
       manualCopyWaiver: artifact.manualCopyWaiver,
     })),
-    errorCode: record.error?.code,
-    errorStage: record.error?.stage,
+    errorCode: mutable.error?.code,
+    errorStage: mutable.error?.stage,
   };
-  record.finalization =
-    record.finalization?.status === "completed"
+  mutable.finalization =
+    mutable.finalization?.status === "completed"
       ? {
           status: "completed",
           runtime: promptEpoch ? { promptEpoch } : {},
         }
       : undefined;
-  record.result = undefined;
-  record.capacityReservationBytes = undefined;
-  Reflect.deleteProperty(record, "requestIdentity");
-  Reflect.deleteProperty(record, "browserConfig");
-  Reflect.deleteProperty(record, "leaseExpiresAt");
-  record.runtime = undefined;
-  record.runtimeJournaledAt = undefined;
-  record.modelSelection = undefined;
-  record.artifacts = undefined;
-  record.stagedCapture = undefined;
-  record.error = undefined;
-  record.settlementMode = undefined;
-  Reflect.deleteProperty(record, "settlementExecutionStartedAt");
-  record.publicationAcknowledgedAt = undefined;
-  record.restartRecovery = undefined;
+  mutable.result = undefined;
+  mutable.capacityReservationBytes = undefined;
+  Reflect.deleteProperty(mutable, "requestIdentity");
+  Reflect.deleteProperty(mutable, "browserConfig");
+  Reflect.deleteProperty(mutable, "leaseExpiresAt");
+  mutable.runtime = undefined;
+  mutable.runtimeJournaledAt = undefined;
+  mutable.modelSelection = undefined;
+  mutable.artifacts = undefined;
+  mutable.stagedCapture = undefined;
+  mutable.error = undefined;
+  mutable.settlementMode = undefined;
+  Reflect.deleteProperty(mutable, "settlementExecutionStartedAt");
+  mutable.publicationAcknowledgedAt = undefined;
+  mutable.restartRecovery = undefined;
 }
 
 export function sameArtifactDeliveryReceipt(

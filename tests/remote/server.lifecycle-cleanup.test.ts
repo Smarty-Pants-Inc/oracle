@@ -6,11 +6,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp, readdir, realpath, rm, writeFile, readFile } from "node:fs/promises";
 import { drainRemoteServerShutdown, type RemoteServerInstance } from "../../src/remote/server.js";
 import { ownRemoteServerLifecycle, serveRemote } from "../../src/remote/serverLifecycle.js";
-import { runBridgeHost } from "../../src/cli/bridge/host.js";
-import {
-  createRemoteBrowserTransactionExecutor,
-  resumeRemoteBrowserTransaction,
-} from "../../src/remote/client.js";
+import { runBridgeHost as runBridgeHostWithAuthority } from "../../src/cli/bridge/host.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import type { BrowserRunTransaction } from "../../src/browser/types.js";
 import { writeBinaryBrowserArtifact } from "../../src/browser/artifacts.js";
@@ -33,6 +29,8 @@ import { retryBrowserRecoveryCleanup } from "../../src/browser/reattach.js";
 import {
   CAN_LISTEN_LOCALHOST,
   createTestRemoteServer,
+  createTestRemoteBrowserTransactionExecutor as createRemoteBrowserTransactionExecutor,
+  resumeTestRemoteBrowserTransaction as resumeRemoteBrowserTransaction,
   browserTransaction,
   lifecycleBrowserTransaction,
   remoteRunPayload,
@@ -47,6 +45,16 @@ import {
 import { readAuthenticatedTransactionRecord } from "./serverTestTransactions.js";
 import { openTestRemoteTransactionStore } from "./testTransactionStore.js";
 import { processIdentity } from "../browser/chromeLifecycleTestHelpers.js";
+import { testWindowsPrivateFileAuthority } from "../privateAuthorityTestHelpers.js";
+
+const runBridgeHost = (
+  options: Parameters<typeof runBridgeHostWithAuthority>[0],
+  deps: Parameters<typeof runBridgeHostWithAuthority>[1] = {},
+) =>
+  runBridgeHostWithAuthority(options, {
+    windowsPrivateFileAuthority: testWindowsPrivateFileAuthority,
+    ...deps,
+  });
 
 describe("remote browser service", { timeout: 15_000 }, () => {
   test.skipIf(!CAN_LISTEN_LOCALHOST).each(["finalize", "abort"] as const)(

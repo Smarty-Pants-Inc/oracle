@@ -3,15 +3,16 @@ import { parsePhysicalDirectoryIdentity } from "../browser/filesystemLockDirecto
 import {
   deriveRemoteArtifactManualCopyWaiverId,
   deriveRemoteArtifactNamespace,
+  isTerminalRemoteTransactionState,
 } from "./transactionModel.js";
 import type {
   DurableRemoteArtifactDeliveryReceipt,
   DurableRemoteArtifactManualCopyWaiver,
   DurableRemoteArtifactRegistration,
   DurableRemoteStagedCapture,
+  RemoteNonterminalTransactionRecord,
+  RemoteTransactionPersistedEnvelope,
   RemoteTransactionRecord,
-  RemoteTransactionSettlementPhase,
-  RemoteTransactionState,
 } from "./transactionModel.js";
 import {
   REMOTE_TRANSACTION_CAPACITY_RESERVATION_BYTES,
@@ -45,35 +46,26 @@ export interface RemoteTransactionValidationOptions {
   maximumLeaseDurationMs?: number;
 }
 
-export function isTerminalRemoteTransactionState(
-  state: RemoteTransactionState,
-): state is "finalized" | "aborted" | "failed" {
-  return state === "finalized" || state === "aborted" || state === "failed";
-}
-
-export function authoritativeRemoteSettlementMode(
-  record: Pick<RemoteTransactionRecord, "settlementMode" | "runtime" | "terminalAudit">,
-): "finalize" | "abort" | undefined {
-  return (
-    record.settlementMode ??
-    record.runtime?.recoveryCleanupResult?.settlementMode ??
-    record.terminalAudit?.settlementMode
-  );
-}
-
-export function remoteTransactionSettlementPhase(
-  record: Pick<
-    RemoteTransactionRecord,
-    "state" | "settlementMode" | "settlementExecutionStartedAt" | "finalization" | "terminalAudit"
-  >,
-): RemoteTransactionSettlementPhase {
-  if (isTerminalRemoteTransactionState(record.state)) return "terminal";
-  if (!authoritativeRemoteSettlementMode(record)) return "unbound";
-  if (record.settlementExecutionStartedAt || record.finalization) {
-    return "executing-or-pending";
-  }
-  return "mode-bound";
-}
+/** Current v3 JSON read shape; validation narrows this flat compatibility form to exact phases. */
+type PersistedRemoteTransactionRecord = RemoteTransactionPersistedEnvelope & {
+  capacityReservationBytes?: number;
+  requestIdentity?: NonNullable<RemoteTransactionRecord["requestIdentity"]>;
+  browserConfig?: NonNullable<RemoteTransactionRecord["browserConfig"]>;
+  leaseExpiresAt?: string;
+  result?: NonNullable<RemoteTransactionRecord["result"]>;
+  runtime?: NonNullable<RemoteTransactionRecord["runtime"]>;
+  runtimeJournaledAt?: string;
+  modelSelection?: NonNullable<RemoteTransactionRecord["modelSelection"]>;
+  artifacts?: DurableRemoteArtifactRegistration[];
+  stagedCapture?: DurableRemoteStagedCapture;
+  error?: NonNullable<RemoteTransactionRecord["error"]>;
+  settlementMode?: NonNullable<RemoteTransactionRecord["settlementMode"]>;
+  settlementExecutionStartedAt?: string;
+  publicationAcknowledgedAt?: string;
+  finalization?: BrowserCaptureFinalizationResult;
+  restartRecovery?: NonNullable<RemoteTransactionRecord["restartRecovery"]>;
+  terminalAudit?: NonNullable<RemoteTransactionRecord["terminalAudit"]>;
+};
 
 export function missingRequiredArtifactDeliveries(
   record: Pick<RemoteTransactionRecord, "artifacts">,
@@ -168,7 +160,7 @@ export function validateRemoteArtifactManualCopyWaiver(
 
 export function validateRemoteStagedCapture(
   record: Pick<
-    RemoteTransactionRecord,
+    RemoteNonterminalTransactionRecord,
     "transactionToken" | "runId" | "requestIdentity" | "stagedCapture"
   >,
   staged: DurableRemoteStagedCapture | undefined = record.stagedCapture,
@@ -195,7 +187,7 @@ export function validateRemoteStagedCapture(
   validateRemoteArtifactOwnership(record, staged.artifacts ?? []);
 }
 
-export function validateRemoteTerminalAudit(record: RemoteTransactionRecord): void {
+export function validateRemoteTerminalAudit(record: PersistedRemoteTransactionRecord): void {
   const audit = record.terminalAudit;
   if (
     !audit ||
@@ -308,9 +300,13 @@ export function validateRemoteTerminalAudit(record: RemoteTransactionRecord): vo
 }
 
 export function validateRemoteTransactionRecord(
-  record: RemoteTransactionRecord,
+  value: unknown,
   options: RemoteTransactionValidationOptions = {},
-): void {
+): asserts value is RemoteTransactionRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    invalidRecord("Invalid remote transaction record");
+  }
+  const record = value as PersistedRemoteTransactionRecord;
   if (
     record.protocolVersion !== REMOTE_TRANSACTION_PROTOCOL_VERSION ||
     !REMOTE_TRANSACTION_TOKEN_PATTERN.test(record.transactionToken) ||
@@ -374,6 +370,9 @@ export function validateRemoteTransactionRecord(
   ) {
     invalidRecord("Nonterminal remote transaction is missing bounded request authority");
   }
+  if (record.terminalAudit) {
+    invalidRecord("Nonterminal remote transaction contains terminal audit state");
+  }
   if (
     record.runtimeJournaledAt !== undefined &&
     (!record.runtime || !Number.isFinite(Date.parse(record.runtimeJournaledAt)))
@@ -389,12 +388,26 @@ export function validateRemoteTransactionRecord(
   ) {
     invalidRecord("Remote transaction settlement execution marker is invalid");
   }
-  if (record.finalization && !record.settlementExecutionStartedAt) {
-    invalidRecord("Remote transaction finalization lacks durable execution authority");
+  if (record.finalization) {
+    if (
+      !record.settlementExecutionStartedAt ||
+      record.finalization.status !== "pending" ||
+      typeof record.finalization.error !== "string" ||
+      !record.finalization.error ||
+      !record.finalization.runtime ||
+      typeof record.finalization.runtime !== "object" ||
+      Array.isArray(record.finalization.runtime)
+    ) {
+      invalidRecord("Nonterminal remote transaction finalization must remain pending");
+    }
   }
-  if (record.finalization) validatePendingFinalization(record.finalization);
   validateRemoteArtifactOwnership(record, record.artifacts ?? []);
-  validateRemoteStagedCapture(record);
+  validateRemoteStagedCapture({
+    transactionToken: record.transactionToken,
+    runId: record.runId,
+    requestIdentity,
+    stagedCapture: record.stagedCapture,
+  });
   validateLeaseBound(record, options.maximumLeaseDurationMs);
 
   switch (record.state) {
@@ -437,7 +450,7 @@ export function validateRemoteTransactionRecord(
       }
       if (record.settlementMode === "finalize") {
         if (!record.publicationAcknowledgedAt) {
-          if (remoteTransactionSettlementPhase(record) !== "mode-bound") {
+          if (record.settlementExecutionStartedAt || record.finalization) {
             invalidRecord("Finalize-bound transaction lacks publication or artifact durability");
           }
         } else if (
@@ -476,26 +489,13 @@ export function validateRemoteTransactionRecord(
   }
 }
 
-function validatePendingFinalization(finalization: BrowserCaptureFinalizationResult): void {
-  if (
-    finalization.status !== "pending" ||
-    typeof finalization.error !== "string" ||
-    !finalization.error ||
-    !finalization.runtime ||
-    typeof finalization.runtime !== "object" ||
-    Array.isArray(finalization.runtime)
-  ) {
-    invalidRecord("Nonterminal remote transaction finalization must remain pending");
-  }
-}
-
 function validateLeaseBound(
-  record: RemoteTransactionRecord,
+  record: PersistedRemoteTransactionRecord,
   maximumLeaseDurationMs: number | undefined,
 ): void {
   if (maximumLeaseDurationMs === undefined) return;
   const updatedAt = Date.parse(record.updatedAt);
-  const leaseExpiresAt = Date.parse(record.leaseExpiresAt);
+  const leaseExpiresAt = Date.parse(record.leaseExpiresAt ?? "");
   if (
     !Number.isFinite(leaseExpiresAt) ||
     leaseExpiresAt <= updatedAt ||

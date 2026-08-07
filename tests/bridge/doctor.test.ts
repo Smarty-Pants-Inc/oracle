@@ -4,6 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
 import { PROJECT_CONFIG_RELATIVE_PATH } from "../../src/config.js";
+import {
+  testWindowsPrivateFileAuthority,
+  testWindowsPrivateFileProtectionAuthority,
+  testWindowsPrivateFileVerificationAuthority,
+} from "../privateAuthorityTestHelpers.js";
 
 // biome-ignore lint/complexity/useRegexLiterals: constructor form avoids control-char lint noise.
 const ansiRegex = new RegExp("\\x1B\\[[0-9;]*m", "g");
@@ -11,6 +16,11 @@ const stripAnsi = (text: string): string => text.replace(ansiRegex, "");
 
 const MODERN_TOKEN = "a".repeat(64);
 const LEGACY_TOKEN = "b".repeat(64);
+const testUserConfigFileAuthorities = {
+  windowsPrivateFileAuthority: testWindowsPrivateFileAuthority,
+  windowsPrivateFileProtectionAuthority: testWindowsPrivateFileProtectionAuthority,
+  windowsPrivateFileVerificationAuthority: testWindowsPrivateFileVerificationAuthority,
+};
 
 vi.mock("../../src/remote/health.js", () => ({
   checkTcpConnection: vi.fn(async () => ({ ok: true })),
@@ -119,13 +129,18 @@ describe("oracle bridge doctor", () => {
     const configFile = path.join(tempDir, "legacy-client.json");
     vi.spyOn(console, "log").mockImplementation(() => undefined);
 
-    await runBridgeClient({
-      connect: "127.0.0.1:9473",
-      legacyToken: LEGACY_TOKEN,
-      allowLegacyTextProtocol: true,
-      config: configFile,
-      test: false,
-    });
+    await runBridgeClient(
+      {
+        connect: "127.0.0.1:9473",
+        legacyToken: LEGACY_TOKEN,
+        allowLegacyTextProtocol: true,
+        config: configFile,
+        test: false,
+      },
+      {
+        userConfigFileAuthorities: testUserConfigFileAuthorities,
+      },
+    );
 
     const config = JSON.parse(await fs.readFile(configFile, "utf8"));
     expect(config.browser).toMatchObject({
@@ -134,6 +149,28 @@ describe("oracle bridge doctor", () => {
       remoteLegacyToken: LEGACY_TOKEN,
       remoteAllowLegacyTextProtocol: true,
     });
+  });
+
+  it("resolves a custom bridge client config path to an absolute publication target", async () => {
+    const configFile = path.join(tempDir, "relative-client.json");
+    const relativeConfigFile = path.relative(process.cwd(), configFile);
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((message) => logs.push(String(message)));
+
+    await runBridgeClient(
+      {
+        connect: `127.0.0.1:9473?token=${MODERN_TOKEN}`,
+        config: relativeConfigFile,
+        test: false,
+      },
+      {
+        userConfigFileAuthorities: testUserConfigFileAuthorities,
+      },
+    );
+
+    await expect(fs.readFile(configFile, "utf8")).resolves.toContain(MODERN_TOKEN);
+    expect(stripAnsi(logs.join("\n"))).toContain(`Wrote remote config to ${configFile}`);
+    expect(configFile).not.toBe(relativeConfigFile);
   });
 
   it("refuses to reuse a modern connection token as the legacy bearer", async () => {

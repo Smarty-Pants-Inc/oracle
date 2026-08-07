@@ -17,7 +17,8 @@ import type { ReattachCleanupDeps, ReattachFinalizationResult } from "./reattach
 import type { ReattachSettlementMode } from "./reattachCleanupTypes.js";
 import type { TargetInfoLite } from "./reattachHelpers.js";
 import type { ChromeClient } from "./types.js";
-import type { ProviderDomAdapter } from "./providerDomFlow.js";
+import type { ChatgptDomAdapter } from "./providers/chatgptDomProvider.js";
+import type { GeminiDeepThinkDomAdapter } from "./providers/geminiDeepThinkDomProvider.js";
 
 export interface ReattachCapture extends Partial<
   Omit<BrowserRunResult, "answerText" | "answerMarkdown">
@@ -27,6 +28,11 @@ export interface ReattachCapture extends Partial<
   runtime?: BrowserRuntimeMetadata;
   finalizeResources?: () => Promise<ReattachFinalizationResult>;
   abortResources?: () => Promise<ReattachFinalizationResult>;
+}
+
+export interface PendingPromptProviderOverrides {
+  chatgpt?: ChatgptDomAdapter;
+  gemini?: GeminiDeepThinkDomAdapter;
 }
 
 export interface ReattachDeps {
@@ -55,7 +61,7 @@ export interface ReattachDeps {
   runtimeHintCb?: (runtime: BrowserRuntimeMetadata) => void | Promise<void>;
   pendingPromptCandidates?: readonly string[];
   pendingPromptSha256Authorities?: readonly string[];
-  pendingPromptProvider?: ProviderDomAdapter;
+  pendingPromptProviders?: PendingPromptProviderOverrides;
   loadRuntimeUnderLock?: () => Promise<BrowserRuntimeMetadata>;
   persistFinalizationResult?: (
     result: ReattachFinalizationResult,

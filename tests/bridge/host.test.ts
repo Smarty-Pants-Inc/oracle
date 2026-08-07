@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 import {
   BRIDGE_HOST_CREDENTIAL_PAYLOAD_MAX_BYTES,
-  runBridgeHost,
+  runBridgeHost as runBridgeHostWithAuthority,
 } from "../../src/cli/bridge/host.js";
 import { startReverseTunnel } from "../../src/cli/bridge/reverseTunnel.js";
 import { WINDOWS_BRIDGE_CHILD_READINESS_STDOUT } from "../../src/cli/bridge/childProtocol.js";
@@ -23,6 +23,7 @@ import {
 import * as fsDurability from "../../src/fsDurability.js";
 import * as sessionManager from "../../src/sessionManager.js";
 import type { WindowsPrivateFileAclRequest } from "../../src/windowsPrivateFileAcl.js";
+import { testWindowsPrivateFileAuthority } from "../privateAuthorityTestHelpers.js";
 
 import {
   resolveWindowsOpenSshExecutable,
@@ -33,6 +34,14 @@ const MODERN_TOKEN = "a".repeat(64);
 const LEGACY_TOKEN = "b".repeat(64);
 const READINESS_NONCE = "11111111-1111-4111-8111-111111111111";
 const OTHER_NONCE = "22222222-2222-4222-8222-222222222222";
+const runBridgeHost = (
+  options: Parameters<typeof runBridgeHostWithAuthority>[0],
+  deps: Parameters<typeof runBridgeHostWithAuthority>[1] = {},
+) =>
+  runBridgeHostWithAuthority(options, {
+    windowsPrivateFileAuthority: testWindowsPrivateFileAuthority,
+    ...deps,
+  });
 async function waitForFileContents(filePath: string, timeoutMs = 5_000): Promise<string> {
   await expect
     .poll(

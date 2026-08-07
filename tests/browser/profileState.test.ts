@@ -27,6 +27,7 @@ import * as profileState from "../../src/browser/profileState.js";
 import { resolveWindowsPowerShellExecutable } from "../../src/windowsSystemExecutable.js";
 import type { ChromeProcessIdentity } from "../../src/browser/chromeProcessIdentity.js";
 import type { OracleChromeOwnerRecord } from "../../src/browser/profileState.js";
+import { testProcessIdentityProvider } from "./filesystemLockTestHelpers.js";
 
 const PROCESS_NONCE_S = "11111111-1111-4111-8111-111111111111";
 
@@ -38,6 +39,13 @@ const UNUSED_PROFILE_USE_DEPS = Object.freeze({
   inspectChromeProfileDirectoryUse: async () => UNUSED_PROFILE_USE,
   revalidateChromeProfileDirectoryUse: async () => UNUSED_PROFILE_USE,
 });
+const acquireProfileRunLock = (
+  userDataDir: Parameters<typeof profileState.acquireProfileRunLock>[0],
+  options: Parameters<typeof profileState.acquireProfileRunLock>[1],
+) =>
+  profileState.acquireProfileRunLock(userDataDir, options, {
+    processIdentityProvider: testProcessIdentityProvider,
+  });
 
 function syntheticWindowsChromeIdentity(
   userDataDir: string,
@@ -1279,7 +1287,7 @@ describe("profileState", () => {
   test("acquires and releases the manual-login profile lock", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-"));
     try {
-      const lock = await profileState.acquireProfileRunLock(dir, { timeoutMs: 500, pollMs: 50 });
+      const lock = await acquireProfileRunLock(dir, { timeoutMs: 500, pollMs: 50 });
       expect(lock).not.toBeNull();
       const lockPath = path.join(dir, "oracle-automation.lock");
       expect(existsSync(lockPath)).toBe(true);
@@ -1296,7 +1304,7 @@ describe("profileState", () => {
     const moved = path.join(root, "moved-profile");
     await mkdir(dir);
     try {
-      const lock = await profileState.acquireProfileRunLock(dir, { timeoutMs: 500, pollMs: 50 });
+      const lock = await acquireProfileRunLock(dir, { timeoutMs: 500, pollMs: 50 });
       expect(lock).not.toBeNull();
       await rename(dir, moved);
       await mkdir(dir);
@@ -1312,10 +1320,10 @@ describe("profileState", () => {
   test("waits for profile lock and errors on timeout", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-"));
     try {
-      const lock = await profileState.acquireProfileRunLock(dir, { timeoutMs: 500, pollMs: 50 });
-      await expect(
-        profileState.acquireProfileRunLock(dir, { timeoutMs: 150, pollMs: 50 }),
-      ).rejects.toThrow(/profile lock/i);
+      const lock = await acquireProfileRunLock(dir, { timeoutMs: 500, pollMs: 50 });
+      await expect(acquireProfileRunLock(dir, { timeoutMs: 150, pollMs: 50 })).rejects.toThrow(
+        /profile lock/i,
+      );
       await lock?.release();
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -1342,7 +1350,7 @@ describe("profileState", () => {
           createdAt: new Date().toISOString(),
         })}\n`,
       );
-      const lock = await profileState.acquireProfileRunLock(dir, { timeoutMs: 500, pollMs: 50 });
+      const lock = await acquireProfileRunLock(dir, { timeoutMs: 500, pollMs: 50 });
       expect(lock).not.toBeNull();
       await lock?.release();
       expect(existsSync(lockPath)).toBe(false);
@@ -1365,7 +1373,7 @@ describe("profileState", () => {
     })}\n`;
     try {
       await writeFile(lockPath, legacyRaw, "utf8");
-      const lock = await profileState.acquireProfileRunLock(dir, {
+      const lock = await acquireProfileRunLock(dir, {
         timeoutMs: 500,
         pollMs: 50,
         sessionId: "replacement-session",
@@ -1390,9 +1398,9 @@ describe("profileState", () => {
     })}\n`;
     try {
       await writeFile(lockPath, legacyRaw, "utf8");
-      await expect(
-        profileState.acquireProfileRunLock(dir, { timeoutMs: 150, pollMs: 50 }),
-      ).rejects.toThrow(/profile lock/i);
+      await expect(acquireProfileRunLock(dir, { timeoutMs: 150, pollMs: 50 })).rejects.toThrow(
+        /profile lock/i,
+      );
       await expect(readFile(lockPath, "utf8")).resolves.toBe(legacyRaw);
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -1411,9 +1419,9 @@ describe("profileState", () => {
     })}\n`;
     try {
       await writeFile(lockPath, raw, "utf8");
-      await expect(
-        profileState.acquireProfileRunLock(dir, { timeoutMs: 150, pollMs: 50 }),
-      ).rejects.toThrow(/profile lock/i);
+      await expect(acquireProfileRunLock(dir, { timeoutMs: 150, pollMs: 50 })).rejects.toThrow(
+        /profile lock/i,
+      );
       await expect(readFile(lockPath, "utf8")).resolves.toBe(raw);
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -1425,9 +1433,9 @@ describe("profileState", () => {
     try {
       const lockPath = path.join(dir, "oracle-automation.lock");
       await writeFile(lockPath, "not-json");
-      await expect(
-        profileState.acquireProfileRunLock(dir, { timeoutMs: 150, pollMs: 50 }),
-      ).rejects.toThrow(/profile lock/i);
+      await expect(acquireProfileRunLock(dir, { timeoutMs: 150, pollMs: 50 })).rejects.toThrow(
+        /profile lock/i,
+      );
       await expect(readFile(lockPath, "utf8")).resolves.toBe("not-json");
     } finally {
       await rm(dir, { recursive: true, force: true });

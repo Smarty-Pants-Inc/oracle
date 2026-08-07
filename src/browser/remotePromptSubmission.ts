@@ -11,7 +11,7 @@ import { uploadAttachmentViaDataTransfer } from "./actions/remoteFileTransfer.js
 import { activateDeepResearch } from "./actions/deepResearch.js";
 import { delay, withRetries } from "./utils.js";
 import { runProviderSubmissionFlow } from "./providerDomFlow.js";
-import { chatgptDomProvider } from "./providers/index.js";
+import { chatgptDomProvider, createChatgptDomProviderState } from "./providers/index.js";
 import { readConversationTurnCount } from "./responseCaptureCoordinator.js";
 import { captureDeepResearchTargetBaseline } from "./promptSubmissionCoordinator.js";
 import { requireCommittedPromptLocator } from "./archiveSettlementCoordinator.js";
@@ -91,7 +91,7 @@ export async function submitRemotePromptOnce(
       `Prompt textarea ready (after Deep Research activation, ${prompt.length.toLocaleString()} chars queued)`,
     );
   }
-  const providerState: Record<string, unknown> = {
+  const providerState = createChatgptDomProviderState({
     runtime: Runtime,
     input: Input,
     logger,
@@ -100,7 +100,7 @@ export async function submitRemotePromptOnce(
     attachmentTimeoutMs: config.attachmentTimeoutMs ?? undefined,
     baselineTurns: dispatchBaselineTurns,
     attachmentNames: attachmentExpectations,
-  };
+  });
   const deepResearchTargetBaseline = deepResearch
     ? await captureDeepResearchTargetBaseline(client, logger)
     : undefined;

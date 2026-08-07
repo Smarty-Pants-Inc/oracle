@@ -3,8 +3,8 @@ import type { BigIntStats } from "node:fs";
 import { link, lstat, open, readdir, rename, rm, unlink } from "node:fs/promises";
 import path from "node:path";
 import { syncDirectory } from "../fsDurability.js";
+import { isTerminalRemoteTransactionState } from "./transactionModel.js";
 import type { RemoteTransactionRecord } from "./transactionModel.js";
-import { isTerminalRemoteTransactionState } from "./transactionValidation.js";
 import {
   assertPhysicalTransactionRecordFile,
   isPhysicalTransactionRecordFile,

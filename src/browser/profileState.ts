@@ -5,6 +5,7 @@ import { readErrorCode } from "../fsDurability.js";
 import {
   acquireCrashRecoverableFilesystemLock,
   type CrashRecoverableFilesystemLock,
+  type CrashRecoverableFilesystemLockDeps,
   FilesystemLockBusyError,
 } from "./filesystemLock.js";
 import {
@@ -586,6 +587,7 @@ export async function acquireProfileRunLock(
     logger?: ProfileStateLogger;
     sessionId?: string;
   },
+  deps: CrashRecoverableFilesystemLockDeps = {},
 ): Promise<ProfileRunLock | null> {
   const timeoutMs = options.timeoutMs;
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return null;
@@ -601,12 +603,16 @@ export async function acquireProfileRunLock(
 
   let filesystemLock: CrashRecoverableFilesystemLock;
   try {
-    filesystemLock = await acquireCrashRecoverableFilesystemLock(lockPath, {
-      timeoutMs,
-      pollMs,
-      createParent: false,
-      sessionId: options.sessionId,
-    });
+    filesystemLock = await acquireCrashRecoverableFilesystemLock(
+      lockPath,
+      {
+        timeoutMs,
+        pollMs,
+        createParent: false,
+        sessionId: options.sessionId,
+      },
+      deps,
+    );
   } catch (error) {
     if (error instanceof FilesystemLockBusyError) {
       const owner = error.owner ? ` by pid ${error.owner.pid}` : "";

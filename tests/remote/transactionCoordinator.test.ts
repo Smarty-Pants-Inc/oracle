@@ -177,7 +177,7 @@ describe("RemoteTransactionCoordinator", () => {
       expect(finalize).toHaveBeenCalledTimes(2);
       expect(coordinator.hasActive(transactionToken)).toBe(false);
       const finalizedRecord = await store.read(transactionToken);
-      if (!finalizedRecord?.finalization) throw new Error("missing terminal finalization");
+      if (finalizedRecord?.state !== "finalized") throw new Error("missing terminal finalization");
       expect(settlementResponse(finalizedRecord, finalizedRecord.finalization)).toMatchObject({
         state: "finalized",
         settlementAuthority: { mode: "finalize", outcome: "completed", state: "finalized" },

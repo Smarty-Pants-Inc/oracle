@@ -8,10 +8,19 @@ import {
   parseHostPort,
   readBridgeConnectionArtifact,
 } from "../../src/bridge/connection.js";
-import { runBridgeHost } from "../../src/cli/bridge/host.js";
+import { runBridgeHost as runBridgeHostWithAuthority } from "../../src/cli/bridge/host.js";
+import { testWindowsPrivateFileAuthority } from "../privateAuthorityTestHelpers.js";
 
 const MODERN_TOKEN = "a".repeat(64);
 const PREDECESSOR_TOKEN = "b".repeat(32);
+const runBridgeHost = (
+  options: Parameters<typeof runBridgeHostWithAuthority>[0],
+  deps: Parameters<typeof runBridgeHostWithAuthority>[1] = {},
+) =>
+  runBridgeHostWithAuthority(options, {
+    windowsPrivateFileAuthority: testWindowsPrivateFileAuthority,
+    ...deps,
+  });
 
 describe("bridge connection parsing", () => {
   it("parses host:port?token=...", () => {

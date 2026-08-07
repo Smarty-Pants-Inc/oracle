@@ -1,5 +1,11 @@
 import type { BigIntStats } from "node:fs";
 import { lstat } from "node:fs/promises";
+import {
+  parsePhysicalFileGeneration,
+  physicalFileGenerationFromStats,
+  samePhysicalFileGeneration,
+  type PhysicalFileGeneration,
+} from "../physicalFileIdentity.js";
 
 export class PhysicalDirectoryIdentityUnavailableError extends Error {
   readonly code = "ERR_ORACLE_PHYSICAL_DIRECTORY_IDENTITY_UNAVAILABLE";
@@ -16,18 +22,10 @@ export interface PhysicalDirectoryIdentityOptions {
   readonly allowZeroBirthtime?: boolean;
 }
 
-export interface PhysicalDirectoryIdentity {
-  readonly device: string;
-  readonly inode: string;
-  readonly birthtimeNs: string;
-}
+export type PhysicalDirectoryIdentity = PhysicalFileGeneration;
 
 export function physicalDirectoryIdentityFromStats(entry: BigIntStats): PhysicalDirectoryIdentity {
-  return {
-    device: entry.dev.toString(),
-    inode: entry.ino.toString(),
-    birthtimeNs: entry.birthtimeNs.toString(),
-  };
+  return physicalFileGenerationFromStats(entry);
 }
 
 export async function capturePhysicalDirectoryIdentity(
@@ -47,20 +45,9 @@ export function parsePhysicalDirectoryIdentity(
   value: unknown,
   options: PhysicalDirectoryIdentityOptions = {},
 ): PhysicalDirectoryIdentity | null {
-  if (
-    !isPlainRecord(value) ||
-    Object.keys(value).sort().join(",") !== "birthtimeNs,device,inode" ||
-    typeof value.device !== "string" ||
-    typeof value.inode !== "string" ||
-    typeof value.birthtimeNs !== "string" ||
-    !/^(?:0|[1-9]\d*)$/u.test(value.device) ||
-    !/^(?:0|[1-9]\d*)$/u.test(value.inode) ||
-    !/^(?:0|[1-9]\d*)$/u.test(value.birthtimeNs) ||
-    (!options.allowZeroBirthtime && value.birthtimeNs === "0")
-  ) {
-    return null;
-  }
-  return { device: value.device, inode: value.inode, birthtimeNs: value.birthtimeNs };
+  const identity = parsePhysicalFileGeneration(value);
+  if (!identity || (!options.allowZeroBirthtime && identity.birthtimeNs === "0")) return null;
+  return identity;
 }
 
 export function samePhysicalDirectoryIdentity(
@@ -70,12 +57,6 @@ export function samePhysicalDirectoryIdentity(
 ): boolean {
   return (
     (options.allowZeroBirthtime || (left.birthtimeNs !== "0" && right.birthtimeNs !== "0")) &&
-    left.device === right.device &&
-    left.inode === right.inode &&
-    left.birthtimeNs === right.birthtimeNs
+    samePhysicalFileGeneration(left, right)
   );
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

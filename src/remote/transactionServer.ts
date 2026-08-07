@@ -1,12 +1,13 @@
 import type { BrowserRunTransaction } from "../browser/types.js";
+import { isTerminalRemoteTransactionState } from "./transactionModel.js";
 import type {
   DurableRemoteAutomationError,
   ReconcileRemoteTransactionResult,
+  RemoteNonterminalTransactionRecord,
   RemoteTransactionRecord,
 } from "./transactionModel.js";
 import type { RemoteTransactionStore } from "./transactionStore.js";
 import type { RemoteTransactionCoordinator } from "./transactionCoordinator.js";
-import { isTerminalRemoteTransactionState } from "./transactionValidation.js";
 
 interface RemoteTransactionServerAuthority {
   transactionStore: RemoteTransactionStore;
@@ -23,7 +24,7 @@ export async function reconcileRemoteTransactionAuthority(
 }
 
 export async function settleExpiredRemoteTransaction(
-  params: RemoteTransactionServerAuthority & { record: RemoteTransactionRecord },
+  params: RemoteTransactionServerAuthority & { record: RemoteNonterminalTransactionRecord },
 ): Promise<RemoteTransactionRecord | null> {
   const settlement = await params.transactionStore.expire({
     transactionToken: params.record.transactionToken,

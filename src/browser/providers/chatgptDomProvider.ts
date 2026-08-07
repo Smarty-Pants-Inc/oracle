@@ -4,9 +4,11 @@ import type {
   PendingPromptObservation,
   PendingPromptReconciliationContext,
   PendingPromptEpochReconciliation,
+  PendingPromptTurnObservation,
   PromptCommitEvidence,
   ProviderDomAdapter,
   ProviderDomFlowContext,
+  ProviderDomState,
 } from "../providerDomFlow.js";
 import { reconcilePendingPromptObservations } from "../providerDomFlow.js";
 import { ensurePromptReady } from "../actions/navigation.js";
@@ -19,7 +21,7 @@ import {
 } from "../conversationTurns.js";
 import { INPUT_SELECTORS, SEND_BUTTON_SELECTORS, STOP_BUTTON_SELECTORS } from "../constants.js";
 
-interface ChatgptDomProviderState {
+export interface ChatgptDomProviderState extends ProviderDomState<"chatgpt"> {
   runtime: ChromeClient["Runtime"];
   input: ChromeClient["Input"];
   logger: BrowserLogger;
@@ -31,24 +33,39 @@ interface ChatgptDomProviderState {
   onPromptDispatchStarted?: () => Promise<void> | void;
 }
 
-function requireState(ctx: ProviderDomFlowContext): ChatgptDomProviderState {
-  const state = ctx.state as ChatgptDomProviderState | undefined;
-  if (!state?.runtime || !state?.input || !state?.logger) {
-    throw new Error("chatgptDomProvider requires runtime/input/logger in context.state.");
+export interface ChatgptDomResponse {
+  text: string;
+  html?: string;
+  meta?: { turnId?: string | null; messageId?: string | null };
+}
+
+export type ChatgptDomAdapter = ProviderDomAdapter<ChatgptDomProviderState, ChatgptDomResponse>;
+export type ChatgptDomFlowContext = ProviderDomFlowContext<ChatgptDomProviderState>;
+
+export function createChatgptDomProviderState(
+  state: Omit<ChatgptDomProviderState, "provider">,
+): ChatgptDomProviderState {
+  return { ...state, provider: "chatgpt" };
+}
+
+function requireState(ctx: ChatgptDomFlowContext): ChatgptDomProviderState {
+  const state = ctx.state;
+  if (state.provider !== "chatgpt" || !state.runtime || !state.input || !state.logger) {
+    throw new Error("chatgptDomProvider requires bound runtime/input/logger provider state.");
   }
   return state;
 }
 
-async function waitForUi(ctx: ProviderDomFlowContext): Promise<void> {
+async function waitForUi(ctx: ChatgptDomFlowContext): Promise<void> {
   const state = requireState(ctx);
   await ensurePromptReady(state.runtime, state.inputTimeoutMs ?? 30_000, state.logger);
 }
 
-async function typePrompt(_ctx: ProviderDomFlowContext): Promise<void> {
+async function typePrompt(_ctx: ChatgptDomFlowContext): Promise<void> {
   // submitPrompt() handles typing + send for ChatGPT.
 }
 
-async function submitPromptViaAdapter(ctx: ProviderDomFlowContext): Promise<PromptCommitEvidence> {
+async function submitPromptViaAdapter(ctx: ChatgptDomFlowContext): Promise<PromptCommitEvidence> {
   const state = requireState(ctx);
   const verification = await submitPrompt(
     {
@@ -67,11 +84,7 @@ async function submitPromptViaAdapter(ctx: ProviderDomFlowContext): Promise<Prom
   return { status: "committed", verification };
 }
 
-async function waitForResponse(ctx: ProviderDomFlowContext): Promise<{
-  text: string;
-  html?: string;
-  meta?: { turnId?: string | null; messageId?: string | null };
-}> {
+async function waitForResponse(ctx: ChatgptDomFlowContext): Promise<ChatgptDomResponse> {
   const state = requireState(ctx);
   const answer = await waitForAssistantResponse(
     state.runtime,
@@ -88,48 +101,56 @@ async function waitForResponse(ctx: ProviderDomFlowContext): Promise<{
 
 function parsePendingPromptObservation(value: unknown): PendingPromptObservation | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const candidate = value as Record<string, unknown>;
   if (
-    typeof candidate.ready !== "boolean" ||
-    (candidate.conversationId !== null && typeof candidate.conversationId !== "string") ||
-    typeof candidate.composerText !== "string" ||
-    typeof candidate.canSubmit !== "boolean" ||
-    typeof candidate.active !== "boolean" ||
-    !Array.isArray(candidate.turns)
+    !("ready" in value) ||
+    typeof value.ready !== "boolean" ||
+    !("conversationId" in value) ||
+    (value.conversationId !== null && typeof value.conversationId !== "string") ||
+    !("composerText" in value) ||
+    typeof value.composerText !== "string" ||
+    !("canSubmit" in value) ||
+    typeof value.canSubmit !== "boolean" ||
+    !("active" in value) ||
+    typeof value.active !== "boolean" ||
+    !("turns" in value) ||
+    !Array.isArray(value.turns)
   ) {
     return null;
   }
-  const turns = candidate.turns.map((turn) => {
+  const turns: PendingPromptTurnObservation[] = [];
+  for (const turn of value.turns) {
     if (!turn || typeof turn !== "object" || Array.isArray(turn)) return null;
-    const entry = turn as Record<string, unknown>;
     if (
-      (entry.role !== "user" && entry.role !== "assistant") ||
-      typeof entry.text !== "string" ||
-      (entry.turnId !== null && typeof entry.turnId !== "string") ||
-      (entry.messageId !== null && typeof entry.messageId !== "string")
+      !("role" in turn) ||
+      (turn.role !== "user" && turn.role !== "assistant") ||
+      !("text" in turn) ||
+      typeof turn.text !== "string" ||
+      !("turnId" in turn) ||
+      (turn.turnId !== null && typeof turn.turnId !== "string") ||
+      !("messageId" in turn) ||
+      (turn.messageId !== null && typeof turn.messageId !== "string")
     ) {
       return null;
     }
-    return {
-      role: entry.role,
-      text: entry.text,
-      turnId: entry.turnId,
-      messageId: entry.messageId,
-    };
-  });
-  if (turns.some((turn) => turn === null)) return null;
+    turns.push({
+      role: turn.role,
+      text: turn.text,
+      turnId: turn.turnId,
+      messageId: turn.messageId,
+    });
+  }
   return {
-    ready: candidate.ready,
-    conversationId: candidate.conversationId,
-    composerText: candidate.composerText,
-    canSubmit: candidate.canSubmit,
-    active: candidate.active,
-    turns: turns as PendingPromptObservation["turns"],
+    ready: value.ready,
+    conversationId: value.conversationId,
+    composerText: value.composerText,
+    canSubmit: value.canSubmit,
+    active: value.active,
+    turns,
   };
 }
 
 async function readPendingPromptObservation(
-  ctx: PendingPromptReconciliationContext,
+  ctx: PendingPromptReconciliationContext<ChatgptDomProviderState>,
 ): Promise<PendingPromptObservation | null> {
   const value = await ctx.evaluate<unknown>(`(() => {
     /* oracle-pending-prompt-reconciliation */
@@ -174,7 +195,7 @@ async function readPendingPromptObservation(
 }
 
 async function reconcilePendingPrompt(
-  ctx: PendingPromptReconciliationContext,
+  ctx: PendingPromptReconciliationContext<ChatgptDomProviderState>,
   authority: PendingPromptEpochAuthority,
 ): Promise<PendingPromptEpochReconciliation> {
   const first = await readPendingPromptObservation(ctx);
@@ -189,7 +210,8 @@ async function reconcilePendingPrompt(
   return reconcilePendingPromptObservations(first, second, authority);
 }
 
-export const chatgptDomProvider: ProviderDomAdapter = {
+export const chatgptDomProvider: ChatgptDomAdapter = {
+  provider: "chatgpt",
   providerName: "chatgpt-web",
   waitForUi,
   typePrompt,

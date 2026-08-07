@@ -15,7 +15,7 @@ import {
 } from "../../src/browser/constants.js";
 import { verifyCommittedPromptTurn } from "../../src/browser/actions/assistantResponse.js";
 import type { CommittedPromptEpochLocator } from "../../src/browser/reattachability.js";
-import { runSubmissionWithRecoveryForTest } from "../../src/browser/promptSubmissionCoordinator.js";
+import { runSubmissionWithRecovery } from "../../src/browser/promptSubmissionCoordinator.js";
 
 describe("promptComposer", () => {
   test("fails composer clearing when stale text remains", async () => {
@@ -244,7 +244,7 @@ describe("promptComposer", () => {
         throw new Error("accepted prompt unexpectedly produced committed identity");
       });
       const prepareFallbackSubmission = vi.fn().mockResolvedValue(undefined);
-      const pending = runSubmissionWithRecoveryForTest({
+      const pending = runSubmissionWithRecovery({
         prompt: acceptedLongPrompt,
         attachments: [],
         fallbackSubmission: { prompt: "fallback prompt", attachments: [] },
@@ -325,7 +325,7 @@ describe("promptComposer", () => {
         throw new Error("ambiguous accepted prompt unexpectedly committed");
       });
       const prepareFallbackSubmission = vi.fn().mockResolvedValue(undefined);
-      const pending = runSubmissionWithRecoveryForTest({
+      const pending = runSubmissionWithRecovery({
         prompt: acceptedLongPrompt,
         attachments: [],
         fallbackSubmission: { prompt: "fallback prompt", attachments: [] },
@@ -412,7 +412,7 @@ describe("promptComposer", () => {
         throw new Error("ambiguous accepted prompt unexpectedly committed");
       });
       const prepareFallbackSubmission = vi.fn().mockResolvedValue(undefined);
-      const pending = runSubmissionWithRecoveryForTest({
+      const pending = runSubmissionWithRecovery({
         prompt: acceptedLongPrompt,
         attachments: [],
         fallbackSubmission: { prompt: "fallback prompt", attachments: [] },
@@ -506,7 +506,7 @@ describe("promptComposer", () => {
         return fallbackResult;
       });
       const prepareFallbackSubmission = vi.fn().mockResolvedValue(undefined);
-      const pending = runSubmissionWithRecoveryForTest({
+      const pending = runSubmissionWithRecovery({
         prompt: oversizedPrompt,
         attachments: [],
         fallbackSubmission: { prompt: "fallback prompt", attachments: [] },

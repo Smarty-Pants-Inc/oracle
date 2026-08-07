@@ -15,8 +15,8 @@ import {
   createRemoteHealthAuthenticationProof,
 } from "../../src/remote/auth.js";
 import { RemoteArtifactStore } from "../../src/remote/artifactStore.js";
-import { createRemoteBrowserTransactionExecutor } from "../../src/remote/client.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
+import { createRemoteBrowserTransactionExecutor as createNativeRemoteBrowserTransactionExecutor } from "../../src/remote/client.js";
 import type { BrowserRunResult } from "../../src/browserMode.js";
 import type { BrowserRunTransaction } from "../../src/browser/types.js";
 import {
@@ -41,6 +41,7 @@ import {
 import {
   CAN_LISTEN_LOCALHOST,
   createTestRemoteServer,
+  createTestRemoteBrowserTransactionExecutor as createRemoteBrowserTransactionExecutor,
   browserTransaction,
   committedPromptEpoch,
   createArtifactDescriptor,
@@ -50,7 +51,12 @@ import {
 import { httpPostJson, httpPostNdjson, readIncomingBody } from "./serverTestHttp.js";
 import { openTestRemoteTransactionStore } from "./testTransactionStore.js";
 import { resolveWindowsPowerShellExecutable } from "../../src/windowsSystemExecutable.js";
-import { establishWindowsPrivateDirectories } from "../../src/remote/windowsPrivateTreeAcl.js";
+import {
+  establishWindowsPrivateDirectories,
+  protectWindowsPrivateFile,
+  protectWindowsPrivateTreeAcl,
+  verifyWindowsPrivateFile,
+} from "../../src/windowsPrivateFileAcl.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -493,6 +499,11 @@ describe("remote browser service", { timeout: 15_000 }, () => {
                   severity: "warning",
                   message: "host-only warning /Users/private/profile",
                 },
+                {
+                  code: "remote-artifact-manual-copy-required",
+                  severity: "warning",
+                  message: "host-only artifact failure C:\\private\\profile token=secret",
+                },
               ],
             };
             return browserTransaction(options.prompt, result);
@@ -518,8 +529,17 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           severity: "warning",
           message: "Remote browser host reported a warning.",
         },
+        {
+          code: "remote-artifact-manual-copy-required",
+          severity: "warning",
+          message:
+            "Oracle captured the browser text response, but automatic artifact transfer could not be completed. Open the ChatGPT conversation on the remote browser host and copy the generated files manually; no local artifact delivery is claimed.",
+        },
       ]);
       expect(JSON.stringify(result)).not.toContain("host-only warning /Users/private/profile");
+      expect(JSON.stringify(result)).not.toContain(
+        "host-only artifact failure C:\\private\\profile token=secret",
+      );
       expect(result.artifacts).toHaveLength(2);
       const artifactsDir = path.join(
         clientHome,
@@ -999,99 +1019,105 @@ describe("remote browser service", { timeout: 15_000 }, () => {
     },
   );
 
-  test.runIf(process.platform === "win32" && CAN_LISTEN_LOCALHOST)(
-    "keeps server artifact namespaces private without mutating the permissive shared sessions root",
-    async () => {
-      const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-windows-artifacts-"));
-      const serverHome = path.join(root, "server-home");
-      const clientHome = path.join(root, "client-home");
-      const serverSessionsRoot = path.join(serverHome, "sessions");
-      const transactionStoreDir = path.join(root, "transactions");
-      const hostArtifactPaths: string[] = [];
-      const payload = Buffer.from("private remote artifact", "utf8");
-      await grantPermissiveInheritedWindowsAcl(root);
-      await mkdir(serverHome);
-      await mkdir(clientHome);
-      await mkdir(serverSessionsRoot);
-      const sharedSessionsAclBefore = await captureWindowsAclSnapshot(serverSessionsRoot);
-      expect(sharedSessionsAclBefore).toMatch(/^False\|[1-9]\d*\|/u);
-      setOracleHomeDirOverrideForTest(serverHome);
-      const server = await createTestRemoteServer(
-        { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
-        {
-          transactionStoreDir,
-          runBrowser: async (options) => {
-            if (!options.artifactWriteAuthority?.windowsPrivateFiles) {
-              throw new Error("Missing Windows private artifact write authority");
-            }
-            const transcript = await saveBrowserTranscriptArtifact({
-              sessionId: options.sessionId,
-              artifactWriteAuthority: options.artifactWriteAuthority,
-              prompt: options.prompt,
-              answerMarkdown: "private answer",
-            });
-            const binary = await writeBinaryBrowserArtifact({
-              sessionId: options.sessionId,
-              artifactWriteAuthority: options.artifactWriteAuthority,
-              kind: "file",
-              filename: "private-result.bin",
-              contents: payload,
-              label: "private-result.bin",
-              mimeType: "application/octet-stream",
-              sourceUrl: "browser-download",
-            });
-            if (!transcript || !binary) throw new Error("Expected private server artifacts");
-            hostArtifactPaths.push(transcript.path, binary.path);
-            return browserTransaction(options.prompt, {
-              answerText: "private answer",
-              answerMarkdown: "private answer",
-              tookMs: 1,
-              answerTokens: 2,
-              answerChars: 14,
-              savedFiles: [
-                {
-                  ...binary,
-                  kind: "file",
-                  url: "browser-download",
-                  finalUrl: "browser-download",
-                  filename: path.basename(binary.path),
-                },
-              ],
-            });
+  describe.sequential("Windows native artifact ACL cohort", () => {
+    test.runIf(process.platform === "win32" && CAN_LISTEN_LOCALHOST)(
+      "keeps server artifact namespaces private without mutating the permissive shared sessions root",
+      async () => {
+        const root = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-windows-artifacts-"));
+        const serverHome = path.join(root, "server-home");
+        const clientHome = path.join(root, "client-home");
+        const serverSessionsRoot = path.join(serverHome, "sessions");
+        const transactionStoreDir = path.join(root, "transactions");
+        const hostArtifactPaths: string[] = [];
+        const payload = Buffer.from("private remote artifact", "utf8");
+        await grantPermissiveInheritedWindowsAcl(root);
+        await mkdir(serverHome);
+        await mkdir(clientHome);
+        await mkdir(serverSessionsRoot);
+        const sharedSessionsAclBefore = await captureWindowsAclSnapshot(serverSessionsRoot);
+        expect(sharedSessionsAclBefore).toMatch(/^False\|[1-9]\d*\|/u);
+        setOracleHomeDirOverrideForTest(serverHome);
+        const server = await createTestRemoteServer(
+          { host: "127.0.0.1", port: 0, token: "a".repeat(64), logger: () => {} },
+          {
+            transactionStoreDir,
+            windowsPrivateTreeAuthority: protectWindowsPrivateTreeAcl,
+            windowsPrivateDirectoriesAuthority: establishWindowsPrivateDirectories,
+            windowsPrivateFileProtectionAuthority: protectWindowsPrivateFile,
+            windowsPrivateFileVerificationAuthority: verifyWindowsPrivateFile,
+            runBrowser: async (options) => {
+              if (!options.artifactWriteAuthority?.windowsPrivateFiles) {
+                throw new Error("Missing Windows private artifact write authority");
+              }
+              const transcript = await saveBrowserTranscriptArtifact({
+                sessionId: options.sessionId,
+                artifactWriteAuthority: options.artifactWriteAuthority,
+                prompt: options.prompt,
+                answerMarkdown: "private answer",
+              });
+              const binary = await writeBinaryBrowserArtifact({
+                sessionId: options.sessionId,
+                artifactWriteAuthority: options.artifactWriteAuthority,
+                kind: "file",
+                filename: "private-result.bin",
+                contents: payload,
+                label: "private-result.bin",
+                mimeType: "application/octet-stream",
+                sourceUrl: "browser-download",
+              });
+              if (!transcript || !binary) throw new Error("Expected private server artifacts");
+              hostArtifactPaths.push(transcript.path, binary.path);
+              return browserTransaction(options.prompt, {
+                answerText: "private answer",
+                answerMarkdown: "private answer",
+                tookMs: 1,
+                answerTokens: 2,
+                answerChars: 14,
+                savedFiles: [
+                  {
+                    ...binary,
+                    kind: "file",
+                    url: "browser-download",
+                    finalUrl: "browser-download",
+                    filename: path.basename(binary.path),
+                  },
+                ],
+              });
+            },
           },
-        },
-      );
-      setOracleHomeDirOverrideForTest(clientHome);
-      try {
-        const result = await createRemoteBrowserTransactionExecutor({
-          host: `127.0.0.1:${server.port}`,
-          token: "a".repeat(64),
-        })({ prompt: "private artifact", config: {}, sessionId: "windows-private-client" });
-        const clientArtifact = result.artifacts?.[0];
-        if (!clientArtifact) throw new Error("Expected private client artifact");
-        await expect(readFile(clientArtifact.path)).resolves.toEqual(payload);
-
-        const serverArtifactsDirectory = path.dirname(hostArtifactPaths[0]!);
-        const serverNamespaceDirectory = path.dirname(serverArtifactsDirectory);
-        await assertCanonicalPrivateWindowsAcls([
-          serverNamespaceDirectory,
-          serverArtifactsDirectory,
-          ...hostArtifactPaths,
-          path.dirname(clientArtifact.path),
-          clientArtifact.path,
-        ]);
-        await expect(captureWindowsAclSnapshot(serverSessionsRoot)).resolves.toBe(
-          sharedSessionsAclBefore,
         );
-        await result.finalize();
-      } finally {
-        await server.close();
-        setOracleHomeDirOverrideForTest(null);
-        await rm(root, { recursive: true, force: true });
-      }
-    },
-    30_000,
-  );
+        setOracleHomeDirOverrideForTest(clientHome);
+        try {
+          const result = await createNativeRemoteBrowserTransactionExecutor({
+            host: `127.0.0.1:${server.port}`,
+            token: "a".repeat(64),
+          })({ prompt: "private artifact", config: {}, sessionId: "windows-private-client" });
+          const clientArtifact = result.artifacts?.[0];
+          if (!clientArtifact) throw new Error("Expected private client artifact");
+          await expect(readFile(clientArtifact.path)).resolves.toEqual(payload);
+
+          const serverArtifactsDirectory = path.dirname(hostArtifactPaths[0]!);
+          const serverNamespaceDirectory = path.dirname(serverArtifactsDirectory);
+          await assertCanonicalPrivateWindowsAcls([
+            serverNamespaceDirectory,
+            serverArtifactsDirectory,
+            ...hostArtifactPaths,
+            path.dirname(clientArtifact.path),
+            clientArtifact.path,
+          ]);
+          await expect(captureWindowsAclSnapshot(serverSessionsRoot)).resolves.toBe(
+            sharedSessionsAclBefore,
+          );
+          await result.finalize();
+        } finally {
+          await server.close();
+          setOracleHomeDirOverrideForTest(null);
+          await rm(root, { recursive: true, force: true });
+        }
+      },
+      30_000,
+    );
+  });
 });
 function createAuthenticatedTestServer(
   handler: (req: http.IncomingMessage, res: http.ServerResponse) => Promise<void>,

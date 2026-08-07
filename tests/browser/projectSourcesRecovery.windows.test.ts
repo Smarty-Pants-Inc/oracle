@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:f
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { expect, test, vi } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { captureProfileDirectoryIdentity } from "../../src/browser/profileState.js";
 import * as recovery from "../../src/browser/projectSourcesRecovery.js";
 import { resolveWindowsPowerShellExecutable } from "../../src/windowsSystemExecutable.js";
@@ -64,131 +64,133 @@ $Directory.SetAccessControl($Acl)
   );
 }
 
-windowsTest(
-  "keeps exact Project Sources storage valid across module reload and ordinary child writes",
-  async () => {
-    const fixture = await createStorageFixture();
-    try {
-      await mkdir(path.join(fixture.oracleHome, "ordinary-child"));
-      await writeFile(
-        path.join(fixture.storage.runtimeRoot.path, "ordinary-child.txt"),
-        "ordinary",
-      );
-      const temporaryProfileAuthority = await createTemporaryProfileChildAuthority(
-        fixture.storage.runtimeRoot,
-        "oracle-browser-",
-        { randomId: () => fixture.intent.generationId },
-      );
-      const establishedIntent = { ...fixture.intent, temporaryProfileAuthority };
-      const proof = await recovery.createProjectSourcesTemporaryCleanupProof(
-        establishedIntent,
-        fixture.storage,
-      );
-      await recovery.persistProjectSourcesCleanupRuntime({}, fixture.storage, {
-        profileCreate: { ...establishedIntent, proof },
-      });
-      vi.resetModules();
-      // Intentional reload proves persisted storage authority does not depend on module-local state.
-      const reloadedRecovery = await import("../../src/browser/projectSourcesRecovery.js");
-      await expect(
-        reloadedRecovery.assertProjectSourcesCleanupStorage(fixture.storage),
-      ).resolves.toBeUndefined();
-      await expect(
-        reloadedRecovery.readProjectSourcesCleanupJournal(fixture.storage),
-      ).resolves.toMatchObject({
-        profileCreate: {
-          generationId: fixture.intent.generationId,
-          temporaryProfileAuthority: {
-            generation: { path: temporaryProfileAuthority.generation.path },
-            profileDirectory: {
-              canonicalPath: temporaryProfileAuthority.profileDirectory.canonicalPath,
+describe.sequential("Project Sources native Windows ACL authority", () => {
+  windowsTest(
+    "keeps exact Project Sources storage valid across module reload and ordinary child writes",
+    async () => {
+      const fixture = await createStorageFixture();
+      try {
+        await mkdir(path.join(fixture.oracleHome, "ordinary-child"));
+        await writeFile(
+          path.join(fixture.storage.runtimeRoot.path, "ordinary-child.txt"),
+          "ordinary",
+        );
+        const temporaryProfileAuthority = await createTemporaryProfileChildAuthority(
+          fixture.storage.runtimeRoot,
+          "oracle-browser-",
+          { randomId: () => fixture.intent.generationId },
+        );
+        const establishedIntent = { ...fixture.intent, temporaryProfileAuthority };
+        const proof = await recovery.createProjectSourcesTemporaryCleanupProof(
+          establishedIntent,
+          fixture.storage,
+        );
+        await recovery.persistProjectSourcesCleanupRuntime({}, fixture.storage, {
+          profileCreate: { ...establishedIntent, proof },
+        });
+        vi.resetModules();
+        // Intentional reload proves persisted storage authority does not depend on module-local state.
+        const reloadedRecovery = await import("../../src/browser/projectSourcesRecovery.js");
+        await expect(
+          reloadedRecovery.assertProjectSourcesCleanupStorage(fixture.storage),
+        ).resolves.toBeUndefined();
+        await expect(
+          reloadedRecovery.readProjectSourcesCleanupJournal(fixture.storage),
+        ).resolves.toMatchObject({
+          profileCreate: {
+            generationId: fixture.intent.generationId,
+            temporaryProfileAuthority: {
+              generation: { path: temporaryProfileAuthority.generation.path },
+              profileDirectory: {
+                canonicalPath: temporaryProfileAuthority.profileDirectory.canonicalPath,
+              },
             },
           },
-        },
-      });
-      await expect(
-        reloadedRecovery.retryPendingProjectSourcesCleanup(() => undefined, fixture.storage),
-      ).resolves.toBeUndefined();
-      await expect(
-        readFile(temporaryProfileAuthority.generation.path, "utf8"),
-      ).rejects.toMatchObject({
-        code: "ENOENT",
-      });
-      await expect(readFile(fixture.storage.journalPath, "utf8")).rejects.toMatchObject({
-        code: "ENOENT",
-      });
-    } finally {
-      await removeFixture(fixture.oracleHome);
-    }
-  },
-  20_000,
-);
+        });
+        await expect(
+          reloadedRecovery.retryPendingProjectSourcesCleanup(() => undefined, fixture.storage),
+        ).resolves.toBeUndefined();
+        await expect(
+          readFile(temporaryProfileAuthority.generation.path, "utf8"),
+        ).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+        await expect(readFile(fixture.storage.journalPath, "utf8")).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      } finally {
+        await removeFixture(fixture.oracleHome);
+      }
+    },
+    20_000,
+  );
 
-windowsTest(
-  "rejects an Oracle-home generation substitution before retiring Project Sources authority",
-  async () => {
-    const fixture = await createStorageFixture();
-    const displaced = `${fixture.oracleHome}-displaced`;
-    const originalJournal = await readFile(fixture.storage.journalPath, "utf8");
-    try {
-      await rename(fixture.oracleHome, displaced);
-      await mkdir(fixture.oracleHome);
-      const replacementSentinel = path.join(fixture.oracleHome, "replacement-owner.txt");
-      await writeFile(replacementSentinel, "preserve replacement");
+  windowsTest(
+    "rejects an Oracle-home generation substitution before retiring Project Sources authority",
+    async () => {
+      const fixture = await createStorageFixture();
+      const displaced = `${fixture.oracleHome}-displaced`;
+      const originalJournal = await readFile(fixture.storage.journalPath, "utf8");
+      try {
+        await rename(fixture.oracleHome, displaced);
+        await mkdir(fixture.oracleHome);
+        const replacementSentinel = path.join(fixture.oracleHome, "replacement-owner.txt");
+        await writeFile(replacementSentinel, "preserve replacement");
 
-      await expect(
-        recovery.persistProjectSourcesCleanupRuntime({}, fixture.storage),
-      ).rejects.toThrow(/Oracle-home physical authority changed/i);
-      await expect(readFile(replacementSentinel, "utf8")).resolves.toBe("preserve replacement");
-      await expect(
-        readFile(path.join(displaced, path.basename(fixture.storage.journalPath)), "utf8"),
-      ).resolves.toBe(originalJournal);
-    } finally {
-      await removeFixture(fixture.oracleHome, displaced);
-    }
-  },
-  20_000,
-);
+        await expect(
+          recovery.persistProjectSourcesCleanupRuntime({}, fixture.storage),
+        ).rejects.toThrow(/Oracle-home physical authority changed/i);
+        await expect(readFile(replacementSentinel, "utf8")).resolves.toBe("preserve replacement");
+        await expect(
+          readFile(path.join(displaced, path.basename(fixture.storage.journalPath)), "utf8"),
+        ).resolves.toBe(originalJournal);
+      } finally {
+        await removeFixture(fixture.oracleHome, displaced);
+      }
+    },
+    20_000,
+  );
 
-windowsTest(
-  "rejects a private runtime reparse substitution before retiring Project Sources authority",
-  async () => {
-    const fixture = await createStorageFixture();
-    const displaced = `${fixture.storage.runtimeRoot.path}-displaced`;
-    const originalJournal = await readFile(fixture.storage.journalPath, "utf8");
-    try {
-      await rename(fixture.storage.runtimeRoot.path, displaced);
-      await symlink(displaced, fixture.storage.runtimeRoot.path, "junction");
-      const replacementSentinel = path.join(displaced, "replacement-owner.txt");
-      await writeFile(replacementSentinel, "preserve replacement");
+  windowsTest(
+    "rejects a private runtime reparse substitution before retiring Project Sources authority",
+    async () => {
+      const fixture = await createStorageFixture();
+      const displaced = `${fixture.storage.runtimeRoot.path}-displaced`;
+      const originalJournal = await readFile(fixture.storage.journalPath, "utf8");
+      try {
+        await rename(fixture.storage.runtimeRoot.path, displaced);
+        await symlink(displaced, fixture.storage.runtimeRoot.path, "junction");
+        const replacementSentinel = path.join(displaced, "replacement-owner.txt");
+        await writeFile(replacementSentinel, "preserve replacement");
 
-      await expect(
-        recovery.persistProjectSourcesCleanupRuntime({}, fixture.storage),
-      ).rejects.toThrow(/physical directory|authority changed/i);
-      await expect(readFile(replacementSentinel, "utf8")).resolves.toBe("preserve replacement");
-      await expect(readFile(fixture.storage.journalPath, "utf8")).resolves.toBe(originalJournal);
-    } finally {
-      await removeFixture(fixture.oracleHome);
-    }
-  },
-  20_000,
-);
+        await expect(
+          recovery.persistProjectSourcesCleanupRuntime({}, fixture.storage),
+        ).rejects.toThrow(/physical directory|authority changed/i);
+        await expect(readFile(replacementSentinel, "utf8")).resolves.toBe("preserve replacement");
+        await expect(readFile(fixture.storage.journalPath, "utf8")).resolves.toBe(originalJournal);
+      } finally {
+        await removeFixture(fixture.oracleHome);
+      }
+    },
+    20_000,
+  );
 
-windowsTest(
-  "rejects private runtime ACL tampering before retiring Project Sources authority",
-  async () => {
-    const fixture = await createStorageFixture();
-    const originalJournal = await readFile(fixture.storage.journalPath, "utf8");
-    try {
-      await addEveryoneReadAcl(fixture.storage.runtimeRoot.path);
+  windowsTest(
+    "rejects private runtime ACL tampering before retiring Project Sources authority",
+    async () => {
+      const fixture = await createStorageFixture();
+      const originalJournal = await readFile(fixture.storage.journalPath, "utf8");
+      try {
+        await addEveryoneReadAcl(fixture.storage.runtimeRoot.path);
 
-      await expect(
-        recovery.persistProjectSourcesCleanupRuntime({}, fixture.storage),
-      ).rejects.toThrow(/Windows private directory protection failed/i);
-      await expect(readFile(fixture.storage.journalPath, "utf8")).resolves.toBe(originalJournal);
-    } finally {
-      await removeFixture(fixture.oracleHome);
-    }
-  },
-  20_000,
-);
+        await expect(
+          recovery.persistProjectSourcesCleanupRuntime({}, fixture.storage),
+        ).rejects.toThrow(/Windows private directory protection failed/i);
+        await expect(readFile(fixture.storage.journalPath, "utf8")).resolves.toBe(originalJournal);
+      } finally {
+        await removeFixture(fixture.oracleHome);
+      }
+    },
+    20_000,
+  );
+});
