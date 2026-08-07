@@ -32,29 +32,6 @@ export type WindowsAclCommandExecutor = (
 export type WindowsPrivateTreeAuthority = (scope: WindowsPrivateTreeScope) => Promise<void>;
 export type WindowsPrivateDirectoryAuthority = (directoryPath: string) => Promise<void>;
 
-let windowsPrivateDirectoryAuthorityOverrideForTest: WindowsPrivateDirectoryAuthority | undefined;
-let windowsPrivateTreeAuthorityOverrideForTest: WindowsPrivateTreeAuthority | undefined;
-
-export function setWindowsPrivateDirectoryAuthorityOverrideForTest(
-  authority: WindowsPrivateDirectoryAuthority | null,
-): void {
-  windowsPrivateDirectoryAuthorityOverrideForTest = authority ?? undefined;
-}
-
-export function setWindowsPrivateTreeAuthorityOverrideForTest(
-  authority: WindowsPrivateTreeAuthority | null,
-): void {
-  windowsPrivateTreeAuthorityOverrideForTest = authority ?? undefined;
-}
-
-export function resolveWindowsPrivateDirectoryAuthority(): WindowsPrivateDirectoryAuthority {
-  return windowsPrivateDirectoryAuthorityOverrideForTest ?? establishWindowsPrivateDirectory;
-}
-
-export function resolveWindowsPrivateTreeAuthority(): WindowsPrivateTreeAuthority {
-  return windowsPrivateTreeAuthorityOverrideForTest ?? protectWindowsPrivateTreeAcl;
-}
-
 const WINDOWS_PRIVATE_ACL_FUNCTIONS_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3

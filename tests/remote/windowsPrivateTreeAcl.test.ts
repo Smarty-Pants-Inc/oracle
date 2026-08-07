@@ -137,14 +137,15 @@ describe("Windows remote transaction private ACL authority", () => {
     ]).toHaveLength(2);
   });
 
-  test("uses the suite-scoped tree authority for ordinary simulated Windows stores", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-windows-suite-authority-"));
+  test("accepts an explicitly injected filesystem-only authority for simulated Windows", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-windows-local-authority-"));
     const transactionToken = "e".repeat(64);
     try {
       const store = await RemoteTransactionStore.open({
         directory: path.join(root, "remote-transactions"),
         integrityKeyPath: path.join(root, ".remote-transaction-integrity.key"),
         platform: "win32",
+        windowsPrivateTreeAuthority: testWindowsPrivateTreeAuthority,
       });
       await beginAclTestRecord(store, transactionToken, "suite-authority-run");
 
@@ -442,7 +443,7 @@ describe("Windows remote transaction private ACL authority", () => {
   });
 
   test.runIf(process.platform === "win32")(
-    "creates fresh roots and publication entries with exact protected ACLs",
+    "uses the default production authority for fresh roots and publication entries with exact ACLs",
     async () => {
       const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-windows-fresh-private-acl-"));
       const privateRoot = path.join(sandbox, "generation");
@@ -455,7 +456,6 @@ describe("Windows remote transaction private ACL authority", () => {
         const store = await RemoteTransactionStore.open({
           directory,
           integrityKeyPath,
-          windowsPrivateTreeAuthority: protectWindowsPrivateTreeAcl,
         });
         await beginAclTestRecord(store, transactionToken, "windows-fresh-acl-run");
         const headDirectory = remoteTransactionHeadDirectory(integrityKeyPath);

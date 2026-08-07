@@ -3,7 +3,6 @@ import * as fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { expect, test, vi } from "vitest";
-import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
 import type { BrowserRuntimeMetadata } from "../../src/sessionManager.js";
 import { createChromeProcessLaunchClaim } from "../../src/browser/chromeProcessLaunchClaim.js";
 import { captureProfileDirectoryIdentity } from "../../src/browser/profileState.js";
@@ -12,6 +11,10 @@ import type * as ProjectSourcesRecovery from "../../src/browser/projectSourcesRe
 
 type Recovery = typeof ProjectSourcesRecovery;
 type ManualProof = ProjectSourcesRecovery.ProjectSourcesManualCleanupProof;
+// The recovery module is reset to install its filesystem mock, so bind its fresh Oracle-home module.
+async function setRecoveryOracleHomeDirOverrideForTest(oracleHome: string | null): Promise<void> {
+  (await import("../../src/oracleHome.js")).setOracleHomeDirOverrideForTest(oracleHome);
+}
 
 function cleanupRuntime(
   proof: ManualProof,
@@ -61,7 +64,7 @@ async function createManualAuthority(recovery: Recovery) {
   const oracleHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-project-sources-settlement-"));
   const profileDir = path.join(oracleHome, "manual-profile");
   await fs.mkdir(profileDir);
-  setOracleHomeDirOverrideForTest(oracleHome);
+  await setRecoveryOracleHomeDirOverrideForTest(oracleHome);
   const storage = await recovery.establishProjectSourcesCleanupStorage();
   const profileDirectory = await captureProfileDirectoryIdentity(profileDir);
   const generationId = randomUUID();
@@ -142,7 +145,7 @@ async function loadRecoveryWithOneJournalRemovalFailure() {
 }
 
 async function removeAuthority(oracleHome: string): Promise<void> {
-  setOracleHomeDirOverrideForTest(null);
+  await setRecoveryOracleHomeDirOverrideForTest(null);
   await fs.rm(oracleHome, { recursive: true, force: true });
 }
 

@@ -2,7 +2,7 @@ import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
-import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
+import { createRemoteBrowserTransactionExecutor } from "../../src/remote/client.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import type { BrowserRunTransaction } from "../../src/browser/types.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
@@ -62,7 +62,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         },
       );
       try {
-        const caught = await createRemoteBrowserExecutor({
+        const caught = await createRemoteBrowserTransactionExecutor({
           host: `127.0.0.1:${server.port}`,
           token: "a".repeat(64),
         })({ prompt, config: {} }).then(

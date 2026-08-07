@@ -31,9 +31,13 @@ export async function drainRemoteServerShutdown(
       await server.close();
       return;
     } catch (error) {
-      logger(
-        `Failed to close remote server: ${error instanceof Error ? error.message : String(error)}. Retrying graceful shutdown.`,
-      );
+      try {
+        logger(
+          `Failed to close remote server: ${error instanceof Error ? error.message : String(error)}. Retrying graceful shutdown.`,
+        );
+      } catch {
+        // Cleanup authority must not depend on a writable diagnostic stream.
+      }
       await delay(retryDelayMs);
     }
   }
@@ -69,6 +73,65 @@ export async function bootstrapRemoteManualChromeOwner(
     );
   } finally {
     await (deps.releaseOwnerEndpoint ?? releaseManualChromeOwnerEndpointAuthority)(owner);
+  }
+}
+
+export async function ownRemoteServerLifecycle(
+  server: RemoteServerInstance,
+  lifecycle: RemoteServerLifecycle = {},
+  options: {
+    signalSource?: {
+      on(signal: "SIGINT" | "SIGTERM", listener: () => void): unknown;
+      off(signal: "SIGINT" | "SIGTERM", listener: () => void): unknown;
+    };
+    logger?: (message: string) => void;
+    retryDelayMs?: number;
+  } = {},
+): Promise<void> {
+  const signalSource = options.signalSource ?? process;
+  const logger = options.logger ?? console.error;
+  const shutdownRequested = Promise.withResolvers<void>();
+  let shutdownStarted = false;
+  const shutdown = () => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    shutdownRequested.resolve();
+    try {
+      console.log("Shutting down remote service...");
+    } catch {
+      // A closed output stream must not block graceful shutdown.
+    }
+  };
+  signalSource.on("SIGINT", shutdown);
+  signalSource.on("SIGTERM", shutdown);
+  try {
+    try {
+      await lifecycle.onReady?.(server);
+    } catch (error) {
+      try {
+        await server.close();
+      } catch (closeError) {
+        try {
+          logger(
+            `Remote service readiness failed and graceful close remains pending: ${closeError instanceof Error ? closeError.message : String(closeError)}. Retaining listener and controller authority until cleanup settles and shutdown is requested.`,
+          );
+        } catch {
+          // Lifecycle ownership must not depend on a writable diagnostic stream.
+        }
+        await drainRemoteServerShutdown(server, shutdownRequested.promise, {
+          logger,
+          retryDelayMs: options.retryDelayMs,
+        });
+      }
+      throw error;
+    }
+    await drainRemoteServerShutdown(server, shutdownRequested.promise, {
+      logger,
+      retryDelayMs: options.retryDelayMs,
+    });
+  } finally {
+    signalSource.off("SIGINT", shutdown);
+    signalSource.off("SIGTERM", shutdown);
   }
 }
 
@@ -141,33 +204,7 @@ export async function serveRemote(
     manualLoginDefault: preferManualLogin,
     manualLoginProfileDir: manualProfileDir,
   });
-  const shutdownRequested = Promise.withResolvers<void>();
-  let shutdownStarted = false;
-  const shutdown = () => {
-    if (shutdownStarted) return;
-    shutdownStarted = true;
-    console.log("Shutting down remote service...");
-    shutdownRequested.resolve();
-  };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
-  try {
-    await lifecycle.onReady?.(server);
-    await drainRemoteServerShutdown(server, shutdownRequested.promise);
-  } catch (error) {
-    try {
-      await server.close();
-    } catch (closeError) {
-      throw new AggregateError(
-        [error, closeError],
-        "Remote service readiness failed and the bound listener could not be closed.",
-      );
-    }
-    throw error;
-  } finally {
-    process.off("SIGINT", shutdown);
-    process.off("SIGTERM", shutdown);
-  }
+  await ownRemoteServerLifecycle(server, lifecycle);
 }
 
 async function loadLocalChatgptCookies(

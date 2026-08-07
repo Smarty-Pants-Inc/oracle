@@ -23,7 +23,6 @@ import {
   removePrivateTempGeneration,
   type PrivateTempRootOptions,
 } from "../src/privateTempRoot.js";
-import { establishWindowsPrivateDirectory } from "../src/remote/windowsPrivateTreeAcl.js";
 import { resolveWindowsPowerShellExecutable } from "../src/windowsSystemExecutable.js";
 
 const execFileAsync = promisify(execFile);
@@ -182,13 +181,21 @@ describe("private temporary root authority", () => {
     }
   });
 
-  test("uses the suite-scoped Windows authority for ordinary private generations", async () => {
-    const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-private-temp-suite-authority-"));
+  test("uses an explicitly injected filesystem-only authority for simulated Windows", async () => {
+    const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-private-temp-local-authority-"));
+    const windowsPrivateDirectoryAuthority = async (directoryPath: string): Promise<void> => {
+      await mkdir(directoryPath, { recursive: true });
+      const entry = await lstat(directoryPath);
+      if (!entry.isDirectory() || entry.isSymbolicLink()) {
+        throw new Error(`Test private directory is not physical: ${directoryPath}`);
+      }
+    };
     try {
       const generation = await createPrivateTempGeneration("ordinary-", {
         platform: "win32",
         tempDirectory: ambient,
         randomId: () => "fixed-generation",
+        windowsPrivateDirectoryAuthority,
       });
 
       expect(generation.path).toBe(
@@ -231,7 +238,7 @@ describe("private temporary root authority", () => {
   );
 
   test.skipIf(process.platform !== "win32")(
-    "uses real Windows ACL wiring and blocks hostile TEMP inheritance from endpoint and cookie files",
+    "uses the default production Windows ACL authority and blocks hostile TEMP inheritance",
     async () => {
       const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-private-temp-windows-"));
       const encodedAmbient = Buffer.from(ambient, "utf8").toString("base64");
@@ -261,7 +268,6 @@ $Acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new([Sy
       try {
         const generation = await createPrivateTempGeneration("reattach-", {
           tempDirectory: ambient,
-          windowsPrivateDirectoryAuthority: establishWindowsPrivateDirectory,
         });
         const defaultDirectory = path.join(generation.path, "Default");
         const activePortPath = path.join(generation.path, "DevToolsActivePort");
@@ -295,9 +301,9 @@ foreach ($Index in 1..5) {
   if ($Rules.Count -ne $Allowed.Count) { throw "Private item has a non-canonical rule count: $($Paths[$Index]); actual=$($Rules.Count)" }
   foreach ($Sid in $Allowed) {
     $Matches = @($Rules | Where-Object { $_.IdentityReference.Value -eq $Sid })
-    if ($Matches.Count -ne 1) { throw "Private item does not grant one exact rule to $Sid: $($Paths[$Index])" }
+    if ($Matches.Count -ne 1) { throw "Private item does not grant one exact rule to $($Sid): $($Paths[$Index])" }
     $Rule = $Matches[0]
-    if ($Rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or [int64]$Rule.FileSystemRights -ne [int64]$FullControl) { throw "Private item has a non-canonical rule for $Sid: $($Paths[$Index])" }
+    if ($Rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or [int64]$Rule.FileSystemRights -ne [int64]$FullControl) { throw "Private item has a non-canonical rule for $($Sid): $($Paths[$Index])" }
   }
 }
 [Console]::Out.Write('oracle.private-temp.inheritance:complete')

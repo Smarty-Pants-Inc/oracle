@@ -68,6 +68,7 @@ const criticalLazyRuntimeModules = [
   ["dist/src/cli/browserConfig.js", "buildBrowserConfig"],
   ["dist/src/cli/sessionRunner.js", "performSessionRun"],
   ["dist/src/remote/client.js", "createRemoteBrowserExecutor"],
+  ["dist/src/remote/client.js", "createRemoteBrowserTransactionExecutor"],
   ["dist/src/remote/server.js", "serveRemote"],
   ["dist/src/cli/bridge/host.js", "runBridgeHost"],
 ];

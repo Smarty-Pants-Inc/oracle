@@ -5,7 +5,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile, stat } from "node:fs/promises";
 import { RemoteArtifactStore } from "../../src/remote/artifactStore.js";
 import {
-  createRemoteBrowserExecutor,
+  createRemoteBrowserTransactionExecutor,
   settleRemoteBrowserRecovery,
 } from "../../src/remote/client.js";
 import type { BrowserLogger, BrowserRunTransaction } from "../../src/browser/types.js";
@@ -78,7 +78,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       );
 
       try {
-        const caught = await createRemoteBrowserExecutor({
+        const caught = await createRemoteBrowserTransactionExecutor({
           host: `127.0.0.1:${server.port}`,
           token: "a".repeat(64),
         })({ prompt: "recover", config: {} }).then(
@@ -329,7 +329,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         },
       );
       try {
-        const caught = await createRemoteBrowserExecutor({
+        const caught = await createRemoteBrowserTransactionExecutor({
           host: `127.0.0.1:${first.port}`,
           token: "a".repeat(64),
         })({ prompt, config: {} }).then(
@@ -852,7 +852,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         },
       );
       try {
-        const caught = await createRemoteBrowserExecutor({
+        const caught = await createRemoteBrowserTransactionExecutor({
           host: `127.0.0.1:${server.port}`,
           token: "a".repeat(64),
         })({ prompt, config: {} }).then(

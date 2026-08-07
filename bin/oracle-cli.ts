@@ -2480,11 +2480,11 @@ async function runRootCommand(options: CliOptions): Promise<void> {
 
   let browserDeps: BrowserSessionRunnerDeps | undefined;
   if (browserConfig && remoteHost) {
-    const { createRemoteBrowserExecutor } = await import("../src/remote/client.js");
+    const { createRemoteBrowserTransactionExecutor } = await import("../src/remote/client.js");
     validateResolvedRemoteServiceConfig(remoteConfig);
     browserDeps = {
       resolveRemoteRecoveryConfig,
-      executeBrowser: createRemoteBrowserExecutor({
+      executeBrowser: createRemoteBrowserTransactionExecutor({
         host: remoteHost,
         token: remoteToken,
         legacyToken: remoteLegacyToken,
@@ -2893,11 +2893,11 @@ async function restartSession(sessionId: string, options: RestartCommandOptions)
 
   let browserDeps: BrowserSessionRunnerDeps | undefined;
   if (browserConfig && remoteHost) {
-    const { createRemoteBrowserExecutor } = await import("../src/remote/client.js");
+    const { createRemoteBrowserTransactionExecutor } = await import("../src/remote/client.js");
     validateResolvedRemoteServiceConfig(remoteConfig);
     browserDeps = {
       resolveRemoteRecoveryConfig,
-      executeBrowser: createRemoteBrowserExecutor({
+      executeBrowser: createRemoteBrowserTransactionExecutor({
         host: remoteHost,
         token: remoteToken,
         legacyToken: remoteLegacyToken,

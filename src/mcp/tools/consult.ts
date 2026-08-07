@@ -15,7 +15,7 @@ import {
   resolveRemoteServiceConfig,
   validateResolvedRemoteServiceConfig,
 } from "../../remote/remoteServiceConfig.js";
-import { createRemoteBrowserExecutor } from "../../remote/client.js";
+import { createRemoteBrowserTransactionExecutor } from "../../remote/client.js";
 import type { BrowserSessionRunnerDeps } from "../../browser/sessionRunner.js";
 import {
   buildAgentBlockerFromSession,
@@ -713,7 +713,7 @@ export async function runConsultTool(
         host: resolvedRemote.host,
         token: resolvedRemote.token,
       })),
-      executeBrowser: createRemoteBrowserExecutor({
+      executeBrowser: createRemoteBrowserTransactionExecutor({
         host: resolvedRemote.host,
         token: resolvedRemote.token,
         legacyToken: resolvedRemote.legacyToken,

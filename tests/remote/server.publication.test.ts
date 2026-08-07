@@ -2,7 +2,7 @@ import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
-import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
+import { createRemoteBrowserTransactionExecutor } from "../../src/remote/client.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import type { BrowserRunResult } from "../../src/browserMode.js";
 import type { BrowserRunTransaction } from "../../src/browser/types.js";
@@ -45,7 +45,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         },
       );
       try {
-        const transaction = await createRemoteBrowserExecutor({
+        const transaction = await createRemoteBrowserTransactionExecutor({
           host: `127.0.0.1:${server.port}`,
           token: "a".repeat(64),
         })({ prompt: "canonical HTTP conflict", config: {} });

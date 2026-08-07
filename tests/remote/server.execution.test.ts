@@ -6,6 +6,7 @@ import {
   link,
   mkdir,
   mkdtemp,
+  open,
   readdir,
   rename,
   rm,
@@ -16,7 +17,7 @@ import {
 } from "node:fs/promises";
 import type { RemoteServerInstance } from "../../src/remote/server.js";
 import { bootstrapRemoteManualChromeOwner } from "../../src/remote/serverLifecycle.js";
-import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
+import { createRemoteBrowserTransactionExecutor } from "../../src/remote/client.js";
 import type { BrowserLogger, BrowserRunTransaction } from "../../src/browser/types.js";
 import type { BrowserRunResult } from "../../src/browserMode.js";
 import { writeBinaryBrowserArtifact } from "../../src/browser/artifacts.js";
@@ -115,7 +116,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         },
       );
 
-      const executor = createRemoteBrowserExecutor({
+      const executor = createRemoteBrowserTransactionExecutor({
         host: `127.0.0.1:${server.port}`,
         token: "a".repeat(64),
       });
@@ -331,7 +332,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             },
           },
         );
-        const executor = createRemoteBrowserExecutor({
+        const executor = createRemoteBrowserTransactionExecutor({
           host: `127.0.0.1:${server.port}`,
           token: "a".repeat(64),
         });
@@ -408,7 +409,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       );
 
       try {
-        const executor = createRemoteBrowserExecutor({
+        const executor = createRemoteBrowserTransactionExecutor({
           host: `127.0.0.1:${server.port}`,
           token: "a".repeat(64),
         });
@@ -568,6 +569,55 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+  test("removes successful and partial files after multi-file materialization fails", async () => {
+    const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-scratch-partial-"));
+    const run = await serverExecutionTest.createRemoteScratchRun("run-", {
+      tempDirectory: ambient,
+    });
+    const generation = await serverExecutionTest.createRemoteScratchGeneration(run, "attachments-");
+    const files: NonNullable<
+      Parameters<typeof serverExecutionTest.materializeRemoteAttachments>[3]
+    > = [];
+    const attachments = [
+      {
+        fileName: "first.txt",
+        displayPath: "first.txt",
+        sizeBytes: 5,
+        contentBase64: Buffer.from("first").toString("base64"),
+      },
+      {
+        fileName: "second.txt",
+        displayPath: "second.txt",
+        sizeBytes: 6,
+        contentBase64: Buffer.from("second").toString("base64"),
+      },
+    ];
+    const probe = await open(path.join(generation.path, "probe"), "w");
+    const sync = vi
+      .spyOn(Object.getPrototypeOf(probe), "sync")
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("simulated sync failure"));
+    await probe.close();
+    await rm(path.join(generation.path, "probe"));
+    try {
+      await expect(
+        serverExecutionTest.materializeRemoteAttachments(
+          attachments,
+          generation.path,
+          "attachment",
+          files,
+        ),
+      ).rejects.toThrow("Remote attachment scratch materialization failed");
+      expect(files).toHaveLength(2);
+      expect(await serverExecutionTest.removeRemoteScratchGeneration(generation, files)).toBe(true);
+      await expect(lstat(generation.path)).rejects.toMatchObject({ code: "ENOENT" });
+      await serverExecutionTest.releaseRemoteScratchRun(run, []);
+      await expect(lstat(run.path)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      sync.mockRestore();
+      await rm(ambient, { recursive: true, force: true });
+    }
+  });
   test("fails before scratch descendants when Windows private authority is unavailable", async () => {
     const ambient = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-hostile-temp-"));
     const establishWindowsPrivateDirectory = vi.fn(async () => {
@@ -678,15 +728,20 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         "attachment",
       );
       const moved = `${generation.path}-moved`;
+      const attackerFile = path.join(generation.path, "attacker.txt");
       await rename(generation.path, moved);
       await mkdir(generation.path, { mode: 0o700 });
+      await writeFile(attackerFile, "attacker content");
       await expect(serverExecutionTest.assertRemoteScratchGeneration(generation)).rejects.toThrow(
         "Remote attachment scratch generation changed",
       );
+      expect(
+        await serverExecutionTest.removeRemoteScratchGeneration(generation, materialized.files),
+      ).toBe(false);
       await serverExecutionTest.releaseRemoteScratchRun(run, [
         { generation, files: materialized.files },
       ]);
-      expect((await lstat(generation.path)).isDirectory()).toBe(true);
+      expect(await readFile(attackerFile, "utf8")).toBe("attacker content");
       expect((await lstat(moved)).isDirectory()).toBe(true);
     } finally {
       await rm(ambient, { recursive: true, force: true });

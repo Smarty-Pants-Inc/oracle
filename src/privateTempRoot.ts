@@ -18,7 +18,6 @@ import { getOracleHomeDir } from "./oracleHome.js";
 import {
   establishWindowsPrivateDirectories,
   establishWindowsPrivateDirectory,
-  resolveWindowsPrivateDirectoryAuthority,
   type WindowsPrivateDirectoryAuthority,
 } from "./remote/windowsPrivateTreeAcl.js";
 
@@ -171,7 +170,7 @@ export async function assertPrivateDirectoryAuthority(
 ): Promise<void> {
   await assertPhysicalDirectoryAuthority(authority);
   if (authority.platform === "win32") {
-    await (options.windowsPrivateDirectoryAuthority ?? resolveWindowsPrivateDirectoryAuthority())(
+    await (options.windowsPrivateDirectoryAuthority ?? establishWindowsPrivateDirectory)(
       authority.path,
     );
     await assertPhysicalDirectoryAuthority(authority);
@@ -227,7 +226,7 @@ async function establishWindowsPrivateRoot(
 ): Promise<PrivateDirectoryAuthority> {
   const stateDirectory = oracleStateDirectory(options);
   const windowsAuthority =
-    options.windowsPrivateDirectoryAuthority ?? resolveWindowsPrivateDirectoryAuthority();
+    options.windowsPrivateDirectoryAuthority ?? establishWindowsPrivateDirectory;
   if (!options.tempDirectory) {
     await mkdir(stateDirectory, { recursive: true });
   }
@@ -326,7 +325,7 @@ export async function createPrivateTempChildGeneration(
     throw new Error("Private temporary child platform does not match its parent authority");
   }
   const windowsAuthority =
-    options.windowsPrivateDirectoryAuthority ?? resolveWindowsPrivateDirectoryAuthority();
+    options.windowsPrivateDirectoryAuthority ?? establishWindowsPrivateDirectory;
   const usesNativeWindowsAuthority =
     parent.platform === "win32" && windowsAuthority === establishWindowsPrivateDirectory;
   if (parent.platform === "win32") {
@@ -380,7 +379,7 @@ export async function assertPrivateTempGeneration(
 ): Promise<void> {
   if (generation.platform === "win32") {
     const windowsAuthority =
-      options.windowsPrivateDirectoryAuthority ?? resolveWindowsPrivateDirectoryAuthority();
+      options.windowsPrivateDirectoryAuthority ?? establishWindowsPrivateDirectory;
     if (windowsAuthority === establishWindowsPrivateDirectory) {
       await assertPhysicalDirectoryAuthority(generation.parent);
       await assertPhysicalDirectoryAuthority(generation);

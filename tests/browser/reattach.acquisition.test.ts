@@ -241,9 +241,12 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
     });
 
     await expect(
-      resumeBrowserSession(runtime, {}, createBrowserLogger(), {
+      resumeBrowserSession(runtime, { manualLogin: false, headless: true }, createBrowserLogger(), {
         createPrivateTempGeneration: establishProfile,
         launchChrome,
+        acquireRecoveryLock: vi.fn(async () => ({
+          release: vi.fn(async (finalize?: () => Promise<void>) => await finalize?.()),
+        })),
       }),
     ).rejects.toThrow("simulated private profile authority failure");
 
@@ -289,17 +292,22 @@ describe("resumeBrowserSession acquisition", { timeout: 15_000 }, () => {
     });
     try {
       await expect(
-        resumeBrowserSession(runtime, {}, createBrowserLogger(), {
-          createPrivateTempGeneration: establishProfile,
-          launchChrome: launchChrome as never,
-          connectRecoveryTargetWithExactAuthority: vi.fn(async () => {
-            throw acquisitionError;
-          }),
-          acquireRecoveryLock: vi.fn(async () => ({
-            release: vi.fn(async (finalize?: () => Promise<void>) => await finalize?.()),
-          })),
-          recoveryCleanup: { removeProfile },
-        }),
+        resumeBrowserSession(
+          runtime,
+          { manualLogin: false, headless: true },
+          createBrowserLogger(),
+          {
+            createPrivateTempGeneration: establishProfile,
+            launchChrome: launchChrome as never,
+            connectRecoveryTargetWithExactAuthority: vi.fn(async () => {
+              throw acquisitionError;
+            }),
+            acquireRecoveryLock: vi.fn(async () => ({
+              release: vi.fn(async (finalize?: () => Promise<void>) => await finalize?.()),
+            })),
+            recoveryCleanup: { removeProfile },
+          },
+        ),
       ).rejects.toBe(acquisitionError);
       expect(establishProfile).toHaveBeenCalledWith("oracle-reattach-");
       expect(launchChrome).toHaveBeenCalledOnce();

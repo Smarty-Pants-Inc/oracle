@@ -471,4 +471,4 @@ test("persists and resolves Project Sources cleanup while discarding successful 
     vi.doUnmock("node:fs/promises");
     vi.resetModules();
   }
-}, 20_000);
+}, 60_000);

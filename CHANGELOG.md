@@ -5,6 +5,7 @@
 ### Fixed
 
 - Remote/Bridge: require authenticated transaction v3 by default and expose predecessor text compatibility only through explicit opt-in with a distinct scoped bearer that is never reused from the modern HMAC key.
+- Remote API: restore `createRemoteBrowserExecutor` as the result-only, artifact-published, auto-finalizing compatibility executor and expose transaction settlement authority only through `createRemoteBrowserTransactionExecutor`.
 - Remote/Bridge: make plaintext serve and client endpoints loopback-only, reject direct LAN binds, document SSH tunnel migration, and report the negotiated protocol in `oracle bridge doctor`.
 - Remote/Bridge: require modern and explicitly configured legacy credentials to be 32-byte keys encoded as exactly 64 lowercase hexadecimal characters at CLI, config, health, client, server, and bridge artifact boundaries; bridge and server auto-generation use 32 CSPRNG bytes.
 - Remote/Bridge: validate remote browser credentials only when remote transport is selected, so dormant predecessor bridge settings cannot brick local or explicit API CLI/MCP commands; 32-character base-generated credentials still fail closed before transport with an exact rotate/clear/re-import migration path.

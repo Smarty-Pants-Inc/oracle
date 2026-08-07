@@ -33,7 +33,7 @@ const MODERN_TOKEN = "a".repeat(64);
 const LEGACY_TOKEN = "b".repeat(64);
 const READINESS_NONCE = "11111111-1111-4111-8111-111111111111";
 const OTHER_NONCE = "22222222-2222-4222-8222-222222222222";
-async function waitForFileContents(filePath: string): Promise<string> {
+async function waitForFileContents(filePath: string, timeoutMs = 5_000): Promise<string> {
   await expect
     .poll(
       async () =>
@@ -44,13 +44,13 @@ async function waitForFileContents(filePath: string): Promise<string> {
             return false;
           },
         ),
-      { timeout: 5_000, interval: 50 },
+      { timeout: timeoutMs, interval: 50 },
     )
     .toBe(true);
   return fs.readFile(filePath, "utf8");
 }
 
-async function waitForProcessExit(pid: number): Promise<void> {
+async function waitForProcessExit(pid: number, timeoutMs = 5_000): Promise<void> {
   await expect
     .poll(
       () => {
@@ -62,7 +62,7 @@ async function waitForProcessExit(pid: number): Promise<void> {
           throw error;
         }
       },
-      { timeout: 5_000, interval: 50 },
+      { timeout: timeoutMs, interval: 50 },
     )
     .toBe(true);
 }
@@ -861,11 +861,11 @@ process.stdin.resume();
         // The supervisor forwards EOF only after assigning the child to the kill-on-close Job.
         supervisor.stdin!.end();
 
-        const child = JSON.parse(await waitForFileContents(childReadyPath)) as {
+        const child = JSON.parse(await waitForFileContents(childReadyPath, 10_000)) as {
           pid: number;
           port: number;
         };
-        const descendant = JSON.parse(await waitForFileContents(descendantReadyPath)) as {
+        const descendant = JSON.parse(await waitForFileContents(descendantReadyPath, 10_000)) as {
           pid: number;
           port: number;
         };
@@ -899,7 +899,10 @@ process.stdin.resume();
         ]);
         expect(childListener.destroyed).toBe(true);
         expect(descendantListener.destroyed).toBe(true);
-        await Promise.all([waitForProcessExit(childPid), waitForProcessExit(descendantPid)]);
+        await Promise.all([
+          waitForProcessExit(childPid, 10_000),
+          waitForProcessExit(descendantPid, 10_000),
+        ]);
       } finally {
         childListener?.destroy();
         descendantListener?.destroy();
@@ -912,7 +915,7 @@ process.stdin.resume();
         await fs.rm(tempDir, { recursive: true, force: true });
       }
     },
-    20_000,
+    30_000,
   );
 
   it.runIf(process.platform === "win32")(

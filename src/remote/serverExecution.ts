@@ -66,7 +66,7 @@ import {
   persistRemoteBrowserRuntime,
 } from "./serverTransactionRuntime.js";
 import type { RemoteServerOptions } from "./serverTypes.js";
-import { samePhysicalFile } from "./transactionRecordStorage.js";
+import { sameFileGeneration, samePhysicalFile } from "./transactionRecordStorage.js";
 import {
   assertPrivateDirectoryAuthority,
   createPrivateTempChildGeneration,
@@ -79,7 +79,8 @@ type RemoteScratchGeneration = PrivateTempGeneration;
 
 interface RemoteScratchFile {
   readonly path: string;
-  readonly identity: BigIntStats;
+  identity: BigIntStats;
+  complete: boolean;
 }
 
 interface MaterializedRemoteAttachments {
@@ -122,13 +123,20 @@ async function assertRemoteScratchGeneration(generation: RemoteScratchGeneration
   }
 }
 
-function assertRemoteScratchFile(entry: BigIntStats, expected?: BigIntStats): void {
+function assertRemoteScratchFileGeneration(entry: BigIntStats, expected?: BigIntStats): void {
   if (
     !entry.isFile() ||
     entry.isSymbolicLink() ||
     entry.nlink !== 1n ||
-    (expected !== undefined && !samePhysicalFile(entry, expected))
+    (expected !== undefined && !sameFileGeneration(entry, expected))
   ) {
+    throw new Error("Remote attachment scratch file changed");
+  }
+}
+
+function assertRemoteScratchFile(entry: BigIntStats, expected?: BigIntStats): void {
+  assertRemoteScratchFileGeneration(entry, expected);
+  if (expected !== undefined && !samePhysicalFile(entry, expected)) {
     throw new Error("Remote attachment scratch file changed");
   }
 }
@@ -136,20 +144,27 @@ function assertRemoteScratchFile(entry: BigIntStats, expected?: BigIntStats): vo
 async function writeRemoteScratchFile(
   filePath: string,
   payload: Buffer,
+  registeredFiles: RemoteScratchFile[],
 ): Promise<RemoteScratchFile> {
   let handle: FileHandle | undefined;
   try {
     handle = await open(filePath, remoteAttachmentOpenFlags, 0o600);
-    await handle.writeFile(payload);
-    await handle.sync();
     const identity = await handle.stat({ bigint: true });
     assertRemoteScratchFile(identity);
-    if (identity.size !== BigInt(payload.byteLength)) {
+    const file: RemoteScratchFile = { path: filePath, identity, complete: false };
+    registeredFiles.push(file);
+    await handle.writeFile(payload);
+    await handle.sync();
+    const written = await handle.stat({ bigint: true });
+    assertRemoteScratchFileGeneration(written, identity);
+    if (written.size !== BigInt(payload.byteLength)) {
       throw new Error("Remote attachment scratch write did not preserve exact bytes");
     }
     const pathEntry = await lstat(filePath, { bigint: true });
-    assertRemoteScratchFile(pathEntry, identity);
-    return { path: filePath, identity };
+    assertRemoteScratchFile(pathEntry, written);
+    file.identity = written;
+    file.complete = true;
+    return file;
   } catch {
     throw new Error("Remote attachment scratch materialization failed");
   } finally {
@@ -159,6 +174,7 @@ async function writeRemoteScratchFile(
 
 async function assertRemoteScratchFiles(files: readonly RemoteScratchFile[]): Promise<void> {
   for (const file of files) {
+    if (!file.complete) throw new Error("Remote attachment scratch file changed");
     let entry: BigIntStats;
     try {
       entry = await lstat(file.path, { bigint: true });
@@ -175,8 +191,16 @@ async function removeRemoteScratchGeneration(
 ): Promise<boolean> {
   try {
     await assertRemoteScratchGeneration(generation);
-    await assertRemoteScratchFiles(files);
-    for (const file of files) await unlink(file.path);
+    for (const file of files) {
+      const entry = await lstat(file.path, { bigint: true });
+      if (file.complete) {
+        assertRemoteScratchFile(entry, file.identity);
+      } else {
+        assertRemoteScratchFileGeneration(entry, file.identity);
+      }
+      await unlink(file.path);
+    }
+    await assertRemoteScratchGeneration(generation);
     await rmdir(generation.path);
     return true;
   } catch {
@@ -467,15 +491,14 @@ export async function handleRemoteRunRequest(params: {
   try {
     scratchRun = await createPrivateTempGeneration(`oracle-serve-${runId}-`);
     const attachmentGeneration = await createRemoteScratchGeneration(scratchRun, "attachments-");
+    const attachmentFiles: RemoteScratchFile[] = [];
+    scratchAttachments.push({ generation: attachmentGeneration, files: attachmentFiles });
     const materializedAttachments = await materializeRemoteAttachments(
       payload.attachments,
       attachmentGeneration.path,
       "attachment",
+      attachmentFiles,
     );
-    scratchAttachments.push({
-      generation: attachmentGeneration,
-      files: materializedAttachments.files,
-    });
     const attachments = materializedAttachments.attachments;
     let fallbackSubmission:
       | {
@@ -488,15 +511,14 @@ export async function handleRemoteRunRequest(params: {
         scratchRun,
         "fallback-attachments-",
       );
+      const fallbackFiles: RemoteScratchFile[] = [];
+      scratchAttachments.push({ generation: fallbackGeneration, files: fallbackFiles });
       const materializedFallback = await materializeRemoteAttachments(
         payload.fallbackSubmission.attachments,
         fallbackGeneration.path,
         "fallback-attachment",
+        fallbackFiles,
       );
-      scratchAttachments.push({
-        generation: fallbackGeneration,
-        files: materializedFallback.files,
-      });
       fallbackSubmission = {
         prompt: payload.fallbackSubmission.prompt,
         attachments: materializedFallback.attachments,
@@ -831,14 +853,14 @@ async function materializeRemoteAttachments(
   attachments: RemoteRunPayload["attachments"],
   directory: string,
   fallbackName: string,
+  files: RemoteScratchFile[] = [],
 ): Promise<MaterializedRemoteAttachments> {
   const materialized: BrowserAttachment[] = [];
-  const files: RemoteScratchFile[] = [];
   for (const [index, attachment] of attachments.entries()) {
     const safeName = sanitizeArtifactFilename(attachment.fileName, `${fallbackName}-${index + 1}`);
     const filePath = path.join(directory, `${index + 1}-${safeName}`);
     const payload = Buffer.from(attachment.contentBase64, "base64");
-    files.push(await writeRemoteScratchFile(filePath, payload));
+    await writeRemoteScratchFile(filePath, payload, files);
     materialized.push({
       path: filePath,
       displayPath: attachment.displayPath,

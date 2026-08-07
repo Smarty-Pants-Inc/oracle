@@ -5,10 +5,10 @@ import path from "node:path";
 import { existsSync } from "node:fs";
 import { mkdtemp, readdir, realpath, rm, writeFile, readFile } from "node:fs/promises";
 import { drainRemoteServerShutdown, type RemoteServerInstance } from "../../src/remote/server.js";
-import { serveRemote } from "../../src/remote/serverLifecycle.js";
+import { ownRemoteServerLifecycle, serveRemote } from "../../src/remote/serverLifecycle.js";
 import { runBridgeHost } from "../../src/cli/bridge/host.js";
 import {
-  createRemoteBrowserExecutor,
+  createRemoteBrowserTransactionExecutor,
   resumeRemoteBrowserTransaction,
 } from "../../src/remote/client.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
@@ -97,7 +97,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       );
 
       try {
-        const transaction = await createRemoteBrowserExecutor({
+        const transaction = await createRemoteBrowserTransactionExecutor({
           host: `127.0.0.1:${server.port}`,
           token: "a".repeat(64),
         })({ prompt: `${mode} exact settlement`, config: {} });
@@ -489,12 +489,14 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       let lockPresentAtTunnelStop: boolean | undefined;
       let recordAtTunnelStop: Promise<unknown> | undefined;
       let listenerProbeAtTunnelStop: Promise<unknown> | undefined;
+      let cleanupError: unknown;
       const stopTunnel = vi.fn(() => {
         lockPresentAtTunnelStop = existsSync(controllerLockPath);
         recordAtTunnelStop = readAuthenticatedTransactionRecord(
           transactionStoreDir,
           transactionToken,
         );
+        void recordAtTunnelStop.catch(() => undefined);
         listenerProbeAtTunnelStop = httpPostJson({
           hostname: "127.0.0.1",
           port: server.port,
@@ -563,20 +565,23 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         });
         shutdownRequested.resolve();
 
-        await vi.waitFor(async () => {
-          await expect(
-            httpPostJson({
-              hostname: "127.0.0.1",
-              port: server.port,
-              path: `/transactions/${rejectedTransactionToken}/run`,
-              token: "a".repeat(64),
-              body: remoteRunPayload(),
-            }),
-          ).resolves.toMatchObject({
-            statusCode: 503,
-            json: { error: "server_closing" },
-          });
-        });
+        await vi.waitFor(
+          async () => {
+            await expect(
+              httpPostJson({
+                hostname: "127.0.0.1",
+                port: server.port,
+                path: `/transactions/${rejectedTransactionToken}/run`,
+                token: "a".repeat(64),
+                body: remoteRunPayload(),
+              }),
+            ).resolves.toMatchObject({
+              statusCode: 503,
+              json: { error: "server_closing" },
+            });
+          },
+          { timeout: 5_000 },
+        );
         const lateReceiptStatus = Promise.withResolvers<number>();
         lateReceiptRequest = http.request(
           {
@@ -654,15 +659,22 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         continueRun.resolve();
         shutdownRequested.resolve();
         await hostPromise?.catch(() => undefined);
+        await recordAtTunnelStop?.catch(() => undefined);
+        await listenerProbeAtTunnelStop?.catch(() => undefined);
         await server.close().catch(() => undefined);
-        await rm(tmpDir, { recursive: true, force: true });
+        try {
+          await rm(tmpDir, { recursive: true, force: true });
+        } catch (error) {
+          cleanupError = error;
+        }
       }
+      if (cleanupError) throw cleanupError;
     },
     15_000,
   );
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
-    "keeps controller authority until live-only manual target close authority settles",
+    "keeps draining controller authority available to public transaction settlement",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-live-close-drain-"));
       const transactionStoreDir = path.join(tmpDir, "transactions");
@@ -753,14 +765,36 @@ describe("remote browser service", { timeout: 15_000 }, () => {
               ),
           },
         );
+        const host = `127.0.0.1:${server.port}`;
+        const requestPayload = remoteRunPayload();
+        const requestIdentity = buildRemotePromptRequestIdentity(requestPayload);
         const initial = await httpPostNdjson({
           hostname: "127.0.0.1",
           port: server.port,
           path: `/transactions/${transactionToken}/run`,
           token: "a".repeat(64),
-          body: remoteRunPayload(),
+          body: requestPayload,
         });
         expect(initial.statusCode).toBe(200);
+        const transaction = await resumeRemoteBrowserTransaction({
+          runtime: {
+            recoveryCleanupResources: [
+              {
+                remoteRecovery: {
+                  protocolVersion: REMOTE_TRANSACTION_PROTOCOL_VERSION,
+                  host,
+                  transactionToken,
+                  state: "pre-receipt",
+                  requestIdentity,
+                },
+                recoveryCleanup: { ownsTarget: false, profileKind: "none", keepBrowser: false },
+              },
+            ],
+          },
+          configuredHost: host,
+          authToken: "a".repeat(64),
+        });
+        expect(transaction.answerText).toBe("manual kept answer");
 
         const firstClose = server.close();
         expect(server.close()).toBe(firstClose);
@@ -797,13 +831,13 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           httpPostJson({
             hostname: "127.0.0.1",
             port: server.port,
-            path: `/transactions/${transactionToken}/bind`,
+            path: `/transactions/${rejectedTransactionToken}/bind`,
             token: "a".repeat(64),
-            body: {},
+            body: { mode: "finalize", durablePublication: true },
           }),
         ).resolves.toMatchObject({
-          statusCode: 503,
-          json: { error: "server_closing" },
+          statusCode: 404,
+          json: { error: "transaction_not_found" },
         });
         await expect(
           httpPostJson({
@@ -821,19 +855,13 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           httpPostJson({
             hostname: "127.0.0.1",
             port: server.port,
-            path: `/transactions/${transactionToken}/finalize`,
-            body: { durablePublication: true },
+            path: `/transactions/${transactionToken}/bind`,
+            body: { mode: "finalize", durablePublication: true },
           }),
         ).resolves.toMatchObject({ statusCode: 401, json: { error: "authentication_required" } });
 
-        const settlement = await httpPostJson({
-          hostname: "127.0.0.1",
-          port: server.port,
-          path: `/transactions/${transactionToken}/finalize`,
-          token: "a".repeat(64),
-          body: { durablePublication: true },
-        });
-        expect(settlement).toMatchObject({ statusCode: 200, json: { state: "finalized" } });
+        const settlement = await transaction.finalize();
+        expect(settlement).toMatchObject({ status: "completed" });
         expect(closeTarget).toHaveBeenCalledOnce();
 
         const retriedClose = server.close();
@@ -841,6 +869,19 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         expect(server.close()).toBe(retriedClose);
         await retriedClose;
         expect(existsSync(controllerLockPath)).toBe(false);
+        const listenerError = await httpPostJson({
+          hostname: "127.0.0.1",
+          port: server.port,
+          path: `/transactions/${rejectedTransactionToken}/run`,
+          body: remoteRunPayload(),
+        }).then(
+          () => null,
+          (error: unknown) => error,
+        );
+        expect(listenerError).toBeInstanceOf(Error);
+        expect(["ECONNREFUSED", "ECONNRESET"]).toContain(
+          (listenerError as NodeJS.ErrnoException).code,
+        );
         await expect(
           readAuthenticatedTransactionRecord(transactionStoreDir, transactionToken),
         ).resolves.toMatchObject({
@@ -968,10 +1009,11 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         runExactOperation: vi.fn(),
         release: vi.fn(async () => undefined),
       }));
+      const cleanupAttempts: Promise<unknown>[] = [];
       const retryCleanup = vi.fn<typeof retryBrowserRecoveryCleanup>(
         async (cleanupRuntime, logger, deps = {}, mode) => {
           expect(mode).toBe("abort");
-          return await retryBrowserRecoveryCleanup(
+          const attempt = retryBrowserRecoveryCleanup(
             cleanupRuntime,
             logger,
             {
@@ -988,10 +1030,13 @@ describe("remote browser service", { timeout: 15_000 }, () => {
             },
             mode,
           );
+          cleanupAttempts.push(attempt);
+          return await attempt;
         },
       );
       targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
       let server: RemoteServerInstance | undefined;
+      let cleanupError: unknown;
 
       try {
         server = await createTestRemoteServer(
@@ -1019,6 +1064,9 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         });
 
         expect(retryCleanup).toHaveBeenCalledOnce();
+        const firstCleanupAttempt = cleanupAttempts[0];
+        if (!firstCleanupAttempt) throw new Error("missing initial recovery cleanup attempt");
+        await firstCleanupAttempt;
         expect(retainChromeEndpointAuthority).toHaveBeenCalledOnce();
         expect(closeTarget).not.toHaveBeenCalled();
         retryCleanup.mockImplementationOnce(async (cleanupRuntime) => {
@@ -1052,10 +1100,16 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           "recoveryCleanupResources",
         );
       } finally {
+        await Promise.allSettled(cleanupAttempts);
         await server?.close().catch(() => undefined);
         targetCloseAuthorityTest.clearRetainedTargetCloseAuthorities();
-        await rm(tmpDir, { recursive: true, force: true });
+        try {
+          await rm(tmpDir, { recursive: true, force: true });
+        } catch (error) {
+          cleanupError = error;
+        }
       }
+      if (cleanupError) throw cleanupError;
     },
     15_000,
   );
@@ -1359,7 +1413,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       );
 
       try {
-        const transaction = await createRemoteBrowserExecutor({
+        const transaction = await createRemoteBrowserTransactionExecutor({
           host: `127.0.0.1:${server.port}`,
           token: "a".repeat(64),
         })({ prompt: "retry cleanup", config: {} });
@@ -1472,7 +1526,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       );
 
       try {
-        const transaction = await createRemoteBrowserExecutor({
+        const transaction = await createRemoteBrowserTransactionExecutor({
           host: `127.0.0.1:${server.port}`,
           token: "a".repeat(64),
         })({ prompt: "WSS contract", config: {} });
@@ -1526,4 +1580,74 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       }
     },
   );
+});
+
+describe("remote server readiness lifecycle", () => {
+  test("retains listener and CLI bridge ownership until pending cleanup can settle and close retries", async () => {
+    const readinessError = new Error("readiness publication failed");
+    const pendingCloseObserved = Promise.withResolvers<void>();
+    let cleanupPending = true;
+    const close = vi.fn(async () => {
+      if (cleanupPending) {
+        throw new Error("durable cleanup remains pending");
+      }
+    });
+    const server: RemoteServerInstance = {
+      port: 9473,
+      token: "a".repeat(64),
+      close,
+    };
+    const listeners = new Map<"SIGINT" | "SIGTERM", () => void>();
+    const signalSource = {
+      on(signal: "SIGINT" | "SIGTERM", listener: () => void) {
+        listeners.set(signal, listener);
+      },
+      off(signal: "SIGINT" | "SIGTERM", listener: () => void) {
+        if (listeners.get(signal) === listener) listeners.delete(signal);
+      },
+    };
+    const releaseBridgeOwner = vi.fn();
+    const shutdownLog = vi.spyOn(console, "log").mockImplementation(() => {
+      throw new Error("readiness output is unavailable");
+    });
+
+    try {
+      const lifecycleResult = ownRemoteServerLifecycle(
+        server,
+        {
+          onReady: async () => {
+            throw readinessError;
+          },
+        },
+        {
+          signalSource,
+          logger: () => {
+            pendingCloseObserved.resolve();
+            throw new Error("diagnostic output is unavailable");
+          },
+          retryDelayMs: 0,
+        },
+      )
+        .then(
+          () => new Error("readiness failure unexpectedly succeeded"),
+          (error: unknown) => error,
+        )
+        .finally(releaseBridgeOwner);
+
+      await pendingCloseObserved.promise;
+      expect(close).toHaveBeenCalledOnce();
+      expect(releaseBridgeOwner).not.toHaveBeenCalled();
+      expect([...listeners.keys()].sort()).toEqual(["SIGINT", "SIGTERM"]);
+
+      cleanupPending = false;
+      expect(() => listeners.get("SIGTERM")?.()).not.toThrow();
+      await expect(lifecycleResult).resolves.toBe(readinessError);
+
+      expect(close).toHaveBeenCalledTimes(2);
+      expect(releaseBridgeOwner).toHaveBeenCalledOnce();
+      expect(listeners.size).toBe(0);
+    } finally {
+      shutdownLog.mockRestore();
+    }
+  });
 });

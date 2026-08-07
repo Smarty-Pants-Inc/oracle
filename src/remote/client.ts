@@ -9,6 +9,7 @@ import type {
   BrowserAttachment,
   BrowserCaptureFinalizationResult,
   BrowserLogger,
+  BrowserRunResult,
   BrowserRunTransaction,
   SavedBrowserFile,
 } from "../browser/types.js";
@@ -78,18 +79,51 @@ export interface RemoteExecutorOptions {
   deadlines?: RemoteTransportDeadlines;
 }
 
+export type RemoteBrowserExecutor = (options: BrowserRunOptions) => Promise<BrowserRunResult>;
+
+export type RemoteBrowserTransactionExecutor = (
+  options: BrowserRunOptions,
+) => Promise<BrowserRunTransaction>;
+
+export function createRemoteBrowserExecutor(options: RemoteExecutorOptions): RemoteBrowserExecutor {
+  const executeTransaction = createRemoteBrowserTransactionExecutor(options);
+  return async (runOptions) => {
+    const transaction = await executeTransaction(runOptions);
+    const finalization = await transaction.finalize();
+    const {
+      runtime: _runtime,
+      bindSettlement: _bindSettlement,
+      finalize: _finalize,
+      abort: _abort,
+      ...result
+    } = transaction;
+    if (finalization.status === "pending") {
+      result.warnings = [
+        ...(result.warnings ?? []),
+        {
+          code: "direct-finalize-cleanup-pending",
+          severity: "warning",
+          message: "The assistant answer is complete, but remote browser cleanup remains pending.",
+          details: { stage: "remote-browser-capture-finalization" },
+        },
+      ];
+    }
+    return result;
+  };
+}
+
 interface RemoteAttachmentBudget {
   count: number;
   bytes: number;
 }
 
-export function createRemoteBrowserExecutor({
+export function createRemoteBrowserTransactionExecutor({
   host,
   token,
   legacyToken,
   allowLegacyTextProtocol = false,
   deadlines,
-}: RemoteExecutorOptions) {
+}: RemoteExecutorOptions): RemoteBrowserTransactionExecutor {
   if (token !== undefined) assertRemoteCredential(token, "Remote v3 HMAC root key");
   if (legacyToken !== undefined) {
     assertRemoteCredential(legacyToken, "Remote legacy bearer credential");

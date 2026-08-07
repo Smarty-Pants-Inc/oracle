@@ -13,7 +13,7 @@ import {
   createRemoteHealthAuthenticationProof,
 } from "../../src/remote/auth.js";
 import { RemoteArtifactStore } from "../../src/remote/artifactStore.js";
-import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
+import { createRemoteBrowserTransactionExecutor } from "../../src/remote/client.js";
 import { RemoteTransactionStore } from "../../src/remote/transactionStore.js";
 import type { BrowserRunResult } from "../../src/browserMode.js";
 import type { BrowserRunTransaction } from "../../src/browser/types.js";
@@ -109,7 +109,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       );
 
       try {
-        const captured = await createRemoteBrowserExecutor({
+        const captured = await createRemoteBrowserTransactionExecutor({
           host: `127.0.0.1:${server.port}`,
           token: "a".repeat(64),
         })({ prompt: "preserve answer after artifact failure", config: {} });
@@ -217,7 +217,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       );
 
       try {
-        const captured = await createRemoteBrowserExecutor({
+        const captured = await createRemoteBrowserTransactionExecutor({
           host: `127.0.0.1:${server.port}`,
           token: "a".repeat(64),
         })({ prompt: "artifact enrichment persistence", config: {} });
@@ -283,7 +283,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       );
 
       try {
-        const captured = await createRemoteBrowserExecutor({
+        const captured = await createRemoteBrowserTransactionExecutor({
           host: `127.0.0.1:${server.port}`,
           token: "a".repeat(64),
         })({ prompt: "bound generated file count", config: {} });
@@ -396,7 +396,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         },
       );
 
-      const executor = createRemoteBrowserExecutor({
+      const executor = createRemoteBrowserTransactionExecutor({
         host: `127.0.0.1:${server.port}`,
         token: "a".repeat(64),
       });
@@ -549,7 +549,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
         });
 
       try {
-        const captured = await createRemoteBrowserExecutor({
+        const captured = await createRemoteBrowserTransactionExecutor({
           host: `127.0.0.1:${server.port}`,
           token: "a".repeat(64),
         })({
@@ -775,7 +775,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
 
       try {
         await expect(
-          createRemoteBrowserExecutor({
+          createRemoteBrowserTransactionExecutor({
             host: `127.0.0.1:${bridge.port}`,
             token: "a".repeat(64),
           })({ prompt: "remote", config: {}, sessionId: "invalid-artifact-session" }),
@@ -817,7 +817,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
 
       try {
         await expect(
-          createRemoteBrowserExecutor({
+          createRemoteBrowserTransactionExecutor({
             host: `127.0.0.1:${bridge.port}`,
             token: "a".repeat(64),
           })({ prompt: "remote", config: {}, sessionId: "wrong-token-session" }),
@@ -857,7 +857,7 @@ describe("remote browser service", { timeout: 15_000 }, () => {
       const host = `127.0.0.1:${bridge.port}`;
 
       try {
-        const captured = await createRemoteBrowserExecutor({
+        const captured = await createRemoteBrowserTransactionExecutor({
           host,
           token: "a".repeat(64),
         })({ prompt: "remote", config: {}, sessionId: "oversize-artifact-session" });

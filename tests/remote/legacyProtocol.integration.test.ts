@@ -2,7 +2,7 @@ import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { describe, expect, test } from "vitest";
-import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
+import { createRemoteBrowserTransactionExecutor } from "../../src/remote/client.js";
 import { promptIdentitySha256 } from "../../src/browser/actions/committedPrompt.js";
 import type { BrowserRunResult, BrowserRunTransaction } from "../../src/browser/types.js";
 import { RemoteLegacyTextResultSchema } from "../../src/remote/legacyProtocol.js";
@@ -201,7 +201,7 @@ describe("legacy remote protocol integration", () => {
         },
       );
       try {
-        const transaction = await createRemoteBrowserExecutor({
+        const transaction = await createRemoteBrowserTransactionExecutor({
           host: `127.0.0.1:${server.port}`,
           legacyToken: "c".repeat(64),
           allowLegacyTextProtocol: true,

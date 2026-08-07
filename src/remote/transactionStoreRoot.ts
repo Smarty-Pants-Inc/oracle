@@ -7,7 +7,7 @@ import {
 } from "../browser/filesystemLockDirectoryIdentity.js";
 import { syncDirectory } from "../fsDurability.js";
 import {
-  resolveWindowsPrivateTreeAuthority,
+  protectWindowsPrivateTreeAcl,
   type WindowsPrivateTreeAuthority,
 } from "./windowsPrivateTreeAcl.js";
 
@@ -56,7 +56,7 @@ export async function initializeRemoteTransactionStoreRoot(
   const integrityKeyPath = path.resolve(options.integrityKeyPath);
   const integrityKeyDirectory = path.dirname(integrityKeyPath);
   if (platform === "win32") {
-    await (options.windowsPrivateTreeAuthority ?? resolveWindowsPrivateTreeAuthority())({
+    await (options.windowsPrivateTreeAuthority ?? protectWindowsPrivateTreeAcl)({
       storeDirectory: directory,
       authorityDirectory: headDirectory,
       integrityKeyDirectory,
@@ -100,7 +100,7 @@ export async function protectRemoteTransactionStoreRoot(
   }
   await assertRemoteTransactionStoreRootGeneration(authority);
   if (platform === "win32") {
-    await (options.windowsPrivateTreeAuthority ?? resolveWindowsPrivateTreeAuthority())({
+    await (options.windowsPrivateTreeAuthority ?? protectWindowsPrivateTreeAcl)({
       storeDirectory: directory,
       authorityDirectory: headDirectory,
       integrityKeyDirectory,

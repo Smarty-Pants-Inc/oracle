@@ -179,6 +179,7 @@ export function attachRemoteRequestRouter(
         artifactWaiverMatch ||
         artifactReceiptMatch ||
         artifactMatch ||
+        transactionMatch?.action === "bind" ||
         transactionMatch?.action === "finalize" ||
         transactionMatch?.action === "abort"
           ? "settlement-continuation"

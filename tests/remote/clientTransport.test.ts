@@ -6,6 +6,7 @@ import * as fsPromises from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 import {
   createRemoteBrowserExecutor,
+  createRemoteBrowserTransactionExecutor,
   resumeRemoteBrowserTransaction,
   settleRemoteBrowserRecovery,
 } from "../../src/remote/client.js";
@@ -261,12 +262,12 @@ describe("remote client transport deadlines", () => {
       "a".repeat(63),
       "g".repeat(64),
     ]) {
-      expect(() => createRemoteBrowserExecutor({ host: "127.0.0.1:9473", token })).toThrow(
-        /exactly 64 lowercase hexadecimal characters \(32 bytes\)/i,
-      );
+      expect(() =>
+        createRemoteBrowserTransactionExecutor({ host: "127.0.0.1:9473", token }),
+      ).toThrow(/exactly 64 lowercase hexadecimal characters \(32 bytes\)/i);
     }
     expect(() =>
-      createRemoteBrowserExecutor({
+      createRemoteBrowserTransactionExecutor({
         host: "127.0.0.1:9473",
         legacyToken: "weak",
         allowLegacyTextProtocol: true,
@@ -293,7 +294,7 @@ describe("remote client transport deadlines", () => {
     });
     const port = await listen(server);
     try {
-      await createRemoteBrowserExecutor({
+      await createRemoteBrowserTransactionExecutor({
         host: `127.0.0.1:${port}`,
         token: "a".repeat(64),
         deadlines,
@@ -431,7 +432,7 @@ describe("remote client transport deadlines", () => {
     });
     const port = await listen(server);
     try {
-      const error = await createRemoteBrowserExecutor({
+      const error = await createRemoteBrowserTransactionExecutor({
         host: `127.0.0.1:${port}`,
         token: "a".repeat(64),
         deadlines,
@@ -473,7 +474,7 @@ describe("remote client transport deadlines", () => {
     });
     const port = await listen(server);
     try {
-      const transaction = await createRemoteBrowserExecutor({
+      const transaction = await createRemoteBrowserTransactionExecutor({
         host: `127.0.0.1:${port}`,
         token: "a".repeat(64),
         deadlines,
@@ -493,7 +494,7 @@ describe("remote client transport deadlines", () => {
     }
   });
 
-  it("preserves text and normal settlement when an artifact download times out", async () => {
+  it("auto-finalizes only after preserving artifact publication on download failure", async () => {
     const artifact = Buffer.from("artifact");
     const descriptor = {
       artifactId: "artifact-1",
@@ -550,12 +551,12 @@ describe("remote client transport deadlines", () => {
     const oracleHome = await fsPromises.mkdtemp(path.join(os.tmpdir(), "oracle-remote-transport-"));
     setOracleHomeDirOverrideForTest(oracleHome);
     try {
-      const transaction = await createRemoteBrowserExecutor({
+      const result = await createRemoteBrowserExecutor({
         host,
         token: "a".repeat(64),
         deadlines,
       })({ prompt: "artifact", config: {}, sessionId: "held-artifact" });
-      expect(transaction).toMatchObject({
+      expect(result).toMatchObject({
         answerText: "answer",
         answerMarkdown: "answer",
         warnings: [
@@ -566,11 +567,14 @@ describe("remote client transport deadlines", () => {
           },
         ],
       });
-      expect(transaction.warnings?.[0]?.message).toMatch(/copy the generated file\(s\) manually/i);
-      expect(transaction.warnings?.[0]?.message).toContain("result.bin");
-      expect(transaction).not.toHaveProperty("artifacts");
-      expect(transaction).not.toHaveProperty("savedFiles");
-      await expect(transaction.finalize()).resolves.toMatchObject({ status: "completed" });
+      expect(result.warnings?.[0]?.message).toMatch(/copy the generated file\(s\) manually/i);
+      expect(result.warnings?.[0]?.message).toContain("result.bin");
+      expect(result).not.toHaveProperty("artifacts");
+      expect(result).not.toHaveProperty("savedFiles");
+      expect(result).not.toHaveProperty("runtime");
+      expect(result).not.toHaveProperty("bindSettlement");
+      expect(result).not.toHaveProperty("finalize");
+      expect(result).not.toHaveProperty("abort");
       expect(settlementRequests).toBe(1);
       expect(waiverRequests).toBe(1);
     } finally {
@@ -625,7 +629,7 @@ describe("remote client transport deadlines", () => {
     const oracleHome = await fsPromises.mkdtemp(path.join(os.tmpdir(), "oracle-waiver-pending-"));
     setOracleHomeDirOverrideForTest(oracleHome);
     try {
-      const transaction = await createRemoteBrowserExecutor({
+      const transaction = await createRemoteBrowserTransactionExecutor({
         host: `127.0.0.1:${port}`,
         token: "a".repeat(64),
         deadlines,
@@ -674,7 +678,7 @@ describe("remote client transport deadlines", () => {
     });
     const port = await listen(server);
     try {
-      const transaction = await createRemoteBrowserExecutor({
+      const transaction = await createRemoteBrowserTransactionExecutor({
         host: `127.0.0.1:${port}`,
         token: "a".repeat(64),
         deadlines,
@@ -739,7 +743,7 @@ describe("remote client transport deadlines", () => {
     });
     const port = await listen(server);
     try {
-      const caught = await createRemoteBrowserExecutor({
+      const caught = await createRemoteBrowserTransactionExecutor({
         host: `127.0.0.1:${port}`,
         token: "a".repeat(64),
         deadlines,
@@ -811,7 +815,7 @@ describe("remote client transport deadlines", () => {
     });
     const port = await listen(server);
     try {
-      const transaction = await createRemoteBrowserExecutor({
+      const transaction = await createRemoteBrowserTransactionExecutor({
         host: `127.0.0.1:${port}`,
         token: "a".repeat(64),
         deadlines: {
@@ -856,7 +860,7 @@ describe("remote client transport deadlines", () => {
     });
     const port = await listen(server);
     try {
-      const caught = await createRemoteBrowserExecutor({
+      const caught = await createRemoteBrowserTransactionExecutor({
         host: `127.0.0.1:${port}`,
         token: "a".repeat(64),
         deadlines: {
@@ -898,7 +902,7 @@ describe("remote client transport deadlines", () => {
     const port = await listen(server);
     try {
       await expect(
-        createRemoteBrowserExecutor({
+        createRemoteBrowserTransactionExecutor({
           host: `127.0.0.1:${port}`,
           token: "a".repeat(64),
           deadlines,
@@ -943,7 +947,11 @@ describe("remote client transport deadlines", () => {
     const remoteHost = `127.0.0.1:${port}`;
     try {
       await expect(
-        createRemoteBrowserExecutor({ host: remoteHost, token: "a".repeat(64), deadlines })({
+        createRemoteBrowserTransactionExecutor({
+          host: remoteHost,
+          token: "a".repeat(64),
+          deadlines,
+        })({
           prompt: "must preserve explicit target authority",
           config: { browserTabRef: "explicit-target" },
           runtimeHintCb,
@@ -991,7 +999,7 @@ describe("remote client transport deadlines", () => {
     });
     const port = await listen(server);
     try {
-      const caught = await createRemoteBrowserExecutor({
+      const caught = await createRemoteBrowserTransactionExecutor({
         host: `127.0.0.1:${port}`,
         token: "a".repeat(64),
       })({ prompt: "abort-bound error", config: {} }).then(
@@ -1611,7 +1619,7 @@ describe("remote client transport deadlines", () => {
       );
       const port = await listen(server);
       try {
-        const transaction = await createRemoteBrowserExecutor({
+        const transaction = await createRemoteBrowserTransactionExecutor({
           host: `127.0.0.1:${port}`,
           token: "a".repeat(64),
           deadlines,
@@ -1701,7 +1709,7 @@ describe("remote client transport deadlines", () => {
     );
     const port = await listen(server);
     try {
-      const transaction = await createRemoteBrowserExecutor({
+      const transaction = await createRemoteBrowserTransactionExecutor({
         host: `127.0.0.1:${port}`,
         token: "a".repeat(64),
         deadlines,
@@ -1802,7 +1810,7 @@ describe("remote client transport deadlines", () => {
     });
     const port = await listen(server);
     try {
-      const transaction = await createRemoteBrowserExecutor({
+      const transaction = await createRemoteBrowserTransactionExecutor({
         host: `127.0.0.1:${port}`,
         token: "a".repeat(64),
         deadlines: { ...deadlines, controlOverallTimeoutMs: 1_000, socketIdleTimeoutMs: 500 },
@@ -1888,7 +1896,7 @@ describe("remote client transport deadlines", () => {
     });
     const port = await listen(server);
     try {
-      const transaction = await createRemoteBrowserExecutor({
+      const transaction = await createRemoteBrowserTransactionExecutor({
         host: `127.0.0.1:${port}`,
         token: "a".repeat(64),
         deadlines,
@@ -2005,7 +2013,7 @@ describe("remote client transport deadlines", () => {
     });
     const port = await listen(server);
     try {
-      const executor = createRemoteBrowserExecutor({
+      const executor = createRemoteBrowserTransactionExecutor({
         host: `127.0.0.1:${port}`,
         token: "a".repeat(64),
         deadlines: {
@@ -2133,7 +2141,7 @@ describe("remote client transport deadlines", () => {
         }
       });
     try {
-      const transaction = await createRemoteBrowserExecutor({
+      const transaction = await createRemoteBrowserTransactionExecutor({
         host,
         token: "a".repeat(64),
         deadlines,
