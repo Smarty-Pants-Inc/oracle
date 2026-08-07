@@ -124,11 +124,14 @@ function snippet(text: string, max = 120): string {
 function resolveSessionTabRef(meta: SessionMetadata): string {
   const runtime = meta?.browser?.runtime ?? {};
   const harvest = meta?.browser?.harvest ?? {};
+  const configuredUrl = meta?.browser?.config?.url;
+  const configuredConversationUrl = configuredUrl?.includes("/c/") ? configuredUrl : undefined;
   return (
     harvest.url ??
     runtime.tabUrl ??
     harvest.conversationId ??
     runtime.conversationId ??
+    configuredConversationUrl ??
     harvest.targetId ??
     runtime.chromeTargetId ??
     "current"
@@ -431,22 +434,15 @@ export async function harvestSessionBrowserOutput(
   };
   const ref = options.browserTabRef ?? resolveSessionTabRef(meta);
   const recoverIfMissing = options.recoverIfMissing !== false && !options.browserTabRef;
+  if (!recordedEndpoint && !recoverIfMissing && !options.browserTabRef) {
+    throw new Error(
+      `Session "${sessionId}" has no recorded Chrome endpoint. Re-run without --no-recover to reopen its saved conversation.`,
+    );
+  }
 
   let recoveredCleanup: RecoveredConversationCleanup | null = null;
   try {
-    let harvested: ChatGptTabSummary;
-    try {
-      harvested = await harvestChatGptTab({
-        host: initialEndpoint.host,
-        port: initialEndpoint.port,
-        ref,
-        stallWindowMs: options.stallWindowMs,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!isRecoverableMissingTabError(message) || !recoverIfMissing) {
-        throw error;
-      }
+    const recoverAndHarvest = async (): Promise<ChatGptTabSummary> => {
       console.log(
         chalk.yellow(
           `No live ChatGPT tab matched session "${sessionId}". Attempting recovery by reopening the saved conversation URL.`,
@@ -460,13 +456,33 @@ export async function harvestSessionBrowserOutput(
         persistRuntime: (runtime) => persistRecoveredConversationRuntime(sessionId, runtime),
       });
       recoveredCleanup = recovered.cleanup;
-      harvested = await harvestChatGptTab({
+      return harvestChatGptTab({
         host: recovered.host,
         port: recovered.port,
         ref: recovered.ref,
         endpointAuthority: recovered.endpointAuthority,
         stallWindowMs: options.stallWindowMs,
       });
+    };
+
+    let harvested: ChatGptTabSummary;
+    if (!recordedEndpoint && recoverIfMissing) {
+      harvested = await recoverAndHarvest();
+    } else {
+      try {
+        harvested = await harvestChatGptTab({
+          host: initialEndpoint.host,
+          port: initialEndpoint.port,
+          ref,
+          stallWindowMs: options.stallWindowMs,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!isRecoverableMissingTabError(message) || !recoverIfMissing) {
+          throw error;
+        }
+        harvested = await recoverAndHarvest();
+      }
     }
 
     assertHarvestMatchesPromptEpoch(harvested, promptLocator);

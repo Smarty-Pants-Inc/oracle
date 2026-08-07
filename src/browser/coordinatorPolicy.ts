@@ -32,13 +32,18 @@ export function redactBrowserConfigForDebugLogForTest(
 
 function isCloudflareChallengeError(error: unknown): error is BrowserAutomationError {
   if (!(error instanceof BrowserAutomationError)) return false;
-  return (error.details as { stage?: string } | undefined)?.stage === "cloudflare-challenge";
+  const details = error.details as { stage?: string; code?: string } | undefined;
+  return details?.stage === "cloudflare-challenge" || details?.code === "cloudflare-challenge";
 }
 
 function isReattachableCaptureError(error: unknown): error is BrowserAutomationError {
   if (!(error instanceof BrowserAutomationError)) return false;
   const stage = (error.details as { stage?: string } | undefined)?.stage;
-  return stage === "assistant-timeout" || stage === "assistant-recheck";
+  return (
+    stage === "assistant-timeout" ||
+    stage === "assistant-recheck" ||
+    stage === "attachment-verification"
+  );
 }
 
 export type PreservedBrowserErrorKind = "cloudflare-challenge" | "reattachable-capture";

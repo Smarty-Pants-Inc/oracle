@@ -534,6 +534,9 @@ describe("semantic prompt epoch persistence", () => {
       expect(hasRecoverableChatGptConversation(runtime)).toBe(false);
       if (transport === "local") {
         expect(fixture.closeChromeTargetWithExactAuthority).toHaveBeenCalledOnce();
+        expect(fixture.closeChromeTargetWithExactAuthority).toHaveBeenCalledWith(
+          expect.objectContaining({ targetId: "epoch-target" }),
+        );
         expect(fixture.closeChromeTarget).not.toHaveBeenCalled();
         expect(fixture.killChrome).toHaveBeenCalledOnce();
       } else {

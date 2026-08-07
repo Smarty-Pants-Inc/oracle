@@ -192,11 +192,77 @@ describe("browser recovery cleanup", () => {
     },
   );
 
-  test("awaits recovered-tab cleanup after normal harvest completion", async () => {
-    const cleanup = vi.fn(async (_mode: string, pendingRuntime: BrowserRuntimeMetadata) => ({
-      status: "completed" as const,
-      runtime: completedCleanupRuntime(pendingRuntime),
+  test("recovers directly when a named session has no recorded endpoint", async () => {
+    const metaWithoutRuntime = {
+      ...baseMeta,
+      browser: {
+        config: {
+          manualLogin: true,
+          manualLoginProfileDir: "/tmp/recover-profile",
+          url: "https://chatgpt.com/c/saved-conversation",
+        },
+        runtime: {
+          promptEpoch: baseMeta.browser?.runtime?.promptEpoch,
+        },
+      },
+    } as unknown as SessionMetadata;
+    const harvestChatGptTab = vi.fn().mockResolvedValue(completedHarvest);
+    const recoverConversationTab = vi.fn(async () => ({
+      host: "127.0.0.1",
+      port: 53997,
+      url: "https://chatgpt.com/c/saved-conversation",
+      ref: "saved-conversation",
+      chrome: null,
     }));
+
+    vi.doMock("../../src/browser/liveTabs.js", () => ({
+      collectChatGptTabs: vi.fn(),
+      DEFAULT_REMOTE_CHROME_HOST: "127.0.0.1",
+      DEFAULT_REMOTE_CHROME_PORT: 9222,
+      extractConversationIdFromUrl: () => "saved-conversation",
+      formatBrowserTabState: () => "completed",
+      harvestChatGptTab,
+      sessionMatchesTab: () => false,
+    }));
+    vi.doMock("../../src/browser/recoverConversation.js", () => ({
+      isRecoveredConversationHarvestReady: vi.fn(),
+      recoveredConversationHarvestMatchesPromptEpoch: vi.fn(() => true),
+      recoverConversationTab,
+    }));
+    vi.doMock("../../src/sessionStore.js", () => ({
+      sessionStore: {
+        readSession: vi.fn(async () => metaWithoutRuntime),
+        updateSession: vi.fn(async () => {}),
+      },
+    }));
+
+    // vi.doMock needs a fresh import so this test observes its isolated module graph.
+    const { harvestSessionBrowserOutput } = await import("../../src/cli/browserTabs.js");
+    await harvestSessionBrowserOutput("sess-recover", { quietOutput: true });
+
+    expect(recoverConversationTab).toHaveBeenCalledWith(
+      metaWithoutRuntime,
+      expect.any(Function),
+      expect.objectContaining({
+        loadRuntimeUnderLock: expect.any(Function),
+        persistRuntime: expect.any(Function),
+      }),
+    );
+    expect(harvestChatGptTab).toHaveBeenCalledTimes(1);
+    expect(harvestChatGptTab).toHaveBeenCalledWith(
+      expect.objectContaining({ host: "127.0.0.1", port: 53997, ref: "saved-conversation" }),
+    );
+  });
+
+  test("retries via recoverConversationTab when initial harvest finds no live tab", async () => {
+    const cleanup = vi.fn(async (mode: string, runtime: BrowserRuntimeMetadata) => {
+      expect(mode).toBe("finalize");
+      expect(runtime).toMatchObject({
+        recoveryCleanupResources: [recoveredCleanupResource],
+        recoveryCleanupResult: { status: "pending" },
+      });
+      return { status: "completed" as const, runtime: completedCleanupRuntime(runtime) };
+    });
     const harvestChatGptTab = vi
       .fn()
       .mockRejectedValueOnce(new Error("No ChatGPT tab matched saved conversation"))

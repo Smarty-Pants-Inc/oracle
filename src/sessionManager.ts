@@ -686,7 +686,7 @@ function upsertModelRun(
   runs: SessionModelRun[] | undefined,
   next: SessionModelRun,
 ): SessionModelRun[] {
-  const existing = runs ?? [];
+  const existing = (runs ?? []).filter((run) => run?.model);
   const index = existing.findIndex((run) => run.model === next.model);
   if (index < 0) return [...existing, next];
   return existing.map((run, runIndex) => (runIndex === index ? next : run));
@@ -696,7 +696,7 @@ function modelRunFromSession(
   session: SessionMetadata | null,
   model: string,
 ): SessionModelRun | undefined {
-  return session?.models?.find((run) => run.model === model);
+  return session?.models?.find((run) => run?.model === model);
 }
 
 export interface SessionModelProjectionCommit {
@@ -1013,10 +1013,12 @@ async function attachModelRuns(meta: SessionMetadata, sessionId: string): Promis
   if (meta.modelProjectionAuthority !== "session") {
     return fileRuns.length > 0 ? { ...meta, models: fileRuns } : meta;
   }
-  if (!meta.models?.length) {
-    return meta;
+  const persistedRuns = meta.models?.filter((run) => run?.model) ?? [];
+  if (!persistedRuns.length) {
+    if (!meta.models?.length) return meta;
+    return fileRuns.length > 0 ? { ...meta, models: fileRuns } : { ...meta, models: persistedRuns };
   }
-  const canonicalModels = meta.models.map((run) => {
+  const canonicalModels = persistedRuns.map((run) => {
     const fileRun = fileRuns.find((candidate) => candidate.model === run.model);
     return ensureModelLogReference(sessionId, {
       ...fileRun,

@@ -167,7 +167,7 @@ export function hasMatchingTerminalBrowserPublicationProjection(
   if (!artifactsContainReceipt(metadata.artifacts ?? [], journal.receipt)) return false;
   if (!journal.model) return true;
   if (metadata.modelProjectionAuthority !== "session") return false;
-  const selectedModel = metadata.models?.find((run) => run.model === journal.model);
+  const selectedModel = metadata.models?.find((run) => run?.model === journal.model);
   return Boolean(
     selectedModel &&
     selectedModel.status === "completed" &&

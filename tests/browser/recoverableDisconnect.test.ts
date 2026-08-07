@@ -475,6 +475,7 @@ async function withDisconnectFixture(
     error: unknown;
     browserAutomationError: BrowserAutomationErrorConstructor;
     closeChromeTarget: Mock;
+    closeChromeTargetWithExactAuthority: Mock;
     kill: Mock;
     connectToRemoteChromeTarget: Mock;
     probeChromeTargetLiveness: Mock;
@@ -851,6 +852,7 @@ async function withDisconnectFixture(
       error,
       browserAutomationError,
       closeChromeTarget,
+      closeChromeTargetWithExactAuthority,
       kill,
       connectToRemoteChromeTarget,
       probeChromeTargetLiveness,
@@ -1213,7 +1215,14 @@ describe("recoverable disconnect lifecycle", () => {
         message: "committed turn identity changed after archive",
       });
       expect(fixture.error).not.toHaveProperty("answerText");
-      expect(fixture.closeChromeTarget).toHaveBeenCalledWith(expect.objectContaining({ targetId }));
+      expect(fixture.closeChromeTargetWithExactAuthority).toHaveBeenCalledOnce();
+      expect(fixture.closeChromeTargetWithExactAuthority).toHaveBeenCalledWith(
+        expect.objectContaining({ targetId }),
+      );
+      expect(fixture.closeChromeTarget).toHaveBeenCalledOnce();
+      expect(fixture.closeChromeTargetWithExactAuthority.mock.invocationCallOrder[0]!).toBeLessThan(
+        fixture.closeChromeTarget.mock.invocationCallOrder[0]!,
+      );
       expect(fixture.kill).toHaveBeenCalledTimes(1);
       await expect(access(fixture.profileDir)).rejects.toMatchObject({ code: "ENOENT" });
     });

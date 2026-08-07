@@ -4,7 +4,7 @@ import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { beforeEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 vi.mock("../../src/oracle.ts", async () => {
   const actual = await vi.importActual<typeof import("../../src/oracle.ts")>("../../src/oracle.ts");
@@ -113,6 +113,7 @@ type DurableAnswerModule = {
 };
 const write = vi.fn(() => true);
 const cliVersion = getCliVersion();
+let testSessionDir: string;
 
 function createReattachResult(
   answerText: string,
@@ -191,9 +192,7 @@ function finalizeBoundJournal(
 beforeEach(async () => {
   vi.restoreAllMocks();
   vi.clearAllMocks();
-  const testSessionDir = path.join(os.tmpdir(), "oracle-test-session");
-  await fsPromises.rm(testSessionDir, { recursive: true, force: true });
-  await fsPromises.mkdir(testSessionDir, { recursive: true });
+  testSessionDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "oracle-test-session-"));
   Object.values(sessionStoreMock).forEach((fn) => {
     if (typeof fn === "function" && "mockReset" in fn) {
       fn.mockReset();
@@ -259,13 +258,16 @@ beforeEach(async () => {
   sessionStoreMock.readModelLog.mockResolvedValue("model log body");
   sessionStoreMock.sessionsDir.mockReturnValue("/tmp/.oracle/sessions");
   sessionStoreMock.getPaths.mockResolvedValue({
-    dir: path.join(os.tmpdir(), "oracle-test-session"),
-    metadata: path.join(os.tmpdir(), "oracle-test-session", "metadata.json"),
-    log: path.join(os.tmpdir(), "oracle-test-session", "session.log"),
-    request: path.join(os.tmpdir(), "oracle-test-session", "request.json"),
+    dir: testSessionDir,
+    metadata: path.join(testSessionDir, "metadata.json"),
+    log: path.join(testSessionDir, "session.log"),
+    request: path.join(testSessionDir, "request.json"),
   });
   vi.spyOn(fsPromises, "mkdir").mockResolvedValue(undefined);
   vi.spyOn(fsPromises, "writeFile").mockResolvedValue(undefined);
+});
+afterEach(async () => {
+  await fsPromises.rm(testSessionDir, { recursive: true, force: true });
 });
 
 describe("performSessionRun", () => {
@@ -456,7 +458,7 @@ describe("performSessionRun", () => {
       createReattachResult("captured answer", "captured answer", recoveredRuntime).value,
     );
 
-    const artifactsDirectory = path.join(os.tmpdir(), "oracle-test-session", "artifacts");
+    const artifactsDirectory = path.join(testSessionDir, "artifacts");
     mkdirSync(artifactsDirectory, { recursive: true });
     const verifiedReceipt = receiptFor(
       "verified receipt",

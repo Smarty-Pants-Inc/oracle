@@ -212,6 +212,17 @@ describe("remote browser service", { timeout: 15_000 }, () => {
           state: "pending",
           runtime: { chromeTargetId: "disconnect-target" },
         });
+        await expect(server.close()).rejects.toThrow(
+          "durable capture depends on non-restart-durable browser cleanup authority",
+        );
+        expect(finalize).not.toHaveBeenCalled();
+        await expect(
+          readAuthenticatedTransactionRecord(transactionStoreDir, transactionToken),
+        ).resolves.toMatchObject({
+          state: "pending",
+          result: { answerText: "durable answer" },
+          runtime: { chromeTargetId: "disconnect-target" },
+        });
 
         await vi.waitFor(async () => {
           const settlement = await httpPostJson({

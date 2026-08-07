@@ -301,6 +301,11 @@ export async function recoverLocalBrowserFailure(
       state.lastUrl = archive.conversationUrl;
       await emitRuntimeHint();
     }
+    state.preserveBrowserOnError =
+      lifecycle.isPromptCommitted() &&
+      !lifecycle.hasPendingPromptAuthorityJournal() &&
+      state.postCapturePendingWork?.code !== "browser-final-identity-verification-pending" &&
+      archive?.archived !== true;
     logger(`Failed to complete ChatGPT run: ${normalizedError.message}`);
     if ((config.debug || process.env.CHATGPT_DEVTOOLS_TRACE === "1") && normalizedError.stack) {
       logger(normalizedError.stack);

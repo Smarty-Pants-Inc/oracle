@@ -444,7 +444,6 @@ export async function executeLocalPrompt({
       name: path.basename(attachment.path),
       generatedBundle: attachment.generatedBundle === true,
     }));
-    let inputOnlyAttachments = false;
     await raceWithDisconnect(clearPromptComposer(Runtime, logger));
     await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
     if (submissionAttachments.length > 0) {
@@ -466,7 +465,14 @@ export async function executeLocalPrompt({
           { expectedCount: attachmentIndex + 1 },
         );
         if (!uiConfirmed) {
-          inputOnlyAttachments = true;
+          throw new BrowserAutomationError(
+            `Attachment ${JSON.stringify(attachment.displayPath)} was accepted by the file input but not confirmed by the ChatGPT composer.`,
+            {
+              stage: "attachment-upload",
+              code: "attachment-ui-unconfirmed",
+              attachmentName: path.basename(attachment.path),
+            },
+          );
         }
         await delay(500);
       }
@@ -525,30 +531,34 @@ export async function executeLocalPrompt({
       baselineTurns = providerBaselineTurns;
     }
     if (attachmentNames.length > 0) {
-      if (inputOnlyAttachments) {
-        logger(
-          "Attachment UI did not render before send; skipping user-turn attachment verification.",
-        );
-      } else {
-        const verified = await waitForUserTurnAttachments(
-          Runtime,
-          attachmentNames,
-          20_000,
-          logger,
+      const verified = await waitForUserTurnAttachments(Runtime, attachmentNames, 20_000, logger, {
+        minTurnIndex: baselineTurns ?? undefined,
+        expectedPrompt: prompt,
+        expectedConversationId: state.lastUrl
+          ? extractConversationIdFromUrl(state.lastUrl)
+          : undefined,
+      }).catch((error) => {
+        throw new BrowserAutomationError(
+          "Attachment could not be verified on the sent ChatGPT user turn.",
           {
-            minTurnIndex: baselineTurns ?? undefined,
-            expectedPrompt: prompt,
-            expectedConversationId: state.lastUrl
-              ? extractConversationIdFromUrl(state.lastUrl)
-              : undefined,
+            stage: "attachment-verification",
+            code: "attachment-missing-user-turn",
+            attachmentNames,
+          },
+          error,
+        );
+      });
+      if (!verified) {
+        throw new BrowserAutomationError(
+          "The newly sent ChatGPT user turn could not be found for attachment verification.",
+          {
+            stage: "attachment-verification",
+            code: "attachment-user-turn-not-found",
+            attachmentNames,
           },
         );
-        if (!verified) {
-          logger("Sent user message did not expose attachment UI; continuing after upload check.");
-        } else {
-          logger("Verified attachments present on sent user message");
-        }
       }
+      logger("Verified attachments present on sent user message");
     }
     return {
       promptLocator,

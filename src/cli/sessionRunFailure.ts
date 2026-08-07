@@ -402,7 +402,8 @@ function reduceBrowserFailure(
   const reattachExplicitlyUnavailable =
     userError?.category === "browser-automation" && userError.details?.reattachable === false;
   const cloudflareChallenge =
-    userError?.category === "browser-automation" && stage === "cloudflare-challenge";
+    userError?.category === "browser-automation" &&
+    (stage === "cloudflare-challenge" || userError.details?.code === "cloudflare-challenge");
   const capturedErrorRuntime = runtimeFromBrowserError(error);
   const errorBrowserRuntime = state.runtimeAuthority.observeError(capturedErrorRuntime);
   const cleanupCompletedAfterCapturedError =

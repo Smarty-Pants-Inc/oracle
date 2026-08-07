@@ -273,7 +273,7 @@ function matchesProjection(
   }
   if (!projection.model) return true;
   if (current.modelProjectionAuthority !== "session") return false;
-  const model = current.models?.find((run) => run.model === projection.model?.model);
+  const model = current.models?.find((run) => run?.model === projection.model?.model);
   if (!model) return false;
   for (const [key, expected] of Object.entries(projection.model.updates)) {
     if (!isDeepStrictEqual(model[key as keyof SessionModelRun], expected)) return false;

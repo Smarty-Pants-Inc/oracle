@@ -2,7 +2,7 @@ import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { beforeEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 vi.mock("../../src/oracle.ts", async () => {
   const actual = await vi.importActual<typeof import("../../src/oracle.ts")>("../../src/oracle.ts");
@@ -85,13 +85,12 @@ import { sendSessionNotification } from "../../src/cli/notifier.ts";
 const log = vi.fn();
 const write = vi.fn(() => true);
 const cliVersion = getCliVersion();
+let testSessionDir: string;
 
 beforeEach(async () => {
   vi.restoreAllMocks();
   vi.clearAllMocks();
-  const testSessionDir = path.join(os.tmpdir(), "oracle-test-session");
-  await fsPromises.rm(testSessionDir, { recursive: true, force: true });
-  await fsPromises.mkdir(testSessionDir, { recursive: true });
+  testSessionDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "oracle-test-session-"));
   Object.values(sessionStoreMock).forEach((fn) => {
     if (typeof fn === "function" && "mockReset" in fn) {
       fn.mockReset();
@@ -150,13 +149,16 @@ beforeEach(async () => {
   sessionStoreMock.readModelLog.mockResolvedValue("model log body");
   sessionStoreMock.sessionsDir.mockReturnValue("/tmp/.oracle/sessions");
   sessionStoreMock.getPaths.mockResolvedValue({
-    dir: path.join(os.tmpdir(), "oracle-test-session"),
-    metadata: path.join(os.tmpdir(), "oracle-test-session", "metadata.json"),
-    log: path.join(os.tmpdir(), "oracle-test-session", "session.log"),
-    request: path.join(os.tmpdir(), "oracle-test-session", "request.json"),
+    dir: testSessionDir,
+    metadata: path.join(testSessionDir, "metadata.json"),
+    log: path.join(testSessionDir, "session.log"),
+    request: path.join(testSessionDir, "request.json"),
   });
   vi.spyOn(fsPromises, "mkdir").mockResolvedValue(undefined);
   vi.spyOn(fsPromises, "writeFile").mockResolvedValue(undefined);
+});
+afterEach(async () => {
+  await fsPromises.rm(testSessionDir, { recursive: true, force: true });
 });
 
 describe("performSessionRun", () => {
@@ -260,7 +262,48 @@ describe("performSessionRun", () => {
     expect(answerOrder).toBeGreaterThan(
       commitSessionModelProjectionMock.mock.invocationCallOrder.at(-1) ?? 0,
     );
+
     expect(vi.mocked(sendSessionNotification)).toHaveBeenCalledOnce();
+  });
+  test("retries a durable browser projection when legacy model state is sparse", async () => {
+    const answerText = "Gemini answer after sparse projection";
+    const runtime: BrowserRuntimeMetadata = {};
+    vi.mocked(runBrowserSessionExecution).mockResolvedValue({
+      usage: { inputTokens: 10, outputTokens: 5, reasoningTokens: 0, totalTokens: 15 },
+      elapsedMs: 500,
+      runtime,
+      answerText,
+      bindSettlement: vi.fn(async () => runtime),
+      finalize: vi.fn(async () => ({ status: "completed" as const, runtime })),
+      abort: vi.fn(async () => ({ status: "completed" as const, runtime })),
+    });
+    commitSessionModelProjectionMock.mockImplementationOnce(async (_sessionId, projection) => ({
+      session: {
+        ...baseSessionMeta,
+        ...projection.session,
+        models: [undefined],
+        modelProjectionAuthority: "session",
+      },
+    }));
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null, desiredModel: "gemini-3.1-pro" },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(commitSessionModelProjectionMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(log).toHaveBeenCalledWith(answerText);
+    expect(
+      sessionStoreMock.updateSession.mock.calls.some(([, patch]) => patch.status === "error"),
+    ).toBe(false);
   });
 
   test("keeps a Gemini answer private while terminal publication remains retryable", async () => {
