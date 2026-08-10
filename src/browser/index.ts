@@ -1000,6 +1000,14 @@ function buildSkippedModelSelectionEvidence(
   };
 }
 
+function shouldSelectRequestedModel(
+  config: Pick<ResolvedBrowserConfig, "desiredModel" | "modelStrategy" | "resumeConversationUrl">,
+): boolean {
+  return (
+    Boolean(config.desiredModel) && (config.modelStrategy ?? DEFAULT_MODEL_STRATEGY) !== "ignore"
+  );
+}
+
 const ATTACHMENT_UPLOAD_BASE_TIMEOUT_MS = 45_000;
 const ATTACHMENT_UPLOAD_PER_FILE_MS = 20_000;
 const ATTACHMENT_UPLOAD_PER_MIB_MS = 2_000;
@@ -1589,7 +1597,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     const updateConversationHint = conversationUrlMonitor.update;
     await captureRuntimeSnapshot();
     const modelStrategy = config.modelStrategy ?? DEFAULT_MODEL_STRATEGY;
-    if (config.desiredModel && modelStrategy !== "ignore" && !isResumingConversation) {
+    if (shouldSelectRequestedModel(config)) {
       modelSelectionEvidence = await raceWithDisconnect(
         withRetries(
           () => ensureModelSelection(Runtime, config.desiredModel as string, logger, modelStrategy),
@@ -1614,16 +1622,12 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       logger(
         `Prompt textarea ready (after model switch, ${promptText.length.toLocaleString()} chars queued)`,
       );
-    } else if (modelStrategy === "ignore" || isResumingConversation) {
+    } else if (modelStrategy === "ignore") {
       modelSelectionEvidence = buildSkippedModelSelectionEvidence(
         config.desiredModel,
         modelStrategy,
       );
-      logger(
-        isResumingConversation
-          ? "Model picker: skipped (resumed conversation)"
-          : "Model picker: skipped (strategy=ignore)",
-      );
+      logger("Model picker: skipped (strategy=ignore)");
     }
     const deepResearch = config.researchMode === "deep";
     // Handle thinking time selection if specified. Deep Research owns its own effort flow.
@@ -3251,7 +3255,7 @@ async function runRemoteBrowserMode(
     }
 
     const modelStrategy = config.modelStrategy ?? DEFAULT_MODEL_STRATEGY;
-    if (config.desiredModel && modelStrategy !== "ignore" && !config.resumeConversationUrl) {
+    if (shouldSelectRequestedModel(config)) {
       modelSelectionEvidence = await withRetries(
         () => ensureModelSelection(Runtime, config.desiredModel as string, logger, modelStrategy),
         {
@@ -3270,16 +3274,12 @@ async function runRemoteBrowserMode(
       logger(
         `Prompt textarea ready (after model switch, ${promptText.length.toLocaleString()} chars queued)`,
       );
-    } else if (modelStrategy === "ignore" || config.resumeConversationUrl) {
+    } else if (modelStrategy === "ignore") {
       modelSelectionEvidence = buildSkippedModelSelectionEvidence(
         config.desiredModel,
         modelStrategy,
       );
-      logger(
-        config.resumeConversationUrl
-          ? "Model picker: skipped (resumed conversation)"
-          : "Model picker: skipped (strategy=ignore)",
-      );
+      logger("Model picker: skipped (strategy=ignore)");
     }
     const deepResearch = config.researchMode === "deep";
     // Handle thinking time selection if specified. Deep Research owns its own effort flow.
@@ -4085,6 +4085,7 @@ export const __test__ = {
   resolveAttachmentUploadTimeoutMs,
   resolveManualLoginWaitMs,
   shouldCleanupBlankTabsAfterLastLease,
+  shouldSelectRequestedModel,
   shouldCloseOwnedRunTargetAfterRun,
   shouldKeepLocalBrowserOpen,
   waitForAssistantResponseWithReload,

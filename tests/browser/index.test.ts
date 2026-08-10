@@ -105,6 +105,21 @@ describe("authenticated model-selection errors", () => {
   });
 });
 
+describe("model selection policy", () => {
+  test("reselects Pro when resuming a conversation", () => {
+    const resumedConfig = {
+      desiredModel: "Pro",
+      modelStrategy: "select" as const,
+      resumeConversationUrl: "https://chatgpt.com/c/resume-me",
+    };
+
+    expect(__test__.shouldSelectRequestedModel(resumedConfig)).toBe(true);
+    expect(__test__.shouldSelectRequestedModel({ ...resumedConfig, modelStrategy: "ignore" })).toBe(
+      false,
+    );
+  });
+});
+
 describe("browser run target cleanup", () => {
   test("never retains a copied profile after a preserved browser error", () => {
     expect(
