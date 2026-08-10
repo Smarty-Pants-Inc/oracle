@@ -45,6 +45,23 @@ describe("browser tab CLI helpers", () => {
     );
   });
 
+  test("refuses the current shared tab when a named session has no browser identity", () => {
+    const meta = {
+      id: "unbound-session",
+      createdAt: "2026-08-10T00:00:00.000Z",
+      status: "pending",
+      options: {},
+      mode: "browser",
+      browser: {
+        config: {
+          url: "https://chatgpt.com/g/project",
+        },
+      },
+    } as SessionMetadata;
+
+    expect(() => resolveSessionTabRefForTest(meta)).toThrow(/Refusing to use the shared browser/);
+  });
+
   const harvested = (overrides: Partial<ChatGptTabSummary> = {}): ChatGptTabSummary => ({
     targetId: "ABCDEF12",
     title: "Oracle review",

@@ -143,15 +143,19 @@ function resolveSessionTabRef(meta: SessionMetadata): string {
   const harvest = meta?.browser?.harvest ?? {};
   const configuredUrl = meta?.browser?.config?.url;
   const configuredConversationUrl = configuredUrl?.includes("/c/") ? configuredUrl : undefined;
-  return (
+  const ref =
     harvest.url ??
     runtime.tabUrl ??
     harvest.conversationId ??
     runtime.conversationId ??
     configuredConversationUrl ??
     harvest.targetId ??
-    runtime.chromeTargetId ??
-    "current"
+    runtime.chromeTargetId;
+  if (ref) {
+    return ref;
+  }
+  throw new Error(
+    `Session "${meta.id}" has no bound ChatGPT tab or conversation URL. Refusing to use the shared browser's current tab; pass --browser-tab with an exact target or rerun the session.`,
   );
 }
 

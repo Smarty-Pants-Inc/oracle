@@ -1,5 +1,9 @@
 import { describe, expect, test, vi } from "vitest";
-import { shouldDetachSession, stopDetachedWorker } from "../../src/cli/detach.js";
+import {
+  buildDetachedWorkerArgv,
+  shouldDetachSession,
+  stopDetachedWorker,
+} from "../../src/cli/detach.js";
 
 describe("shouldDetachSession", () => {
   test("disables detach when env disables it", () => {
@@ -107,5 +111,13 @@ describe("shouldDetachSession", () => {
       disableDetachEnv: false,
     });
     expect(result).toBe(true);
+  });
+});
+
+describe("buildDetachedWorkerArgv", () => {
+  test("preserves the parent Node loader for detached TypeScript workers", () => {
+    expect(
+      buildDetachedWorkerArgv("/repo/bin/oracle-cli.ts", "session-1", ["--import", "tsx"]),
+    ).toEqual(["--import", "tsx", "--", "/repo/bin/oracle-cli.ts", "--exec-session", "session-1"]);
   });
 });

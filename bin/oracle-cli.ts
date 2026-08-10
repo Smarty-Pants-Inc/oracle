@@ -57,7 +57,11 @@ import {
 } from "../src/cli/options.js";
 import { copyToClipboard } from "../src/cli/clipboard.js";
 import { buildMarkdownBundle } from "../src/cli/markdownBundle.js";
-import { shouldDetachSession, stopDetachedWorker } from "../src/cli/detach.js";
+import {
+  buildDetachedWorkerArgv,
+  shouldDetachSession,
+  stopDetachedWorker,
+} from "../src/cli/detach.js";
 import { applyHiddenAliases } from "../src/cli/hiddenAliases.js";
 import type { BrowserSessionRunnerDeps } from "../src/browser/sessionRunner.js";
 import { isMediaFile } from "../src/browser/prompt.js";
@@ -2565,7 +2569,7 @@ async function launchDetachedSession(
 ): Promise<number> {
   return new Promise((resolve, reject) => {
     try {
-      const args = ["--", CLI_ENTRYPOINT, "--exec-session", sessionId];
+      const args = buildDetachedWorkerArgv(CLI_ENTRYPOINT, sessionId);
       const env = {
         ...buildDetachedPerfTraceEnv(process.env, perfTraceArgs.value, sessionId),
         ORACLE_DETACHED_START_GATE: "1",
