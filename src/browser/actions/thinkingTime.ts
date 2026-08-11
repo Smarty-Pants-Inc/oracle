@@ -322,7 +322,10 @@ function buildThinkingTimeExpression(
       const picker = document.querySelector(INTELLIGENCE_MENU_SELECTOR);
       if (!isVisible(picker)) return null;
       const slider = picker.querySelector?.(INTELLIGENCE_SLIDER_SELECTOR) ?? null;
-      return isVisible(slider) ? slider : null;
+      const rect = slider?.getBoundingClientRect?.();
+      return slider?.getAttribute?.('role') === 'slider' && rect?.width > 0 && rect?.height > 0
+        ? slider
+        : null;
     };
     const intelligenceSliderIsAtMaximum = (slider) => {
       const now = slider?.getAttribute?.('aria-valuenow');

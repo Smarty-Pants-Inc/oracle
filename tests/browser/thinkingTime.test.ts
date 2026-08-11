@@ -367,6 +367,7 @@ describe("browser thinking-time selection expression", () => {
       let endPresses = 0;
       const sliderAttributes: Record<string, string> = {
         role: "slider",
+        "aria-hidden": "true",
         "aria-label": "Pro, 5 of 5",
         "aria-valuemin": "0",
         "aria-valuemax": "4",
@@ -685,6 +686,7 @@ describe("browser thinking-time selection expression", () => {
       "Pro, 5 of 5. Use Left and Right arrow keys to adjust power.",
       {
         role: "slider",
+        "aria-hidden": "true",
         "aria-valuemin": "0",
         "aria-valuemax": "4",
         "aria-valuenow": "4",
