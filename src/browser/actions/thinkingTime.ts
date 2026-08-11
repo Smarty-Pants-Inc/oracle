@@ -51,9 +51,8 @@ function logPickerDiagnostic(result: ThinkingTimeOutcome | undefined, logger: Br
 
 /**
  * Selects a thinking-time level in ChatGPT's composer.
- *
- * Missing controls remain best-effort except Pro Extended, which fails closed
- * unless the selected option is confirmed.
+ * Missing controls remain best-effort except highest Pro reasoning, which fails closed
+ * unless the selected state is confirmed.
  */
 export async function ensureThinkingTime(
   Runtime: ChromeClient["Runtime"],
@@ -90,7 +89,7 @@ export async function ensureThinkingTime(
             : "";
       const message = `Thinking time: ${result.status.replaceAll("-", " ")}${kindHint} (requested ${capitalizedLevel})`;
       if (strictProEffort) {
-        throw new Error(`${message}; refusing to submit without confirmed Pro Extended.`);
+        throw new Error(`${message}; refusing to submit without confirmed highest Pro reasoning.`);
       }
       logger(formatBrowserThinkingLog(`${message}; continuing with ChatGPT default.`));
       return;
@@ -100,7 +99,7 @@ export async function ensureThinkingTime(
       logPickerDiagnostic(result, logger);
       if (strictProEffort) {
         throw new Error(
-          `Thinking time: unknown outcome selecting ${capitalizedLevel}; refusing to submit without confirmed Pro Extended.`,
+          `Thinking time: unknown outcome selecting ${capitalizedLevel}; refusing to submit without confirmed highest Pro reasoning.`,
         );
       }
       logger(
@@ -307,6 +306,8 @@ function buildThinkingTimeExpression(
     const TRAILING_SELECTOR = '[data-model-picker-thinking-effort-action="true"]';
     const INTELLIGENCE_MENU_SELECTOR = '[data-testid="composer-intelligence-picker-content"]';
     const PRO_EFFORT_TRIGGER_SELECTOR = '[data-testid="composer-intelligence-pro-thinking-effort-trigger"]';
+    const INTELLIGENCE_SLIDER_SELECTOR =
+      '[data-model-reasoning-effort-slider] [role="slider"], [data-model-reasoning-effort-slider][role="slider"]';
 
     const findModelButton = () => document.querySelector(MODEL_BUTTON_SELECTOR);
     const findTrailingButtons = () => Array.from(document.querySelectorAll(TRAILING_SELECTOR));
@@ -316,6 +317,52 @@ function buildThinkingTimeExpression(
       if (!node || node.getAttribute?.('aria-hidden') === 'true') return false;
       const rect = node.getBoundingClientRect?.();
       return Boolean(rect && rect.width > 0 && rect.height > 0);
+    };
+    const findIntelligenceSlider = () => {
+      const picker = document.querySelector(INTELLIGENCE_MENU_SELECTOR);
+      if (!isVisible(picker)) return null;
+      const slider =
+        picker.querySelector?.(INTELLIGENCE_SLIDER_SELECTOR) ??
+        document.querySelector('[data-testid="composer-model-picker-slider-simple-view"]');
+      return isVisible(slider) ? slider : null;
+    };
+    const intelligenceSliderIsAtMaximum = (slider) => {
+      const now = slider?.getAttribute?.('aria-valuenow');
+      const max = slider?.getAttribute?.('aria-valuemax');
+      if (now || max) return Boolean(now && max && now === max);
+      const label = normalize(slider?.textContent ?? '');
+      return hasToken(label, 'pro') && label.includes('5 of 5');
+    };
+    const selectIntelligenceSliderMaximum = async () => {
+      const slider = findIntelligenceSlider();
+      if (!slider) return null;
+      if (intelligenceSliderIsAtMaximum(slider)) {
+        closeOpenMenus();
+        return { status: 'already-selected', label: slider.getAttribute?.('aria-label') ?? 'Pro' };
+      }
+      try {
+        slider.focus?.();
+        const KeyboardEventCtor = window.KeyboardEvent;
+        if (typeof KeyboardEventCtor !== 'function') return failure('selection-unverified');
+        for (const type of ['keydown', 'keyup']) {
+          slider.dispatchEvent(
+            new KeyboardEventCtor(type, {
+              key: 'End',
+              code: 'End',
+              bubbles: true,
+              cancelable: true,
+            }),
+          );
+        }
+      } catch {
+        return failure('selection-unverified');
+      }
+      await sleep(STEP_WAIT_MS);
+      if (intelligenceSliderIsAtMaximum(findIntelligenceSlider())) {
+        closeOpenMenus();
+        return { status: 'switched', label: slider.getAttribute?.('aria-label') ?? 'Pro' };
+      }
+      return failure('selection-unverified');
     };
     const redactDiagnosticText = (value, maxLength = 120) =>
       String(value ?? '')
@@ -590,7 +637,11 @@ function buildThinkingTimeExpression(
         return hasToken(label, 'pro') && !hasToken(label, 'extended');
       }
       if (TARGET_LEVEL === 'extended') {
-        return hasToken(label, 'pro') && hasToken(label, 'extended');
+        const slider = findIntelligenceSlider();
+        return (
+          (hasToken(label, 'pro') && hasToken(label, 'extended')) ||
+          intelligenceSliderIsAtMaximum(slider)
+        );
       }
       return false;
     };
@@ -621,8 +672,8 @@ function buildThinkingTimeExpression(
       const option = findOption();
       if (
         !option &&
-        TARGET_IS_GPT56_MODEL &&
-        TARGET_LEVEL === 'heavy' &&
+        (TARGET_MODEL_KIND === 'pro' ||
+          (TARGET_IS_GPT56_MODEL && TARGET_LEVEL === 'heavy')) &&
         currentEffortPillMatchesTarget(trigger, triggerModelKind)
       ) {
         closeOpenMenus();
@@ -802,6 +853,26 @@ function buildThinkingTimeExpression(
       while (performance.now() < deadline) {
         const menu = findVisibleEffortMenu(composerEffortPill);
         if (menu) {
+          if (
+            TARGET_MODEL_KIND === 'pro' &&
+            TARGET_LEVEL === 'extended' &&
+            isIntelligenceEffortMenu(menu)
+          ) {
+            const sliderResult = await selectIntelligenceSliderMaximum();
+            if (sliderResult) return sliderResult;
+            if (!document.querySelector(PRO_EFFORT_TRIGGER_SELECTOR)) {
+              const checkedPro = Array.from(menu.querySelectorAll(MENU_ITEM_SELECTOR)).find((item) => {
+                const label = normalize(
+                  (item.textContent ?? '') + ' ' + (item.getAttribute?.('aria-label') ?? ''),
+                );
+                return label === 'pro' && optionIsSelected(item);
+              });
+              if (checkedPro) {
+                closeOpenMenus();
+                return { status: 'already-selected', label: checkedPro.textContent?.trim?.() || 'Pro' };
+              }
+            }
+          }
           const proEffortResult = await selectProEffortFromSubmenu();
           if (proEffortResult) {
             return proEffortResult;
@@ -913,12 +984,17 @@ function buildThinkingTimeExpression(
     }
 
     // ---------- COMPATIBILITY UI: unified "Intelligence" effort picker ----------
-    // One observed ChatGPT layout replaced the per-model trailing buttons with a single
-    // "Intelligence" menu ([data-testid="composer-intelligence-picker-content"]),
-    // whose role="menuitemradio" rows are the effort tiers. We verify the checked
-    // radio instead of trusting the composer-pill label; non-Pro targets also
-    // explicitly skip Pro rows before matching effort labels.
+    // GPT-5.6's simple view exposes its highest Pro tier as an ARIA slider rather
+    // than a "Pro Extended" row. End is the semantic maximum action; only its
+    // aria value equality confirms the legacy extended request.
     if (TARGET_MODEL_KIND === 'pro' && TARGET_LEVEL === 'extended') {
+      const intelligenceDeadline = performance.now() + INTELLIGENCE_WAIT_MS;
+      while (performance.now() < intelligenceDeadline) {
+        const sliderResult = await selectIntelligenceSliderMaximum();
+        if (sliderResult) return sliderResult;
+        await sleep(100);
+      }
+
       const matchesProExtended = (node) => {
         const text = normalize(
           (node?.textContent ?? '') + ' ' + (node?.getAttribute?.('aria-label') ?? ''),
@@ -935,18 +1011,12 @@ function buildThinkingTimeExpression(
         }
         return null;
       };
-      let proExtended = null;
-      const intelligenceDeadline = performance.now() + INTELLIGENCE_WAIT_MS;
-      while (performance.now() < intelligenceDeadline) {
-        proExtended = findProExtendedOption();
-        if (proExtended) break;
-        await sleep(100);
-      }
+      const proExtended = findProExtendedOption();
       if (proExtended) {
         return selectAndVerify(modelBtn, findProExtendedOption);
       }
-      // Intelligence menu absent (older UI) or its Pro Extended row is missing:
-      // fall through to the legacy trailing-button path below.
+      // Intelligence menu absent (older UI) or no recognized legacy row: fall
+      // through to the older trailing-button and nested-dialog paths below.
     }
 
     let trailing = null;

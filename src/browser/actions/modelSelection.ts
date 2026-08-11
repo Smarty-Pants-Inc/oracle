@@ -125,6 +125,16 @@ function assertResolvedModelSelection(desiredModel: string, resolvedLabel: strin
     }
     return;
   }
+  const splitGpt56SolProTarget =
+    (desired === "pro" || desired === "chatgpt pro") &&
+    /(?:^| )5 6(?: |$)/.test(normalizedResolved) &&
+    normalizedResolved.split(" ").includes("sol") &&
+    !normalizedResolved.split(" ").includes("thinking");
+  if (splitGpt56SolProTarget) {
+    // The current picker splits the GPT-5.6 Sol model from its Pro effort.
+    // ensureThinkingTime performs the separate fail-closed effort check.
+    return;
+  }
   const wantsGpt55Pro =
     desired === "pro" ||
     desired === "chatgpt pro" ||
@@ -320,7 +330,61 @@ function buildModelSelectionExpression(
       if (explicit) return explicit;
       return Array.from(document.querySelectorAll('button.__composer-pill')).find(looksLikeModelPill) ?? null;
     };
-
+    const INTELLIGENCE_PICKER_SELECTOR = '[data-testid="composer-intelligence-picker-content"]';
+    const INTELLIGENCE_SLIDER_SELECTOR =
+      '[data-model-reasoning-effort-slider] [role="slider"], [data-model-reasoning-effort-slider][role="slider"]';
+    const intelligencePickerIsAvailable = () =>
+      typeof HTMLElement !== 'undefined' &&
+      document.querySelector(INTELLIGENCE_PICKER_SELECTOR) instanceof HTMLElement;
+    const findIntelligenceSlider = () => {
+      const picker = document.querySelector(INTELLIGENCE_PICKER_SELECTOR);
+      if (!isVisibleElement(picker)) return null;
+      const slider = picker.querySelector?.(INTELLIGENCE_SLIDER_SELECTOR) ?? null;
+      return isVisibleElement(slider) ? slider : null;
+    };
+    const intelligenceSliderIsAtMaximum = (slider) => {
+      const now = slider?.getAttribute?.('aria-valuenow');
+      const max = slider?.getAttribute?.('aria-valuemax');
+      return Boolean(now && max && now === max);
+    };
+    const intelligencePickerModelLabel = () => {
+      const text = normalizeText(document.querySelector(INTELLIGENCE_PICKER_SELECTOR)?.textContent ?? '');
+      return text.includes('gpt 5 6 sol') ? 'GPT-5.6 Sol' : '';
+    };
+    const intelligencePickerMatchesTarget = () => {
+      if (!wantsPro) return false;
+      const label = normalizeText(intelligencePickerModelLabel());
+      if (desiredVersion && !label.includes(desiredVersion.replace('-', ' '))) return false;
+      if (desiredModelVariant && !label.includes(desiredModelVariant)) return false;
+      return true;
+    };
+    const intelligenceSliderMatchesTarget = () => {
+      const slider = findIntelligenceSlider();
+      return Boolean(
+        slider && intelligencePickerMatchesTarget() && intelligenceSliderIsAtMaximum(slider),
+      );
+    };
+    const driveIntelligenceSliderToMaximum = (slider) => {
+      if (!slider || intelligenceSliderIsAtMaximum(slider)) return true;
+      try {
+        slider.focus?.();
+        const KeyboardEventCtor = window.KeyboardEvent;
+        if (typeof KeyboardEventCtor !== 'function') return false;
+        for (const type of ['keydown', 'keyup']) {
+          slider.dispatchEvent(
+            new KeyboardEventCtor(type, {
+              key: 'End',
+              code: 'End',
+              bubbles: true,
+              cancelable: true,
+            }),
+          );
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    };
     const closeMenu = () => {
       const dialogCloseButton = document.querySelector(
         '[role="dialog"] [data-testid="close-button"]',
@@ -453,6 +517,9 @@ function buildModelSelectionExpression(
         if (desiredModelVariant === 'sol' && labelHasProWord(normalizeText(variant))) return version;
         return [variant, version].filter(Boolean).join(' ');
       }
+      if (intelligencePickerIsAvailable() && intelligenceSliderMatchesTarget()) {
+        return intelligencePickerModelLabel() || 'Pro';
+      }
       const composerLabel = getComposerModelLabel();
       const normalizedComposerLabel = normalizeText(composerLabel);
       if (
@@ -584,6 +651,10 @@ function buildModelSelectionExpression(
       return COMPOSER_SIGNAL_INCLUDES.some((token) => token && signal.includes(token));
     };
     const activeSelectionMatchesTarget = () => {
+      if (intelligencePickerIsAvailable()) {
+        if (intelligenceSliderMatchesTarget()) return true;
+        if (wantsPro && findIntelligenceSlider()) return false;
+      }
       if (buttonMatchesTarget()) {
         return true;
       }
@@ -605,7 +676,10 @@ function buildModelSelectionExpression(
       return currentComposerSignal !== previousComposerSignal;
     };
 
-    if (activeSelectionMatchesTarget()) {
+    if (
+      activeSelectionMatchesTarget() &&
+      !(wantsPro && intelligencePickerIsAvailable())
+    ) {
       return { status: 'already-selected', label: getResolvedLabel() };
     }
 
@@ -1148,6 +1222,27 @@ function buildModelSelectionExpression(
           await openDelay();
         }
         ensureMenuOpen();
+        const intelligenceSlider = findIntelligenceSlider();
+        if (intelligenceSlider && intelligencePickerMatchesTarget()) {
+          if (intelligenceSliderIsAtMaximum(intelligenceSlider)) {
+            closeMenu();
+            resolve({
+              status: clickedTargetOption ? 'switched' : 'already-selected',
+              label: getResolvedLabel(),
+            });
+            return;
+          }
+          if (!driveIntelligenceSliderToMaximum(intelligenceSlider)) {
+            resolve({
+              status: 'option-not-found',
+              hint: { temporaryChat: detectTemporaryChat(), availableOptions: collectAvailableOptions() },
+            });
+            return;
+          }
+          clickedTargetOption = true;
+          setTimeout(attempt, INITIAL_WAIT_MS);
+          return;
+        }
         const match = findBestOption();
         if (match) {
           if (

@@ -273,7 +273,7 @@ describe("browser thinking-time selection expression", () => {
     expect(expression).not.toContain("hasToken(modelButtonLabel, 'extended')");
   });
 
-  it("fails closed for any unconfirmed Pro Extended effort status", async () => {
+  it("fails closed for any unconfirmed highest Pro reasoning status", async () => {
     const statuses = [
       "chip-not-found",
       "menu-not-found",
@@ -300,7 +300,7 @@ describe("browser thinking-time selection expression", () => {
 
       await expect(
         ensureThinkingTime(runtime as never, "extended", (() => {}) as never, "gpt-5.5-pro"),
-      ).rejects.toThrow(/refusing to submit without confirmed Pro Extended/);
+      ).rejects.toThrow(/refusing to submit without confirmed highest Pro reasoning/);
     }
   });
 
@@ -313,7 +313,7 @@ describe("browser thinking-time selection expression", () => {
 
     await expect(
       ensureThinkingTime(runtime as never, "extended", (() => {}) as never, null),
-    ).rejects.toThrow(/refusing to submit without confirmed Pro Extended/);
+    ).rejects.toThrow(/refusing to submit without confirmed highest Pro reasoning/);
   });
 
   it("keeps thinking effort best-effort when no target model kind is provided", async () => {
@@ -336,14 +336,155 @@ describe("browser thinking-time selection expression", () => {
     expect(logs.at(-1)).toContain("continuing with ChatGPT default");
   });
 
-  it("drives ChatGPT's new Intelligence effort picker for Pro Extended", () => {
+  it("drives ChatGPT's new Intelligence effort picker for highest Pro reasoning", () => {
     const expression = buildThinkingTimeExpressionForTest("extended", "gpt-5.5-pro");
     expect(expression).toContain("composer-intelligence-picker-content");
     expect(expression).toContain("matchesProExtended");
     expect(expression).toContain("INTELLIGENCE_WAIT_MS");
-    expect(expression).toContain("menu?.querySelector?.(INTELLIGENCE_MENU_SELECTOR)");
-    expect(expression).toContain("itemText === 'pro'");
-    expect(expression).toContain("!document.querySelector(PRO_EFFORT_TRIGGER_SELECTOR)");
+    expect(expression).toContain("INTELLIGENCE_SLIDER_SELECTOR");
+    expect(expression).toContain("data-model-reasoning-effort-slider");
+    expect(expression).toContain("aria-valuenow");
+    expect(expression).toContain("aria-valuemax");
+    expect(expression).toContain("key: 'End'");
+  });
+  it("selects one-below-max Pro reasoning and accepts only the confirmed slider maximum", async () => {
+    class FakeEventTarget {
+      dispatchEvent(_event: unknown): boolean {
+        return true;
+      }
+    }
+    class FakeKeyboardEvent {
+      constructor(
+        readonly type: string,
+        readonly init?: { key?: string },
+      ) {}
+    }
+    class FakeMouseEvent extends FakeKeyboardEvent {}
+    const evaluateSlider = async (initialValue: string) => {
+      let endPresses = 0;
+      const sliderAttributes: Record<string, string> = {
+        role: "slider",
+        "aria-label": "Pro, 5 of 5",
+        "aria-valuemin": "0",
+        "aria-valuemax": "4",
+        "aria-valuenow": initialValue,
+      };
+      class FakeElement extends FakeEventTarget {
+        constructor(
+          public textContent: string,
+          private readonly attributes: Record<string, string> = {},
+          private readonly children: FakeElement[] = [],
+          private readonly onDispatch?: (event: FakeKeyboardEvent) => void,
+        ) {
+          super();
+        }
+        getAttribute(name: string): string | null {
+          return this.attributes[name] ?? null;
+        }
+        querySelector(selector: string): FakeElement | null {
+          return selector.includes("data-model-reasoning-effort-slider")
+            ? (this.children[0] ?? null)
+            : null;
+        }
+        querySelectorAll(_selector: string): FakeElement[] {
+          return [...this.children];
+        }
+        closest(): null {
+          return null;
+        }
+        matches(selector: string): boolean {
+          return (
+            selector.includes("__composer-pill") &&
+            this.attributes.class?.includes("__composer-pill")
+          );
+        }
+        focus(): void {}
+        getBoundingClientRect(): { width: number; height: number } {
+          return { width: 120, height: 36 };
+        }
+        override dispatchEvent(event: unknown): boolean {
+          this.onDispatch?.(event as FakeKeyboardEvent);
+          return true;
+        }
+      }
+      const slider = new FakeElement("Pro, 5 of 5", sliderAttributes, [], (event) => {
+        if (event.type === "keydown" && event.init?.key === "End") {
+          endPresses += 1;
+          sliderAttributes["aria-valuenow"] = sliderAttributes["aria-valuemax"];
+        }
+      });
+      const intelligencePicker = new FakeElement(
+        `Model GPT-5.6 Sol Effort ${initialValue === "4" ? "Pro" : "Extra High"}`,
+        { "data-testid": "composer-intelligence-picker-content", role: "group" },
+        [slider],
+      );
+      const modelButton = new FakeElement("Pro", {
+        class: "__composer-pill",
+        "aria-expanded": "true",
+        "aria-haspopup": "menu",
+      });
+      const documentStub = {
+        body: new FakeElement(""),
+        querySelector: (selector: string) => {
+          if (selector.includes("composer-intelligence-pro-thinking-effort-trigger")) return null;
+          if (selector.includes("composer-intelligence-picker-content")) return intelligencePicker;
+          if (
+            selector.includes("model-switcher-dropdown-button") ||
+            selector.includes("__composer-pill")
+          ) {
+            return modelButton;
+          }
+          return null;
+        },
+        querySelectorAll: (selector: string) => {
+          if (selector.includes("__composer-pill")) return [modelButton];
+          if (selector.includes('role="menu"') || selector.includes("data-radix")) {
+            return [intelligencePicker];
+          }
+          return [];
+        },
+        dispatchEvent: () => true,
+      };
+      let now = 0;
+      const expression = buildThinkingTimeExpressionForTest("extended", "gpt-5.6-sol-pro");
+      const evaluate = new Function(
+        "document",
+        "performance",
+        "setTimeout",
+        "window",
+        "EventTarget",
+        "PointerEvent",
+        "MouseEvent",
+        "HTMLElement",
+        `return ${expression};`,
+      ) as (...args: unknown[]) => Promise<unknown>;
+      const result = await evaluate(
+        documentStub,
+        { now: () => (now += 100) },
+        (callback: () => void) => callback(),
+        {
+          KeyboardEvent: FakeKeyboardEvent,
+          PointerEvent: FakeMouseEvent,
+          MouseEvent: FakeMouseEvent,
+        },
+        FakeEventTarget,
+        FakeMouseEvent,
+        FakeMouseEvent,
+        FakeElement,
+      );
+      return { result, endPresses, value: sliderAttributes["aria-valuenow"] };
+    };
+
+    await expect(evaluateSlider("3")).resolves.toEqual({
+      result: { status: "switched", label: "Pro, 5 of 5" },
+      endPresses: 1,
+      value: "4",
+    });
+    await expect(evaluateSlider("4")).resolves.toEqual({
+      result: { status: "already-selected", label: "Pro, 5 of 5" },
+      endPresses: 0,
+      value: "4",
+    });
   });
 
   it("accepts checked Pro in GPT-5.6's wrapped Intelligence menu", async () => {
@@ -526,6 +667,33 @@ describe("browser thinking-time selection expression", () => {
         return [];
       },
     };
+
+    const proSlider = new FakeElement(
+      "Pro, 5 of 5. Use Left and Right arrow keys to adjust power.",
+      {
+        "data-testid": "composer-model-picker-slider-simple-view",
+      },
+    );
+    const sliderDocumentStub = {
+      ...proOnlyDocumentStub,
+      querySelector: (selector: string) =>
+        selector.includes("composer-model-picker-slider-simple-view")
+          ? proSlider
+          : proOnlyDocumentStub.querySelector(selector),
+    };
+
+    await expect(
+      evaluate(
+        sliderDocumentStub,
+        performanceStub,
+        (callback: () => void) => callback(),
+        { PointerEvent: FakeMouseEvent, MouseEvent: FakeMouseEvent, Event: FakeMouseEvent },
+        FakeEventTarget,
+        FakeMouseEvent,
+        FakeMouseEvent,
+        FakeElement,
+      ),
+    ).resolves.toEqual({ status: "already-selected", label: "Pro" });
     const evaluateSolHeavy = new Function(
       "document",
       "performance",
