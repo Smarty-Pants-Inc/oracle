@@ -332,7 +332,7 @@ function buildModelSelectionExpression(
     };
     const INTELLIGENCE_PICKER_SELECTOR = '[data-testid="composer-intelligence-picker-content"]';
     const INTELLIGENCE_SLIDER_SELECTOR =
-      '[data-model-reasoning-effort-slider] [role="slider"], [data-model-reasoning-effort-slider][role="slider"]';
+      '[data-model-reasoning-effort-slider] [role="slider"], [data-model-reasoning-effort-slider][role="slider"], [data-testid="composer-model-picker-slider-simple-view"] [role="slider"]';
     const intelligencePickerIsAvailable = () =>
       typeof HTMLElement !== 'undefined' &&
       document.querySelector(INTELLIGENCE_PICKER_SELECTOR) instanceof HTMLElement;

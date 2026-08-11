@@ -343,6 +343,9 @@ describe("browser thinking-time selection expression", () => {
     expect(expression).toContain("INTELLIGENCE_WAIT_MS");
     expect(expression).toContain("INTELLIGENCE_SLIDER_SELECTOR");
     expect(expression).toContain("data-model-reasoning-effort-slider");
+    expect(expression).toContain(
+      '[data-testid="composer-model-picker-slider-simple-view"] [role="slider"]',
+    );
     expect(expression).toContain("aria-valuenow");
     expect(expression).toContain("aria-valuemax");
     expect(expression).toContain("key: 'End'");
@@ -382,7 +385,7 @@ describe("browser thinking-time selection expression", () => {
           return this.attributes[name] ?? null;
         }
         querySelector(selector: string): FakeElement | null {
-          return selector.includes("data-model-reasoning-effort-slider")
+          return selector.includes("composer-model-picker-slider-simple-view")
             ? (this.children[0] ?? null)
             : null;
         }
@@ -509,6 +512,16 @@ describe("browser thinking-time selection expression", () => {
       querySelector(selector: string): FakeElement | null {
         if (selector.includes("composer-intelligence-picker-content")) {
           return this.nestedIntelligence;
+        }
+        if (selector.includes("composer-model-picker-slider-simple-view")) {
+          const view = this.children.find(
+            (child) =>
+              child.attributes["data-testid"] === "composer-model-picker-slider-simple-view",
+          );
+          return view?.querySelector('[role="slider"]') ?? null;
+        }
+        if (selector.includes('[role="slider"]')) {
+          return this.children.find((child) => child.attributes.role === "slider") ?? null;
         }
         return null;
       }
@@ -671,14 +684,27 @@ describe("browser thinking-time selection expression", () => {
     const proSlider = new FakeElement(
       "Pro, 5 of 5. Use Left and Right arrow keys to adjust power.",
       {
-        "data-testid": "composer-model-picker-slider-simple-view",
+        role: "slider",
+        "aria-valuemin": "0",
+        "aria-valuemax": "4",
+        "aria-valuenow": "4",
       },
+    );
+    const proSliderView = new FakeElement(
+      proSlider.textContent,
+      { "data-testid": "composer-model-picker-slider-simple-view" },
+      [proSlider],
+    );
+    const sliderIntelligenceGroup = new FakeElement(
+      `ModelGPT-5.6 SolEffortPro${proSlider.textContent}`,
+      { "data-testid": "composer-intelligence-picker-content", role: "group" },
+      [...currentMenuItems, proSliderView],
     );
     const sliderDocumentStub = {
       ...proOnlyDocumentStub,
       querySelector: (selector: string) =>
-        selector.includes("composer-model-picker-slider-simple-view")
-          ? proSlider
+        selector.includes("composer-intelligence-picker-content")
+          ? sliderIntelligenceGroup
           : proOnlyDocumentStub.querySelector(selector),
     };
 

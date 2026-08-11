@@ -518,7 +518,7 @@ const evaluateIntelligenceSliderModelSelection = async (initialValue: string) =>
       return this.attributes[name] ?? null;
     }
     querySelector(selector: string): FakeElement | null {
-      return selector.includes("data-model-reasoning-effort-slider")
+      return selector.includes("composer-model-picker-slider-simple-view")
         ? (this.children[0] ?? null)
         : null;
     }
@@ -1646,6 +1646,13 @@ describe("browser model selection matchers", () => {
     expect(expression).toContain("button.__composer-pill[aria-haspopup=");
     expect(expression).toContain("const findModelButton = () =>");
     expect(expression).toContain("button.__composer-pill')).find(looksLikeModelPill)");
+  });
+
+  it("targets ChatGPT's current simple-view Intelligence slider", () => {
+    const expression = buildModelSelectionExpressionForTest("gpt-5.6-sol-pro");
+    expect(expression).toContain(
+      '[data-testid="composer-model-picker-slider-simple-view"] [role="slider"]',
+    );
   });
 
   it("drives a one-below-max Intelligence Pro slider to its confirmed maximum", async () => {

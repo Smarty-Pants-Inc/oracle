@@ -307,7 +307,7 @@ function buildThinkingTimeExpression(
     const INTELLIGENCE_MENU_SELECTOR = '[data-testid="composer-intelligence-picker-content"]';
     const PRO_EFFORT_TRIGGER_SELECTOR = '[data-testid="composer-intelligence-pro-thinking-effort-trigger"]';
     const INTELLIGENCE_SLIDER_SELECTOR =
-      '[data-model-reasoning-effort-slider] [role="slider"], [data-model-reasoning-effort-slider][role="slider"]';
+      '[data-model-reasoning-effort-slider] [role="slider"], [data-model-reasoning-effort-slider][role="slider"], [data-testid="composer-model-picker-slider-simple-view"] [role="slider"]';
 
     const findModelButton = () => document.querySelector(MODEL_BUTTON_SELECTOR);
     const findTrailingButtons = () => Array.from(document.querySelectorAll(TRAILING_SELECTOR));
@@ -321,9 +321,7 @@ function buildThinkingTimeExpression(
     const findIntelligenceSlider = () => {
       const picker = document.querySelector(INTELLIGENCE_MENU_SELECTOR);
       if (!isVisible(picker)) return null;
-      const slider =
-        picker.querySelector?.(INTELLIGENCE_SLIDER_SELECTOR) ??
-        document.querySelector('[data-testid="composer-model-picker-slider-simple-view"]');
+      const slider = picker.querySelector?.(INTELLIGENCE_SLIDER_SELECTOR) ?? null;
       return isVisible(slider) ? slider : null;
     };
     const intelligenceSliderIsAtMaximum = (slider) => {
