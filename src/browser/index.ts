@@ -1040,6 +1040,12 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   const fallbackSubmission = options.fallbackSubmission;
 
   let config = resolveBrowserConfig(options.config);
+  if (process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" && !config.remoteChrome) {
+    throw new BrowserAutomationError(
+      "The agent wrapper requires a stored or wrapper-selected remote Chrome endpoint; refusing to launch or attach local Chrome.",
+      { stage: "background-browser-policy" },
+    );
+  }
   const usingCopiedProfile = Boolean(config.copyProfileSource);
   if (usingCopiedProfile && (config.attachRunning || config.remoteChrome)) {
     throw new BrowserAutomationError(

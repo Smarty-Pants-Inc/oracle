@@ -90,7 +90,10 @@ import {
   createPerfTrace,
   isTraceValueFlag,
 } from "../src/cli/perfTrace.js";
-import { resolveBrowserFollowupReference } from "../src/cli/followup.js";
+import {
+  resolveBrowserFollowupReference,
+  type BrowserFollowupResolution,
+} from "../src/cli/followup.js";
 
 interface CliOptions extends OptionValues {
   prompt?: string;
@@ -1075,7 +1078,7 @@ program
   )
   .option(
     "--remote-chrome <host:port>",
-    "Chrome DevTools endpoint to inspect (default 127.0.0.1:9222).",
+    "Explicit raw-CLI Chrome DevTools endpoint override; when omitted, resolve the endpoint from stored session affinity.",
   )
   .option("--obu-session-id <id>", "Open Browser Use session id for OBU-managed tabs.")
   .option("--obu-tab-id <id>", "Open Browser Use tab id for an approved OBU-managed tab.")
@@ -1876,6 +1879,8 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   }
 
   const providerMode = resolveApiProviderMode(options);
+  const explicitApiProviderRequested =
+    providerMode !== "auto" || hasExplicitAzureOption(optionUsesDefault);
   const engineModels = multiModelProvided
     ? Array.from(new Set(options.models!.map((entry) => resolveApiModel(entry))))
     : [resolveApiModel(normalizeModelOption(options.model) || DEFAULT_MODEL)];
@@ -1919,6 +1924,49 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   const retentionHours = typeof options.retainHours === "number" ? options.retainHours : undefined;
   await sessionStore.ensureStorage();
   await pruneOldSessions(retentionHours, (message) => console.log(chalk.dim(message)));
+  const explicitFollowupEngine = options.browser
+    ? "browser"
+    : !optionUsesDefault("engine")
+      ? options.engine
+      : !optionUsesDefault("mode")
+        ? (options as CliOptions & { mode?: EngineMode }).mode
+        : explicitApiProviderRequested
+          ? "api"
+          : undefined;
+  let browserFollowup: BrowserFollowupResolution | null = null;
+  let apiFollowup: FollowupResolution | null = null;
+  if (
+    options.followup &&
+    !options.status &&
+    !options.session &&
+    !options.execSession &&
+    !renderMarkdown &&
+    !copyMarkdown
+  ) {
+    if (multiModelProvided) {
+      throw new Error("--followup cannot be combined with --models.");
+    }
+    browserFollowup = await resolveBrowserFollowupReference(options.followup, sessionStore);
+    if (browserFollowup) {
+      if (explicitFollowupEngine === "api") {
+        throw new Error(
+          "API engine/provider settings cannot continue a browser --followup session. Omit them to reuse the parent browser session.",
+        );
+      }
+    } else {
+      apiFollowup = await resolveFollowupReference(options.followup, options.followupModel);
+      if (explicitFollowupEngine === "browser") {
+        throw new Error(
+          "--engine browser cannot continue an API --followup session. Omit --engine to reuse the parent API session.",
+        );
+      }
+    }
+  }
+  if (browserFollowup && remoteHost) {
+    throw new Error(
+      "--remote-host cannot continue a browser --followup session that is bound to its stored Chrome endpoint.",
+    );
+  }
   if (providerMode === "openai") {
     if (hasExplicitAzureOption(optionUsesDefault)) {
       throw new Error("--provider openai/--no-azure cannot be combined with Azure options.");
@@ -1957,8 +2005,6 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     providerMode !== "openai" &&
     Boolean(options.azureEndpoint?.trim()) &&
     engineModels.some((model) => isAzureOpenAICandidateModel(model));
-  const explicitApiProviderRequested =
-    providerMode !== "auto" || hasExplicitAzureOption(optionUsesDefault);
   const envEnginePreference = (process.env.ORACLE_ENGINE ?? "").trim().toLowerCase();
   const explicitApiEngineRequested =
     options.engine === "api" || (!options.engine && envEnginePreference === "api");
@@ -1971,7 +2017,13 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     apiProviderRequested: explicitApiProviderRequested,
     env: process.env,
   });
+  if (browserFollowup) {
+    engine = "browser";
+  } else if (apiFollowup) {
+    engine = "api";
+  }
   const browserEngineRequested =
+    Boolean(browserFollowup) ||
     options.browser ||
     options.engine === "browser" ||
     Boolean(remoteHost) ||
@@ -1999,7 +2051,8 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     : [];
   const defaultModel = engine === "browser" ? DEFAULT_BROWSER_MODEL : DEFAULT_API_MODEL;
   const cliModelArg =
-    normalizeModelOption(options.model) || (multiModelProvided ? "" : defaultModel);
+    browserFollowup?.model ??
+    (normalizeModelOption(options.model) || (multiModelProvided ? "" : defaultModel));
   const inferredModelCandidate: ModelName = multiModelProvided
     ? normalizedMultiModels[0]
     : engine === "browser"
@@ -2159,30 +2212,21 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     options.browserAttachmentTimeout = attachmentTimeoutEnv;
   }
 
-  let browserFollowup: Awaited<ReturnType<typeof resolveBrowserFollowupReference>> = null;
-  if (options.followup) {
-    if (normalizedMultiModels.length > 0) {
-      throw new Error("--followup cannot be combined with --models.");
-    }
-    browserFollowup = await resolveBrowserFollowupReference(options.followup, sessionStore);
-    if (browserFollowup) {
-      engine = "browser";
-      resolvedOptions.model = browserFollowup.model;
-      resolvedOptions.effectiveModelId = browserFollowup.model;
-      resolvedOptions.followupSessionId = browserFollowup.sessionId;
-      resolvedOptions.browserResumeConversationUrl = browserFollowup.resumeConversationUrl;
-    } else {
-      assertFollowupSupported({
-        engine,
-        model: resolvedModel,
-        baseUrl: resolvedBaseUrl,
-        azureEndpoint: resolvedOptions.azure?.endpoint,
-      });
-      const followup = await resolveFollowupReference(options.followup, options.followupModel);
-      resolvedOptions.previousResponseId = followup.responseId;
-      resolvedOptions.followupSessionId = followup.sessionId;
-      resolvedOptions.followupModel = options.followupModel;
-    }
+  if (browserFollowup) {
+    resolvedOptions.model = browserFollowup.model;
+    resolvedOptions.effectiveModelId = browserFollowup.model;
+    resolvedOptions.followupSessionId = browserFollowup.sessionId;
+    resolvedOptions.browserResumeConversationUrl = browserFollowup.resumeConversationUrl;
+  } else if (apiFollowup) {
+    assertFollowupSupported({
+      engine,
+      model: resolvedModel,
+      baseUrl: resolvedBaseUrl,
+      azureEndpoint: resolvedOptions.azure?.endpoint,
+    });
+    resolvedOptions.previousResponseId = apiFollowup.responseId;
+    resolvedOptions.followupSessionId = apiFollowup.sessionId;
+    resolvedOptions.followupModel = options.followupModel;
   }
   const activeModel = resolvedOptions.model;
   if (options.reasoningMode && engine !== "api") {

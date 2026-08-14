@@ -66,6 +66,16 @@ function execCli(
   });
 }
 
+async function writeFollowupFixture(
+  oracleHome: string,
+  id: string,
+  metadata: Record<string, unknown>,
+): Promise<void> {
+  const sessionDir = path.join(oracleHome, "sessions", id);
+  await mkdir(sessionDir, { recursive: true });
+  await writeFile(path.join(sessionDir, "meta.json"), JSON.stringify(metadata), "utf8");
+}
+
 type CliChild = ChildProcessByStdio<null, Readable, Readable>;
 
 function waitForChildExit(
@@ -910,7 +920,187 @@ module.exports = () => ({
     },
     INTEGRATION_TIMEOUT,
   );
+  test(
+    "reconciles --followup engine intent to the stored parent before previewing",
+    async () => {
+      const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-followup-engine-"));
+      const browserParentId = "browser-parent";
+      const apiParentId = "api-parent";
+      await Promise.all([
+        writeFollowupFixture(oracleHome, browserParentId, {
+          id: browserParentId,
+          createdAt: "2026-08-14T00:00:00.000Z",
+          status: "completed",
+          mode: "browser",
+          model: "gpt-5.5-pro",
+          options: {},
+          browser: {
+            config: {
+              url: "https://chatgpt.com/g/g-p-parent/project",
+              manualLogin: true,
+              remoteChrome: { host: "127.0.0.1", port: 9223 },
+            },
+            harvest: { url: "https://chatgpt.com/c/browser-parent" },
+          },
+        }),
+        writeFollowupFixture(oracleHome, apiParentId, {
+          id: apiParentId,
+          createdAt: "2026-08-14T00:00:00.000Z",
+          status: "completed",
+          mode: "api",
+          model: "gpt-5.5-pro",
+          options: {},
+          response: { responseId: "resp_api_parent" },
+        }),
+      ]);
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        // biome-ignore lint/style/useNamingConvention: env var name
+        ORACLE_HOME_DIR: oracleHome,
+        // biome-ignore lint/style/useNamingConvention: env var name
+        ORACLE_DISABLE_KEYTAR: "1",
+      };
+      delete env.OPENAI_API_KEY;
+      delete env.OPENROUTER_API_KEY;
+      env.ORACLE_ENGINE = "api";
+      const browserEnv: NodeJS.ProcessEnv = {
+        ...env,
+        // biome-ignore lint/style/useNamingConvention: env var name
+        AZURE_OPENAI_ENDPOINT: "https://followup-test.openai.azure.com",
+      };
 
+      const browserWithApi = await execCli(
+        [
+          "--dry-run",
+          "summary",
+          "--engine",
+          "api",
+          "--followup",
+          browserParentId,
+          "--prompt",
+          "Child",
+        ],
+        { env, timeout: INTEGRATION_TIMEOUT },
+      );
+      expect(browserWithApi.code).toBe(1);
+      expect(`${browserWithApi.stdout}\n${browserWithApi.stderr}`).toMatch(
+        /API engine\/provider.*browser/i,
+      );
+
+      const browserWithProvider = await execCli(
+        [
+          "--dry-run",
+          "summary",
+          "--provider",
+          "openai",
+          "--followup",
+          browserParentId,
+          "--prompt",
+          "Child",
+        ],
+        { env, timeout: INTEGRATION_TIMEOUT },
+      );
+      expect(browserWithProvider.code).toBe(1);
+      expect(`${browserWithProvider.stdout}\n${browserWithProvider.stderr}`).toMatch(
+        /API engine\/provider.*browser/i,
+      );
+
+      const browserWithRemoteHost = await execCli(
+        [
+          "--dry-run",
+          "summary",
+          "--followup",
+          browserParentId,
+          "--remote-host",
+          "127.0.0.1:9473",
+          "--prompt",
+          "Child",
+        ],
+        { env, timeout: INTEGRATION_TIMEOUT },
+      );
+      expect(browserWithRemoteHost.code).toBe(1);
+      expect(`${browserWithRemoteHost.stdout}\n${browserWithRemoteHost.stderr}`).toMatch(
+        /remote-host.*stored Chrome endpoint/i,
+      );
+
+      for (const apiFollowup of [apiParentId, "resp_direct_parent"]) {
+        const apiWithBrowser = await execCli(
+          [
+            "--dry-run",
+            "summary",
+            "--engine",
+            "browser",
+            "--followup",
+            apiFollowup,
+            "--prompt",
+            "Child",
+          ],
+          { env, timeout: INTEGRATION_TIMEOUT },
+        );
+        expect(apiWithBrowser.code).toBe(1);
+        expect(`${apiWithBrowser.stdout}\n${apiWithBrowser.stderr}`).toMatch(
+          /--engine browser.*API/i,
+        );
+      }
+
+      const browserPreview = await execCli(
+        ["--dry-run", "summary", "--followup", browserParentId, "--prompt", "Child"],
+        { env: browserEnv, timeout: INTEGRATION_TIMEOUT },
+      );
+      expect(browserPreview.code).toBe(0);
+      expect(browserPreview.stdout).toContain("[preview] Oracle");
+      expect(browserPreview.stdout).toContain("browser mode");
+      expect(browserPreview.stdout).toContain("target: https://chatgpt.com/g/g-p-parent/project");
+      expect(browserPreview.stdout).toContain("manual-login: yes");
+      expect(browserPreview.stdout).toContain("reuse an existing remote Chrome session");
+
+      const browserWithIncompatibleCurrentModel = await execCli(
+        [
+          "--dry-run",
+          "summary",
+          "--model",
+          "claude-4.6-sonnet",
+          "--followup",
+          browserParentId,
+          "--prompt",
+          "Child",
+        ],
+        { env: browserEnv, timeout: INTEGRATION_TIMEOUT },
+      );
+      expect(browserWithIncompatibleCurrentModel.code).toBe(0);
+      expect(browserWithIncompatibleCurrentModel.stdout).toContain("browser mode (gpt-5.5-pro)");
+
+      for (const apiFollowup of [apiParentId, "resp_direct_parent"]) {
+        const apiPreview = await execCli(
+          ["--dry-run", "summary", "--followup", apiFollowup, "--prompt", "Child"],
+          { env, timeout: INTEGRATION_TIMEOUT },
+        );
+        expect(apiPreview.code).toBe(0);
+        expect(apiPreview.stdout).toContain("[dry-run] Oracle");
+        expect(apiPreview.stdout).not.toContain("browser mode");
+      }
+
+      const renderWithUnusedFollowup = await execCli(
+        [
+          "--render-markdown",
+          "--followup",
+          "missing-session",
+          "--prompt",
+          "Render without following up",
+        ],
+        { env, timeout: INTEGRATION_TIMEOUT },
+      );
+      expect(renderWithUnusedFollowup.code).toBe(0);
+      expect(renderWithUnusedFollowup.stdout).toContain("Render without following up");
+
+      expect((await readdir(path.join(oracleHome, "sessions"))).sort()).toEqual([
+        apiParentId,
+        browserParentId,
+      ]);
+      await rm(oracleHome, { recursive: true, force: true });
+    },
+    INTEGRATION_TIMEOUT,
+  );
   test(
     "persists followup lineage and reuses previous_response_id during --exec-session",
     async () => {

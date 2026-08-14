@@ -25,6 +25,22 @@ describe("background-only browser policy", () => {
       runBrowserMode({ prompt: "review", config: { attachRunning: true } }),
     ).rejects.toMatchObject({ details: { stage: "background-browser-policy" } });
   });
+
+  test("rejects local Chrome when invoked through the agent wrapper", async () => {
+    const previous = process.env.ORACLE_WRAPPER_REMOTE_ONLY;
+    process.env.ORACLE_WRAPPER_REMOTE_ONLY = "1";
+    try {
+      await expect(
+        runBrowserMode({ prompt: "review", config: { manualLogin: true } }),
+      ).rejects.toMatchObject({ details: { stage: "background-browser-policy" } });
+    } finally {
+      if (previous === undefined) {
+        delete process.env.ORACLE_WRAPPER_REMOTE_ONLY;
+      } else {
+        process.env.ORACLE_WRAPPER_REMOTE_ONLY = previous;
+      }
+    }
+  });
 });
 
 describe("shouldPreserveBrowserOnErrorForTest", () => {
