@@ -1243,6 +1243,7 @@ export async function captureApprovedChatGptConversationBackend(
       postExportArchive = await archiveChatGptConversation(Runtime, () => {}, {
         mode: "always",
         conversationUrl: options.targetUrl,
+        expectedAccountDigest,
       });
       if (!postExportArchive.archived) {
         throw new Error(`Post-export archive failed: ${JSON.stringify(postExportArchive)}`);
@@ -1262,6 +1263,7 @@ export async function captureApprovedChatGptConversationBackend(
         return archiveChatGptConversation(client.Runtime, () => {}, {
           mode: "always",
           conversationUrl: options.targetUrl,
+          expectedAccountDigest,
         });
       })().catch(() => null);
       if (!restore?.archived) {

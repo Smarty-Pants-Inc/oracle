@@ -738,19 +738,14 @@ describe("browser follow-ups", () => {
 describe("browser conversation archiving", () => {
   test("archives interrupted project one-shots in auto mode", async () => {
     const runtime = {
-      evaluate: vi
-        .fn()
-        .mockResolvedValueOnce({
-          result: { value: "https://chatgpt.com/g/g-p-demo/project/c/abc" },
-        })
-        .mockResolvedValueOnce({
-          result: {
-            value: {
-              status: "archived",
-              conversationUrl: "https://chatgpt.com/g/g-p-demo/project/c/abc",
-            },
+      evaluate: vi.fn().mockResolvedValueOnce({
+        result: {
+          value: {
+            status: "archived",
+            conversationUrl: "https://chatgpt.com/g/g-p-demo/project/c/abc",
           },
-        }),
+        },
+      }),
     };
     const log = vi.fn();
 
@@ -762,6 +757,7 @@ describe("browser conversation archiving", () => {
           archiveConversations: "auto",
           chatgptUrl: "https://chatgpt.com/g/g-p-demo/project",
         }),
+        accountDigest: "a".repeat(64),
         conversationUrl: "https://chatgpt.com/g/g-p-demo/project/c/abc",
         followUpCount: 0,
       }),
@@ -771,7 +767,181 @@ describe("browser conversation archiving", () => {
       archived: true,
       conversationUrl: "https://chatgpt.com/g/g-p-demo/project/c/abc",
     });
-    expect(runtime.evaluate).toHaveBeenCalledTimes(2);
+    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+  });
+
+  test("does not archive a completed remote run after the account changes", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValueOnce({
+        result: {
+          value: {
+            status: "skipped",
+            reason: "affinity-mismatch",
+            conversationUrl: "https://chatgpt.com/c/abc",
+          },
+        },
+      }),
+    };
+
+    await expect(
+      maybeArchiveCompletedConversationForTest({
+        Runtime: runtime as never,
+        logger: vi.fn() as never,
+        config: resolveBrowserConfig({
+          archiveConversations: "always",
+          remoteChrome: { host: "127.0.0.1", port: 9223 },
+          remoteChromeBrowserId: "browser-a",
+          remoteChromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+          remoteChromeAccountDigest: "a".repeat(64),
+        }),
+        accountDigest: "a".repeat(64),
+        conversationUrl: "https://chatgpt.com/c/abc",
+        followUpCount: 0,
+        requiredArtifactsSaved: true,
+      }),
+    ).resolves.toMatchObject({
+      attempted: false,
+      archived: false,
+      reason: "affinity-mismatch",
+    });
+    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+  });
+
+  test("does not archive a completed run after the conversation changes", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValueOnce({
+        result: {
+          value: {
+            status: "skipped",
+            reason: "affinity-mismatch",
+            conversationUrl: "https://chatgpt.com/c/other",
+          },
+        },
+      }),
+    };
+
+    await expect(
+      maybeArchiveCompletedConversationForTest({
+        Runtime: runtime as never,
+        logger: vi.fn() as never,
+        config: resolveBrowserConfig({ archiveConversations: "always" }),
+        accountDigest: "a".repeat(64),
+        conversationUrl: "https://chatgpt.com/c/abc",
+        followUpCount: 0,
+        requiredArtifactsSaved: true,
+      }),
+    ).resolves.toMatchObject({
+      attempted: false,
+      archived: false,
+      reason: "affinity-mismatch",
+      conversationUrl: "https://chatgpt.com/c/abc",
+    });
+    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+  });
+
+  test("does not substitute the current conversation during interrupted archiving", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValueOnce({
+        result: {
+          value: {
+            status: "skipped",
+            reason: "affinity-mismatch",
+            conversationUrl: "https://chatgpt.com/c/other",
+          },
+        },
+      }),
+    };
+
+    await expect(
+      maybeArchiveInterruptedConversationForTest({
+        Runtime: runtime as never,
+        logger: vi.fn() as never,
+        config: resolveBrowserConfig({ archiveConversations: "always" }),
+        accountDigest: "a".repeat(64),
+        conversationUrl: "https://chatgpt.com/c/abc",
+        followUpCount: 0,
+      }),
+    ).resolves.toMatchObject({
+      attempted: false,
+      archived: false,
+      reason: "affinity-mismatch",
+      conversationUrl: "https://chatgpt.com/c/abc",
+    });
+    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+  });
+
+  test("does not archive any run without an originating account digest", async () => {
+    const runtime = { evaluate: vi.fn() };
+
+    await expect(
+      maybeArchiveCompletedConversationForTest({
+        Runtime: runtime as never,
+        logger: vi.fn() as never,
+        config: resolveBrowserConfig({ archiveConversations: "always" }),
+        conversationUrl: "https://chatgpt.com/c/abc",
+        followUpCount: 0,
+        requiredArtifactsSaved: true,
+      }),
+    ).resolves.toMatchObject({
+      attempted: false,
+      archived: false,
+      reason: "affinity-mismatch",
+    });
+    expect(runtime.evaluate).not.toHaveBeenCalled();
+  });
+
+  test("does not archive any run with a malformed originating account digest", async () => {
+    const runtime = { evaluate: vi.fn() };
+
+    await expect(
+      maybeArchiveCompletedConversationForTest({
+        Runtime: runtime as never,
+        logger: vi.fn() as never,
+        config: resolveBrowserConfig({ archiveConversations: "always" }),
+        accountDigest: "not-a-digest",
+        conversationUrl: "https://chatgpt.com/c/abc",
+        followUpCount: 0,
+        requiredArtifactsSaved: true,
+      }),
+    ).resolves.toMatchObject({
+      attempted: false,
+      archived: false,
+      reason: "affinity-mismatch",
+    });
+    expect(runtime.evaluate).not.toHaveBeenCalled();
+  });
+
+  test("archives once when the bound account and conversation still match", async () => {
+    const accountDigest = "a".repeat(64);
+    const conversationUrl = "https://chatgpt.com/c/abc";
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValueOnce({
+        result: { value: { status: "archived", conversationUrl } },
+      }),
+    };
+
+    await expect(
+      maybeArchiveCompletedConversationForTest({
+        Runtime: runtime as never,
+        logger: vi.fn() as never,
+        config: resolveBrowserConfig({
+          archiveConversations: "always",
+          remoteChrome: { host: "127.0.0.1", port: 9223 },
+          remoteChromeBrowserId: "browser-a",
+          remoteChromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+          remoteChromeAccountDigest: accountDigest,
+        }),
+        accountDigest,
+        conversationUrl,
+        followUpCount: 0,
+        requiredArtifactsSaved: true,
+      }),
+    ).resolves.toMatchObject({
+      attempted: true,
+      archived: true,
+      conversationUrl,
+    });
+    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
   });
 
   test("does not attempt interrupted archive before a conversation exists", async () => {
@@ -793,7 +963,7 @@ describe("browser conversation archiving", () => {
         followUpCount: 0,
       }),
     ).resolves.toBeNull();
-    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+    expect(runtime.evaluate).not.toHaveBeenCalled();
   });
 
   test("does not attempt archive when required local artifacts were not saved", async () => {

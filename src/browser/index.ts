@@ -676,6 +676,7 @@ async function maybeArchiveCompletedConversation({
   Runtime,
   logger,
   config,
+  accountDigest,
   conversationUrl,
   followUpCount,
   requiredArtifactsSaved,
@@ -683,6 +684,7 @@ async function maybeArchiveCompletedConversation({
   Runtime: ChromeClient["Runtime"];
   logger: BrowserLogger;
   config: ResolvedBrowserConfig;
+  accountDigest?: string | null;
   conversationUrl?: string | null;
   followUpCount: number;
   requiredArtifactsSaved: boolean;
@@ -717,6 +719,7 @@ async function maybeArchiveCompletedConversation({
   return runChatGptArchive({
     Runtime,
     logger,
+    accountDigest,
     mode: decision.mode,
     conversationUrl,
   });
@@ -726,24 +729,24 @@ async function maybeArchiveInterruptedConversation({
   Runtime,
   logger,
   config,
+  accountDigest,
   conversationUrl,
   followUpCount,
 }: {
   Runtime: ChromeClient["Runtime"];
   logger: BrowserLogger;
   config: ResolvedBrowserConfig;
+  accountDigest?: string | null;
   conversationUrl?: string | null;
   followUpCount: number;
 }): Promise<BrowserArchiveResult | null> {
-  const currentUrl = await readConversationUrl(Runtime);
-  const resolvedUrl = currentUrl && isConversationUrl(currentUrl) ? currentUrl : conversationUrl;
-  if (!resolvedUrl || !isConversationUrl(resolvedUrl)) {
+  if (!conversationUrl || !isConversationUrl(conversationUrl)) {
     return null;
   }
   const decision = resolveBrowserArchiveDecision({
     mode: config.archiveConversations,
     chatgptUrl: config.chatgptUrl ?? config.url,
-    conversationUrl: resolvedUrl,
+    conversationUrl,
     researchMode: config.researchMode,
     followUpCount,
   });
@@ -754,32 +757,49 @@ async function maybeArchiveInterruptedConversation({
       attempted: false,
       archived: false,
       reason: decision.reason,
-      conversationUrl: resolvedUrl,
+      conversationUrl,
     };
   }
   logger("[browser] Attempting to archive interrupted ChatGPT conversation.");
   return runChatGptArchive({
     Runtime,
     logger,
+    accountDigest,
     mode: decision.mode,
-    conversationUrl: resolvedUrl,
+    conversationUrl,
   });
 }
 
 async function runChatGptArchive({
   Runtime,
   logger,
+  accountDigest,
   mode,
   conversationUrl,
 }: {
   Runtime: ChromeClient["Runtime"];
   logger: BrowserLogger;
+  accountDigest?: string | null;
   mode: BrowserArchiveResult["mode"];
   conversationUrl?: string | null;
 }): Promise<BrowserArchiveResult> {
+  const expectedAccountDigest = accountDigest?.trim();
+  if (!expectedAccountDigest || !/^[a-f0-9]{64}$/.test(expectedAccountDigest)) {
+    const error = "originating account identity is unavailable";
+    logger(`[browser] ChatGPT archive skipped (${error}).`);
+    return {
+      mode,
+      attempted: false,
+      archived: false,
+      reason: "affinity-mismatch",
+      conversationUrl: conversationUrl ?? undefined,
+      error,
+    };
+  }
   return archiveChatGptConversation(Runtime, logger, {
     mode,
     conversationUrl,
+    expectedAccountDigest,
   }).catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
     logger(`[browser] ChatGPT archive failed (${message}).`);
@@ -1282,6 +1302,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   let stopThinkingMonitor: (() => void) | null = null;
   let removeDialogHandler: (() => void) | null = null;
   let appliedCookies = 0;
+  let chatGptAccountDigest: string | null = null;
   let preserveBrowserOnError = false;
 
   try {
@@ -1540,6 +1561,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     );
     if (chatMode === "switched") {
       await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
+    }
+    if (config.archiveConversations !== "never") {
+      chatGptAccountDigest = await raceWithDisconnect(
+        readChatGptAccountDigest(Runtime).catch(() => null),
+      );
     }
     logger(
       `Prompt textarea ready (initial focus, ${promptText.length.toLocaleString()} chars queued)`,
@@ -1887,6 +1913,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         Runtime,
         logger,
         config,
+        accountDigest: chatGptAccountDigest,
         conversationUrl: lastUrl,
         followUpCount: 0,
         requiredArtifactsSaved: Boolean(reportArtifact && transcriptArtifact),
@@ -2392,6 +2419,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       Runtime,
       logger,
       config,
+      accountDigest: chatGptAccountDigest,
       conversationUrl: lastUrl,
       followUpCount: followUpPrompts.length,
       requiredArtifactsSaved:
@@ -2487,6 +2515,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
               Runtime: browserRuntime,
               logger,
               config,
+              accountDigest: chatGptAccountDigest,
               conversationUrl: lastUrl,
               followUpCount: followUpPrompts.length,
             })
@@ -2509,6 +2538,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
             Runtime: browserRuntime,
             logger,
             config,
+            accountDigest: chatGptAccountDigest,
             conversationUrl: lastUrl,
             followUpCount: followUpPrompts.length,
           })
@@ -3583,6 +3613,7 @@ async function runRemoteBrowserMode(
         Runtime,
         logger,
         config,
+        accountDigest: config.remoteChromeAccountDigest,
         conversationUrl: lastUrl,
         followUpCount: 0,
         requiredArtifactsSaved: Boolean(reportArtifact && transcriptArtifact),
@@ -4037,6 +4068,7 @@ async function runRemoteBrowserMode(
       Runtime,
       logger,
       config,
+      accountDigest: config.remoteChromeAccountDigest,
       conversationUrl: lastUrl,
       followUpCount: followUpPrompts.length,
       requiredArtifactsSaved:
@@ -4089,6 +4121,7 @@ async function runRemoteBrowserMode(
             Runtime: browserRuntime,
             logger,
             config,
+            accountDigest: config.remoteChromeAccountDigest,
             conversationUrl: lastUrl,
             followUpCount: followUpPrompts.length,
           })

@@ -59,19 +59,49 @@ export function resolveBrowserArchiveDecision({
   return { mode, shouldArchive: true, reason: "successful-one-shot" };
 }
 
+function resolveArchiveConversationAffinity(
+  rawUrl?: string | null,
+): { origin: string; conversationId: string } | null {
+  try {
+    const parsed = new URL(rawUrl ?? "");
+    if (parsed.origin !== "https://chatgpt.com") return null;
+    const match = /^\/(?:c|g\/[^/]+(?:\/project)?\/c)\/([a-zA-Z0-9-]+)\/?$/.exec(parsed.pathname);
+    return match?.[1] ? { origin: parsed.origin, conversationId: match[1] } : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function archiveChatGptConversation(
   Runtime: ChromeClient["Runtime"],
   logger: BrowserLogger,
   {
     mode,
     conversationUrl,
+    expectedAccountDigest,
   }: {
     mode: BrowserArchiveMode;
     conversationUrl?: string | null;
+    expectedAccountDigest?: string;
   },
 ): Promise<BrowserArchiveResult> {
+  const affinity = resolveArchiveConversationAffinity(conversationUrl);
+  if (!affinity) {
+    return {
+      mode,
+      attempted: false,
+      archived: false,
+      reason: "affinity-mismatch",
+      conversationUrl: conversationUrl ?? undefined,
+      error: "originating conversation identity is unavailable",
+    };
+  }
   const evaluated = await Runtime.evaluate({
-    expression: buildArchiveConversationExpression(),
+    expression: buildArchiveConversationExpression({
+      expectedOrigin: affinity.origin,
+      expectedConversationId: affinity.conversationId,
+      expectedAccountDigest,
+    }),
     awaitPromise: true,
     returnByValue: true,
   });
@@ -80,17 +110,20 @@ export async function archiveChatGptConversation(
     | { status: "skipped"; reason: string; conversationUrl?: string | null }
     | { status: "failed"; error: string; conversationUrl?: string | null }
     | undefined;
-  const resolvedUrl = value?.conversationUrl ?? conversationUrl ?? undefined;
+  const reason = value?.status === "skipped" ? value.reason : "archive-failed";
+  const error = value?.status === "failed" ? value.error : undefined;
+  const resolvedUrl =
+    reason === "affinity-mismatch"
+      ? (conversationUrl ?? undefined)
+      : (value?.conversationUrl ?? conversationUrl ?? undefined);
   if (value?.status === "archived") {
     logger("[browser] Archived ChatGPT conversation after saving local artifacts.");
     return { mode, attempted: true, archived: true, conversationUrl: resolvedUrl };
   }
-  const reason = value?.status === "skipped" ? value.reason : "archive-failed";
-  const error = value?.status === "failed" ? value.error : undefined;
   logger(`[browser] ChatGPT archive skipped (${error ?? reason}).`);
   return {
     mode,
-    attempted: true,
+    attempted: reason !== "affinity-mismatch",
     archived: false,
     reason,
     conversationUrl: resolvedUrl,
@@ -98,19 +131,68 @@ export async function archiveChatGptConversation(
   };
 }
 
-export function buildArchiveConversationExpressionForTest(): string {
-  return buildArchiveConversationExpression();
+export function buildArchiveConversationExpressionForTest(options?: {
+  expectedOrigin?: string;
+  expectedConversationId?: string;
+  expectedAccountDigest?: string;
+}): string {
+  return buildArchiveConversationExpression({
+    expectedOrigin: options?.expectedOrigin ?? "https://chatgpt.com",
+    expectedConversationId: options?.expectedConversationId ?? "abc",
+    expectedAccountDigest: options?.expectedAccountDigest,
+  });
 }
 
-function buildArchiveConversationExpression(): string {
+function buildArchiveConversationExpression({
+  expectedOrigin,
+  expectedConversationId,
+  expectedAccountDigest,
+}: {
+  expectedOrigin: string;
+  expectedConversationId: string;
+  expectedAccountDigest?: string;
+}): string {
   return `(() => {
-    const conversationUrl = typeof location === 'object' ? location.href : null;
+    const expectedOrigin = ${JSON.stringify(expectedOrigin)};
+    const expectedConversationId = ${JSON.stringify(expectedConversationId)};
+    const expectedAccountDigest = ${JSON.stringify(expectedAccountDigest ?? null)};
+    let conversationUrl = typeof location === 'object' ? location.href : null;
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     const normalize = (value) =>
       String(value ?? '')
         .replace(/\\s+/g, ' ')
         .trim()
         .toLowerCase();
+    const readAccountDigest = async () => {
+      if (!expectedAccountDigest) return null;
+      try {
+        const response = await fetch('/api/auth/session', {
+          cache: 'no-store', credentials: 'include',
+        });
+        if (!response.ok) return null;
+        const body = await response.json();
+        const userId = typeof body?.user?.id === 'string' ? body.user.id.trim() : '';
+        if (!userId || !globalThis.crypto?.subtle) return null;
+        const bytes = new Uint8Array(await crypto.subtle.digest(
+          'SHA-256', new TextEncoder().encode(userId),
+        ));
+        return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+      } catch {
+        return null;
+      }
+    };
+    const hasExpectedAffinity = async () => {
+      if (expectedAccountDigest && await readAccountDigest() !== expectedAccountDigest) return false;
+      conversationUrl = typeof location === 'object' ? location.href : null;
+      try {
+        const currentUrl = new URL(conversationUrl);
+        const match = currentUrl.pathname
+          .match(/^\\/(?:c|g\\/[^/]+(?:\\/project)?\\/c)\\/([a-zA-Z0-9-]+)\\/?$/);
+        return currentUrl.origin === expectedOrigin && match?.[1] === expectedConversationId;
+      } catch {
+        return false;
+      }
+    };
     const isVisible = (element) => {
       if (!element || !(element instanceof HTMLElement)) return false;
       const rect = element.getBoundingClientRect();
@@ -243,12 +325,18 @@ function buildArchiveConversationExpression(): string {
 	      return archived;
 	    };
 	    return (async () => {
+      if (!await hasExpectedAffinity()) {
+        return { status: 'skipped', reason: 'affinity-mismatch', conversationUrl };
+      }
 	      const menuButton = findConversationMenuButton();
       if (!menuButton) {
         return { status: 'skipped', reason: 'conversation-menu-not-found', conversationUrl };
       }
       click(menuButton);
       await sleep(350);
+      if (!await hasExpectedAffinity()) {
+        return { status: 'skipped', reason: 'affinity-mismatch', conversationUrl };
+      }
       const archiveItem = findArchiveMenuItem();
       if (!archiveItem) {
         document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
@@ -258,12 +346,18 @@ function buildArchiveConversationExpression(): string {
 	      await sleep(350);
 	      const confirmButton = findArchiveConfirmationButton();
 	      if (confirmButton) {
+        if (!await hasExpectedAffinity()) {
+          return { status: 'skipped', reason: 'affinity-mismatch', conversationUrl };
+        }
 	        click(confirmButton);
 	        await sleep(500);
 	      }
 	      if (await waitForArchiveConfirmation()) {
 	        return { status: 'archived', conversationUrl };
 	      }
+	      if (!await hasExpectedAffinity()) {
+        return { status: 'skipped', reason: 'affinity-mismatch', conversationUrl };
+      }
 	      if (await verifyArchivedStateFromMenu()) {
 	        return { status: 'archived', conversationUrl };
 	      }
