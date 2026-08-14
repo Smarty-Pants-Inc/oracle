@@ -37,6 +37,10 @@ export interface ChatGptExportRemoteChromeAffinity {
   browserWSEndpoint: string;
 }
 
+export type ChatGptExportRemoteChromeTarget =
+  | { host: string; port: number }
+  | ChatGptExportRemoteChromeAffinity;
+
 function storedConversationUrls(metadata: SessionMetadata): Array<string | null | undefined> {
   const optionsConfig = metadata.options.browserConfig;
   const browserConfig = metadata.browser?.config;
@@ -65,9 +69,9 @@ function sessionMatchesConversation(metadata: SessionMetadata, conversationId: s
 
 function storedRemoteChromeAffinities(
   metadata: SessionMetadata,
-): ChatGptExportRemoteChromeAffinity[] {
+): ChatGptExportRemoteChromeTarget[] {
   const runtimeBrowserWSEndpoint = metadata.browser?.runtime?.chromeBrowserWSEndpoint?.trim();
-  const affinities = new Map<string, ChatGptExportRemoteChromeAffinity>();
+  const affinities = new Map<string, ChatGptExportRemoteChromeTarget>();
   for (const config of [metadata.options.browserConfig, metadata.browser?.config]) {
     const endpoint = config?.remoteChrome;
     if (!endpoint) continue;
@@ -80,7 +84,11 @@ function storedRemoteChromeAffinities(
     const configuredBrowserWSEndpoint = config?.remoteChromeBrowserWSEndpoint?.trim();
     const browserWSEndpoint = runtimeBrowserWSEndpoint ?? configuredBrowserWSEndpoint;
     if (!browserWSEndpoint) {
-      throw new Error("Stored remote Chrome browser identity is unavailable.");
+      if (configuredBrowserId || process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1") {
+        throw new Error("Stored remote Chrome browser identity is unavailable.");
+      }
+      affinities.set(`${host.toLowerCase()}:${port}\t`, { host, port });
+      continue;
     }
     const browserId = browserIdFromWebSocketEndpoint(browserWSEndpoint);
     if (configuredBrowserId && configuredBrowserId !== browserId) {
@@ -102,9 +110,9 @@ function storedRemoteChromeAffinities(
 export function resolveChatGptExportRemoteChrome(
   targetUrl: string,
   sessions: SessionMetadata[],
-): ChatGptExportRemoteChromeAffinity {
+): ChatGptExportRemoteChromeTarget {
   const conversationId = conversationIdFromChatGptUrl(targetUrl);
-  const affinities = new Map<string, ChatGptExportRemoteChromeAffinity>();
+  const affinities = new Map<string, ChatGptExportRemoteChromeTarget>();
   const resolutionHint =
     process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1"
       ? "Rerun the originating conversation through the agent wrapper to record its browser identity."
@@ -121,10 +129,8 @@ export function resolveChatGptExportRemoteChrome(
       );
     }
     for (const affinity of storedAffinities) {
-      affinities.set(
-        `${affinity.host.toLowerCase()}:${affinity.port}\t${affinity.browserId}`,
-        affinity,
-      );
+      const browserId = "browserId" in affinity ? affinity.browserId : "";
+      affinities.set(`${affinity.host.toLowerCase()}:${affinity.port}\t${browserId}`, affinity);
     }
   }
 
@@ -138,7 +144,7 @@ export function resolveChatGptExportRemoteChrome(
       `Matched ChatGPT conversation ${conversationId} has conflicting stored remote Chrome browser affinities. ${resolutionHint}`,
     );
   }
-  return affinities.values().next().value as ChatGptExportRemoteChromeAffinity;
+  return affinities.values().next().value as ChatGptExportRemoteChromeTarget;
 }
 
 export function parseRemoteChromeTarget(raw: string): { host: string; port: number } {

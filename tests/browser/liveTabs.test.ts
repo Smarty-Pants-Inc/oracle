@@ -1,16 +1,29 @@
-import { describe, expect, test } from "vitest";
+import { beforeEach, describe, expect, test, vi } from "vitest";
 import {
   buildTabInspectionExpressionForTest,
   classifyTabState,
+  connectToExistingChatGptTab,
   formatBrowserTabState,
   resolveExactChatGptTargetForTest,
   resolveChatGptTabFromSummariesForTest,
-  summaryFromTargetForTest,
-  type ChromeTarget,
   sessionMatchesTab,
+  summaryFromTargetForTest,
   type ChatGptTabSummary,
+  type ChromeTarget,
 } from "../../src/browser/liveTabs.js";
 import type { SessionMetadata } from "../../src/sessionStore.js";
+
+const remoteChromeMocks = vi.hoisted(() => ({
+  connectToRemoteChromeTarget: vi.fn(),
+  listRemoteChromeTargets: vi.fn(),
+}));
+
+vi.mock("../../src/browser/chromeLifecycle.js", () => remoteChromeMocks);
+
+beforeEach(() => {
+  remoteChromeMocks.connectToRemoteChromeTarget.mockReset();
+  remoteChromeMocks.listRemoteChromeTargets.mockReset();
+});
 
 function makeTab(overrides: Partial<ChatGptTabSummary> = {}): ChatGptTabSummary {
   return {
@@ -105,6 +118,9 @@ describe("liveTabs helpers", () => {
     expect(resolveChatGptTabFromSummariesForTest(tabs, "https://chatgpt.com/c/a").targetId).toBe(
       "target-1",
     );
+    expect(
+      resolveChatGptTabFromSummariesForTest(tabs, "https://chatgpt.com/g/g-project/c/a").targetId,
+    ).toBe("target-1");
     expect(resolveChatGptTabFromSummariesForTest(tabs, "b").targetId).toBe("target-2");
     expect(resolveChatGptTabFromSummariesForTest(tabs, "Review B").targetId).toBe("target-2");
   });
@@ -118,9 +134,108 @@ describe("liveTabs helpers", () => {
     expect(resolveExactChatGptTargetForTest(targets, "https://chatgpt.com/c/a")?.id).toBe(
       "target-1",
     );
+    expect(
+      resolveExactChatGptTargetForTest(targets, "https://chatgpt.com/g/g-project/c/a")?.id,
+    ).toBe("target-1");
     expect(resolveExactChatGptTargetForTest(targets, "current")).toBeNull();
     expect(resolveExactChatGptTargetForTest(targets, "Review B")).toBeNull();
   });
+  test.each([
+    { ref: "current", expectedTargetId: "target-2" },
+    { ref: "Review A", expectedTargetId: "target-1" },
+    { ref: "https://chatgpt.com/g/g-project/c/a", expectedTargetId: "target-1" },
+  ])(
+    "inspects and attaches $ref through the exact browser socket",
+    async ({ ref, expectedTargetId }) => {
+      const browserWSEndpoint = "ws://127.0.0.1:9222/devtools/browser/browser-a";
+      const tabInfo = {
+        "target-1": {
+          title: "Review A",
+          url: "https://chatgpt.com/c/a",
+          focused: false,
+        },
+        "target-2": {
+          title: "Review B",
+          url: "https://chatgpt.com/c/b",
+          focused: true,
+        },
+      } as const;
+      remoteChromeMocks.listRemoteChromeTargets.mockResolvedValue([
+        { targetId: "target-1", type: "page", url: tabInfo["target-1"].url },
+        { targetId: "target-2", type: "page", url: tabInfo["target-2"].url },
+      ]);
+      remoteChromeMocks.connectToRemoteChromeTarget.mockImplementation(
+        async (
+          _host: string,
+          _port: number,
+          _logger: unknown,
+          options: { browserWSEndpoint?: string; targetId?: string },
+        ) => {
+          const info = tabInfo[options.targetId as keyof typeof tabInfo];
+          let evaluationCount = 0;
+          const close = vi.fn(async () => undefined);
+          return {
+            client: {
+              Runtime: {
+                evaluate: vi.fn(async () => {
+                  evaluationCount += 1;
+                  return evaluationCount === 1 && info
+                    ? {
+                        result: {
+                          value: {
+                            ...info,
+                            currentModelLabel: "ChatGPT + Pro",
+                            stopExists: false,
+                            sendExists: true,
+                            promptReady: true,
+                            loginButtonExists: false,
+                            authenticated: true,
+                            assistantCount: 1,
+                            lastAssistantText: "Answer",
+                            assistantFollowsLatestUser: true,
+                            lastAssistantTurnIndex: 1,
+                            lastUserTurnIndex: 0,
+                            lastUserText: "Question",
+                            visibilityState: "visible",
+                          },
+                        },
+                      }
+                    : { result: { value: null } };
+                }),
+              },
+            },
+            targetId: options.targetId,
+            browserWSEndpoint: options.browserWSEndpoint,
+            close,
+          };
+        },
+      );
+
+      const result = await connectToExistingChatGptTab({
+        host: "127.0.0.1",
+        port: 9222,
+        browserWSEndpoint,
+        ref,
+      });
+
+      expect(remoteChromeMocks.listRemoteChromeTargets).toHaveBeenCalledWith({
+        host: "127.0.0.1",
+        port: 9222,
+        browserWSEndpoint,
+      });
+      expect(result.targetId).toBe(expectedTargetId);
+      expect(result.tab.title).toBe(tabInfo[expectedTargetId as keyof typeof tabInfo].title);
+      expect(
+        remoteChromeMocks.connectToRemoteChromeTarget.mock.calls.every(
+          ([, , , options]) => options.browserWSEndpoint === browserWSEndpoint,
+        ),
+      ).toBe(true);
+      expect(remoteChromeMocks.connectToRemoteChromeTarget.mock.lastCall?.[3]?.targetId).toBe(
+        expectedTargetId,
+      );
+      await result.client.close();
+    },
+  );
 
   test("builds enough summary from exact targets for export scope checks", () => {
     const summary = summaryFromTargetForTest("127.0.0.1", 9222, {

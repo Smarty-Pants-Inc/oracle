@@ -103,9 +103,13 @@ export async function resolveBrowserFollowupReference(
     remoteChromeBrowserId = runtimeBrowserId;
     remoteChromeBrowserWSEndpoint = runtimeBrowserWSEndpoint;
   }
+  const missingRemoteAffinity =
+    parentBrowserConfig.remoteChrome && (!remoteChromeBrowserId || !remoteChromeBrowserWSEndpoint);
   if (
-    parentBrowserConfig.remoteChrome &&
-    (!remoteChromeBrowserId || !remoteChromeBrowserWSEndpoint)
+    missingRemoteAffinity &&
+    (process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" ||
+      Boolean(remoteChromeBrowserId) ||
+      Boolean(remoteChromeBrowserWSEndpoint))
   ) {
     throw new Error(
       `Session ${trimmed} has no verified remote Chrome browser identity; start a fresh browser conversation through the agent wrapper.`,

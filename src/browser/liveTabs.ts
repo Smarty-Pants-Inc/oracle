@@ -306,7 +306,24 @@ export async function openChatGptTarget(
   return target.id;
 }
 
-async function connectToTarget(host: string, port: number, targetId: string) {
+async function connectToTarget(
+  host: string,
+  port: number,
+  targetId: string,
+  browserWSEndpoint?: string,
+) {
+  if (browserWSEndpoint) {
+    const connection = await connectToRemoteChromeTarget(host, port, noopLogger, {
+      browserWSEndpoint,
+      targetId,
+      closeTargetOnDispose: false,
+    });
+    Object.defineProperty(connection.client, "close", {
+      configurable: true,
+      value: connection.close,
+    });
+    return connection.client;
+  }
   const client = await CDP({ host, port, target: targetId });
   const { Runtime, DOM } = client;
   if (Runtime?.enable) {
@@ -328,7 +345,7 @@ export async function inspectChatGptTab(
     throw new Error("inspectChatGptTab requires a target with targetId.");
   }
 
-  const client = await connectToTarget(host, port, targetId);
+  const client = await connectToTarget(host, port, targetId, options.browserWSEndpoint);
   try {
     const { Runtime } = client;
     const evaluation = await Runtime.evaluate({
@@ -464,9 +481,10 @@ function resolveChatGptTabFromSummaries(
   if (exactUrl) {
     return exactUrl;
   }
-  const exactConversationId = summaries.find((tab) => tab.conversationId === trimmedRef);
-  if (exactConversationId) {
-    return exactConversationId;
+  const refConversationId = extractConversationIdFromUrl(trimmedRef) ?? trimmedRef;
+  const exactConversation = summaries.find((tab) => tab.conversationId === refConversationId);
+  if (exactConversation) {
+    return exactConversation;
   }
   const lower = trimmedRef.toLowerCase();
   const titleMatches = summaries.filter((tab) => tab.title.toLowerCase().includes(lower));
@@ -496,9 +514,15 @@ function resolveExactChatGptTarget(targets: ChromeTarget[], ref?: string): Chrom
   if (!trimmedRef || trimmedRef.toLowerCase() === "current") {
     return null;
   }
+  const refConversationId = extractConversationIdFromUrl(trimmedRef);
   return (
     targets.find((target) => extractTargetId(target) === trimmedRef) ??
     targets.find((target) => normalizeUrl(target.url ?? "") === trimmedRef) ??
+    (refConversationId
+      ? targets.find(
+          (target) => extractConversationIdFromUrl(target.url ?? "") === refConversationId,
+        )
+      : undefined) ??
     null
   );
 }
@@ -551,11 +575,12 @@ async function collectChatGptTabsFromTargets(
   host: string,
   port: number,
   targets: ChromeTarget[],
+  browserWSEndpoint?: string,
 ): Promise<ChatGptTabSummary[]> {
   const summaries: ChatGptTabSummary[] = [];
   for (const target of targets) {
     try {
-      const summary = await inspectChatGptTab({ host, port, target });
+      const summary = await inspectChatGptTab({ host, port, target, browserWSEndpoint });
       summaries.push(summary);
     } catch (error) {
       summaries.push({
@@ -610,23 +635,35 @@ export async function connectToExistingChatGptTab(
 ): Promise<{ client: Awaited<ReturnType<typeof CDP>>; targetId: string; tab: ChatGptTabSummary }> {
   const { host, port } = normalizeHostPort(options);
   if (options.browserWSEndpoint) {
-    const targets = (await listRemoteChromeTargets({
-      host,
-      port,
-      browserWSEndpoint: options.browserWSEndpoint,
-    })) as ChromeTarget[];
-    const exactTarget = resolveExactChatGptTarget(targets.filter(isChatGptTarget), options.ref);
-    const targetId = extractTargetId(exactTarget);
-    if (!exactTarget || !targetId) {
-      throw new Error("Exact browser WebSocket attachment requires a matching target id or URL.");
-    }
+    const targets = (
+      (await listRemoteChromeTargets({
+        host,
+        port,
+        browserWSEndpoint: options.browserWSEndpoint,
+      })) as ChromeTarget[]
+    ).filter(isChatGptTarget);
+    const exactTarget = resolveExactChatGptTarget(targets, options.ref);
+    const tab = exactTarget
+      ? await inspectChatGptTab({
+          host,
+          port,
+          target: exactTarget,
+          browserWSEndpoint: options.browserWSEndpoint,
+        })
+      : resolveChatGptTabFromSummaries(
+          await collectChatGptTabsFromTargets(host, port, targets, options.browserWSEndpoint),
+          options.ref,
+        );
     const connection = await connectToRemoteChromeTarget(host, port, noopLogger, {
       browserWSEndpoint: options.browserWSEndpoint,
-      targetId,
+      targetId: tab.targetId,
       closeTargetOnDispose: false,
     });
-    Object.defineProperty(connection.client, "close", { value: connection.close });
-    return { client: connection.client, targetId, tab: summaryFromTarget(host, port, exactTarget) };
+    Object.defineProperty(connection.client, "close", {
+      configurable: true,
+      value: connection.close,
+    });
+    return { client: connection.client, targetId: tab.targetId, tab };
   }
   const targets = await listChatGptTargets({ host, port });
   const exactTarget = resolveExactChatGptTarget(targets, options.ref);

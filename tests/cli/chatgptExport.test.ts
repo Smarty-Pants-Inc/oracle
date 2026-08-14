@@ -148,15 +148,36 @@ describe("ChatGPT export endpoint affinity", () => {
     ).toThrow(/stored remote Chrome endpoint is invalid/i);
   });
 
-  test("fails closed for matching sessions with only host and port", () => {
-    expect(() =>
+  test("preserves raw stored endpoints outside the wrapper", () => {
+    expect(
       resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-host-only", [
         session("host-only", {
           harvest: { conversationId: "thread-host-only" },
           config: { remoteChrome: { host: "127.0.0.1", port: 9223 } },
         }),
       ]),
-    ).toThrow(/browser identity is unavailable/i);
+    ).toEqual({ host: "127.0.0.1", port: 9223 });
+  });
+
+  test("fails closed for wrapper-routed sessions with only host and port", () => {
+    const previous = process.env.ORACLE_WRAPPER_REMOTE_ONLY;
+    process.env.ORACLE_WRAPPER_REMOTE_ONLY = "1";
+    try {
+      expect(() =>
+        resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-host-only", [
+          session("host-only", {
+            harvest: { conversationId: "thread-host-only" },
+            config: { remoteChrome: { host: "127.0.0.1", port: 9223 } },
+          }),
+        ]),
+      ).toThrow(/browser identity is unavailable/i);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.ORACLE_WRAPPER_REMOTE_ONLY;
+      } else {
+        process.env.ORACLE_WRAPPER_REMOTE_ONLY = previous;
+      }
+    }
   });
 
   test("fails closed when configured and runtime browser identities conflict", () => {

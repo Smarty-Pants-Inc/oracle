@@ -125,7 +125,7 @@ describe("browser follow-up resolution", () => {
     });
   });
 
-  test("fails closed for legacy remote sessions with only host and port", async () => {
+  test("preserves raw host and port follow-ups outside the wrapper", async () => {
     const metadata: SessionMetadata = {
       ...baseMetadata,
       mode: "browser",
@@ -139,7 +139,36 @@ describe("browser follow-up resolution", () => {
       resolveBrowserFollowupReference("session-1", {
         readSession: vi.fn(async () => metadata),
       }),
-    ).rejects.toThrow(/no verified remote Chrome browser identity/i);
+    ).resolves.toMatchObject({
+      browserConfig: { remoteChrome: { host: "127.0.0.1", port: 9223 } },
+    });
+  });
+
+  test("fails closed for wrapper-routed sessions with only host and port", async () => {
+    const previous = process.env.ORACLE_WRAPPER_REMOTE_ONLY;
+    process.env.ORACLE_WRAPPER_REMOTE_ONLY = "1";
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      browser: {
+        config: { remoteChrome: { host: "127.0.0.1", port: 9223 } },
+        runtime: { conversationId: "host-only-thread" },
+      },
+    };
+
+    try {
+      await expect(
+        resolveBrowserFollowupReference("session-1", {
+          readSession: vi.fn(async () => metadata),
+        }),
+      ).rejects.toThrow(/no verified remote Chrome browser identity/i);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.ORACLE_WRAPPER_REMOTE_ONLY;
+      } else {
+        process.env.ORACLE_WRAPPER_REMOTE_ONLY = previous;
+      }
+    }
   });
 
   test("fails closed when configured and runtime browser identities conflict", async () => {
