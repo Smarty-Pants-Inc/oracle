@@ -43,6 +43,40 @@ describe("background-only browser policy", () => {
   });
 });
 
+describe("remote browser identity", () => {
+  test("rejects a browser swap before actual attachment", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          webSocketDebuggerUrl: "ws://127.0.0.1:9223/devtools/browser/browser-b",
+        }),
+      }),
+    );
+    try {
+      await expect(
+        runBrowserMode({
+          prompt: "must not send",
+          config: {
+            remoteChrome: { host: "127.0.0.1", port: 9223 },
+            remoteChromeBrowserId: "browser-a",
+            remoteChromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+          },
+        }),
+      ).rejects.toMatchObject({
+        details: {
+          stage: "remote-browser-identity",
+          expectedBrowserId: "browser-a",
+          observedBrowserId: "browser-b",
+        },
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 describe("shouldPreserveBrowserOnErrorForTest", () => {
   test("preserves the browser for headful cloudflare challenge errors", () => {
     const error = new BrowserAutomationError("Cloudflare challenge detected.", {

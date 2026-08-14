@@ -3,6 +3,7 @@ import { CHATGPT_URL } from "../browser/constants.js";
 import { buildConversationUrl } from "../browser/reattachHelpers.js";
 import { resolveRecoveryUrl } from "../browser/recoverConversation.js";
 import { isRecoverableChatGptConversationUrl } from "../browser/reattachability.js";
+import { browserIdFromWebSocketEndpoint } from "../browser/profileState.js";
 import { DEFAULT_MODEL } from "../oracle/config.js";
 import type { ModelName } from "../oracle/types.js";
 
@@ -80,6 +81,36 @@ export async function resolveBrowserFollowupReference(
   if (!parentBrowserConfig) {
     throw new Error(`Session ${trimmed} is missing its stored browser configuration.`);
   }
+  const configuredBrowserId = parentBrowserConfig.remoteChromeBrowserId?.trim();
+  const configuredBrowserWSEndpoint = parentBrowserConfig.remoteChromeBrowserWSEndpoint?.trim();
+  const runtimeBrowserWSEndpoint = metadata.browser?.runtime?.chromeBrowserWSEndpoint?.trim();
+  let remoteChromeBrowserId = configuredBrowserId;
+  let remoteChromeBrowserWSEndpoint = configuredBrowserWSEndpoint;
+  if (configuredBrowserWSEndpoint) {
+    const configuredWebSocketBrowserId = browserIdFromWebSocketEndpoint(
+      configuredBrowserWSEndpoint,
+    );
+    if (configuredBrowserId && configuredWebSocketBrowserId !== configuredBrowserId) {
+      throw new Error(`Session ${trimmed} has conflicting stored browser identity metadata.`);
+    }
+    remoteChromeBrowserId ??= configuredWebSocketBrowserId;
+  }
+  if (runtimeBrowserWSEndpoint) {
+    const runtimeBrowserId = browserIdFromWebSocketEndpoint(runtimeBrowserWSEndpoint);
+    if (remoteChromeBrowserId && runtimeBrowserId !== remoteChromeBrowserId) {
+      throw new Error(`Session ${trimmed} has conflicting stored browser identity metadata.`);
+    }
+    remoteChromeBrowserId = runtimeBrowserId;
+    remoteChromeBrowserWSEndpoint = runtimeBrowserWSEndpoint;
+  }
+  if (
+    parentBrowserConfig.remoteChrome &&
+    (!remoteChromeBrowserId || !remoteChromeBrowserWSEndpoint)
+  ) {
+    throw new Error(
+      `Session ${trimmed} has no verified remote Chrome browser identity; start a fresh browser conversation through the agent wrapper.`,
+    );
+  }
   const storedModel = metadata.options?.model ?? metadata.model;
   const model =
     typeof storedModel === "string" && storedModel.startsWith("gpt-")
@@ -91,6 +122,9 @@ export async function resolveBrowserFollowupReference(
     model,
     browserConfig: {
       ...parentBrowserConfig,
+      ...(remoteChromeBrowserId && remoteChromeBrowserWSEndpoint
+        ? { remoteChromeBrowserId, remoteChromeBrowserWSEndpoint }
+        : {}),
       browserTabRef: null,
       resumeConversationUrl,
       researchMode: "off",

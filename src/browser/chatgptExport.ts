@@ -12,6 +12,10 @@ import {
   openChatGptTarget,
 } from "./liveTabs.js";
 import { delay } from "./utils.js";
+import {
+  browserIdFromWebSocketEndpoint,
+  resolveRemoteChromeBrowserIdentity,
+} from "./profileState.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -53,6 +57,8 @@ export interface ChatGptConversationExportOptions {
   tabRef?: string;
   host?: string;
   port?: number;
+  browserId?: string;
+  browserWSEndpoint?: string;
   timeoutMs?: number;
   chunkSize?: number;
   recoverArchived?: boolean;
@@ -359,11 +365,13 @@ async function recoverArchivedConversation({
   targetUrl,
   host,
   port,
+  browserWSEndpoint,
   timeoutMs,
 }: {
   targetUrl: string;
   host: string;
   port: number;
+  browserWSEndpoint?: string;
   timeoutMs: number;
 }): Promise<{
   client: Awaited<ReturnType<typeof connectToExistingChatGptTab>>["client"];
@@ -374,8 +382,13 @@ async function recoverArchivedConversation({
   const conversationId = conversationIdFromChatGptUrl(targetUrl);
   const settingsUrl = archivedSettingsUrlFromConversationUrl(targetUrl);
   const projectUrl = settingsUrl.split("#", 1)[0] as string;
-  const targetId = await openChatGptTarget({ host, port, url: projectUrl });
-  const { client } = await connectToExistingChatGptTab({ host, port, ref: targetId });
+  const targetId = await openChatGptTarget({ host, port, browserWSEndpoint, url: projectUrl });
+  const { client } = await connectToExistingChatGptTab({
+    host,
+    port,
+    browserWSEndpoint,
+    ref: targetId,
+  });
   try {
     const { Page, Runtime } = client;
     await Page.enable();
@@ -1052,6 +1065,21 @@ export async function captureApprovedChatGptConversationBackend(
   const host = options.host ?? DEFAULT_REMOTE_CHROME_HOST;
   const port = options.port ?? DEFAULT_REMOTE_CHROME_PORT;
   const timeoutMs = options.timeoutMs ?? 45_000;
+  const expectedBrowserId = options.browserId?.trim();
+  let browserWSEndpoint = options.browserWSEndpoint?.trim();
+  if (expectedBrowserId || browserWSEndpoint) {
+    if (!expectedBrowserId || !browserWSEndpoint) {
+      throw new Error("ChatGPT export browser affinity requires both browser id and WebSocket.");
+    }
+    if (browserIdFromWebSocketEndpoint(browserWSEndpoint) !== expectedBrowserId) {
+      throw new Error("ChatGPT export browser id does not match its WebSocket.");
+    }
+    const liveIdentity = await resolveRemoteChromeBrowserIdentity({ host, port });
+    if (liveIdentity.browserId !== expectedBrowserId) {
+      throw new Error("Remote Chrome browser identity changed before ChatGPT export.");
+    }
+    browserWSEndpoint = liveIdentity.browserWSEndpoint;
+  }
   const chunkSize = options.chunkSize ?? 250_000;
   const tabRef = options.tabRef ?? options.targetUrl;
   const outDir = path.resolve(options.outDir);
@@ -1063,7 +1091,12 @@ export async function captureApprovedChatGptConversationBackend(
     recovery: ChatGptArchiveRecoveryResult;
   };
   try {
-    const connected = await connectToExistingChatGptTab({ host, port, ref: tabRef });
+    const connected = await connectToExistingChatGptTab({
+      host,
+      port,
+      browserWSEndpoint,
+      ref: tabRef,
+    });
     if (!isSameConversationUrl(connected.tab.url, conversationId)) {
       await connected.client.close().catch(() => undefined);
       throw new Error(
@@ -1083,6 +1116,7 @@ export async function captureApprovedChatGptConversationBackend(
       targetUrl: options.targetUrl,
       host,
       port,
+      browserWSEndpoint,
       timeoutMs,
     });
     resolved = {

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -8,6 +8,51 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as profileState from "../../src/browser/profileState.js";
 
 describe("profileState", () => {
+  test("resolves and validates the exact remote browser identity", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        webSocketDebuggerUrl: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await expect(
+        profileState.resolveRemoteChromeBrowserIdentity({
+          host: "127.0.0.1",
+          port: 9223,
+          attempts: 1,
+        }),
+      ).resolves.toEqual({
+        browserId: "browser-a",
+        browserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+      });
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://127.0.0.1:9223/json/version",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+      expect(() =>
+        profileState.browserIdFromWebSocketEndpoint("ws://127.0.0.1:9223/page/a"),
+      ).toThrow(/invalid browser WebSocket URL/i);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  test("rejects malformed remote browser identity responses", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, json: async () => ({ Browser: "Chrome" }) }),
+    );
+    try {
+      await expect(
+        profileState.resolveRemoteChromeBrowserIdentity({ port: 9223, attempts: 1 }),
+      ).rejects.toThrow(/missing webSocketDebuggerUrl/i);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   test("writes DevToolsActivePort to both root and Default", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-"));
     try {

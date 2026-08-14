@@ -71,6 +71,8 @@ import {
   readChromePid,
   readDevToolsPort,
   shouldCleanupManualLoginProfileState,
+  browserIdFromWebSocketEndpoint,
+  resolveRemoteChromeBrowserIdentity,
   terminateRecordedChromeForProfile,
   verifyDevToolsReachable,
   writeChromePid,
@@ -3058,6 +3060,42 @@ async function runRemoteBrowserMode(
     );
   }
   const { host, port } = remoteChromeConfig;
+  const expectedBrowserId = config.remoteChromeBrowserId?.trim();
+  let browserWSEndpoint = config.remoteChromeBrowserWSEndpoint ?? undefined;
+  if (expectedBrowserId) {
+    if (!browserWSEndpoint) {
+      throw new BrowserAutomationError("Remote Chrome browser identity is missing its WebSocket.", {
+        stage: "remote-browser-identity",
+      });
+    }
+    if (browserIdFromWebSocketEndpoint(browserWSEndpoint) !== expectedBrowserId) {
+      throw new BrowserAutomationError(
+        "Remote Chrome browser identity does not match its WebSocket.",
+        {
+          stage: "remote-browser-identity",
+        },
+      );
+    }
+    const liveIdentity = await resolveRemoteChromeBrowserIdentity({ host, port });
+    if (liveIdentity.browserId !== expectedBrowserId) {
+      throw new BrowserAutomationError(
+        "Remote Chrome browser identity changed before attachment.",
+        {
+          stage: "remote-browser-identity",
+          expectedBrowserId,
+          observedBrowserId: liveIdentity.browserId,
+        },
+      );
+    }
+    browserWSEndpoint = liveIdentity.browserWSEndpoint;
+  } else if (process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1") {
+    throw new BrowserAutomationError(
+      "The agent wrapper requires a verified remote Chrome browser identity.",
+      {
+        stage: "remote-browser-identity",
+      },
+    );
+  }
   logger(`Connecting to remote Chrome at ${host}:${port}`);
 
   let client: ChromeClient | null = null;
@@ -3117,7 +3155,6 @@ async function runRemoteBrowserMode(
   let stopThinkingMonitor: (() => void) | null = null;
   let removeDialogHandler: (() => void) | null = null;
   let connection: Awaited<ReturnType<typeof connectToRemoteChrome>> | null = null;
-  const browserWSEndpoint = config.remoteChromeBrowserWSEndpoint ?? undefined;
   const chromeProfileRoot = config.remoteChromeProfileRoot ?? undefined;
   const followUpPrompts = normalizeBrowserFollowUpPrompts(options.followUpPrompts);
 
@@ -3141,6 +3178,7 @@ async function runRemoteBrowserMode(
         host,
         port,
         ref: config.browserTabRef,
+        browserWSEndpoint,
       });
       client = attached.client;
       remoteTargetId = attached.targetId ?? null;

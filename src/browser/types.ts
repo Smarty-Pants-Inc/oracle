@@ -103,6 +103,7 @@ export interface BrowserAutomationConfig {
   debug?: boolean;
   allowCookieErrors?: boolean;
   remoteChrome?: { host: string; port: number } | null;
+  remoteChromeBrowserId?: string | null;
   remoteChromeBrowserWSEndpoint?: string | null;
   remoteChromeProfileRoot?: string | null;
   manualLogin?: boolean;
@@ -199,6 +200,7 @@ export type ResolvedBrowserConfig = Required<
     | "chromeCookiePath"
     | "desiredModel"
     | "remoteChrome"
+    | "remoteChromeBrowserId"
     | "remoteChromeBrowserWSEndpoint"
     | "remoteChromeProfileRoot"
     | "thinkingTime"
@@ -219,6 +221,7 @@ export type ResolvedBrowserConfig = Required<
   debugPort?: number | null;
   inlineCookiesSource?: string | null;
   remoteChrome?: { host: string; port: number } | null;
+  remoteChromeBrowserId?: string | null;
   remoteChromeBrowserWSEndpoint?: string | null;
   remoteChromeProfileRoot?: string | null;
   manualLogin?: boolean;

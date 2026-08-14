@@ -1,9 +1,10 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import {
   backendToPayload,
   archivedSettingsUrlFromConversationUrl,
   buildBackendConversationUrl,
   buildArchivedConversationRecoveryHookForTest,
+  captureApprovedChatGptConversationBackend,
   buildScopedBackendCaptureHook,
   contentToText,
   conversationIdFromChatGptUrl,
@@ -29,6 +30,32 @@ describe("ChatGPT conversation export helpers", () => {
     expect(() => conversationIdFromChatGptUrl("https://chatgpt.com/g/example/project")).toThrow(
       /specific/i,
     );
+  });
+
+  test("rejects a browser swap before exact export attachment", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          webSocketDebuggerUrl: "ws://127.0.0.1:9223/devtools/browser/browser-b",
+        }),
+      }),
+    );
+    try {
+      await expect(
+        captureApprovedChatGptConversationBackend({
+          targetUrl: "https://chatgpt.com/c/conv-1",
+          outDir: "/tmp/oracle-export-identity-test",
+          host: "127.0.0.1",
+          port: 9223,
+          browserId: "browser-a",
+          browserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+        }),
+      ).rejects.toThrow(/identity changed before ChatGPT export/i);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   test("derives exact backend conversation URL and scope check", () => {

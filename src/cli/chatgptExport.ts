@@ -11,6 +11,10 @@ import {
 import { DEFAULT_REMOTE_CHROME_HOST, DEFAULT_REMOTE_CHROME_PORT } from "../browser/liveTabs.js";
 import { extractStableConversationIdFromUrl } from "../browser/conversationUrl.js";
 import { sessionStore, type SessionMetadata } from "../sessionStore.js";
+import {
+  browserIdFromWebSocketEndpoint,
+  resolveRemoteChromeBrowserIdentity,
+} from "../browser/profileState.js";
 
 export interface ChatGptExportCliOptions {
   targetUrl?: string;
@@ -26,9 +30,11 @@ export interface ChatGptExportCliOptions {
   json?: boolean;
 }
 
-export interface ChatGptExportRemoteChromeEndpoint {
+export interface ChatGptExportRemoteChromeAffinity {
   host: string;
   port: number;
+  browserId: string;
+  browserWSEndpoint: string;
 }
 
 function storedConversationUrls(metadata: SessionMetadata): Array<string | null | undefined> {
@@ -57,47 +63,68 @@ function sessionMatchesConversation(metadata: SessionMetadata, conversationId: s
   );
 }
 
-function storedRemoteChromeEndpoints(
+function storedRemoteChromeAffinities(
   metadata: SessionMetadata,
-): ChatGptExportRemoteChromeEndpoint[] {
-  return [metadata.options.browserConfig?.remoteChrome, metadata.browser?.config?.remoteChrome]
-    .filter((endpoint): endpoint is ChatGptExportRemoteChromeEndpoint => Boolean(endpoint))
-    .map((endpoint) => {
-      const host = typeof endpoint.host === "string" ? endpoint.host.trim() : "";
-      const port = endpoint.port;
-      if (!host || !Number.isInteger(port) || port <= 0 || port > 65_535) {
-        throw new Error("Stored remote Chrome endpoint is invalid.");
-      }
-      return { host, port };
-    });
+): ChatGptExportRemoteChromeAffinity[] {
+  const runtimeBrowserWSEndpoint = metadata.browser?.runtime?.chromeBrowserWSEndpoint?.trim();
+  const affinities = new Map<string, ChatGptExportRemoteChromeAffinity>();
+  for (const config of [metadata.options.browserConfig, metadata.browser?.config]) {
+    const endpoint = config?.remoteChrome;
+    if (!endpoint) continue;
+    const host = typeof endpoint.host === "string" ? endpoint.host.trim() : "";
+    const port = endpoint.port;
+    if (!host || !Number.isInteger(port) || port <= 0 || port > 65_535) {
+      throw new Error("Stored remote Chrome endpoint is invalid.");
+    }
+    const configuredBrowserId = config?.remoteChromeBrowserId?.trim();
+    const configuredBrowserWSEndpoint = config?.remoteChromeBrowserWSEndpoint?.trim();
+    const browserWSEndpoint = runtimeBrowserWSEndpoint ?? configuredBrowserWSEndpoint;
+    if (!browserWSEndpoint) {
+      throw new Error("Stored remote Chrome browser identity is unavailable.");
+    }
+    const browserId = browserIdFromWebSocketEndpoint(browserWSEndpoint);
+    if (configuredBrowserId && configuredBrowserId !== browserId) {
+      throw new Error("Stored remote Chrome browser identity is conflicting.");
+    }
+    if (
+      configuredBrowserWSEndpoint &&
+      browserIdFromWebSocketEndpoint(configuredBrowserWSEndpoint) !== browserId
+    ) {
+      throw new Error("Stored remote Chrome browser identity is conflicting.");
+    }
+    const affinity = { host, port, browserId, browserWSEndpoint };
+    affinities.set(`${host.toLowerCase()}:${port}\t${browserId}`, affinity);
+  }
+  return [...affinities.values()];
 }
 
-/** Resolves a target conversation to the single browser endpoint recorded for it. */
+/** Resolves a target conversation to its single recorded browser affinity. */
 export function resolveChatGptExportRemoteChrome(
   targetUrl: string,
   sessions: SessionMetadata[],
-): ChatGptExportRemoteChromeEndpoint {
+): ChatGptExportRemoteChromeAffinity {
   const conversationId = conversationIdFromChatGptUrl(targetUrl);
-  const endpoints = new Map<string, ChatGptExportRemoteChromeEndpoint>();
+  const affinities = new Map<string, ChatGptExportRemoteChromeAffinity>();
   const resolutionHint =
     process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1"
-      ? "Rerun the originating conversation through the agent wrapper to record its endpoint."
+      ? "Rerun the originating conversation through the agent wrapper to record its browser identity."
       : "Pass --remote-chrome explicitly.";
   let matchedSessionCount = 0;
 
   for (const metadata of sessions) {
-    if (!sessionMatchesConversation(metadata, conversationId)) {
-      continue;
-    }
+    if (!sessionMatchesConversation(metadata, conversationId)) continue;
     matchedSessionCount += 1;
-    const storedEndpoints = storedRemoteChromeEndpoints(metadata);
-    if (storedEndpoints.length === 0) {
+    const storedAffinities = storedRemoteChromeAffinities(metadata);
+    if (storedAffinities.length === 0) {
       throw new Error(
         `Matched ChatGPT conversation ${conversationId} has no stored remote Chrome endpoint. ${resolutionHint}`,
       );
     }
-    for (const endpoint of storedEndpoints) {
-      endpoints.set(`${endpoint.host.toLowerCase()}:${endpoint.port}`, endpoint);
+    for (const affinity of storedAffinities) {
+      affinities.set(
+        `${affinity.host.toLowerCase()}:${affinity.port}\t${affinity.browserId}`,
+        affinity,
+      );
     }
   }
 
@@ -106,12 +133,12 @@ export function resolveChatGptExportRemoteChrome(
       `No stored browser session matches ChatGPT conversation ${conversationId}. ${resolutionHint}`,
     );
   }
-  if (endpoints.size !== 1) {
+  if (affinities.size !== 1) {
     throw new Error(
-      `Matched ChatGPT conversation ${conversationId} has conflicting stored remote Chrome endpoints. ${resolutionHint}`,
+      `Matched ChatGPT conversation ${conversationId} has conflicting stored remote Chrome browser affinities. ${resolutionHint}`,
     );
   }
-  return endpoints.values().next().value as ChatGptExportRemoteChromeEndpoint;
+  return affinities.values().next().value as ChatGptExportRemoteChromeAffinity;
 }
 
 export function parseRemoteChromeTarget(raw: string): { host: string; port: number } {
@@ -207,11 +234,15 @@ export async function handleChatGptExportCommand(options: ChatGptExportCliOption
   if (options.obuSessionId && !options.obuTabId) {
     throw new Error("--obu-session-id requires --obu-tab-id.");
   }
-  const { host, port } =
-    explicitRemoteChrome ??
-    (options.obuTabId
-      ? { host: DEFAULT_REMOTE_CHROME_HOST, port: DEFAULT_REMOTE_CHROME_PORT }
-      : resolveChatGptExportRemoteChrome(targetUrl, await sessionStore.listSessions()));
+  const remoteChromeAffinity = options.obuTabId
+    ? { host: DEFAULT_REMOTE_CHROME_HOST, port: DEFAULT_REMOTE_CHROME_PORT }
+    : explicitRemoteChrome
+      ? {
+          ...explicitRemoteChrome,
+          ...(await resolveRemoteChromeBrowserIdentity(explicitRemoteChrome)),
+        }
+      : resolveChatGptExportRemoteChrome(targetUrl, await sessionStore.listSessions());
+  const { host, port } = remoteChromeAffinity;
   const outDir = path.resolve(expandPath(options.out ?? defaultOutputDir(targetUrl)));
   const chunkSize = parsePositiveInteger(options.chunkSize, "--chunk-size");
   const result = options.obuTabId
@@ -229,6 +260,11 @@ export async function handleChatGptExportCommand(options: ChatGptExportCliOption
         tabRef: options.browserTab ?? targetUrl,
         host,
         port,
+        browserId: "browserId" in remoteChromeAffinity ? remoteChromeAffinity.browserId : undefined,
+        browserWSEndpoint:
+          "browserWSEndpoint" in remoteChromeAffinity
+            ? remoteChromeAffinity.browserWSEndpoint
+            : undefined,
         timeoutMs,
         chunkSize,
         recoverArchived: options.recoverArchived,

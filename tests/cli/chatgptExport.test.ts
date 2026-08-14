@@ -21,17 +21,31 @@ function session(
 }
 
 describe("ChatGPT export endpoint affinity", () => {
+  const ws = (browserId: string, host = "127.0.0.1", port = 9223) =>
+    `ws://${host}:${port}/devtools/browser/${browserId}`;
+  const config = (host: string, port: number, browserId: string) => ({
+    remoteChrome: { host, port },
+    remoteChromeBrowserId: browserId,
+    remoteChromeBrowserWSEndpoint: ws(browserId, host, port),
+  });
+  const affinity = (host: string, port: number, browserId: string) => ({
+    host,
+    port,
+    browserId,
+    browserWSEndpoint: ws(browserId, host, port),
+  });
+
   test("matches a root target URL to project conversation evidence", () => {
     expect(
       resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-1", [
         session("project", {
           config: {
             url: "https://chatgpt.com/g/g-project/c/thread-1",
-            remoteChrome: { host: "127.0.0.1", port: 9223 },
+            ...config("127.0.0.1", 9223, "browser-a"),
           },
         }),
       ]),
-    ).toEqual({ host: "127.0.0.1", port: 9223 });
+    ).toEqual(affinity("127.0.0.1", 9223, "browser-a"));
   });
 
   test("matches stored conversation ids when no conversation URL is available", () => {
@@ -39,27 +53,27 @@ describe("ChatGPT export endpoint affinity", () => {
       resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-id-only", [
         session("stored-id", {
           runtime: { conversationId: "thread-id-only" },
-          config: { remoteChrome: { host: "127.0.0.1", port: 9228 } },
+          config: config("127.0.0.1", 9228, "browser-a"),
         }),
       ]),
-    ).toEqual({ host: "127.0.0.1", port: 9228 });
+    ).toEqual(affinity("127.0.0.1", 9228, "browser-a"));
   });
 
-  test("deduplicates a parent and follow-up stored on the same endpoint", () => {
-    const endpoint = { host: "127.0.0.1", port: 9224 };
+  test("deduplicates a parent and follow-up stored on the same browser affinity", () => {
+    const browserConfig = config("127.0.0.1", 9224, "browser-a");
     expect(
       resolveChatGptExportRemoteChrome("https://chatgpt.com/g/g-project/c/thread-2", [
         session("parent", {
           harvest: { url: "https://chatgpt.com/c/thread-2" },
-          config: { remoteChrome: endpoint },
+          config: browserConfig,
         }),
         session(
           "follow-up",
-          { config: { remoteChrome: endpoint } },
+          { config: browserConfig },
           { browserResumeConversationUrl: "https://chatgpt.com/c/thread-2" },
         ),
       ]),
-    ).toEqual(endpoint);
+    ).toEqual(affinity("127.0.0.1", 9224, "browser-a"));
   });
 
   test("deduplicates equivalent endpoint hostnames case-insensitively", () => {
@@ -67,14 +81,32 @@ describe("ChatGPT export endpoint affinity", () => {
       resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-host-case", [
         session("uppercase", {
           harvest: { conversationId: "thread-host-case" },
-          config: { remoteChrome: { host: "Chrome.EXAMPLE", port: 9223 } },
+          config: config("Chrome.EXAMPLE", 9223, "browser-a"),
         }),
         session("lowercase", {
           harvest: { conversationId: "thread-host-case" },
-          config: { remoteChrome: { host: "chrome.example", port: 9223 } },
+          config: config("chrome.example", 9223, "browser-a"),
         }),
       ]),
-    ).toEqual({ host: "chrome.example", port: 9223 });
+    ).toEqual(affinity("chrome.example", 9223, "browser-a"));
+  });
+
+  test("prefers the runtime browser WebSocket and derives legacy browser ids", () => {
+    const browserWSEndpoint = ws("browser-a", "127.0.0.1", 9229);
+    expect(
+      resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-runtime", [
+        session("runtime", {
+          harvest: { conversationId: "thread-runtime" },
+          config: { remoteChrome: { host: "127.0.0.1", port: 9229 } },
+          runtime: { chromeBrowserWSEndpoint: browserWSEndpoint },
+        }),
+      ]),
+    ).toEqual({
+      host: "127.0.0.1",
+      port: 9229,
+      browserId: "browser-a",
+      browserWSEndpoint,
+    });
   });
 
   test("fails closed when no session matches the target conversation", () => {
@@ -83,7 +115,7 @@ describe("ChatGPT export endpoint affinity", () => {
         session("other", {
           config: {
             url: "https://chatgpt.com/c/other-thread",
-            remoteChrome: { host: "127.0.0.1", port: 9225 },
+            ...config("127.0.0.1", 9225, "browser-a"),
           },
         }),
       ]),
@@ -114,6 +146,29 @@ describe("ChatGPT export endpoint affinity", () => {
         }),
       ]),
     ).toThrow(/stored remote Chrome endpoint is invalid/i);
+  });
+
+  test("fails closed for matching sessions with only host and port", () => {
+    expect(() =>
+      resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-host-only", [
+        session("host-only", {
+          harvest: { conversationId: "thread-host-only" },
+          config: { remoteChrome: { host: "127.0.0.1", port: 9223 } },
+        }),
+      ]),
+    ).toThrow(/browser identity is unavailable/i);
+  });
+
+  test("fails closed when configured and runtime browser identities conflict", () => {
+    expect(() =>
+      resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-identity-conflict", [
+        session("identity-conflict", {
+          harvest: { conversationId: "thread-identity-conflict" },
+          config: config("127.0.0.1", 9223, "browser-a"),
+          runtime: { chromeBrowserWSEndpoint: ws("browser-b") },
+        }),
+      ]),
+    ).toThrow(/browser identity is conflicting/i);
   });
 
   test.each(["", "127.0.0.1:9223junk", "127.0.0.1:9223.5"])(
@@ -148,20 +203,36 @@ describe("ChatGPT export endpoint affinity", () => {
       }
     }
   });
-  test("rejects conflicting endpoints across matching sessions", () => {
+
+  test("rejects conflicting browser affinities across matching sessions", () => {
     expect(() =>
       resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-5", [
         session("parent", {
           runtime: { tabUrl: "https://chatgpt.com/c/thread-5" },
-          config: { remoteChrome: { host: "127.0.0.1", port: 9226 } },
+          config: config("127.0.0.1", 9226, "browser-a"),
         }),
         session("follow-up", undefined, {
           browserConfig: {
             resumeConversationUrl: "https://chatgpt.com/c/thread-5",
-            remoteChrome: { host: "127.0.0.1", port: 9227 },
+            ...config("127.0.0.1", 9227, "browser-b"),
           },
         }),
       ]),
-    ).toThrow(/conflicting stored remote Chrome endpoints/i);
+    ).toThrow(/conflicting stored remote Chrome browser affinities/i);
+  });
+
+  test("rejects a browser restart on the same host and port", () => {
+    expect(() =>
+      resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-restarted", [
+        session("before-restart", {
+          harvest: { conversationId: "thread-restarted" },
+          config: config("127.0.0.1", 9223, "browser-a"),
+        }),
+        session("after-restart", {
+          harvest: { conversationId: "thread-restarted" },
+          config: config("127.0.0.1", 9223, "browser-b"),
+        }),
+      ]),
+    ).toThrow(/conflicting stored remote Chrome browser affinities/i);
   });
 });

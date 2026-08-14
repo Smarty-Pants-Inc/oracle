@@ -61,6 +61,7 @@ export const DEFAULT_BROWSER_CONFIG: ResolvedBrowserConfig = {
   debug: false,
   allowCookieErrors: false,
   remoteChrome: null,
+  remoteChromeBrowserId: null,
   remoteChromeBrowserWSEndpoint: null,
   remoteChromeProfileRoot: null,
   manualLogin: false,
@@ -152,6 +153,8 @@ export function resolveBrowserConfig(
     debug: config?.debug ?? DEFAULT_BROWSER_CONFIG.debug,
     allowCookieErrors:
       config?.allowCookieErrors ?? envAllowCookieErrors ?? DEFAULT_BROWSER_CONFIG.allowCookieErrors,
+    remoteChromeBrowserId:
+      config?.remoteChromeBrowserId ?? DEFAULT_BROWSER_CONFIG.remoteChromeBrowserId,
     remoteChromeBrowserWSEndpoint:
       config?.remoteChromeBrowserWSEndpoint ?? DEFAULT_BROWSER_CONFIG.remoteChromeBrowserWSEndpoint,
     remoteChromeProfileRoot:

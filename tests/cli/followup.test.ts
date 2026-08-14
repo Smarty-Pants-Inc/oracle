@@ -72,6 +72,100 @@ describe("browser follow-up resolution", () => {
     });
   });
 
+  test("preserves the originating remote browser affinity", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      browser: {
+        config: {
+          remoteChrome: { host: "127.0.0.1", port: 9223 },
+          remoteChromeBrowserId: "browser-a",
+          remoteChromeBrowserWSEndpoint: browserWSEndpoint,
+        },
+        runtime: {
+          conversationId: "remote-thread",
+          chromeBrowserWSEndpoint: browserWSEndpoint,
+        },
+      },
+    };
+
+    await expect(
+      resolveBrowserFollowupReference("session-1", {
+        readSession: vi.fn(async () => metadata),
+      }),
+    ).resolves.toMatchObject({
+      browserConfig: {
+        remoteChromeBrowserId: "browser-a",
+        remoteChromeBrowserWSEndpoint: browserWSEndpoint,
+      },
+    });
+  });
+
+  test("derives legacy remote browser affinity from the exact runtime WebSocket", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      browser: {
+        config: { remoteChrome: { host: "127.0.0.1", port: 9223 } },
+        runtime: { conversationId: "legacy-thread", chromeBrowserWSEndpoint: browserWSEndpoint },
+      },
+    };
+
+    await expect(
+      resolveBrowserFollowupReference("session-1", {
+        readSession: vi.fn(async () => metadata),
+      }),
+    ).resolves.toMatchObject({
+      browserConfig: {
+        remoteChromeBrowserId: "browser-a",
+        remoteChromeBrowserWSEndpoint: browserWSEndpoint,
+      },
+    });
+  });
+
+  test("fails closed for legacy remote sessions with only host and port", async () => {
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      browser: {
+        config: { remoteChrome: { host: "127.0.0.1", port: 9223 } },
+        runtime: { conversationId: "host-only-thread" },
+      },
+    };
+
+    await expect(
+      resolveBrowserFollowupReference("session-1", {
+        readSession: vi.fn(async () => metadata),
+      }),
+    ).rejects.toThrow(/no verified remote Chrome browser identity/i);
+  });
+
+  test("fails closed when configured and runtime browser identities conflict", async () => {
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      browser: {
+        config: {
+          remoteChrome: { host: "127.0.0.1", port: 9223 },
+          remoteChromeBrowserId: "browser-a",
+          remoteChromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+        },
+        runtime: {
+          conversationId: "conflicting-thread",
+          chromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-b",
+        },
+      },
+    };
+
+    await expect(
+      resolveBrowserFollowupReference("session-1", {
+        readSession: vi.fn(async () => metadata),
+      }),
+    ).rejects.toThrow(/conflicting stored browser identity metadata/i);
+  });
+
   test("leaves stored API sessions on the existing API follow-up path", async () => {
     const metadata: SessionMetadata = {
       ...baseMetadata,

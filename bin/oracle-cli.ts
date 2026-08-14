@@ -168,6 +168,8 @@ interface CliOptions extends OptionValues {
   browserBundleFiles?: boolean;
   browserBundleFormat?: "auto" | "text" | "zip";
   remoteChrome?: string;
+  remoteChromeBrowserId?: string;
+  remoteChromeBrowserWs?: string;
   browserPort?: number;
   browserDebugPort?: number;
   remoteHost?: string;
@@ -860,6 +862,18 @@ program
       "--remote-chrome <host:port>",
       "Connect to a dedicated background Chrome DevTools Protocol endpoint.",
     ),
+  )
+  .addOption(
+    new Option(
+      "--remote-chrome-browser-id <id>",
+      "Expected remote Chrome browser identity supplied by the agent wrapper.",
+    ).hideHelp(),
+  )
+  .addOption(
+    new Option(
+      "--remote-chrome-browser-ws <url>",
+      "Exact remote Chrome browser WebSocket supplied by the agent wrapper.",
+    ).hideHelp(),
   )
   .option(
     "--browser-tab <ref>",

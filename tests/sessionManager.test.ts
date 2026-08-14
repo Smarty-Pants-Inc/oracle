@@ -113,6 +113,29 @@ describe("session lifecycle", () => {
     }
   });
 
+  test("persists remote browser affinity for detached workers", async () => {
+    const browserConfig = {
+      remoteChrome: { host: "127.0.0.1", port: 9223 },
+      remoteChromeBrowserId: "browser-a",
+      remoteChromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+    };
+    const metadata = await sessionModule.initializeSession(
+      {
+        prompt: "Persist browser identity",
+        model: "gpt-5.6-sol-pro",
+        mode: "browser",
+        browserConfig,
+      },
+      "/tmp/cwd",
+    );
+    const stored = JSON.parse(
+      await readFile(path.join(sessionModule.getSessionsDir(), metadata.id, "meta.json"), "utf8"),
+    );
+
+    expect(stored.browser?.config).toEqual(browserConfig);
+    expect(stored.options?.browserConfig).toEqual(browserConfig);
+  });
+
   test("readSessionMetadata returns null for missing sessions and updateSessionMetadata persists changes", async () => {
     expect(await sessionModule.readSessionMetadata("missing")).toBeNull();
     const meta = await sessionModule.initializeSession(

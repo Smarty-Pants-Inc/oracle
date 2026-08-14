@@ -72,6 +72,9 @@ export interface BrowserSessionConfig {
   debug?: boolean;
   allowCookieErrors?: boolean;
   remoteChrome?: { host: string; port: number } | null;
+  remoteChromeBrowserId?: string | null;
+  remoteChromeBrowserWSEndpoint?: string | null;
+  remoteChromeProfileRoot?: string | null;
   manualLogin?: boolean;
   manualLoginProfileDir?: string | null;
   manualLoginCookieSync?: boolean;

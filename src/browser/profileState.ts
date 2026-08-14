@@ -335,6 +335,70 @@ export async function releaseProfileRunLock(
   }
 }
 
+export interface RemoteChromeBrowserIdentity {
+  browserId: string;
+  browserWSEndpoint: string;
+}
+
+export function browserIdFromWebSocketEndpoint(browserWSEndpoint: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(browserWSEndpoint);
+  } catch {
+    throw new Error("Remote Chrome returned an invalid browser WebSocket URL.");
+  }
+  const match = /^\/devtools\/browser\/([^/]+)$/u.exec(parsed.pathname);
+  if ((parsed.protocol !== "ws:" && parsed.protocol !== "wss:") || !match?.[1]) {
+    throw new Error("Remote Chrome returned an invalid browser WebSocket URL.");
+  }
+  return match[1];
+}
+
+export async function resolveRemoteChromeBrowserIdentity({
+  port,
+  host = "127.0.0.1",
+  attempts = 3,
+  timeoutMs = 3000,
+}: {
+  port: number;
+  host?: string;
+  attempts?: number;
+  timeoutMs?: number;
+}): Promise<RemoteChromeBrowserIdentity> {
+  const formattedHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  const versionUrl = `http://${formattedHost}:${port}/json/version`;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(versionUrl, { signal: controller.signal });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const payload = (await response.json()) as { webSocketDebuggerUrl?: unknown };
+        if (typeof payload.webSocketDebuggerUrl !== "string") {
+          throw new Error("Remote Chrome response is missing webSocketDebuggerUrl.");
+        }
+        return {
+          browserId: browserIdFromWebSocketEndpoint(payload.webSocketDebuggerUrl),
+          browserWSEndpoint: payload.webSocketDebuggerUrl,
+        };
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch (error) {
+      if (attempt < attempts - 1) {
+        await delay(500 * (attempt + 1));
+        continue;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Remote Chrome identity probe failed for ${host}:${port}: ${message}`);
+    }
+  }
+  throw new Error(`Remote Chrome identity probe failed for ${host}:${port}: unreachable`);
+}
+
 export async function verifyDevToolsReachable({
   port,
   host = "127.0.0.1",
