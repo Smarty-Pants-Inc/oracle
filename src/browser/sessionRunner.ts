@@ -311,6 +311,7 @@ export async function runBrowserSessionExecution(
       chromePort: browserResult.chromePort,
       chromeHost: browserResult.chromeHost,
       chromeBrowserWSEndpoint: browserResult.chromeBrowserWSEndpoint,
+      chatGptAccountDigest: browserResult.chatGptAccountDigest,
       chromeProfileRoot: browserResult.chromeProfileRoot,
       userDataDir: browserResult.userDataDir,
       chromeTargetId: browserResult.chromeTargetId,

@@ -299,6 +299,7 @@ describe("resumeBrowserSession", () => {
 
   test("revalidates routed browser identity and uses the fresh exact WebSocket", async () => {
     const freshBrowserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const accountDigest = "a".repeat(64);
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
@@ -318,7 +319,14 @@ describe("resumeBrowserSession", () => {
         [{ targetId: "target-2", type: "page", url: runtime.tabUrl }] satisfies FakeTarget[],
     ) as unknown as () => Promise<FakeTarget[]>;
     const evaluate = vi.fn(async ({ expression }: { expression: string }) => ({
-      result: { value: expression === "location.href" ? runtime.tabUrl : 2 },
+      result: {
+        value:
+          expression === "location.href"
+            ? runtime.tabUrl
+            : expression.includes("/api/auth/session")
+              ? accountDigest
+              : 2,
+      },
     }));
     const connect = vi.fn(
       async () =>
@@ -337,6 +345,7 @@ describe("resumeBrowserSession", () => {
             remoteChrome: { host: "127.0.0.1", port: 9223 },
             remoteChromeBrowserId: "browser-a",
             remoteChromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+            remoteChromeAccountDigest: accountDigest,
             timeoutMs: 2_000,
           },
           vi.fn() as BrowserLogger,
@@ -387,6 +396,7 @@ describe("resumeBrowserSession", () => {
             remoteChrome: { host: "127.0.0.1", port: 9223 },
             remoteChromeBrowserId: "browser-a",
             remoteChromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+            remoteChromeAccountDigest: "a".repeat(64),
           },
           vi.fn() as BrowserLogger,
           { recoverSession },
@@ -396,6 +406,122 @@ describe("resumeBrowserSession", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  test.each([
+    {
+      label: "browser",
+      runtime: {
+        chromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/different-browser",
+        chatGptAccountDigest: "a".repeat(64),
+      },
+    },
+    {
+      label: "account",
+      runtime: {
+        chromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+        chatGptAccountDigest: "b".repeat(64),
+      },
+    },
+  ])("rejects conflicting runtime $label affinity before reattach", async ({ label, runtime }) => {
+    const recoverSession = vi.fn(async () => ({
+      answerText: "must not recover",
+      answerMarkdown: "must not recover",
+    }));
+    await expect(
+      resumeBrowserSession(
+        {
+          chromePort: 9223,
+          chromeHost: "127.0.0.1",
+          chromeTargetId: "target-a",
+          tabUrl: "https://chatgpt.com/c/abc",
+          ...runtime,
+        },
+        {
+          remoteChrome: { host: "127.0.0.1", port: 9223 },
+          remoteChromeBrowserId: "browser-a",
+          remoteChromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+          remoteChromeAccountDigest: "a".repeat(64),
+        },
+        vi.fn() as BrowserLogger,
+        { recoverSession },
+      ),
+    ).rejects.toThrow(new RegExp(`${label} identity is conflicting`, "i"));
+    expect(recoverSession).not.toHaveBeenCalled();
+  });
+
+  test("rejects a same-browser account swap", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ webSocketDebuggerUrl: browserWSEndpoint }),
+      }),
+    );
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => ({
+      result: {
+        value:
+          expression === "location.href"
+            ? "https://chatgpt.com/c/abc"
+            : expression.includes("/api/auth/session")
+              ? "b".repeat(64)
+              : 2,
+      },
+    }));
+    const connect = vi.fn(async () => ({
+      Runtime: { enable: vi.fn(), evaluate },
+      DOM: { enable: vi.fn() },
+      close: vi.fn(async () => {}),
+    })) as unknown as (options?: unknown) => Promise<ChromeClient>;
+    try {
+      await expect(
+        resumeBrowserSession(
+          {
+            chromePort: 9223,
+            chromeHost: "127.0.0.1",
+            chromeTargetId: "target-a",
+            tabUrl: "https://chatgpt.com/c/abc",
+          },
+          {
+            remoteChrome: { host: "127.0.0.1", port: 9223 },
+            remoteChromeBrowserId: "browser-a",
+            remoteChromeBrowserWSEndpoint: browserWSEndpoint,
+            remoteChromeAccountDigest: "a".repeat(64),
+          },
+          vi.fn() as BrowserLogger,
+          {
+            listTargets: vi.fn(async () => [
+              { targetId: "target-a", type: "page", url: "https://chatgpt.com/c/abc" },
+            ]),
+            connect,
+          },
+        ),
+      ).rejects.toThrow(/account identity changed/i);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  test("fails closed when runtime account affinity outlives remote config", async () => {
+    const recoverSession = vi.fn(async () => ({
+      answerText: "must not recover",
+      answerMarkdown: "must not recover",
+    }));
+    await expect(
+      resumeBrowserSession(
+        {
+          chromePort: 9223,
+          chromeHost: "127.0.0.1",
+          chromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+          chatGptAccountDigest: "a".repeat(64),
+        },
+        {},
+        vi.fn() as BrowserLogger,
+        { recoverSession },
+      ),
+    ).rejects.toThrow(/browser and account identity/i);
+    expect(recoverSession).not.toHaveBeenCalled();
   });
 
   test("fails closed for wrapper-routed host-only sessions", async () => {
@@ -413,7 +539,20 @@ describe("resumeBrowserSession", () => {
           vi.fn() as BrowserLogger,
           { recoverSession },
         ),
-      ).rejects.toThrow(/no verified browser identity/i);
+      ).rejects.toThrow(/browser and account identity/i);
+      await expect(
+        resumeBrowserSession(
+          {
+            chromePort: 9223,
+            chromeHost: "127.0.0.1",
+            chromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+            chatGptAccountDigest: "a".repeat(64),
+          },
+          {},
+          vi.fn() as BrowserLogger,
+          { recoverSession },
+        ),
+      ).rejects.toThrow(/browser and account identity/i);
       expect(recoverSession).not.toHaveBeenCalled();
     } finally {
       if (previous === undefined) {

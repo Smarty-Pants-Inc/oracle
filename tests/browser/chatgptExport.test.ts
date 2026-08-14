@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 import {
+  assertChatGptExportMutationAffinityForTest,
   backendToPayload,
   archivedSettingsUrlFromConversationUrl,
   buildBackendConversationUrl,
@@ -51,6 +52,7 @@ describe("ChatGPT conversation export helpers", () => {
           port: 9223,
           browserId: "browser-a",
           browserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+          accountDigest: "a".repeat(64),
         }),
       ).rejects.toThrow(/identity changed before ChatGPT export/i);
     } finally {
@@ -67,6 +69,34 @@ describe("ChatGPT conversation export helpers", () => {
     expect(isSameConversationUrl("https://chatgpt.com/c/other", "conv-1")).toBe(false);
     expect(isSameConversationUrl("https://chatgpt.com/g/project/c/other", "conv-1")).toBe(false);
     expect(isSameConversationUrl("https://chatgpt.com/", "conv-1")).toBe(false);
+  });
+
+  test("revalidates account and exact conversation before archive mutations", async () => {
+    const expectedDigest = "a".repeat(64);
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: expression.includes("/api/auth/session")
+            ? expectedDigest
+            : "https://chatgpt.com/c/conv-1",
+        },
+      })),
+    };
+
+    await expect(
+      assertChatGptExportMutationAffinityForTest(runtime as never, expectedDigest, "conv-1"),
+    ).resolves.toBeUndefined();
+
+    runtime.evaluate.mockImplementation(async ({ expression }: { expression: string }) => ({
+      result: {
+        value: expression.includes("/api/auth/session")
+          ? expectedDigest
+          : "https://chatgpt.com/c/other",
+      },
+    }));
+    await expect(
+      assertChatGptExportMutationAffinityForTest(runtime as never, expectedDigest, "conv-1"),
+    ).rejects.toThrow(/conversation changed before archive mutation/i);
   });
 
   test("derives archived-chat settings without leaving the approved project", () => {

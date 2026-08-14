@@ -237,6 +237,122 @@ describe("liveTabs helpers", () => {
     },
   );
 
+  test("rejects a restarted browser before inspecting a bound live tab", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          webSocketDebuggerUrl: "ws://127.0.0.1:9223/devtools/browser/browser-b",
+        }),
+      }),
+    );
+    try {
+      await expect(
+        connectToExistingChatGptTab({
+          host: "127.0.0.1",
+          port: 9223,
+          browserId: "browser-a",
+          browserWSEndpoint: "ws://stale.invalid/devtools/browser/browser-a",
+          accountDigest: "a".repeat(64),
+          ref: "target-1",
+        }),
+      ).rejects.toThrow(/browser identity changed before live tab inspection/i);
+      expect(remoteChromeMocks.listRemoteChromeTargets).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  test("uses the fresh browser WebSocket and rejects an account swap", async () => {
+    const freshBrowserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ webSocketDebuggerUrl: freshBrowserWSEndpoint }),
+      }),
+    );
+    remoteChromeMocks.listRemoteChromeTargets.mockResolvedValue([
+      { targetId: "target-1", type: "page", url: "https://chatgpt.com/c/a" },
+    ]);
+    remoteChromeMocks.connectToRemoteChromeTarget.mockResolvedValue({
+      client: {
+        Runtime: {
+          evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+            result: { value: expression.includes("/api/auth/session") ? "b".repeat(64) : null },
+          })),
+        },
+      },
+      targetId: "target-1",
+      browserWSEndpoint: freshBrowserWSEndpoint,
+      close: vi.fn(async () => undefined),
+    });
+    try {
+      await expect(
+        connectToExistingChatGptTab({
+          host: "127.0.0.1",
+          port: 9223,
+          browserId: "browser-a",
+          browserWSEndpoint: "ws://stale.invalid/devtools/browser/browser-a",
+          accountDigest: "a".repeat(64),
+          ref: "current",
+        }),
+      ).rejects.toThrow(/account identity changed before live tab inspection/i);
+      expect(remoteChromeMocks.listRemoteChromeTargets).toHaveBeenCalledWith({
+        host: "127.0.0.1",
+        port: 9223,
+        browserWSEndpoint: freshBrowserWSEndpoint,
+      });
+      expect(remoteChromeMocks.connectToRemoteChromeTarget).toHaveBeenCalledWith(
+        "127.0.0.1",
+        9223,
+        expect.any(Function),
+        expect.objectContaining({ browserWSEndpoint: freshBrowserWSEndpoint }),
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  test("fails closed when a bound account probe cannot complete", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ webSocketDebuggerUrl: browserWSEndpoint }),
+      }),
+    );
+    remoteChromeMocks.listRemoteChromeTargets.mockResolvedValue([
+      { targetId: "target-1", type: "page", url: "https://chatgpt.com/c/a" },
+    ]);
+    remoteChromeMocks.connectToRemoteChromeTarget.mockResolvedValue({
+      client: {
+        Runtime: {
+          evaluate: vi.fn().mockRejectedValue(new Error("CDP context destroyed")),
+        },
+      },
+      targetId: "target-1",
+      browserWSEndpoint,
+      close: vi.fn(async () => undefined),
+    });
+    try {
+      await expect(
+        connectToExistingChatGptTab({
+          host: "127.0.0.1",
+          port: 9223,
+          browserId: "browser-a",
+          browserWSEndpoint,
+          accountDigest: "a".repeat(64),
+          ref: "current",
+        }),
+      ).rejects.toThrow(/CDP context destroyed/);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   test("builds enough summary from exact targets for export scope checks", () => {
     const summary = summaryFromTargetForTest("127.0.0.1", 9222, {
       id: "target-1",

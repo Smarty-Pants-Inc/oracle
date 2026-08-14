@@ -18,6 +18,7 @@ import {
   recoverConversationTab,
 } from "../browser/recoverConversation.js";
 import { resolveOutputPath } from "./writeOutputPath.js";
+import { browserIdFromWebSocketEndpoint } from "../browser/profileState.js";
 
 const LIVE_POLL_MS = 2000;
 const DEFAULT_STALL_THRESHOLD_MS = 60_000;
@@ -84,33 +85,120 @@ export interface BrowserLiveTailOptions {
   closeAfterRecover?: boolean;
 }
 
-function sessionBrowserEndpoint(
-  meta: SessionMetadata | null | undefined,
-): { host: string; port: number } | null {
-  const runtime = meta?.browser?.runtime ?? {};
-  const remote: { host?: string; port?: number } = meta?.browser?.config?.remoteChrome ?? {};
-  const host = runtime.chromeHost ?? remote.host;
-  const port = runtime.chromePort ?? remote.port;
-  if (!host || !port) {
-    return null;
-  }
-  return { host, port };
+function hasRemoteAffinityMarker(meta: SessionMetadata | null | undefined): boolean {
+  const config = meta?.browser?.config;
+  const runtime = meta?.browser?.runtime;
+  return (
+    process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" ||
+    Boolean(
+      config?.remoteChrome ||
+      config?.remoteChromeBrowserId?.trim() ||
+      config?.remoteChromeBrowserWSEndpoint?.trim() ||
+      config?.remoteChromeAccountDigest?.trim() ||
+      runtime?.chatGptAccountDigest?.trim(),
+    )
+  );
 }
 
-function collectUniqueEndpoints(metas: SessionMetadata[]): Array<{ host: string; port: number }> {
-  const entries = new Map<string, { host: string; port: number }>();
-  entries.set(`${DEFAULT_REMOTE_CHROME_HOST}:${DEFAULT_REMOTE_CHROME_PORT}`, {
-    host: DEFAULT_REMOTE_CHROME_HOST,
-    port: DEFAULT_REMOTE_CHROME_PORT,
-  });
-  for (const meta of metas) {
-    const endpoint = sessionBrowserEndpoint(meta);
-    if (!endpoint) {
-      continue;
+function sessionBrowserEndpoint(
+  meta: SessionMetadata | null | undefined,
+): { host: string; port: number; browserId?: string; accountDigest?: string } | null {
+  const runtime = meta?.browser?.runtime ?? {};
+  const config = meta?.browser?.config;
+  const remote = config?.remoteChrome;
+  const host = runtime.chromeHost ?? remote?.host;
+  const port = runtime.chromePort ?? remote?.port;
+  const requiresAffinity = hasRemoteAffinityMarker(meta);
+  if (!host || !port) {
+    if (requiresAffinity) {
+      throw new Error("Stored remote Chrome browser and account identity is incomplete.");
     }
-    entries.set(`${endpoint.host}:${endpoint.port}`, endpoint);
+    return null;
+  }
+  if (!requiresAffinity) return { host, port };
+  const configuredBrowserWSEndpoint = config?.remoteChromeBrowserWSEndpoint?.trim();
+  const runtimeBrowserWSEndpoint = runtime.chromeBrowserWSEndpoint?.trim();
+  const configuredAccountDigest = config?.remoteChromeAccountDigest?.trim();
+  const runtimeAccountDigest = runtime.chatGptAccountDigest?.trim();
+  if (
+    configuredAccountDigest &&
+    runtimeAccountDigest &&
+    configuredAccountDigest !== runtimeAccountDigest
+  ) {
+    throw new Error("Stored remote Chrome account identity is conflicting.");
+  }
+  const browserWSEndpoint = runtimeBrowserWSEndpoint ?? configuredBrowserWSEndpoint;
+  const accountDigest = runtimeAccountDigest ?? configuredAccountDigest;
+  if (!browserWSEndpoint || !accountDigest) {
+    throw new Error("Stored remote Chrome browser and account identity is incomplete.");
+  }
+  if (!/^[a-f0-9]{64}$/.test(accountDigest)) {
+    throw new Error("Stored remote Chrome account identity is invalid.");
+  }
+  const browserId = browserIdFromWebSocketEndpoint(browserWSEndpoint);
+  const configuredBrowserId = config?.remoteChromeBrowserId?.trim();
+  if (configuredBrowserId && configuredBrowserId !== browserId) {
+    throw new Error("Stored remote Chrome browser identity is conflicting.");
+  }
+  if (
+    configuredBrowserWSEndpoint &&
+    browserIdFromWebSocketEndpoint(configuredBrowserWSEndpoint) !== browserId
+  ) {
+    throw new Error("Stored remote Chrome browser identity is conflicting.");
+  }
+  return { host, port, browserId, accountDigest };
+}
+
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase().replace(/\.$/, "");
+  return (
+    normalized === "localhost" ||
+    normalized === "::1" ||
+    normalized === "[::1]" ||
+    /^127(?:\.\d{1,3}){3}$/.test(normalized)
+  );
+}
+
+function collectUniqueEndpoints(
+  metas: SessionMetadata[],
+): Array<{ host: string; port: number; browserId?: string; accountDigest?: string }> {
+  const entries = new Map<
+    string,
+    { host: string; port: number; browserId?: string; accountDigest?: string }
+  >();
+  let suppressRawDefault = process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1";
+  for (const meta of metas) {
+    const runtime = meta?.browser?.runtime ?? {};
+    const remote = meta?.browser?.config?.remoteChrome;
+    const recordedHost = runtime.chromeHost ?? remote?.host;
+    const recordedPort = runtime.chromePort ?? remote?.port;
+    if (
+      hasRemoteAffinityMarker(meta) ||
+      (recordedHost && isLoopbackHost(recordedHost) && recordedPort === DEFAULT_REMOTE_CHROME_PORT)
+    ) {
+      suppressRawDefault = true;
+    }
+    try {
+      const endpoint = sessionBrowserEndpoint(meta);
+      if (!endpoint) continue;
+      const key = `${endpoint.host.toLowerCase()}:${endpoint.port}\t${endpoint.browserId ?? ""}\t${endpoint.accountDigest ?? ""}`;
+      if (!entries.has(key)) entries.set(key, endpoint);
+    } catch {
+      // Named operations fail closed; global discovery skips incomplete legacy sessions.
+    }
+  }
+  if (!suppressRawDefault) {
+    entries.set(`${DEFAULT_REMOTE_CHROME_HOST}:${DEFAULT_REMOTE_CHROME_PORT}\t\t`, {
+      host: DEFAULT_REMOTE_CHROME_HOST,
+      port: DEFAULT_REMOTE_CHROME_PORT,
+    });
   }
   return Array.from(entries.values());
+}
+export function collectUniqueEndpointsForTest(
+  metas: SessionMetadata[],
+): Array<{ host: string; port: number; browserId?: string; accountDigest?: string }> {
+  return collectUniqueEndpoints(metas);
 }
 
 function buildSessionIndex(metas: SessionMetadata[]): SessionMetadata[] {
@@ -312,7 +400,7 @@ async function maybeWriteHarvestOutput(
 }
 
 export async function showBrowserTabsStatus(): Promise<void> {
-  const metas = await sessionStore.listSessions().catch(() => [] as SessionMetadata[]);
+  const metas = await sessionStore.listSessions();
   const endpoints = collectUniqueEndpoints(metas);
   let printedAny = false;
   for (const endpoint of endpoints) {
@@ -386,6 +474,8 @@ export async function harvestSessionBrowserOutput(
       return harvestChatGptTab({
         host: recovered.host,
         port: recovered.port,
+        browserId: recovered.browserId,
+        accountDigest: recovered.accountDigest,
         ref: recovered.ref,
         stallWindowMs: options.stallWindowMs,
       });
@@ -397,8 +487,7 @@ export async function harvestSessionBrowserOutput(
     } else {
       try {
         harvested = await harvestChatGptTab({
-          host: initialEndpoint.host,
-          port: initialEndpoint.port,
+          ...initialEndpoint,
           ref,
           stallWindowMs: options.stallWindowMs,
         });
@@ -451,11 +540,7 @@ export async function liveTailSessionBrowserOutput(
   try {
     // Probe once to see if the live tab is still alive; recover if not.
     try {
-      await harvestChatGptTab({
-        host: endpoint.host,
-        port: endpoint.port,
-        ref: browserTabRef,
-      });
+      await harvestChatGptTab({ ...endpoint, ref: browserTabRef });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (!isRecoverableMissingTabError(message) || !recoverIfMissing) {
@@ -471,18 +556,19 @@ export async function liveTailSessionBrowserOutput(
         waitForReady: false,
       });
       recoveredChrome = recovered.chrome;
-      endpoint = { host: recovered.host, port: recovered.port };
+      endpoint = {
+        host: recovered.host,
+        port: recovered.port,
+        browserId: recovered.browserId,
+        accountDigest: recovered.accountDigest,
+      };
       browserTabRef = recovered.ref;
       requireRecoveredContent = true;
       recoveredContentDeadlineMs = Date.now() + stallThresholdMs;
     }
 
     while (true) {
-      const harvested = await harvestChatGptTab({
-        host: endpoint.host,
-        port: endpoint.port,
-        ref: browserTabRef,
-      });
+      const harvested = await harvestChatGptTab({ ...endpoint, ref: browserTabRef });
       const fullText = harvested.lastAssistantMarkdown ?? harvested.lastAssistantText ?? "";
       if (requireRecoveredContent && !isRecoveredConversationHarvestReady(harvested)) {
         if (Date.now() < recoveredContentDeadlineMs) {

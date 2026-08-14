@@ -12,6 +12,7 @@ import {
   ensureNotBlocked,
   ensureLoggedIn,
   ensureChatGptScopeRetained,
+  readChatGptAccountDigest,
 } from "../../src/browser/pageActions.js";
 import { isAnswerNowPlaceholderText } from "../../src/browser/actions/assistantResponse.js";
 import { createContext, Script } from "node:vm";
@@ -1571,6 +1572,26 @@ describe("ensureLoggedIn", () => {
     await expect(ensureLoggedIn(runtime, logger, { appliedCookies: 2 })).resolves.toBeUndefined();
     expect(logger).toHaveBeenCalledWith("Welcome back account click triggered navigation.");
     expect(logger).toHaveBeenCalledWith("Login restored via Welcome back account picker");
+  });
+  test("accepts only a SHA-256 account digest from the page probe", async () => {
+    const digest = "a".repeat(64);
+    const evaluate = vi.fn().mockResolvedValue({ result: { value: digest } });
+    const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
+
+    await expect(readChatGptAccountDigest(runtime)).resolves.toBe(digest);
+    expect(evaluate).toHaveBeenCalledWith(
+      expect.objectContaining({ awaitPromise: true, returnByValue: true }),
+    );
+  });
+
+  test("rejects raw or unavailable account identifiers", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({ result: { value: "raw-user-id" } }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(readChatGptAccountDigest(runtime)).rejects.toThrow(
+      /account identity is unavailable/i,
+    );
   });
 });
 

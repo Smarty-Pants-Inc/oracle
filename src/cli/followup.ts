@@ -83,6 +83,16 @@ export async function resolveBrowserFollowupReference(
   }
   const configuredBrowserId = parentBrowserConfig.remoteChromeBrowserId?.trim();
   const configuredBrowserWSEndpoint = parentBrowserConfig.remoteChromeBrowserWSEndpoint?.trim();
+  const configuredAccountDigest = parentBrowserConfig.remoteChromeAccountDigest?.trim();
+  const runtimeAccountDigest = metadata.browser?.runtime?.chatGptAccountDigest?.trim();
+  if (
+    configuredAccountDigest &&
+    runtimeAccountDigest &&
+    configuredAccountDigest !== runtimeAccountDigest
+  ) {
+    throw new Error(`Session ${trimmed} has conflicting stored account identity metadata.`);
+  }
+  const remoteChromeAccountDigest = runtimeAccountDigest ?? configuredAccountDigest;
   const runtimeBrowserWSEndpoint = metadata.browser?.runtime?.chromeBrowserWSEndpoint?.trim();
   let remoteChromeBrowserId = configuredBrowserId;
   let remoteChromeBrowserWSEndpoint = configuredBrowserWSEndpoint;
@@ -103,16 +113,23 @@ export async function resolveBrowserFollowupReference(
     remoteChromeBrowserId = runtimeBrowserId;
     remoteChromeBrowserWSEndpoint = runtimeBrowserWSEndpoint;
   }
+  const hasRemoteAffinityMarker = Boolean(
+    process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" ||
+    parentBrowserConfig.remoteChrome ||
+    configuredBrowserId ||
+    configuredBrowserWSEndpoint ||
+    configuredAccountDigest ||
+    runtimeAccountDigest,
+  );
   const missingRemoteAffinity =
-    parentBrowserConfig.remoteChrome && (!remoteChromeBrowserId || !remoteChromeBrowserWSEndpoint);
-  if (
-    missingRemoteAffinity &&
-    (process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" ||
-      Boolean(remoteChromeBrowserId) ||
-      Boolean(remoteChromeBrowserWSEndpoint))
-  ) {
+    hasRemoteAffinityMarker &&
+    (!parentBrowserConfig.remoteChrome ||
+      !remoteChromeBrowserId ||
+      !remoteChromeBrowserWSEndpoint ||
+      !remoteChromeAccountDigest);
+  if (missingRemoteAffinity) {
     throw new Error(
-      `Session ${trimmed} has no verified remote Chrome browser identity; start a fresh browser conversation through the agent wrapper.`,
+      `Session ${trimmed} has no verified remote Chrome browser and account identity; start a fresh browser conversation through the agent wrapper.`,
     );
   }
   const storedModel = metadata.options?.model ?? metadata.model;
@@ -126,8 +143,8 @@ export async function resolveBrowserFollowupReference(
     model,
     browserConfig: {
       ...parentBrowserConfig,
-      ...(remoteChromeBrowserId && remoteChromeBrowserWSEndpoint
-        ? { remoteChromeBrowserId, remoteChromeBrowserWSEndpoint }
+      ...(remoteChromeBrowserId && remoteChromeBrowserWSEndpoint && remoteChromeAccountDigest
+        ? { remoteChromeBrowserId, remoteChromeBrowserWSEndpoint, remoteChromeAccountDigest }
         : {}),
       browserTabRef: null,
       resumeConversationUrl,

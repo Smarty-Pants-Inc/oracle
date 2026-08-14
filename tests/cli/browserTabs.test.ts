@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
   recoverBrowserMetadataFromHarvestForTest,
+  collectUniqueEndpointsForTest,
   resolveSessionTabRefForTest,
 } from "../../src/cli/browserTabs.js";
 import type { ChatGptTabSummary } from "../../src/browser/liveTabs.js";
@@ -43,6 +44,118 @@ describe("browser tab CLI helpers", () => {
     expect(resolveSessionTabRefForTest(meta)).toBe(
       "https://chatgpt.com/g/project/c/configured-conversation",
     );
+  });
+
+  test("keeps complete affinities distinct and skips incomplete legacy sessions", () => {
+    const remoteSession = (id: string, browserId: string, accountDigest: string, port = 9223) =>
+      ({
+        id,
+        createdAt: "2026-08-14T00:00:00.000Z",
+        status: "completed",
+        options: {},
+        mode: "browser",
+        browser: {
+          config: {
+            remoteChrome: { host: "127.0.0.1", port },
+            remoteChromeBrowserId: browserId,
+            remoteChromeBrowserWSEndpoint: `ws://127.0.0.1:${port}/devtools/browser/${browserId}`,
+            remoteChromeAccountDigest: accountDigest,
+          },
+        },
+      }) as SessionMetadata;
+    const legacy = {
+      ...remoteSession("legacy", "legacy-browser", "a".repeat(64)),
+      browser: { config: { remoteChrome: { host: "127.0.0.1", port: 9223 } } },
+    } as SessionMetadata;
+
+    const allEndpoints = collectUniqueEndpointsForTest([
+      legacy,
+      remoteSession("new", "browser-new", "b".repeat(64)),
+      remoteSession("old", "browser-old", "c".repeat(64)),
+    ]);
+    const endpoints = allEndpoints.filter((endpoint) => endpoint.port === 9223);
+
+    expect(endpoints).toHaveLength(2);
+    expect(endpoints.map((endpoint) => endpoint.browserId).sort()).toEqual([
+      "browser-new",
+      "browser-old",
+    ]);
+    expect(allEndpoints.some((endpoint) => endpoint.port === 9222)).toBe(false);
+
+    const boundDefault = collectUniqueEndpointsForTest([
+      remoteSession("default", "browser-default", "d".repeat(64), 9222),
+    ]).filter((endpoint) => endpoint.port === 9222);
+    expect(boundDefault).toEqual([
+      expect.objectContaining({
+        browserId: "browser-default",
+        accountDigest: "d".repeat(64),
+      }),
+    ]);
+
+    const incompleteDefault = {
+      ...remoteSession("incomplete", "browser-incomplete", "e".repeat(64), 9222),
+      browser: { config: { remoteChrome: { host: "127.0.0.1", port: 9222 } } },
+    } as SessionMetadata;
+    expect(
+      collectUniqueEndpointsForTest([incompleteDefault]).filter(
+        (endpoint) => endpoint.port === 9222,
+      ),
+    ).toEqual([]);
+
+    const localhostDefault = {
+      ...remoteSession("localhost", "browser-localhost", "f".repeat(64), 9222),
+      browser: {
+        config: {
+          remoteChrome: { host: "localhost", port: 9222 },
+          remoteChromeBrowserId: "browser-localhost",
+          remoteChromeBrowserWSEndpoint: "ws://localhost:9222/devtools/browser/browser-localhost",
+          remoteChromeAccountDigest: "f".repeat(64),
+        },
+      },
+    } as SessionMetadata;
+    expect(
+      collectUniqueEndpointsForTest([localhostDefault]).filter(
+        (endpoint) => endpoint.port === 9222,
+      ),
+    ).toEqual([expect.objectContaining({ host: "localhost", browserId: "browser-localhost" })]);
+
+    const runtimeOnly = {
+      id: "runtime-only",
+      createdAt: "2026-08-14T00:00:00.000Z",
+      status: "completed",
+      options: {},
+      mode: "browser",
+      browser: {
+        runtime: {
+          chromeHost: "127.0.0.1",
+          chromePort: 9224,
+          chromeBrowserWSEndpoint: "ws://127.0.0.1:9224/devtools/browser/browser-runtime",
+          chatGptAccountDigest: "1".repeat(64),
+        },
+      },
+    } as SessionMetadata;
+    expect(collectUniqueEndpointsForTest([runtimeOnly])).toEqual([
+      {
+        host: "127.0.0.1",
+        port: 9224,
+        browserId: "browser-runtime",
+        accountDigest: "1".repeat(64),
+      },
+    ]);
+
+    const incompleteRuntimeAffinity = {
+      ...runtimeOnly,
+      browser: {
+        runtime: {
+          chromeHost: "127.0.0.1",
+          chromePort: 9224,
+          chatGptAccountDigest: "1".repeat(64),
+        },
+      },
+    } as SessionMetadata;
+    expect(collectUniqueEndpointsForTest([incompleteRuntimeAffinity])).toEqual([]);
+
+    expect(collectUniqueEndpointsForTest([])).toEqual([{ host: "127.0.0.1", port: 9222 }]);
   });
 
   const harvested = (overrides: Partial<ChatGptTabSummary> = {}): ChatGptTabSummary => ({

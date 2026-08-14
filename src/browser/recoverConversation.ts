@@ -6,6 +6,10 @@ import { resolveBrowserConfig } from "./config.js";
 import { acquireManualLoginChromeForRun, isImageOnlyUiChromeText } from "./index.js";
 import { isRecoverableChatGptConversationUrl } from "./reattachability.js";
 import { harvestChatGptTab, openChatGptTarget } from "./liveTabs.js";
+import { connectToRemoteChromeTarget } from "./chromeLifecycle.js";
+import { resolveRemoteChromeBrowserIdentity } from "./profileState.js";
+import { readChatGptAccountDigest } from "./pageActions.js";
+import { CHATGPT_URL } from "./constants.js";
 
 const DEFAULT_READY_TIMEOUT_MS = 30_000;
 const READY_POLL_MS = 1_000;
@@ -15,12 +19,16 @@ export interface RecoveredConversation {
   port: number;
   url: string;
   ref: string;
+  browserId?: string;
+  accountDigest?: string;
   chrome: LaunchedChrome | null;
 }
 
 export interface RecoveryEndpoint {
   host: string;
   port: number;
+  browserId?: string;
+  accountDigest?: string;
 }
 
 /**
@@ -119,6 +127,67 @@ export function isRecoveredConversationHarvestReady(harvested: {
   );
 }
 
+async function openRecoveryTarget(
+  endpoint: RecoveryEndpoint,
+  url: string,
+  logger: BrowserLogger,
+): Promise<string> {
+  const expectedBrowserId = endpoint.browserId?.trim();
+  const expectedAccountDigest = endpoint.accountDigest?.trim();
+  if (!expectedBrowserId && !expectedAccountDigest) {
+    return openChatGptTarget({ ...endpoint, url });
+  }
+  if (
+    !expectedBrowserId ||
+    !expectedAccountDigest ||
+    !/^[a-f0-9]{64}$/.test(expectedAccountDigest)
+  ) {
+    throw new Error("Stored remote Chrome browser and account identity is incomplete.");
+  }
+  const liveIdentity = await resolveRemoteChromeBrowserIdentity(endpoint);
+  if (liveIdentity.browserId !== expectedBrowserId) {
+    throw new Error("Remote Chrome browser identity changed before conversation recovery.");
+  }
+  const targetId = await openChatGptTarget({
+    host: endpoint.host,
+    port: endpoint.port,
+    browserWSEndpoint: liveIdentity.browserWSEndpoint,
+    url: CHATGPT_URL,
+  });
+  const connection = await connectToRemoteChromeTarget(endpoint.host, endpoint.port, logger, {
+    browserWSEndpoint: liveIdentity.browserWSEndpoint,
+    targetId,
+    closeTargetOnDispose: false,
+  });
+  try {
+    const { Page, Runtime } = connection.client;
+    await Promise.all([Page.enable(), Runtime.enable()]);
+    const deadline = Date.now() + 10_000;
+    let lastError: unknown = null;
+    while (Date.now() < deadline) {
+      try {
+        const observedAccountDigest = await readChatGptAccountDigest(Runtime);
+        if (observedAccountDigest !== expectedAccountDigest) {
+          throw new Error("Remote Chrome account identity changed before conversation recovery.");
+        }
+        await Page.navigate({ url });
+        return targetId;
+      } catch (error) {
+        if (error instanceof Error && /identity changed/i.test(error.message)) {
+          throw error;
+        }
+        lastError = error;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("Authenticated ChatGPT account identity is unavailable.");
+  } finally {
+    await connection.close().catch(() => undefined);
+  }
+}
+
 /**
  * Re-open a previously-harvested ChatGPT conversation by relaunching Chrome
  * with the session's persistent profile and navigating to the saved tab URL.
@@ -153,7 +222,7 @@ export async function recoverConversationTab(
         `[browser] Recovery: opening saved conversation in existing Chrome at ` +
           `${options.existingEndpoint.host}:${options.existingEndpoint.port}`,
       );
-      const targetId = await openChatGptTarget({ ...options.existingEndpoint, url });
+      const targetId = await openRecoveryTarget(options.existingEndpoint, url, logger);
       if (waitForReady) {
         await waitForRecoveredConversationReady(options.existingEndpoint, targetId, readyTimeoutMs);
       }
@@ -161,6 +230,9 @@ export async function recoverConversationTab(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       logger(`[browser] Recovery: existing Chrome could not reopen the conversation (${message}).`);
+      if (options.existingEndpoint.browserId || options.existingEndpoint.accountDigest) {
+        throw error;
+      }
     }
   }
 

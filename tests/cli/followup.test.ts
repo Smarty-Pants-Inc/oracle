@@ -74,6 +74,7 @@ describe("browser follow-up resolution", () => {
 
   test("preserves the originating remote browser affinity", async () => {
     const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const accountDigest = "a".repeat(64);
     const metadata: SessionMetadata = {
       ...baseMetadata,
       mode: "browser",
@@ -82,10 +83,12 @@ describe("browser follow-up resolution", () => {
           remoteChrome: { host: "127.0.0.1", port: 9223 },
           remoteChromeBrowserId: "browser-a",
           remoteChromeBrowserWSEndpoint: browserWSEndpoint,
+          remoteChromeAccountDigest: accountDigest,
         },
         runtime: {
           conversationId: "remote-thread",
           chromeBrowserWSEndpoint: browserWSEndpoint,
+          chatGptAccountDigest: accountDigest,
         },
       },
     };
@@ -98,34 +101,38 @@ describe("browser follow-up resolution", () => {
       browserConfig: {
         remoteChromeBrowserId: "browser-a",
         remoteChromeBrowserWSEndpoint: browserWSEndpoint,
+        remoteChromeAccountDigest: accountDigest,
       },
     });
   });
 
-  test("derives legacy remote browser affinity from the exact runtime WebSocket", async () => {
+  test("carries the runtime account digest with a derived browser identity", async () => {
     const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const accountDigest = "a".repeat(64);
     const metadata: SessionMetadata = {
       ...baseMetadata,
       mode: "browser",
       browser: {
         config: { remoteChrome: { host: "127.0.0.1", port: 9223 } },
-        runtime: { conversationId: "legacy-thread", chromeBrowserWSEndpoint: browserWSEndpoint },
+        runtime: {
+          conversationId: "legacy-thread",
+          chromeBrowserWSEndpoint: browserWSEndpoint,
+          chatGptAccountDigest: accountDigest,
+        },
       },
     };
-
     await expect(
-      resolveBrowserFollowupReference("session-1", {
-        readSession: vi.fn(async () => metadata),
-      }),
+      resolveBrowserFollowupReference("session-1", { readSession: vi.fn(async () => metadata) }),
     ).resolves.toMatchObject({
       browserConfig: {
         remoteChromeBrowserId: "browser-a",
         remoteChromeBrowserWSEndpoint: browserWSEndpoint,
+        remoteChromeAccountDigest: accountDigest,
       },
     });
   });
 
-  test("preserves raw host and port follow-ups outside the wrapper", async () => {
+  test("rejects incomplete remote follow-up affinity outside the wrapper", async () => {
     const metadata: SessionMetadata = {
       ...baseMetadata,
       mode: "browser",
@@ -134,14 +141,27 @@ describe("browser follow-up resolution", () => {
         runtime: { conversationId: "host-only-thread" },
       },
     };
-
     await expect(
-      resolveBrowserFollowupReference("session-1", {
-        readSession: vi.fn(async () => metadata),
-      }),
-    ).resolves.toMatchObject({
-      browserConfig: { remoteChrome: { host: "127.0.0.1", port: 9223 } },
-    });
+      resolveBrowserFollowupReference("session-1", { readSession: vi.fn(async () => metadata) }),
+    ).rejects.toThrow(/browser and account identity/i);
+  });
+
+  test("rejects runtime-only remote affinity without its stored endpoint", async () => {
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      browser: {
+        config: { url: "https://chatgpt.com/" },
+        runtime: {
+          conversationId: "runtime-only-thread",
+          chromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+          chatGptAccountDigest: "a".repeat(64),
+        },
+      },
+    };
+    await expect(
+      resolveBrowserFollowupReference("session-1", { readSession: vi.fn(async () => metadata) }),
+    ).rejects.toThrow(/browser and account identity/i);
   });
 
   test("fails closed for wrapper-routed sessions with only host and port", async () => {
@@ -161,7 +181,7 @@ describe("browser follow-up resolution", () => {
         resolveBrowserFollowupReference("session-1", {
           readSession: vi.fn(async () => metadata),
         }),
-      ).rejects.toThrow(/no verified remote Chrome browser identity/i);
+      ).rejects.toThrow(/browser and account identity/i);
     } finally {
       if (previous === undefined) {
         delete process.env.ORACLE_WRAPPER_REMOTE_ONLY;

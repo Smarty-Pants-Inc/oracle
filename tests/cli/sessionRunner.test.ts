@@ -1256,6 +1256,8 @@ describe("performSessionRun", () => {
   });
 
   test("preserves persisted runtime hints when browser automation fails without runtime details", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const accountDigest = "a".repeat(64);
     const automationError = new BrowserAutomationError(
       "Prompt did not appear in conversation before timeout (send may have failed)",
       { stage: "submit-prompt", code: "prompt-commit-timeout" },
@@ -1274,6 +1276,8 @@ describe("performSessionRun", () => {
         {
           chromePort: 9222,
           chromeHost: "127.0.0.1",
+          chromeBrowserWSEndpoint: browserWSEndpoint,
+          chatGptAccountDigest: accountDigest,
           tabUrl: "https://chatgpt.com/c/demo",
           promptSubmitted: true,
         },
@@ -1295,7 +1299,12 @@ describe("performSessionRun", () => {
         sessionMeta: { ...baseSessionMeta },
         runOptions: baseRunOptions,
         mode: "browser",
-        browserConfig: { chromePath: null },
+        browserConfig: {
+          chromePath: null,
+          remoteChrome: { host: "127.0.0.1", port: 9223 },
+          remoteChromeBrowserId: "browser-a",
+          remoteChromeBrowserWSEndpoint: browserWSEndpoint,
+        },
         cwd: "/tmp",
         log,
         write,
@@ -1307,7 +1316,7 @@ describe("performSessionRun", () => {
     expect(finalUpdate).toMatchObject({
       status: "error",
       browser: expect.objectContaining({
-        config: expect.any(Object),
+        config: expect.objectContaining({ remoteChromeAccountDigest: accountDigest }),
         runtime: expect.objectContaining({
           promptSubmitted: true,
           tabUrl: "https://chatgpt.com/c/demo",

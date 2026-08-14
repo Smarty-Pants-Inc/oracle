@@ -14,6 +14,8 @@ import { buildConversationTurnListExpression } from "./conversationTurns.js";
 import { extractStableConversationIdFromUrl } from "./conversationUrl.js";
 import { delay } from "./utils.js";
 import { connectToRemoteChromeTarget, listRemoteChromeTargets } from "./chromeLifecycle.js";
+import { resolveRemoteChromeBrowserIdentity } from "./profileState.js";
+import { readChatGptAccountDigest } from "./pageActions.js";
 
 export const DEFAULT_REMOTE_CHROME_HOST = "127.0.0.1";
 export const DEFAULT_REMOTE_CHROME_PORT = 9222;
@@ -33,6 +35,8 @@ interface HostPort {
   host?: string;
   port?: number;
   browserWSEndpoint?: string;
+  browserId?: string;
+  accountDigest?: string;
 }
 
 export interface ChatGptTabSummary {
@@ -98,6 +102,25 @@ function normalizeHostPort(input: HostPort = {}): { host: string; port: number }
     host: input.host ?? DEFAULT_REMOTE_CHROME_HOST,
     port: input.port ?? DEFAULT_REMOTE_CHROME_PORT,
   };
+}
+
+async function refreshBoundBrowserEndpoint(options: HostPort): Promise<string | undefined> {
+  const expectedBrowserId = options.browserId?.trim();
+  const expectedAccountDigest = options.accountDigest?.trim();
+  if (!expectedBrowserId && !expectedAccountDigest) return options.browserWSEndpoint;
+  if (
+    !expectedBrowserId ||
+    !expectedAccountDigest ||
+    !/^[a-f0-9]{64}$/.test(expectedAccountDigest)
+  ) {
+    throw new Error("Stored remote Chrome browser and account identity is incomplete.");
+  }
+  const { host, port } = normalizeHostPort(options);
+  const liveIdentity = await resolveRemoteChromeBrowserIdentity({ host, port });
+  if (liveIdentity.browserId !== expectedBrowserId) {
+    throw new Error("Remote Chrome browser identity changed before live tab inspection.");
+  }
+  return liveIdentity.browserWSEndpoint;
 }
 
 function normalizeUrl(value: unknown): string {
@@ -348,6 +371,13 @@ export async function inspectChatGptTab(
   const client = await connectToTarget(host, port, targetId, options.browserWSEndpoint);
   try {
     const { Runtime } = client;
+    const expectedAccountDigest = options.accountDigest?.trim();
+    if (expectedAccountDigest) {
+      const observedAccountDigest = await readChatGptAccountDigest(Runtime);
+      if (observedAccountDigest !== expectedAccountDigest) {
+        throw new Error("Remote Chrome account identity changed before live tab inspection.");
+      }
+    }
     const evaluation = await Runtime.evaluate({
       expression: buildTabInspectionExpression(),
       returnByValue: true,
@@ -458,8 +488,19 @@ export function classifyTabState(
 
 export async function collectChatGptTabs(options: HostPort = {}): Promise<ChatGptTabSummary[]> {
   const { host, port } = normalizeHostPort(options);
-  const targets = await listChatGptTargets({ host, port });
-  return collectChatGptTabsFromTargets(host, port, targets);
+  const browserWSEndpoint = await refreshBoundBrowserEndpoint(options);
+  const targets = browserWSEndpoint
+    ? ((await listRemoteChromeTargets({ host, port, browserWSEndpoint })) as ChromeTarget[]).filter(
+        isChatGptTarget,
+      )
+    : await listChatGptTargets({ host, port });
+  return collectChatGptTabsFromTargets(
+    host,
+    port,
+    targets,
+    browserWSEndpoint,
+    options.accountDigest,
+  );
 }
 
 function resolveChatGptTabFromSummaries(
@@ -576,13 +617,22 @@ async function collectChatGptTabsFromTargets(
   port: number,
   targets: ChromeTarget[],
   browserWSEndpoint?: string,
+  accountDigest?: string,
 ): Promise<ChatGptTabSummary[]> {
   const summaries: ChatGptTabSummary[] = [];
   for (const target of targets) {
     try {
-      const summary = await inspectChatGptTab({ host, port, target, browserWSEndpoint });
+      const summary = await inspectChatGptTab({
+        host,
+        port,
+        target,
+        browserWSEndpoint,
+        accountDigest,
+      });
       summaries.push(summary);
     } catch (error) {
+      if (accountDigest) throw error;
+
       summaries.push({
         host,
         port,
@@ -621,12 +671,29 @@ export async function resolveChatGptTab(
   options: ResolveChatGptTabOptions = {},
 ): Promise<ChatGptTabSummary> {
   const { host, port } = normalizeHostPort(options);
-  const targets = await listChatGptTargets({ host, port });
+  const browserWSEndpoint = await refreshBoundBrowserEndpoint(options);
+  const targets = browserWSEndpoint
+    ? ((await listRemoteChromeTargets({ host, port, browserWSEndpoint })) as ChromeTarget[]).filter(
+        isChatGptTarget,
+      )
+    : await listChatGptTargets({ host, port });
   const exactTarget = resolveExactChatGptTarget(targets, options.ref);
   if (exactTarget) {
-    return inspectChatGptTab({ host, port, target: exactTarget });
+    return inspectChatGptTab({
+      host,
+      port,
+      browserWSEndpoint,
+      accountDigest: options.accountDigest,
+      target: exactTarget,
+    });
   }
-  const summaries = await collectChatGptTabsFromTargets(host, port, targets);
+  const summaries = await collectChatGptTabsFromTargets(
+    host,
+    port,
+    targets,
+    browserWSEndpoint,
+    options.accountDigest,
+  );
   return resolveChatGptTabFromSummaries(summaries, options.ref);
 }
 
@@ -634,12 +701,13 @@ export async function connectToExistingChatGptTab(
   options: ResolveChatGptTabOptions = {},
 ): Promise<{ client: Awaited<ReturnType<typeof CDP>>; targetId: string; tab: ChatGptTabSummary }> {
   const { host, port } = normalizeHostPort(options);
-  if (options.browserWSEndpoint) {
+  const browserWSEndpoint = await refreshBoundBrowserEndpoint(options);
+  if (browserWSEndpoint) {
     const targets = (
       (await listRemoteChromeTargets({
         host,
         port,
-        browserWSEndpoint: options.browserWSEndpoint,
+        browserWSEndpoint,
       })) as ChromeTarget[]
     ).filter(isChatGptTarget);
     const exactTarget = resolveExactChatGptTarget(targets, options.ref);
@@ -648,14 +716,21 @@ export async function connectToExistingChatGptTab(
           host,
           port,
           target: exactTarget,
-          browserWSEndpoint: options.browserWSEndpoint,
+          browserWSEndpoint,
+          accountDigest: options.accountDigest,
         })
       : resolveChatGptTabFromSummaries(
-          await collectChatGptTabsFromTargets(host, port, targets, options.browserWSEndpoint),
+          await collectChatGptTabsFromTargets(
+            host,
+            port,
+            targets,
+            browserWSEndpoint,
+            options.accountDigest,
+          ),
           options.ref,
         );
     const connection = await connectToRemoteChromeTarget(host, port, noopLogger, {
-      browserWSEndpoint: options.browserWSEndpoint,
+      browserWSEndpoint,
       targetId: tab.targetId,
       closeTargetOnDispose: false,
     });
@@ -683,16 +758,19 @@ export async function connectToExistingChatGptTab(
 export async function harvestChatGptTab(
   options: HarvestChatGptTabOptions = {},
 ): Promise<ChatGptTabSummary> {
+  const browserWSEndpoint = await refreshBoundBrowserEndpoint(options);
   const { host, port } = normalizeHostPort(options);
   const resolved = options.target
-    ? await inspectChatGptTab({ host, port, target: options.target })
-    : await resolveChatGptTab({ host, port, ref: options.ref });
-  const client = await connectToTarget(host, port, resolved.targetId);
+    ? await inspectChatGptTab({ ...options, browserWSEndpoint, target: options.target })
+    : await resolveChatGptTab({ ...options, browserWSEndpoint, ref: options.ref });
+  const client = await connectToTarget(host, port, resolved.targetId, browserWSEndpoint);
   try {
     const { Runtime } = client;
     const snapshot = await readAssistantSnapshot(Runtime).catch(() => null);
     const nowSummary = await inspectChatGptTab({
+      ...options,
       host,
+      browserWSEndpoint,
       port,
       target: {
         targetId: resolved.targetId,
@@ -745,7 +823,9 @@ export async function harvestChatGptTab(
       const firstFingerprint = harvested.fingerprint;
       await delay(options.stallWindowMs);
       const followup = await inspectChatGptTab({
+        ...options,
         host,
+        browserWSEndpoint,
         port,
         target: {
           targetId: harvested.targetId,

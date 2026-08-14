@@ -30,6 +30,7 @@ import {
   navigateToPromptReadyWithFallback,
   ensureNotBlocked,
   ensureLoggedIn,
+  readChatGptAccountDigest,
   ensurePromptReady,
   ensureChatMode,
   waitForResumedConversationHydration,
@@ -3046,6 +3047,25 @@ async function maybeReuseRunningChrome(
   } as unknown as LaunchedChrome;
 }
 
+async function assertRemoteChatGptAccountAffinity(
+  Runtime: ChromeClient["Runtime"],
+  accountDigest: string | null | undefined,
+  action: string,
+): Promise<void> {
+  const expectedAccountDigest = accountDigest?.trim();
+  if (!expectedAccountDigest || !/^[a-f0-9]{64}$/.test(expectedAccountDigest)) {
+    throw new BrowserAutomationError(
+      `Remote Chrome account identity is unavailable before ${action}.`,
+      { stage: "remote-browser-identity" },
+    );
+  }
+  if ((await readChatGptAccountDigest(Runtime)) !== expectedAccountDigest) {
+    throw new BrowserAutomationError(`Remote Chrome account identity changed before ${action}.`, {
+      stage: "remote-browser-identity",
+    });
+  }
+}
+
 async function runRemoteBrowserMode(
   promptText: string,
   attachments: BrowserAttachment[],
@@ -3061,6 +3081,12 @@ async function runRemoteBrowserMode(
   }
   const { host, port } = remoteChromeConfig;
   const expectedBrowserId = config.remoteChromeBrowserId?.trim();
+  const expectedAccountDigest = config.remoteChromeAccountDigest?.trim();
+  if (expectedAccountDigest && !/^[a-f0-9]{64}$/.test(expectedAccountDigest)) {
+    throw new BrowserAutomationError("Remote Chrome account identity is invalid.", {
+      stage: "remote-browser-identity",
+    });
+  }
   let browserWSEndpoint = config.remoteChromeBrowserWSEndpoint ?? undefined;
   if (expectedBrowserId) {
     if (!browserWSEndpoint) {
@@ -3096,6 +3122,16 @@ async function runRemoteBrowserMode(
       },
     );
   }
+  if (
+    process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" &&
+    config.resumeConversationUrl &&
+    !expectedAccountDigest
+  ) {
+    throw new BrowserAutomationError(
+      "Stored remote Chrome session has no verified account identity; start a fresh browser conversation through the agent wrapper.",
+      { stage: "remote-browser-identity" },
+    );
+  }
   logger(`Connecting to remote Chrome at ${host}:${port}`);
 
   let client: ChromeClient | null = null;
@@ -3106,6 +3142,7 @@ async function runRemoteBrowserMode(
   let promptSubmitted = false;
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
   let attachedExistingTab = false;
+  let attachedTabDescription: string | null = null;
   let ownsTarget = true;
   let conversationUrlMonitor: ConversationUrlMonitor | null = null;
   const runtimeHintCb = options.runtimeHintCb;
@@ -3117,6 +3154,7 @@ async function runRemoteBrowserMode(
           chromePort: port,
           chromeHost: host,
           chromeBrowserWSEndpoint: browserWSEndpoint,
+          chatGptAccountDigest: config.remoteChromeAccountDigest ?? undefined,
           chromeProfileRoot,
           chromeTargetId: remoteTargetId ?? undefined,
           tabUrl: lastUrl,
@@ -3178,16 +3216,16 @@ async function runRemoteBrowserMode(
         host,
         port,
         ref: config.browserTabRef,
+        browserId: expectedBrowserId,
         browserWSEndpoint,
+        accountDigest: expectedAccountDigest,
       });
       client = attached.client;
       remoteTargetId = attached.targetId ?? null;
       lastUrl = attached.tab.url || lastUrl;
       attachedExistingTab = true;
       ownsTarget = false;
-      logger(
-        `Attached to existing remote ChatGPT tab ${attached.targetId}${attached.tab.url ? ` (${attached.tab.url})` : ""}`,
-      );
+      attachedTabDescription = `Attached to existing remote ChatGPT tab ${attached.targetId}${attached.tab.url ? ` (${attached.tab.url})` : ""}`;
     } else {
       connection = await connectToRemoteChrome(
         host,
@@ -3210,7 +3248,6 @@ async function runRemoteBrowserMode(
         chromeTargetId: remoteTargetId,
       });
     }
-    await emitRuntimeHint();
     const markConnectionLost = () => {
       connectionClosedUnexpectedly = true;
     };
@@ -3241,7 +3278,24 @@ async function runRemoteBrowserMode(
     });
     conversationUrlMonitor = activeConversationUrlMonitor;
 
-    // Skip cookie sync for remote Chrome - it already has cookies
+    // Skip cookie sync for remote Chrome - it already has cookies.
+    // For a stored session, verify the signed-in account before touching its conversation state.
+    if (expectedAccountDigest) {
+      if (!attachedExistingTab) {
+        await navigateToChatGPT(Page, Runtime, CHATGPT_URL, logger);
+      }
+      await ensureNotBlocked(Runtime, config.headless, logger);
+      await ensureLoggedIn(Runtime, logger, { remoteSession: true });
+      const observedAccountDigest = await readChatGptAccountDigest(Runtime);
+      if (observedAccountDigest !== expectedAccountDigest) {
+        throw new BrowserAutomationError(
+          "Remote Chrome account identity changed before submission.",
+          {
+            stage: "remote-browser-identity",
+          },
+        );
+      }
+    }
     logger("Skipping cookie sync for remote Chrome (using existing session)");
     await clearStaleChatGptConversationCookies(Network, Target, logger, {
       preserveConversationIds: [
@@ -3252,11 +3306,25 @@ async function runRemoteBrowserMode(
 
     if (config.resumeConversationUrl) {
       await navigateToChatGPT(Page, Runtime, config.resumeConversationUrl, logger);
-    } else if (!attachedExistingTab) {
+    } else if (!attachedExistingTab && !expectedAccountDigest) {
       await navigateToChatGPT(Page, Runtime, config.url, logger);
     }
     await ensureNotBlocked(Runtime, config.headless, logger);
     await ensureLoggedIn(Runtime, logger, { remoteSession: true });
+    const observedAccountDigest = await readChatGptAccountDigest(Runtime);
+    if (expectedAccountDigest && observedAccountDigest !== expectedAccountDigest) {
+      throw new BrowserAutomationError(
+        "Remote Chrome account identity changed before submission.",
+        {
+          stage: "remote-browser-identity",
+        },
+      );
+    }
+    if (!expectedAccountDigest) {
+      config.remoteChromeAccountDigest = observedAccountDigest;
+    }
+    if (attachedTabDescription) logger(attachedTabDescription);
+    await emitRuntimeHint();
     await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
     if (config.resumeConversationUrl) {
       await waitForResumedConversationHydration(Runtime, config.inputTimeoutMs, logger, {
@@ -3345,7 +3413,13 @@ async function runRemoteBrowserMode(
         },
       );
     }
+
     const submitOnce = async (prompt: string, submissionAttachments: BrowserAttachment[]) => {
+      await assertRemoteChatGptAccountAffinity(
+        Runtime,
+        config.remoteChromeAccountDigest,
+        "submission preparation",
+      );
       const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
       const baselineAssistantText =
         typeof baselineSnapshot?.text === "string" ? baselineSnapshot.text.trim() : "";
@@ -3363,6 +3437,11 @@ async function runRemoteBrowserMode(
         await clearComposerAttachments(Runtime, 5_000, logger);
         // Use remote file transfer for remote Chrome (reads local files and injects via CDP)
         for (const attachment of submissionAttachments) {
+          await assertRemoteChatGptAccountAffinity(
+            Runtime,
+            config.remoteChromeAccountDigest,
+            "attachment upload",
+          );
           logger(`Uploading attachment: ${attachment.displayPath}`);
           await uploadAttachmentViaDataTransfer({ runtime: Runtime, dom: DOM }, attachment, logger);
           await delay(500);
@@ -3409,6 +3488,11 @@ async function runRemoteBrowserMode(
         deepResearch && client
           ? await captureDeepResearchTargetBaseline(client, logger)
           : undefined;
+      await assertRemoteChatGptAccountAffinity(
+        Runtime,
+        config.remoteChromeAccountDigest,
+        "submission",
+      );
       await runProviderSubmissionFlow(chatgptDomProvider, {
         prompt,
         evaluate: async () => undefined,
@@ -3977,6 +4061,7 @@ async function runRemoteBrowserMode(
       chromePort: port,
       chromeHost: host,
       chromeBrowserWSEndpoint: browserWSEndpoint,
+      chatGptAccountDigest: config.remoteChromeAccountDigest ?? undefined,
       chromeProfileRoot,
       userDataDir: undefined,
       chromeTargetId: remoteTargetId ?? undefined,
@@ -4039,6 +4124,7 @@ async function runRemoteBrowserMode(
         chromeHost: host,
         chromePort: port,
         chromeBrowserWSEndpoint: browserWSEndpoint,
+        chatGptAccountDigest: config.remoteChromeAccountDigest ?? undefined,
         chromeProfileRoot,
         chromeTargetId: remoteTargetId ?? undefined,
         tabUrl: liveness.matchedUrl ?? lastUrl,
@@ -4114,6 +4200,7 @@ export { resolveBrowserConfig, DEFAULT_BROWSER_CONFIG } from "./config.js";
 
 // biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
 export const __test__ = {
+  assertRemoteChatGptAccountAffinity,
   assertManualLoginProfileReadyForRun,
   closeRemoteConnectionAfterRun,
   classifyChatGptUiWarningText,

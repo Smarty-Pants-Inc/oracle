@@ -540,6 +540,36 @@ export async function ensureLoggedIn(
   throw new Error(`ChatGPT session not detected.${domLabel}${accountHint} ${cookieHint}`);
 }
 
+/** Returns only the SHA-256 digest of ChatGPT's authenticated user id. */
+export async function readChatGptAccountDigest(Runtime: ChromeClient["Runtime"]): Promise<string> {
+  const outcome = await Runtime.evaluate({
+    expression: `(() => (async () => {
+      try {
+        const response = await fetch('/api/auth/session', {
+          cache: 'no-store', credentials: 'include',
+        });
+        if (!response.ok) return null;
+        const body = await response.json();
+        const userId = typeof body?.user?.id === 'string' ? body.user.id.trim() : '';
+        if (!userId || !globalThis.crypto?.subtle) return null;
+        const bytes = new Uint8Array(await crypto.subtle.digest(
+          'SHA-256', new TextEncoder().encode(userId),
+        ));
+        return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+      } catch {
+        return null;
+      }
+    })())()`,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  const digest = outcome.result?.value;
+  if (typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest)) {
+    throw new Error("Authenticated ChatGPT account identity is unavailable.");
+  }
+  return digest;
+}
+
 interface WelcomeBackLoginAttempt {
   accepted: boolean;
   hint?: string;

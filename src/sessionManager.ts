@@ -74,6 +74,8 @@ export interface BrowserSessionConfig {
   remoteChrome?: { host: string; port: number } | null;
   remoteChromeBrowserId?: string | null;
   remoteChromeBrowserWSEndpoint?: string | null;
+  /** SHA-256 digest of the authenticated ChatGPT user id; never the user id itself. */
+  remoteChromeAccountDigest?: string | null;
   remoteChromeProfileRoot?: string | null;
   manualLogin?: boolean;
   manualLoginProfileDir?: string | null;
@@ -96,6 +98,7 @@ export interface BrowserRuntimeMetadata {
   chromePort?: number;
   chromeHost?: string;
   chromeBrowserWSEndpoint?: string;
+  chatGptAccountDigest?: string;
   chromeProfileRoot?: string;
   userDataDir?: string;
   chromeTargetId?: string;

@@ -941,6 +941,7 @@ module.exports = () => ({
               remoteChrome: { host: "127.0.0.1", port: 9223 },
               remoteChromeBrowserId: "browser-parent",
               remoteChromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-parent",
+              remoteChromeAccountDigest: "a".repeat(64),
             },
             harvest: { url: "https://chatgpt.com/c/browser-parent" },
           },

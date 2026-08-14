@@ -16,6 +16,7 @@ import {
   browserIdFromWebSocketEndpoint,
   resolveRemoteChromeBrowserIdentity,
 } from "./profileState.js";
+import { readChatGptAccountDigest } from "./pageActions.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -59,6 +60,7 @@ export interface ChatGptConversationExportOptions {
   port?: number;
   browserId?: string;
   browserWSEndpoint?: string;
+  accountDigest?: string;
   timeoutMs?: number;
   chunkSize?: number;
   recoverArchived?: boolean;
@@ -192,6 +194,35 @@ export function isSameConversationUrl(actualUrl: string, expectedConversationId:
   } catch {
     return false;
   }
+}
+
+async function assertChatGptExportMutationAffinity(
+  Runtime: ChromeClient["Runtime"],
+  expectedAccountDigest: string | undefined,
+  conversationId: string,
+  action: string,
+): Promise<void> {
+  if (expectedAccountDigest) {
+    const observedAccountDigest = await readChatGptAccountDigest(Runtime);
+    if (observedAccountDigest !== expectedAccountDigest) {
+      throw new Error(`Remote Chrome account identity changed before ${action}.`);
+    }
+  }
+  const currentUrl = await evaluateByValue<string>(Runtime, "location.href", "conversation URL");
+  if (!isSameConversationUrl(currentUrl, conversationId)) {
+    throw new Error(
+      `ChatGPT conversation changed before ${action}; expected ${conversationId}, got ${currentUrl}`,
+    );
+  }
+}
+
+export async function assertChatGptExportMutationAffinityForTest(
+  Runtime: ChromeClient["Runtime"],
+  expectedAccountDigest: string | undefined,
+  conversationId: string,
+  action = "archive mutation",
+): Promise<void> {
+  await assertChatGptExportMutationAffinity(Runtime, expectedAccountDigest, conversationId, action);
 }
 
 function hashText(value: string): string {
@@ -366,12 +397,14 @@ async function recoverArchivedConversation({
   host,
   port,
   browserWSEndpoint,
+  accountDigest,
   timeoutMs,
 }: {
   targetUrl: string;
   host: string;
   port: number;
   browserWSEndpoint?: string;
+  accountDigest?: string;
   timeoutMs: number;
 }): Promise<{
   client: Awaited<ReturnType<typeof connectToExistingChatGptTab>>["client"];
@@ -382,7 +415,12 @@ async function recoverArchivedConversation({
   const conversationId = conversationIdFromChatGptUrl(targetUrl);
   const settingsUrl = archivedSettingsUrlFromConversationUrl(targetUrl);
   const projectUrl = settingsUrl.split("#", 1)[0] as string;
-  const targetId = await openChatGptTarget({ host, port, browserWSEndpoint, url: projectUrl });
+  const targetId = await openChatGptTarget({
+    host,
+    port,
+    browserWSEndpoint,
+    url: accountDigest ? "https://chatgpt.com/" : projectUrl,
+  });
   const { client } = await connectToExistingChatGptTab({
     host,
     port,
@@ -393,6 +431,12 @@ async function recoverArchivedConversation({
     const { Page, Runtime } = client;
     await Page.enable();
     await waitForDocument(Runtime, timeoutMs);
+    if (accountDigest) {
+      const observedAccountDigest = await readChatGptAccountDigest(Runtime);
+      if (observedAccountDigest !== accountDigest) {
+        throw new Error("Remote Chrome account identity changed before ChatGPT export.");
+      }
+    }
     await Runtime.evaluate({
       expression: buildArchivedConversationRecoveryHook(conversationId),
       awaitPromise: false,
@@ -1067,12 +1111,18 @@ export async function captureApprovedChatGptConversationBackend(
   const timeoutMs = options.timeoutMs ?? 45_000;
   const expectedBrowserId = options.browserId?.trim();
   let browserWSEndpoint = options.browserWSEndpoint?.trim();
-  if (expectedBrowserId || browserWSEndpoint) {
-    if (!expectedBrowserId || !browserWSEndpoint) {
-      throw new Error("ChatGPT export browser affinity requires both browser id and WebSocket.");
+  const expectedAccountDigest = options.accountDigest?.trim();
+  if (expectedBrowserId || browserWSEndpoint || expectedAccountDigest) {
+    if (!expectedBrowserId || !browserWSEndpoint || !expectedAccountDigest) {
+      throw new Error(
+        "ChatGPT export browser affinity requires browser id, WebSocket, and account identity.",
+      );
     }
     if (browserIdFromWebSocketEndpoint(browserWSEndpoint) !== expectedBrowserId) {
       throw new Error("ChatGPT export browser id does not match its WebSocket.");
+    }
+    if (!/^[a-f0-9]{64}$/.test(expectedAccountDigest)) {
+      throw new Error("ChatGPT export account identity is invalid.");
     }
     const liveIdentity = await resolveRemoteChromeBrowserIdentity({ host, port });
     if (liveIdentity.browserId !== expectedBrowserId) {
@@ -1095,6 +1145,8 @@ export async function captureApprovedChatGptConversationBackend(
       host,
       port,
       browserWSEndpoint,
+      browserId: expectedBrowserId,
+      accountDigest: expectedAccountDigest,
       ref: tabRef,
     });
     if (!isSameConversationUrl(connected.tab.url, conversationId)) {
@@ -1118,6 +1170,7 @@ export async function captureApprovedChatGptConversationBackend(
       port,
       browserWSEndpoint,
       timeoutMs,
+      accountDigest: expectedAccountDigest,
     });
     resolved = {
       client: recovered.client,
@@ -1131,6 +1184,12 @@ export async function captureApprovedChatGptConversationBackend(
   let archiveRestored = false;
   try {
     const { Page, Runtime } = client;
+    if (expectedAccountDigest) {
+      const observedAccountDigest = await readChatGptAccountDigest(Runtime);
+      if (observedAccountDigest !== expectedAccountDigest) {
+        throw new Error("Remote Chrome account identity changed before ChatGPT export.");
+      }
+    }
     await Page.addScriptToEvaluateOnNewDocument({
       source: buildScopedBackendCaptureHook(targetApiUrl),
     });
@@ -1175,6 +1234,12 @@ export async function captureApprovedChatGptConversationBackend(
     const shouldArchive = options.archiveAfterExport === true || recovery.recovered;
     let postExportArchive: BrowserArchiveResult | undefined;
     if (shouldArchive) {
+      await assertChatGptExportMutationAffinity(
+        Runtime,
+        expectedAccountDigest,
+        conversationId,
+        "post-export archive",
+      );
       postExportArchive = await archiveChatGptConversation(Runtime, () => {}, {
         mode: "always",
         conversationUrl: options.targetUrl,
@@ -1187,10 +1252,18 @@ export async function captureApprovedChatGptConversationBackend(
     return { ...result, archiveRecovery: recovery, postExportArchive };
   } catch (error) {
     if (recovery.recovered && !archiveRestored) {
-      const restore = await archiveChatGptConversation(client.Runtime, () => {}, {
-        mode: "always",
-        conversationUrl: options.targetUrl,
-      }).catch(() => null);
+      const restore = await (async () => {
+        await assertChatGptExportMutationAffinity(
+          client.Runtime,
+          expectedAccountDigest,
+          conversationId,
+          "archive restore",
+        );
+        return archiveChatGptConversation(client.Runtime, () => {}, {
+          mode: "always",
+          conversationUrl: options.targetUrl,
+        });
+      })().catch(() => null);
       if (!restore?.archived) {
         throw new Error(
           `${error instanceof Error ? error.message : String(error)}; archive restore also failed`,

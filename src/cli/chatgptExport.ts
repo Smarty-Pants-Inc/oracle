@@ -11,10 +11,7 @@ import {
 import { DEFAULT_REMOTE_CHROME_HOST, DEFAULT_REMOTE_CHROME_PORT } from "../browser/liveTabs.js";
 import { extractStableConversationIdFromUrl } from "../browser/conversationUrl.js";
 import { sessionStore, type SessionMetadata } from "../sessionStore.js";
-import {
-  browserIdFromWebSocketEndpoint,
-  resolveRemoteChromeBrowserIdentity,
-} from "../browser/profileState.js";
+import { browserIdFromWebSocketEndpoint } from "../browser/profileState.js";
 
 export interface ChatGptExportCliOptions {
   targetUrl?: string;
@@ -36,6 +33,7 @@ export interface ChatGptExportRemoteChromeAffinity {
   port: number;
   browserId: string;
   browserWSEndpoint: string;
+  accountDigest: string;
 }
 
 export type ChatGptExportRemoteChromeTarget =
@@ -83,13 +81,19 @@ function storedRemoteChromeAffinities(
     }
     const configuredBrowserId = config?.remoteChromeBrowserId?.trim();
     const configuredBrowserWSEndpoint = config?.remoteChromeBrowserWSEndpoint?.trim();
+    const configuredAccountDigest = config?.remoteChromeAccountDigest?.trim();
+    const runtimeAccountDigest = metadata.browser?.runtime?.chatGptAccountDigest?.trim();
+    const accountDigest = runtimeAccountDigest ?? configuredAccountDigest;
+    if (
+      configuredAccountDigest &&
+      runtimeAccountDigest &&
+      configuredAccountDigest !== runtimeAccountDigest
+    ) {
+      throw new Error("Stored remote Chrome account identity is conflicting.");
+    }
     const browserWSEndpoint = runtimeBrowserWSEndpoint ?? configuredBrowserWSEndpoint;
-    if (!browserWSEndpoint) {
-      if (configuredBrowserId || process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1") {
-        throw new Error("Stored remote Chrome browser identity is unavailable.");
-      }
-      affinities.set(`${host.toLowerCase()}:${port}\t`, { host, port });
-      continue;
+    if (!browserWSEndpoint || !accountDigest) {
+      throw new Error("Stored remote Chrome browser and account identity is unavailable.");
     }
     const browserId = browserIdFromWebSocketEndpoint(browserWSEndpoint);
     if (configuredBrowserId && configuredBrowserId !== browserId) {
@@ -101,8 +105,11 @@ function storedRemoteChromeAffinities(
     ) {
       throw new Error("Stored remote Chrome browser identity is conflicting.");
     }
-    const affinity = { host, port, browserId, browserWSEndpoint };
-    affinities.set(`${host.toLowerCase()}:${port}\t${browserId}`, affinity);
+    if (!/^[a-f0-9]{64}$/.test(accountDigest)) {
+      throw new Error("Stored remote Chrome account identity is invalid.");
+    }
+    const affinity = { host, port, browserId, browserWSEndpoint, accountDigest };
+    affinities.set(`${host.toLowerCase()}:${port}\t${browserId}\t${accountDigest}`, affinity);
   }
   return [...affinities.values()];
 }
@@ -131,7 +138,11 @@ export function resolveChatGptExportRemoteChrome(
     }
     for (const affinity of storedAffinities) {
       const browserId = "browserId" in affinity ? affinity.browserId : "";
-      affinities.set(`${affinity.host.toLowerCase()}:${affinity.port}\t${browserId}`, affinity);
+      const accountDigest = "accountDigest" in affinity ? affinity.accountDigest : "";
+      affinities.set(
+        `${affinity.host.toLowerCase()}:${affinity.port}\t${browserId}\t${accountDigest}`,
+        affinity,
+      );
     }
   }
 
@@ -242,6 +253,7 @@ export async function handleChatGptExportCommand(options: ChatGptExportCliOption
   if (!targetUrl) {
     throw new Error("--target-url is required.");
   }
+  conversationIdFromChatGptUrl(targetUrl);
   if (
     process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" &&
     (options.remoteChrome !== undefined || options.obuSessionId || options.obuTabId)
@@ -262,10 +274,7 @@ export async function handleChatGptExportCommand(options: ChatGptExportCliOption
   const remoteChromeAffinity = options.obuTabId
     ? { host: DEFAULT_REMOTE_CHROME_HOST, port: DEFAULT_REMOTE_CHROME_PORT }
     : explicitRemoteChrome
-      ? {
-          ...explicitRemoteChrome,
-          ...(await resolveRemoteChromeBrowserIdentity(explicitRemoteChrome)),
-        }
+      ? explicitRemoteChrome
       : options.sessionId
         ? resolveChatGptExportRemoteChromeForSession(
             targetUrl,
@@ -296,6 +305,8 @@ export async function handleChatGptExportCommand(options: ChatGptExportCliOption
           "browserWSEndpoint" in remoteChromeAffinity
             ? remoteChromeAffinity.browserWSEndpoint
             : undefined,
+        accountDigest:
+          "accountDigest" in remoteChromeAffinity ? remoteChromeAffinity.accountDigest : undefined,
         timeoutMs,
         chunkSize,
         recoverArchived: options.recoverArchived,

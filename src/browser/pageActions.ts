@@ -3,6 +3,7 @@ export {
   navigateToPromptReadyWithFallback,
   ensureNotBlocked,
   ensureLoggedIn,
+  readChatGptAccountDigest,
   ensurePromptReady,
   ensureChatMode,
   waitForResumedConversationHydration,

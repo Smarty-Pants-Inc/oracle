@@ -75,6 +75,39 @@ describe("remote browser identity", () => {
       vi.unstubAllGlobals();
     }
   });
+  test("rechecks the stored account digest at the requested action boundary", async () => {
+    const digest = "a".repeat(64);
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({ result: { value: digest } }),
+    };
+
+    await expect(
+      __test__.assertRemoteChatGptAccountAffinity(runtime as never, digest, "submission"),
+    ).resolves.toBeUndefined();
+    await expect(
+      __test__.assertRemoteChatGptAccountAffinity(
+        runtime as never,
+        "b".repeat(64),
+        "attachment upload",
+      ),
+    ).rejects.toMatchObject({
+      message: expect.stringMatching(/changed before attachment upload/i),
+      details: { stage: "remote-browser-identity" },
+    });
+  });
+
+  test("rejects a missing stored account digest before submission", async () => {
+    await expect(
+      __test__.assertRemoteChatGptAccountAffinity(
+        { evaluate: vi.fn() } as never,
+        null,
+        "submission",
+      ),
+    ).rejects.toMatchObject({
+      message: expect.stringMatching(/unavailable before submission/i),
+      details: { stage: "remote-browser-identity" },
+    });
+  });
 });
 
 describe("shouldPreserveBrowserOnErrorForTest", () => {

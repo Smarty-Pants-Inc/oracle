@@ -24,16 +24,19 @@ function session(
 describe("ChatGPT export endpoint affinity", () => {
   const ws = (browserId: string, host = "127.0.0.1", port = 9223) =>
     `ws://${host}:${port}/devtools/browser/${browserId}`;
+  const accountDigest = "a".repeat(64);
   const config = (host: string, port: number, browserId: string) => ({
     remoteChrome: { host, port },
     remoteChromeBrowserId: browserId,
     remoteChromeBrowserWSEndpoint: ws(browserId, host, port),
+    remoteChromeAccountDigest: accountDigest,
   });
   const affinity = (host: string, port: number, browserId: string) => ({
     host,
     port,
     browserId,
     browserWSEndpoint: ws(browserId, host, port),
+    accountDigest,
   });
 
   test("matches a root target URL to project conversation evidence", () => {
@@ -99,7 +102,10 @@ describe("ChatGPT export endpoint affinity", () => {
         session("runtime", {
           harvest: { conversationId: "thread-runtime" },
           config: { remoteChrome: { host: "127.0.0.1", port: 9229 } },
-          runtime: { chromeBrowserWSEndpoint: browserWSEndpoint },
+          runtime: {
+            chromeBrowserWSEndpoint: browserWSEndpoint,
+            chatGptAccountDigest: accountDigest,
+          },
         }),
       ]),
     ).toEqual({
@@ -107,6 +113,7 @@ describe("ChatGPT export endpoint affinity", () => {
       port: 9229,
       browserId: "browser-a",
       browserWSEndpoint,
+      accountDigest,
     });
   });
 
@@ -199,18 +206,18 @@ describe("ChatGPT export endpoint affinity", () => {
     ).toThrow(/stored remote Chrome endpoint is invalid/i);
   });
 
-  test("preserves raw stored endpoints outside the wrapper", () => {
-    expect(
+  test("rejects incomplete session-derived affinity outside the wrapper", () => {
+    expect(() =>
       resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-host-only", [
         session("host-only", {
           harvest: { conversationId: "thread-host-only" },
           config: { remoteChrome: { host: "127.0.0.1", port: 9223 } },
         }),
       ]),
-    ).toEqual({ host: "127.0.0.1", port: 9223 });
+    ).toThrow(/browser and account identity is unavailable/i);
   });
 
-  test("fails closed for wrapper-routed sessions with only host and port", () => {
+  test("rejects incomplete wrapper-routed session affinity", () => {
     const previous = process.env.ORACLE_WRAPPER_REMOTE_ONLY;
     process.env.ORACLE_WRAPPER_REMOTE_ONLY = "1";
     try {
@@ -221,13 +228,10 @@ describe("ChatGPT export endpoint affinity", () => {
             config: { remoteChrome: { host: "127.0.0.1", port: 9223 } },
           }),
         ]),
-      ).toThrow(/browser identity is unavailable/i);
+      ).toThrow(/browser and account identity is unavailable/i);
     } finally {
-      if (previous === undefined) {
-        delete process.env.ORACLE_WRAPPER_REMOTE_ONLY;
-      } else {
-        process.env.ORACLE_WRAPPER_REMOTE_ONLY = previous;
-      }
+      if (previous === undefined) delete process.env.ORACLE_WRAPPER_REMOTE_ONLY;
+      else process.env.ORACLE_WRAPPER_REMOTE_ONLY = previous;
     }
   });
 
@@ -303,6 +307,24 @@ describe("ChatGPT export endpoint affinity", () => {
         session("after-restart", {
           harvest: { conversationId: "thread-restarted" },
           config: config("127.0.0.1", 9223, "browser-b"),
+        }),
+      ]),
+    ).toThrow(/conflicting stored remote Chrome browser affinities/i);
+  });
+  test("rejects different account bindings on the same browser generation", () => {
+    const targetUrl = "https://chatgpt.com/c/thread-account-switch";
+    expect(() =>
+      resolveChatGptExportRemoteChrome(targetUrl, [
+        session("account-a", {
+          harvest: { conversationId: "thread-account-switch" },
+          config: config("127.0.0.1", 9223, "browser-a"),
+        }),
+        session("account-b", {
+          harvest: { conversationId: "thread-account-switch" },
+          config: {
+            ...config("127.0.0.1", 9223, "browser-a"),
+            remoteChromeAccountDigest: "b".repeat(64),
+          },
         }),
       ]),
     ).toThrow(/conflicting stored remote Chrome browser affinities/i);

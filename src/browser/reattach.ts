@@ -9,6 +9,7 @@ import {
   navigateToChatGPT,
   ensureNotBlocked,
   ensureLoggedIn,
+  readChatGptAccountDigest,
   ensurePromptReady,
   waitForResumedConversationHydration,
 } from "./pageActions.js";
@@ -84,18 +85,44 @@ export async function resumeBrowserSession(
 
   const expectedBrowserId = config?.remoteChromeBrowserId?.trim();
   const configuredBrowserWSEndpoint = config?.remoteChromeBrowserWSEndpoint?.trim();
+  const expectedAccountDigest = config?.remoteChromeAccountDigest?.trim();
+  const runtimeBrowserWSEndpoint = runtime.chromeBrowserWSEndpoint?.trim();
+  const runtimeAccountDigest = runtime.chatGptAccountDigest?.trim();
   const configuredRemoteChrome = config?.remoteChrome ?? undefined;
-  const wrapperRemoteSession =
-    process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" && Boolean(configuredRemoteChrome);
-  const identityBoundRemoteSession = Boolean(expectedBrowserId) || wrapperRemoteSession;
+  const wrapperRemoteSession = process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1";
+  const identityBoundRemoteSession = Boolean(
+    wrapperRemoteSession ||
+    configuredRemoteChrome ||
+    expectedBrowserId ||
+    configuredBrowserWSEndpoint ||
+    expectedAccountDigest ||
+    runtimeAccountDigest,
+  );
   if (identityBoundRemoteSession) {
-    if (!expectedBrowserId || !configuredBrowserWSEndpoint || !configuredRemoteChrome) {
+    if (
+      !expectedBrowserId ||
+      !configuredBrowserWSEndpoint ||
+      !configuredRemoteChrome ||
+      !expectedAccountDigest
+    ) {
       throw new Error(
-        "Stored remote Chrome session has no verified browser identity; start a fresh browser conversation through the agent wrapper.",
+        "Stored remote Chrome session has no verified browser and account identity; start a fresh browser conversation through the agent wrapper.",
       );
     }
     if (browserIdFromWebSocketEndpoint(configuredBrowserWSEndpoint) !== expectedBrowserId) {
       throw new Error("Stored remote Chrome browser identity does not match its WebSocket.");
+    }
+    if (!/^[a-f0-9]{64}$/.test(expectedAccountDigest)) {
+      throw new Error("Stored remote Chrome account identity is invalid.");
+    }
+    if (
+      runtimeBrowserWSEndpoint &&
+      browserIdFromWebSocketEndpoint(runtimeBrowserWSEndpoint) !== expectedBrowserId
+    ) {
+      throw new Error("Stored remote Chrome browser identity is conflicting.");
+    }
+    if (runtimeAccountDigest && runtimeAccountDigest !== expectedAccountDigest) {
+      throw new Error("Stored remote Chrome account identity is conflicting.");
     }
   }
 
@@ -212,6 +239,12 @@ export async function resumeBrowserSession(
       pingTimeoutMs,
       "Reattach target did not respond",
     );
+    if (identityBoundRemoteSession) {
+      const observedAccountDigest = await readChatGptAccountDigest(Runtime);
+      if (observedAccountDigest !== expectedAccountDigest) {
+        throw new Error("Remote Chrome account identity changed before session reattach.");
+      }
+    }
     await ensureConversationOpen();
     const waitForHydration =
       deps.waitForConversationHydration ?? waitForResumedConversationHydration;

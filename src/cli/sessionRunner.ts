@@ -117,6 +117,9 @@ export async function performSessionRun({
           runtime: BrowserRuntimeMetadata,
           modelSelection?: BrowserModelSelectionEvidence,
         ) => {
+          if (runtime.chatGptAccountDigest && browserConfig.remoteChrome) {
+            browserConfig.remoteChromeAccountDigest ??= runtime.chatGptAccountDigest;
+          }
           const browser = {
             config: browserConfig,
             runtime,
