@@ -18,6 +18,7 @@ import {
 
 export interface ChatGptExportCliOptions {
   targetUrl?: string;
+  sessionId?: string;
   out?: string;
   browserTab?: string;
   remoteChrome?: string;
@@ -147,6 +148,24 @@ export function resolveChatGptExportRemoteChrome(
   return affinities.values().next().value as ChatGptExportRemoteChromeTarget;
 }
 
+/** Resolves one known Oracle session to its recorded browser affinity. */
+export function resolveChatGptExportRemoteChromeForSession(
+  targetUrl: string,
+  sessionId: string,
+  metadata: SessionMetadata | null,
+): ChatGptExportRemoteChromeTarget {
+  const conversationId = conversationIdFromChatGptUrl(targetUrl);
+  if (!metadata) {
+    throw new Error(`Stored Oracle session ${sessionId} was not found.`);
+  }
+  if (!sessionMatchesConversation(metadata, conversationId)) {
+    throw new Error(
+      `Stored Oracle session ${sessionId} does not match ChatGPT conversation ${conversationId}.`,
+    );
+  }
+  return resolveChatGptExportRemoteChrome(targetUrl, [metadata]);
+}
+
 export function parseRemoteChromeTarget(raw: string): { host: string; port: number } {
   const target = raw.trim();
   if (!target) {
@@ -247,7 +266,13 @@ export async function handleChatGptExportCommand(options: ChatGptExportCliOption
           ...explicitRemoteChrome,
           ...(await resolveRemoteChromeBrowserIdentity(explicitRemoteChrome)),
         }
-      : resolveChatGptExportRemoteChrome(targetUrl, await sessionStore.listSessions());
+      : options.sessionId
+        ? resolveChatGptExportRemoteChromeForSession(
+            targetUrl,
+            options.sessionId,
+            await sessionStore.readSession(options.sessionId),
+          )
+        : resolveChatGptExportRemoteChrome(targetUrl, await sessionStore.listSessions());
   const { host, port } = remoteChromeAffinity;
   const outDir = path.resolve(expandPath(options.out ?? defaultOutputDir(targetUrl)));
   const chunkSize = parsePositiveInteger(options.chunkSize, "--chunk-size");

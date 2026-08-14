@@ -117,15 +117,18 @@ See [Browser Mode](browser-mode.md) for usage.
 ```bash
 oracle chatgpt-export \
   --target-url "https://chatgpt.com/c/<conversation-id>" \
-  --remote-chrome 127.0.0.1:9222 \
+  --session-id "<originating-oracle-session-id>" \
   --out ~/Documents/chatgpt-conversation-exports/review
 ```
 
 The exact approved conversation is exported as raw JSON, normalized JSON,
-Markdown, a manifest, and checksums. Use `--browser-tab` or OBU session/tab ids
-to select an already approved tab, `--json` for a machine-readable result,
-`--no-recover-archived` to disable exact archived-chat recovery, and
-`--archive-after-export` to archive the conversation after success.
+Markdown, a manifest, and checksums. `--session-id` binds the export to that
+Oracle session's stored browser affinity; omit it only when the conversation has
+one globally unique stored affinity, or use `--remote-chrome` for an explicit
+raw-CLI endpoint. Use `--browser-tab` or OBU session/tab ids to select an already
+approved tab, `--json` for a machine-readable result, `--no-recover-archived` to
+disable exact archived-chat recovery, and `--archive-after-export` to archive the
+conversation after success.
 
 ## Image / media (browser)
 

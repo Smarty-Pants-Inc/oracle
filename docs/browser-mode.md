@@ -74,12 +74,15 @@ sending a prompt:
 ```bash
 oracle chatgpt-export \
   --target-url "https://chatgpt.com/c/<conversation-id>" \
-  --remote-chrome 127.0.0.1:9222 \
+  --session-id "<originating-oracle-session-id>" \
   --out ~/Documents/chatgpt-conversation-exports/review
 ```
 
 The command scopes capture to that exact backend conversation URL and writes
-raw JSON, normalized JSON, Markdown, a manifest, and checksums. It does not read
+raw JSON, normalized JSON, Markdown, a manifest, and checksums. `--session-id`
+uses only that Oracle session's stored browser UUID and WebSocket; omit it only
+when the conversation has one globally unique stored affinity, or use
+`--remote-chrome` for an explicit raw-CLI endpoint. The command does not read
 cookies, local storage, browser profiles, or unrelated history. Archived targets
 are recovered only for the exact approved id and re-archived after export; use
 `--no-recover-archived` to disable recovery. `--archive-after-export` is an

@@ -4,6 +4,7 @@ import {
   handleChatGptExportCommand,
   parseRemoteChromeTarget,
   resolveChatGptExportRemoteChrome,
+  resolveChatGptExportRemoteChromeForSession,
 } from "../../src/cli/chatgptExport.js";
 
 function session(
@@ -109,6 +110,56 @@ describe("ChatGPT export endpoint affinity", () => {
     });
   });
 
+  test("uses the named originating session when one conversation has multiple affinities", () => {
+    const targetUrl = "https://chatgpt.com/c/thread-session-bound";
+    const primary = session("primary", {
+      harvest: { conversationId: "thread-session-bound" },
+      config: config("127.0.0.1", 9223, "browser-primary"),
+    });
+    const backup = session("backup", {
+      harvest: { conversationId: "thread-session-bound" },
+      config: config("127.0.0.1", 9333, "browser-backup"),
+    });
+
+    expect(() => resolveChatGptExportRemoteChrome(targetUrl, [primary, backup])).toThrow(
+      /conflicting stored remote Chrome browser affinities/i,
+    );
+    expect(resolveChatGptExportRemoteChromeForSession(targetUrl, "backup", backup)).toEqual(
+      affinity("127.0.0.1", 9333, "browser-backup"),
+    );
+  });
+
+  test("uses the named session despite incomplete matching legacy metadata", () => {
+    const targetUrl = "https://chatgpt.com/c/thread-legacy-match";
+    const legacy = session("legacy", {
+      harvest: { conversationId: "thread-legacy-match" },
+    });
+    const originating = session("originating", {
+      harvest: { conversationId: "thread-legacy-match" },
+      config: config("127.0.0.1", 9444, "browser-originating"),
+    });
+
+    expect(() => resolveChatGptExportRemoteChrome(targetUrl, [legacy, originating])).toThrow(
+      /no stored remote Chrome endpoint/i,
+    );
+    expect(
+      resolveChatGptExportRemoteChromeForSession(targetUrl, "originating", originating),
+    ).toEqual(affinity("127.0.0.1", 9444, "browser-originating"));
+  });
+
+  test("rejects missing or mismatched named sessions", () => {
+    const targetUrl = "https://chatgpt.com/c/thread-exact";
+    expect(() => resolveChatGptExportRemoteChromeForSession(targetUrl, "missing", null)).toThrow(
+      /stored Oracle session missing was not found/i,
+    );
+    expect(() =>
+      resolveChatGptExportRemoteChromeForSession(
+        targetUrl,
+        "other",
+        session("other", { harvest: { conversationId: "different-thread" } }),
+      ),
+    ).toThrow(/does not match ChatGPT conversation thread-exact/i);
+  });
   test("fails closed when no session matches the target conversation", () => {
     expect(() =>
       resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-3", [

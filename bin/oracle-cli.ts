@@ -1083,6 +1083,10 @@ program
     "Exact approved ChatGPT conversation URL, e.g. https://chatgpt.com/c/<conversation-id>.",
   )
   .option(
+    "--session-id <id>",
+    "Originating Oracle session whose stored browser affinity must be used for this export.",
+  )
+  .option(
     "--out <dir>",
     "Output directory (default ~/Documents/chatgpt-conversation-exports/oracle-chatgpt-conversation-...).",
   )
