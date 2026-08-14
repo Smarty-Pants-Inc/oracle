@@ -297,6 +297,133 @@ describe("resumeBrowserSession", () => {
     );
   });
 
+  test("revalidates routed browser identity and uses the fresh exact WebSocket", async () => {
+    const freshBrowserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ webSocketDebuggerUrl: freshBrowserWSEndpoint }),
+      }),
+    );
+    const runtime = {
+      chromePort: 9223,
+      chromeHost: "127.0.0.1",
+      chromeBrowserWSEndpoint: "ws://stale.invalid/devtools/browser/browser-a",
+      chromeTargetId: "target-2",
+      tabUrl: "https://chatgpt.com/c/abc",
+    };
+    const listTargets = vi.fn(
+      async () =>
+        [{ targetId: "target-2", type: "page", url: runtime.tabUrl }] satisfies FakeTarget[],
+    ) as unknown as () => Promise<FakeTarget[]>;
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => ({
+      result: { value: expression === "location.href" ? runtime.tabUrl : 2 },
+    }));
+    const connect = vi.fn(
+      async () =>
+        ({
+          Runtime: { enable: vi.fn(), evaluate },
+          DOM: { enable: vi.fn() },
+          close: vi.fn(async () => {}),
+        }) satisfies FakeClient,
+    ) as unknown as (options?: unknown) => Promise<ChromeClient>;
+
+    try {
+      await expect(
+        resumeBrowserSession(
+          runtime,
+          {
+            remoteChrome: { host: "127.0.0.1", port: 9223 },
+            remoteChromeBrowserId: "browser-a",
+            remoteChromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+            timeoutMs: 2_000,
+          },
+          vi.fn() as BrowserLogger,
+          {
+            listTargets,
+            connect,
+            waitForAssistantResponse: vi.fn(async () => ({
+              text: "attached",
+              html: "",
+              meta: { messageId: "m1", turnId: "conversation-turn-1" },
+            })),
+            captureAssistantMarkdown: vi.fn(async () => "attached-md"),
+            waitForConversationHydration: vi.fn(async () => 2),
+          },
+        ),
+      ).resolves.toMatchObject({ answerMarkdown: "attached-md" });
+      expect(connect).toHaveBeenCalledWith(
+        expect.objectContaining({ target: freshBrowserWSEndpoint, local: true }),
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  test("rejects a routed browser swap without recovery", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          webSocketDebuggerUrl: "ws://127.0.0.1:9223/devtools/browser/browser-b",
+        }),
+      }),
+    );
+    const recoverSession = vi.fn(async () => ({
+      answerText: "must not recover",
+      answerMarkdown: "must not recover",
+    }));
+    try {
+      await expect(
+        resumeBrowserSession(
+          {
+            chromePort: 9223,
+            chromeHost: "127.0.0.1",
+            chromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+          },
+          {
+            remoteChrome: { host: "127.0.0.1", port: 9223 },
+            remoteChromeBrowserId: "browser-a",
+            remoteChromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+          },
+          vi.fn() as BrowserLogger,
+          { recoverSession },
+        ),
+      ).rejects.toThrow(/identity changed before session reattach/i);
+      expect(recoverSession).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  test("fails closed for wrapper-routed host-only sessions", async () => {
+    const previous = process.env.ORACLE_WRAPPER_REMOTE_ONLY;
+    process.env.ORACLE_WRAPPER_REMOTE_ONLY = "1";
+    const recoverSession = vi.fn(async () => ({
+      answerText: "must not recover",
+      answerMarkdown: "must not recover",
+    }));
+    try {
+      await expect(
+        resumeBrowserSession(
+          { chromePort: 9223, chromeHost: "127.0.0.1" },
+          { remoteChrome: { host: "127.0.0.1", port: 9223 } },
+          vi.fn() as BrowserLogger,
+          { recoverSession },
+        ),
+      ).rejects.toThrow(/no verified browser identity/i);
+      expect(recoverSession).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) {
+        delete process.env.ORACLE_WRAPPER_REMOTE_ONLY;
+      } else {
+        process.env.ORACLE_WRAPPER_REMOTE_ONLY = previous;
+      }
+    }
+  });
+
   test("closes the attached client before falling back to recovery", async () => {
     const runtime = {
       chromePort: 51559,

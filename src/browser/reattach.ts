@@ -24,7 +24,11 @@ import { resolveBrowserConfig } from "./config.js";
 import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
 import { CHATGPT_URL } from "./constants.js";
 import { buildConversationTurnListExpression } from "./conversationTurns.js";
-import { cleanupStaleProfileState } from "./profileState.js";
+import {
+  browserIdFromWebSocketEndpoint,
+  cleanupStaleProfileState,
+  resolveRemoteChromeBrowserIdentity,
+} from "./profileState.js";
 import { readDevToolsActivePortInfo } from "./detect.js";
 import {
   pickTarget,
@@ -78,17 +82,50 @@ export async function resumeBrowserSession(
     await close?.().catch(() => undefined);
   };
 
-  if (!runtime.chromePort && !runtime.chromeBrowserWSEndpoint) {
+  const expectedBrowserId = config?.remoteChromeBrowserId?.trim();
+  const configuredBrowserWSEndpoint = config?.remoteChromeBrowserWSEndpoint?.trim();
+  const configuredRemoteChrome = config?.remoteChrome ?? undefined;
+  const wrapperRemoteSession =
+    process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" && Boolean(configuredRemoteChrome);
+  const identityBoundRemoteSession = Boolean(expectedBrowserId) || wrapperRemoteSession;
+  if (identityBoundRemoteSession) {
+    if (!expectedBrowserId || !configuredBrowserWSEndpoint || !configuredRemoteChrome) {
+      throw new Error(
+        "Stored remote Chrome session has no verified browser identity; start a fresh browser conversation through the agent wrapper.",
+      );
+    }
+    if (browserIdFromWebSocketEndpoint(configuredBrowserWSEndpoint) !== expectedBrowserId) {
+      throw new Error("Stored remote Chrome browser identity does not match its WebSocket.");
+    }
+  }
+
+  if (!identityBoundRemoteSession && !runtime.chromePort && !runtime.chromeBrowserWSEndpoint) {
     logger("No running Chrome detected; reopening browser to locate the session.");
     return recoverSession(runtime, config);
   }
 
   try {
-    const liveRuntime = (await refreshAttachRuntime(runtime).catch(() => runtime)) ?? runtime;
+    let liveRuntime: BrowserRuntimeMetadata;
+    let browserWSEndpoint: string | undefined;
+    if (identityBoundRemoteSession) {
+      const liveIdentity = await resolveRemoteChromeBrowserIdentity(configuredRemoteChrome!);
+      if (liveIdentity.browserId !== expectedBrowserId) {
+        throw new Error("Remote Chrome browser identity changed before session reattach.");
+      }
+      liveRuntime = {
+        ...runtime,
+        chromeHost: configuredRemoteChrome!.host,
+        chromePort: configuredRemoteChrome!.port,
+        chromeBrowserWSEndpoint: liveIdentity.browserWSEndpoint,
+      };
+      browserWSEndpoint = liveIdentity.browserWSEndpoint;
+    } else {
+      liveRuntime = (await refreshAttachRuntime(runtime).catch(() => runtime)) ?? runtime;
+      browserWSEndpoint = liveRuntime.chromeBrowserWSEndpoint ?? undefined;
+    }
     const host = liveRuntime.chromeHost ?? "127.0.0.1";
     const port =
       liveRuntime.chromePort ?? inferPortFromBrowserWSEndpoint(liveRuntime.chromeBrowserWSEndpoint);
-    const browserWSEndpoint = liveRuntime.chromeBrowserWSEndpoint ?? undefined;
     const listTargets =
       deps.listTargets ??
       (async () =>
@@ -232,6 +269,9 @@ export async function resumeBrowserSession(
     return { answerText: aligned.answerText, answerMarkdown: aligned.answerMarkdown };
   } catch (error) {
     await closeAttached();
+    if (identityBoundRemoteSession) {
+      throw error;
+    }
     const message = error instanceof Error ? error.message : String(error);
     logger(
       `Existing Chrome reattach failed (${message}); reopening browser to locate the session.`,
