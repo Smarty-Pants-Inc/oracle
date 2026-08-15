@@ -647,6 +647,27 @@ describe("ensureChatMode", () => {
     expect(input.dispatchMouseEvent).not.toHaveBeenCalled();
   });
 
+  test("allows conversation metadata to hydrate for the configured input timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = {
+        evaluate: vi
+          .fn()
+          .mockResolvedValueOnce({ result: { value: { status: "conversation-unresolved" } } })
+          .mockResolvedValueOnce({ result: { value: { status: "conversation-unresolved" } } })
+          .mockResolvedValueOnce({ result: { value: { status: "chat-conversation" } } }),
+      } as unknown as ChromeClient["Runtime"];
+      const input = { dispatchMouseEvent: vi.fn() } as unknown as ChromeClient["Input"];
+
+      const result = ensureChatMode(runtime, input, 20_000, logger, { pollMs: 10_001 });
+      await vi.advanceTimersByTimeAsync(20_002);
+
+      await expect(result).resolves.toBe("chat");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("aggregates responsive duplicates for the exact conversation id", () => {
     expect(
       runConversationModeProbe("/c/duplicate-thread", [

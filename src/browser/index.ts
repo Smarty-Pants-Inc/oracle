@@ -956,6 +956,15 @@ export function isLocalChromeHostForTest(host: string): boolean {
   return isLocalChromeHost(host);
 }
 
+function conversationCookieIdsToPreserve(
+  config: Pick<ResolvedBrowserConfig, "url" | "resumeConversationUrl">,
+  lastUrl: string | null | undefined,
+): string[] {
+  return [config.resumeConversationUrl, config.url, lastUrl]
+    .map((url) => extractConversationIdFromUrl(url ?? ""))
+    .filter((id): id is string => Boolean(id));
+}
+
 async function closeRemoteConnectionAfterRun(options: {
   connectionClosedUnexpectedly: boolean;
   connection: { close: () => Promise<void> } | null;
@@ -1453,10 +1462,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       );
     }
     await clearStaleChatGptConversationCookies(Network, Target, logger, {
-      preserveConversationIds: [
-        extractConversationIdFromUrl(config.resumeConversationUrl ?? ""),
-        extractConversationIdFromUrl(lastUrl ?? ""),
-      ],
+      preserveConversationIds: conversationCookieIdsToPreserve(config, lastUrl),
     });
 
     if (cookieSyncEnabled && !manualLogin && (appliedCookies ?? 0) === 0 && !config.inlineCookies) {
@@ -3328,10 +3334,7 @@ async function runRemoteBrowserMode(
     }
     logger("Skipping cookie sync for remote Chrome (using existing session)");
     await clearStaleChatGptConversationCookies(Network, Target, logger, {
-      preserveConversationIds: [
-        extractConversationIdFromUrl(config.resumeConversationUrl ?? ""),
-        extractConversationIdFromUrl(lastUrl ?? ""),
-      ],
+      preserveConversationIds: conversationCookieIdsToPreserve(config, lastUrl),
     });
 
     if (config.resumeConversationUrl) {
@@ -4246,6 +4249,7 @@ export const __test__ = {
   isImageOnlyUiChromeText,
   listIgnoredRemoteChromeFlags,
   normalizeAuthenticatedModelSelectionError,
+  conversationCookieIdsToPreserve,
   resolveAttachmentUploadTimeoutMs,
   resolveManualLoginWaitMs,
   shouldCleanupBlankTabsAfterLastLease,

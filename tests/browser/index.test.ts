@@ -43,6 +43,16 @@ describe("background-only browser policy", () => {
   });
 });
 
+describe("conversation cookie cleanup", () => {
+  test("preserves an exact conversation configured as the browser URL", () => {
+    const config = resolveBrowserConfig({
+      url: "https://chatgpt.com/g/project/c/current-thread",
+    });
+
+    expect(__test__.conversationCookieIdsToPreserve(config, null)).toEqual(["current-thread"]);
+  });
+});
+
 describe("remote browser identity", () => {
   test("rejects a browser swap before actual attachment", async () => {
     vi.stubGlobal(

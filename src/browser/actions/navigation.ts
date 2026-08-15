@@ -326,7 +326,7 @@ export async function ensureChatMode(
   logger: BrowserLogger,
   options: { pollMs?: number; resetWorkConversation?: () => Promise<void> } = {},
 ): Promise<"chat" | "switched" | "unavailable"> {
-  const verificationWindowMs = Math.min(Math.max(0, timeoutMs), 10_000);
+  const verificationWindowMs = Math.max(0, timeoutMs);
   let deadline = Date.now() + verificationWindowMs;
   const pollMs = Math.max(0, options.pollMs ?? 200);
   let changedFromWork = false;
