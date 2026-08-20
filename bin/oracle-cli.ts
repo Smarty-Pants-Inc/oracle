@@ -14,7 +14,12 @@ import { resolveEngine, type EngineMode, defaultWaitPreference } from "../src/cl
 import { shouldRequirePrompt } from "../src/cli/promptRequirement.js";
 import { resolveDashPrompt } from "../src/cli/stdin.js";
 import chalk from "chalk";
-import type { SessionMetadata, SessionMode, BrowserSessionConfig } from "../src/sessionStore.js";
+import type {
+  SessionMetadata,
+  SessionMode,
+  BrowserSessionConfig,
+  RequestOrigin,
+} from "../src/sessionStore.js";
 import { sessionStore, pruneOldSessions } from "../src/sessionStore.js";
 import {
   DEFAULT_API_MODEL,
@@ -217,6 +222,7 @@ type ResolvedCliOptions = Omit<CliOptions, "model"> & {
   followupSessionId?: string;
   followupModel?: string;
   browserResumeConversationUrl?: string;
+  requestOrigin?: RequestOrigin;
 };
 
 interface RestartCommandOptions {
@@ -2235,6 +2241,7 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     resolvedOptions.effectiveModelId = browserFollowup.model;
     resolvedOptions.followupSessionId = browserFollowup.sessionId;
     resolvedOptions.browserResumeConversationUrl = browserFollowup.resumeConversationUrl;
+    resolvedOptions.requestOrigin = browserFollowup.requestOrigin;
   } else if (apiFollowup) {
     assertFollowupSupported({
       engine,
@@ -2465,6 +2472,7 @@ async function runRootCommand(options: CliOptions): Promise<void> {
       followupSessionId: resolvedOptions.followupSessionId,
       followupModel: resolvedOptions.followupModel,
       browserResumeConversationUrl: resolvedOptions.browserResumeConversationUrl,
+      requestOrigin: resolvedOptions.requestOrigin,
       waitPreference,
       youtube: options.youtube,
       generateImage: options.generateImage,

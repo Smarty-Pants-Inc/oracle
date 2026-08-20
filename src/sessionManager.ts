@@ -29,6 +29,7 @@ import { safeModelSlug } from "./oracle/modelResolver.js";
 import { getOracleHomeDir } from "./oracleHome.js";
 
 export type SessionMode = "api" | "browser";
+export type RequestOrigin = "user" | "agent";
 
 export interface BrowserSessionConfig {
   chromeProfile?: string | null;
@@ -241,6 +242,7 @@ export interface StoredRunOptions {
   slug?: string;
   mode?: SessionMode;
   browserConfig?: BrowserSessionConfig;
+  requestOrigin?: RequestOrigin;
   verbose?: boolean;
   heartbeatIntervalMs?: number;
   browserAttachments?: "auto" | "never" | "always";
@@ -286,6 +288,7 @@ export interface SessionMetadata {
   startedAt?: string;
   completedAt?: string;
   mode?: SessionMode;
+  requestOrigin?: RequestOrigin;
   usage?: {
     inputTokens: number;
     outputTokens: number;
@@ -555,6 +558,40 @@ export async function readModelRunMetadata(
   return readModelRunFile(sessionId, model);
 }
 
+function parseRequestOrigin(value: unknown, label: string): RequestOrigin | undefined {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  if (value === "user" || value === "agent") {
+    return value;
+  }
+  throw new Error(`${label} must be "user" or "agent".`);
+}
+
+function resolveSessionRequestOrigin(
+  options: InitializeSessionOptions,
+  mode: SessionMode,
+): RequestOrigin | undefined {
+  const optionOrigin = parseRequestOrigin(options.requestOrigin, "Stored request origin");
+  const wrapperBrowser = process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" && mode === "browser";
+  const environmentOrigin = wrapperBrowser
+    ? parseRequestOrigin(
+        process.env.ORACLE_WRAPPER_INVOCATION_ORIGIN?.trim(),
+        "Wrapper request origin",
+      )
+    : undefined;
+  if (optionOrigin && environmentOrigin && optionOrigin !== environmentOrigin) {
+    throw new Error("Stored and wrapper request origins do not match.");
+  }
+  const requestOrigin = optionOrigin ?? environmentOrigin;
+  if (wrapperBrowser && !requestOrigin) {
+    throw new Error(
+      'Wrapper-routed browser sessions require an explicit "user" or "agent" request origin.',
+    );
+  }
+  return requestOrigin;
+}
+
 export async function initializeSession(
   options: InitializeSessionOptions,
   cwd: string,
@@ -562,10 +599,11 @@ export async function initializeSession(
   baseSlugOverride?: string,
 ): Promise<SessionMetadata> {
   await ensureSessionStorage();
+  const mode = options.mode ?? "api";
+  const requestOrigin = resolveSessionRequestOrigin(options, mode);
   const baseSlug =
     baseSlugOverride || createSessionId(options.prompt || DEFAULT_SLUG, options.slug);
   const sessionId = await reserveUniqueSessionDir(baseSlug);
-  const mode = options.mode ?? "api";
   const browserConfig = options.browserConfig;
   const modelList: ModelName[] =
     Array.isArray(options.models) && options.models.length > 0
@@ -586,6 +624,7 @@ export async function initializeSession(
     })),
     cwd,
     mode,
+    requestOrigin,
     browser: browserConfig ? { config: browserConfig } : undefined,
     notifications,
     options: {
@@ -608,6 +647,7 @@ export async function initializeSession(
       filesReport: options.filesReport,
       slug: sessionId,
       mode,
+      requestOrigin,
       browserConfig,
       verbose: options.verbose,
       heartbeatIntervalMs: options.heartbeatIntervalMs,

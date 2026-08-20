@@ -13,6 +13,7 @@ import {
   ensureLoggedIn,
   ensureChatGptScopeRetained,
   readChatGptAccountDigest,
+  assertWrapperExpectedChatGptAccount,
 } from "../../src/browser/pageActions.js";
 import { isAnswerNowPlaceholderText } from "../../src/browser/actions/assistantResponse.js";
 import { createContext, Script } from "node:vm";
@@ -1613,6 +1614,99 @@ describe("ensureLoggedIn", () => {
     await expect(readChatGptAccountDigest(runtime)).rejects.toThrow(
       /account identity is unavailable/i,
     );
+  });
+});
+
+describe("assertWrapperExpectedChatGptAccount", () => {
+  test("accepts the wrapper-selected account", async () => {
+    vi.stubEnv("ORACLE_WRAPPER_REMOTE_ONLY", "1");
+    vi.stubEnv("ORACLE_WRAPPER_EXPECTED_ACCOUNT_EMAIL", "paul@smartypants.ai");
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: await new Script(expression).runInContext(
+            createContext({
+              location: { origin: "https://chatgpt.com" },
+              fetch: async () => ({
+                ok: true,
+                json: async () => ({ user: { email: " PAUL@SMARTYPANTS.AI " } }),
+              }),
+            }),
+          ),
+        },
+      })),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(assertWrapperExpectedChatGptAccount(runtime)).resolves.toBeUndefined();
+  });
+
+  test("fails closed without exposing a mismatched account email", async () => {
+    vi.stubEnv("ORACLE_WRAPPER_REMOTE_ONLY", "1");
+    vi.stubEnv("ORACLE_WRAPPER_EXPECTED_ACCOUNT_EMAIL", "paul@smartypants.ai");
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: await new Script(expression).runInContext(
+            createContext({
+              location: { origin: "https://chatgpt.com" },
+              fetch: async () => ({
+                ok: true,
+                json: async () => ({ user: { email: "dev1@smartypants.ai" } }),
+              }),
+            }),
+          ),
+        },
+      })),
+    } as unknown as ChromeClient["Runtime"];
+
+    const error = await assertWrapperExpectedChatGptAccount(runtime).catch(
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(BrowserAutomationError);
+    expect(String(error)).toMatch(/wrong ChatGPT account/i);
+    expect(String(error)).not.toContain("paul@smartypants.ai");
+    expect(String(error)).not.toContain("dev1@smartypants.ai");
+  });
+
+  test("fails closed before fetching account state on another origin", async () => {
+    vi.stubEnv("ORACLE_WRAPPER_REMOTE_ONLY", "1");
+    vi.stubEnv("ORACLE_WRAPPER_EXPECTED_ACCOUNT_EMAIL", "paul@smartypants.ai");
+    const fetch = vi.fn();
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: await new Script(expression).runInContext(
+            createContext({ location: { origin: "https://example.com" }, fetch }),
+          ),
+        },
+      })),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(assertWrapperExpectedChatGptAccount(runtime)).rejects.toMatchObject({
+      details: { code: "chatgpt-origin-mismatch" },
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("fails closed when the account email is unavailable", async () => {
+    vi.stubEnv("ORACLE_WRAPPER_REMOTE_ONLY", "1");
+    vi.stubEnv("ORACLE_WRAPPER_EXPECTED_ACCOUNT_EMAIL", "paul@smartypants.ai");
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({ result: { value: "unavailable" } }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(assertWrapperExpectedChatGptAccount(runtime)).rejects.toMatchObject({
+      details: { code: "account-email-unavailable" },
+    });
+  });
+
+  test("does nothing outside a wrapper-selected new session", async () => {
+    vi.stubEnv("ORACLE_WRAPPER_EXPECTED_ACCOUNT_EMAIL", "paul@smartypants.ai");
+    const evaluate = vi.fn();
+    const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
+
+    await expect(assertWrapperExpectedChatGptAccount(runtime)).resolves.toBeUndefined();
+    expect(evaluate).not.toHaveBeenCalled();
   });
 });
 

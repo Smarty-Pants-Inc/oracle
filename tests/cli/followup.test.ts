@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import type { SessionMetadata } from "../../src/sessionStore.js";
 import {
   resolveBrowserFollowupReference,
@@ -11,6 +11,10 @@ const baseMetadata: SessionMetadata = {
   status: "completed",
   options: {},
 };
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 describe("browser follow-up resolution", () => {
   test("derives a resume URL from conversationId", () => {
@@ -106,6 +110,93 @@ describe("browser follow-up resolution", () => {
     });
   });
 
+  test.each([
+    ["user", 9222, "browser-user"],
+    ["agent", 9223, "browser-agent"],
+  ] as const)(
+    "inherits %s request origin and endpoint for wrapper-routed browser follow-ups",
+    async (requestOrigin, port, browserId) => {
+      vi.stubEnv("ORACLE_WRAPPER_REMOTE_ONLY", "1");
+      const browserWSEndpoint = `ws://127.0.0.1:${port}/devtools/browser/${browserId}`;
+      const accountDigest = "a".repeat(64);
+      const metadata: SessionMetadata = {
+        ...baseMetadata,
+        mode: "browser",
+        requestOrigin,
+        options: { requestOrigin },
+        browser: {
+          config: {
+            remoteChrome: { host: "127.0.0.1", port },
+            remoteChromeBrowserId: browserId,
+            remoteChromeBrowserWSEndpoint: browserWSEndpoint,
+            remoteChromeAccountDigest: accountDigest,
+          },
+          runtime: {
+            conversationId: `${requestOrigin}-thread`,
+            chromeBrowserWSEndpoint: browserWSEndpoint,
+            chatGptAccountDigest: accountDigest,
+          },
+        },
+      };
+
+      await expect(
+        resolveBrowserFollowupReference("session-1", {
+          readSession: vi.fn(async () => metadata),
+        }),
+      ).resolves.toMatchObject({
+        requestOrigin,
+        browserConfig: {
+          remoteChrome: { host: "127.0.0.1", port },
+          remoteChromeBrowserId: browserId,
+        },
+      });
+    },
+  );
+
+  test("fails closed for legacy wrapper sessions without request origin", async () => {
+    vi.stubEnv("ORACLE_WRAPPER_REMOTE_ONLY", "1");
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const accountDigest = "a".repeat(64);
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      browser: {
+        config: {
+          remoteChrome: { host: "127.0.0.1", port: 9223 },
+          remoteChromeBrowserId: "browser-a",
+          remoteChromeBrowserWSEndpoint: browserWSEndpoint,
+          remoteChromeAccountDigest: accountDigest,
+        },
+        runtime: {
+          conversationId: "legacy-thread",
+          chromeBrowserWSEndpoint: browserWSEndpoint,
+          chatGptAccountDigest: accountDigest,
+        },
+      },
+    };
+
+    await expect(
+      resolveBrowserFollowupReference("session-1", { readSession: vi.fn(async () => metadata) }),
+    ).rejects.toThrow(/no verified request origin/i);
+  });
+
+  test("rejects conflicting stored request origin metadata", async () => {
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      requestOrigin: "user",
+      options: { requestOrigin: "agent" },
+      browser: {
+        config: { url: "https://chatgpt.com/" },
+        runtime: { conversationId: "conflicting-origin" },
+      },
+    };
+
+    await expect(
+      resolveBrowserFollowupReference("session-1", { readSession: vi.fn(async () => metadata) }),
+    ).rejects.toThrow(/conflicting stored request origin/i);
+  });
+
   test("carries the runtime account digest with a derived browser identity", async () => {
     const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
     const accountDigest = "a".repeat(64);
@@ -189,6 +280,99 @@ describe("browser follow-up resolution", () => {
         process.env.ORACLE_WRAPPER_REMOTE_ONLY = previous;
       }
     }
+  });
+
+  test("fails closed when duplicated browser endpoint metadata conflicts", async () => {
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      options: {
+        browserConfig: { remoteChrome: { host: "127.0.0.1", port: 9222 } },
+      },
+      browser: {
+        config: { remoteChrome: { host: "127.0.0.1", port: 9223 } },
+        runtime: { conversationId: "conflicting-endpoint" },
+      },
+    };
+
+    await expect(
+      resolveBrowserFollowupReference("session-1", { readSession: vi.fn(async () => metadata) }),
+    ).rejects.toThrow(/conflicting stored Chrome endpoint metadata/i);
+  });
+
+  test("fails closed when duplicated browser identity metadata conflicts", async () => {
+    const endpoint = { host: "127.0.0.1", port: 9223 };
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      options: {
+        browserConfig: {
+          remoteChrome: endpoint,
+          remoteChromeBrowserId: "browser-a",
+          remoteChromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+        },
+      },
+      browser: {
+        config: {
+          remoteChrome: endpoint,
+          remoteChromeBrowserId: "browser-b",
+          remoteChromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-b",
+        },
+        runtime: { conversationId: "conflicting-browser" },
+      },
+    };
+
+    await expect(
+      resolveBrowserFollowupReference("session-1", { readSession: vi.fn(async () => metadata) }),
+    ).rejects.toThrow(/conflicting stored browser identity metadata/i);
+  });
+
+  test("fails closed when duplicated account identity metadata conflicts", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      options: {
+        browserConfig: {
+          remoteChrome: { host: "127.0.0.1", port: 9223 },
+          remoteChromeBrowserId: "browser-a",
+          remoteChromeBrowserWSEndpoint: browserWSEndpoint,
+          remoteChromeAccountDigest: "a".repeat(64),
+        },
+      },
+      browser: {
+        config: {
+          remoteChrome: { host: "127.0.0.1", port: 9223 },
+          remoteChromeBrowserId: "browser-a",
+          remoteChromeBrowserWSEndpoint: browserWSEndpoint,
+          remoteChromeAccountDigest: "b".repeat(64),
+        },
+        runtime: { conversationId: "conflicting-account" },
+      },
+    };
+
+    await expect(
+      resolveBrowserFollowupReference("session-1", { readSession: vi.fn(async () => metadata) }),
+    ).rejects.toThrow(/conflicting stored account identity metadata/i);
+  });
+
+  test("fails closed when runtime and configured endpoints conflict", async () => {
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      browser: {
+        config: { remoteChrome: { host: "127.0.0.1", port: 9223 } },
+        runtime: {
+          conversationId: "conflicting-runtime-endpoint",
+          chromeHost: "127.0.0.1",
+          chromePort: 9224,
+        },
+      },
+    };
+
+    await expect(
+      resolveBrowserFollowupReference("session-1", { readSession: vi.fn(async () => metadata) }),
+    ).rejects.toThrow(/conflicting stored Chrome endpoint metadata/i);
   });
 
   test("fails closed when configured and runtime browser identities conflict", async () => {

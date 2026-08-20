@@ -4,6 +4,7 @@ export {
   ensureNotBlocked,
   ensureLoggedIn,
   readChatGptAccountDigest,
+  assertWrapperExpectedChatGptAccount,
   ensurePromptReady,
   ensureChatMode,
   waitForResumedConversationHydration,

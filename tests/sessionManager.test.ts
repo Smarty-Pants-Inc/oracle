@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { mkdtemp, rm, readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -20,6 +20,10 @@ beforeAll(async () => {
 beforeEach(async () => {
   await rm(sessionModule.getSessionsDir(), { recursive: true, force: true });
   await sessionModule.ensureSessionStorage();
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
 });
 
 afterAll(async () => {
@@ -134,6 +138,49 @@ describe("session lifecycle", () => {
 
     expect(stored.browser?.config).toEqual(browserConfig);
     expect(stored.options?.browserConfig).toEqual(browserConfig);
+  });
+
+  test("persists wrapper request origin as immutable session evidence", async () => {
+    vi.stubEnv("ORACLE_WRAPPER_REMOTE_ONLY", "1");
+    vi.stubEnv("ORACLE_WRAPPER_INVOCATION_ORIGIN", "user");
+    const metadata = await sessionModule.initializeSession(
+      {
+        prompt: "Persist request origin",
+        model: "gpt-5.6-sol-pro",
+        mode: "browser",
+      },
+      "/tmp/cwd",
+    );
+    const stored = JSON.parse(
+      await readFile(path.join(sessionModule.getSessionsDir(), metadata.id, "meta.json"), "utf8"),
+    );
+
+    expect(metadata.requestOrigin).toBe("user");
+    expect(stored.requestOrigin).toBe("user");
+    expect(stored.options.requestOrigin).toBe("user");
+  });
+
+  test("fails closed for missing or conflicting wrapper request origins", async () => {
+    vi.stubEnv("ORACLE_WRAPPER_REMOTE_ONLY", "1");
+    await expect(
+      sessionModule.initializeSession(
+        { prompt: "Missing origin", model: "gpt-5.6-sol-pro", mode: "browser" },
+        "/tmp/cwd",
+      ),
+    ).rejects.toThrow(/explicit.*request origin/i);
+
+    vi.stubEnv("ORACLE_WRAPPER_INVOCATION_ORIGIN", "agent");
+    await expect(
+      sessionModule.initializeSession(
+        {
+          prompt: "Conflicting origin",
+          model: "gpt-5.6-sol-pro",
+          mode: "browser",
+          requestOrigin: "user",
+        },
+        "/tmp/cwd",
+      ),
+    ).rejects.toThrow(/origins do not match/i);
   });
 
   test("readSessionMetadata returns null for missing sessions and updateSessionMetadata persists changes", async () => {

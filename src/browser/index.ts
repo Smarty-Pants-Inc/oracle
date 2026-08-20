@@ -31,6 +31,7 @@ import {
   ensureNotBlocked,
   ensureLoggedIn,
   readChatGptAccountDigest,
+  assertWrapperExpectedChatGptAccount,
   ensurePromptReady,
   ensureChatMode,
   waitForResumedConversationHydration,
@@ -3344,6 +3345,7 @@ async function runRemoteBrowserMode(
     }
     await ensureNotBlocked(Runtime, config.headless, logger);
     await ensureLoggedIn(Runtime, logger, { remoteSession: true });
+    await assertWrapperExpectedChatGptAccount(Runtime);
     const observedAccountDigest = await readChatGptAccountDigest(Runtime);
     if (expectedAccountDigest && observedAccountDigest !== expectedAccountDigest) {
       throw new BrowserAutomationError(

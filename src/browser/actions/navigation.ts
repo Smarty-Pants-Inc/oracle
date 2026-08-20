@@ -449,6 +449,7 @@ export async function ensureNotBlocked(
 
 const LOGIN_CHECK_TIMEOUT_MS = 5_000;
 const CHATGPT_ACCOUNT_EMAIL_ENV = "ORACLE_CHATGPT_ACCOUNT_EMAIL";
+const WRAPPER_EXPECTED_ACCOUNT_EMAIL_ENV = "ORACLE_WRAPPER_EXPECTED_ACCOUNT_EMAIL";
 
 function preferredChatGptAccountEmail(): string | null {
   const email = process.env[CHATGPT_ACCOUNT_EMAIL_ENV]?.trim().toLowerCase();
@@ -538,6 +539,65 @@ export async function ensureLoggedIn(
 
   const accountHint = welcomeBack.hint ? ` ${welcomeBack.hint}` : "";
   throw new Error(`ChatGPT session not detected.${domLabel}${accountHint} ${cookieHint}`);
+}
+
+export async function assertWrapperExpectedChatGptAccount(
+  Runtime: ChromeClient["Runtime"],
+): Promise<void> {
+  if (process.env.ORACLE_WRAPPER_REMOTE_ONLY !== "1") {
+    return;
+  }
+  const expectedEmail = process.env[WRAPPER_EXPECTED_ACCOUNT_EMAIL_ENV]?.trim().toLowerCase();
+  if (!expectedEmail) {
+    return;
+  }
+
+  let status: unknown;
+  try {
+    const outcome = await Runtime.evaluate({
+      expression: `(() => (async () => {
+        if (globalThis.location?.origin !== 'https://chatgpt.com') return 'wrong-origin';
+        try {
+          const response = await fetch('/api/auth/session', {
+            cache: 'no-store', credentials: 'include',
+          });
+          if (!response.ok) return 'unavailable';
+          const body = await response.json();
+          const email = typeof body?.user?.email === 'string'
+            ? body.user.email.trim().toLowerCase()
+            : '';
+          if (!email) return 'unavailable';
+          return email === ${JSON.stringify(expectedEmail)} ? 'match' : 'mismatch';
+        } catch {
+          return 'unavailable';
+        }
+      })())()`,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    status = outcome.result?.value;
+  } catch {
+    status = "unavailable";
+  }
+  if (status === "match") {
+    return;
+  }
+  const message =
+    status === "mismatch"
+      ? "Remote Chrome is signed into the wrong ChatGPT account."
+      : status === "wrong-origin"
+        ? "Remote Chrome left the trusted ChatGPT origin."
+        : "Remote Chrome ChatGPT account email is unavailable.";
+  const code =
+    status === "mismatch"
+      ? "account-email-mismatch"
+      : status === "wrong-origin"
+        ? "chatgpt-origin-mismatch"
+        : "account-email-unavailable";
+  throw new BrowserAutomationError(message, {
+    stage: "remote-browser-account-email",
+    code,
+  });
 }
 
 /** Returns only the SHA-256 digest of ChatGPT's authenticated user id. */
