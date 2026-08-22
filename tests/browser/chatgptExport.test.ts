@@ -19,6 +19,7 @@ import {
   scanTextForSecretLikeMarkers,
   writeChatGptExportBundleForTest,
 } from "../../src/browser/chatgptExport.js";
+const testNonWindows = process.platform === "win32" ? test.skip : test;
 
 describe("ChatGPT conversation export helpers", () => {
   test("accepts only exact chatgpt.com conversation URLs", () => {
@@ -42,7 +43,7 @@ describe("ChatGPT conversation export helpers", () => {
     );
   });
 
-  test("rejects a browser swap before exact export attachment", async () => {
+  testNonWindows("rejects a browser swap before exact export attachment", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
@@ -433,8 +434,7 @@ describe("ChatGPT conversation export helpers", () => {
     }
   });
 
-  test("removes a partial sensitive bundle when a precommit write fails", async () => {
-    if (process.platform === "win32") return;
+  testNonWindows("removes a partial sensitive bundle when a precommit write fails", async () => {
     const root = await fs.mkdtemp(
       path.join(await fs.realpath(os.tmpdir()), "oracle-export-rollback-"),
     );

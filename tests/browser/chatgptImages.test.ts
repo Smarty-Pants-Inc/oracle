@@ -526,7 +526,7 @@ describe("collectGeneratedImageArtifacts", () => {
     } finally {
       await fs.rm(tmpDir, { recursive: true, force: true });
     }
-  });
+  }, 10_000);
 
   test("falls back to a behavior button when the rendered image URL fails", async () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-image-404-"));

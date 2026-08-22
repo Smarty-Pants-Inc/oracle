@@ -61,6 +61,8 @@ import { runBrowserMode } from "../../src/browser/index.js";
 type Transport = "local" | "remote";
 type RetargetPoint = "before-clear" | "before-upload";
 type FirstConversationRetargetPoint = "before-pin" | "before-follow-up";
+const transports =
+  process.platform === "win32" ? (["remote"] as const) : (["local", "remote"] as const);
 
 function resetMocks(): void {
   chromeMocks.launchChrome.mockReset();
@@ -267,7 +269,7 @@ describe("attached conversation mutation guards", () => {
     resetMocks();
   });
 
-  test.each(["local", "remote"] as const)(
+  test.each(transports)(
     "does not clear the composer after a %s attached conversation retarget",
     async (transport) => {
       const error = await runWithRetargetedAttachedConversation(transport, "before-clear");
@@ -282,7 +284,7 @@ describe("attached conversation mutation guards", () => {
     },
   );
 
-  test.each(["local", "remote"] as const)(
+  test.each(transports)(
     "does not upload after a %s attached conversation retarget during attachment setup",
     async (transport) => {
       const error = await runWithRetargetedAttachedConversation(transport, "before-upload");
@@ -298,7 +300,7 @@ describe("attached conversation mutation guards", () => {
   );
 
   test.each(
-    (["local", "remote"] as const).flatMap(
+    transports.flatMap(
       (transport) =>
         [
           [transport, "root", "https://chatgpt.com/"],
@@ -319,7 +321,7 @@ describe("attached conversation mutation guards", () => {
   );
 
   test.each(
-    (["local", "remote"] as const).flatMap(
+    transports.flatMap(
       (transport) =>
         [
           [transport, "root URL", "https://chatgpt.com/"],

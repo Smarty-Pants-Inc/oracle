@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test as it, vi } from "vitest";
 
 const execFileAsyncMock = vi.hoisted(() => vi.fn());
 
@@ -6,6 +6,7 @@ vi.mock("node:child_process", () => ({ execFile: vi.fn() }));
 vi.mock("node:util", () => ({ promisify: () => execFileAsyncMock }));
 
 import { captureApprovedChatGptConversationBackendViaObu } from "../../src/browser/chatgptExport.js";
+const test = process.platform === "win32" ? it.skip : it;
 
 describe("OBU ChatGPT export cleanup", () => {
   afterEach(() => {

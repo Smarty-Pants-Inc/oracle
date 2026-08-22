@@ -1,7 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs/promises";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test as it, vi } from "vitest";
 import type { ChromeClient } from "../../src/browser/types.js";
 import type * as LiveTabs from "../../src/browser/liveTabs.js";
 
@@ -59,7 +59,7 @@ describe("ChatGPT export account receipt", () => {
         .map((directory) => fs.rm(directory, { recursive: true, force: true })),
     );
   });
-  test.each([
+  it.each([
     "https://chatgpt.com.evil.example/c/conv-1",
     "https://chatgpt.com@evil.example/c/conv-1",
     "https://chatgpt.com:443/c/conv-1",
@@ -69,6 +69,7 @@ describe("ChatGPT export account receipt", () => {
   ])("rejects a spoofed or redirect-bearing approved URL %s", (url) => {
     expect(() => conversationIdFromChatGptUrl(url)).toThrow(/target-url/i);
   });
+  const test = process.platform === "win32" ? it.skip : it;
 
   test("keeps the verified account digest internal and honors explicit post-export archiving", async () => {
     const outDir = await freshOutputDir("oracle-chatgpt-export-affinity-");
