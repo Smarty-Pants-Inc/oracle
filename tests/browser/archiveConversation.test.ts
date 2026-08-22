@@ -107,13 +107,13 @@ describe("archiveChatGptConversation", () => {
       }),
     };
     const logger = vi.fn();
-    const deadline = Date.now() + 10_000;
+    const remainingMs = 10_000;
 
     await expect(
       archiveChatGptConversation(runtime as never, logger as never, {
         mode: "auto",
         conversationUrl: "https://chatgpt.com/c/abc",
-        deadline,
+        remainingMs,
       }),
     ).resolves.toMatchObject({
       mode: "auto",
@@ -124,10 +124,36 @@ describe("archiveChatGptConversation", () => {
     expect(runtime.evaluate).toHaveBeenCalledWith(
       expect.objectContaining({
         awaitPromise: true,
-        expression: expect.stringContaining(`const deadline = ${deadline};`),
+        expression: expect.stringContaining(`const remainingMs = ${remainingMs};`),
         returnByValue: true,
       }),
     );
+    expect(runtime.evaluate.mock.calls[0]?.[0]?.expression).toContain(
+      "const deadline = Date.now() + remainingMs;",
+    );
+  });
+  test("bounds a stalled Runtime.evaluate by the caller remaining time", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = { evaluate: vi.fn(() => new Promise<never>(() => {})) };
+      const result = archiveChatGptConversation(runtime as never, vi.fn() as never, {
+        mode: "always",
+        conversationUrl: "https://chatgpt.com/c/abc",
+        remainingMs: 100,
+      });
+
+      await vi.advanceTimersByTimeAsync(100);
+
+      await expect(result).resolves.toMatchObject({
+        attempted: true,
+        archived: false,
+        reason: "archive-failed",
+        error: "Timed out while archiving ChatGPT conversation.",
+      });
+      expect(runtime.evaluate).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("returns a non-archived result when the DOM action is not confirmed", async () => {
@@ -303,14 +329,14 @@ describe("archiveChatGptConversation", () => {
     ).resolves.toMatchObject({ status: "skipped", reason: "affinity-mismatch" });
     expect(domAccess).not.toHaveBeenCalled();
   });
-  test("bounds a stalled account-affinity probe by the caller deadline", async () => {
+  test("bounds a stalled account-affinity probe by the caller remaining budget", async () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(0);
       const expression = buildArchiveConversationExpressionForTest({
         expectedConversationId: "abc",
         expectedAccountDigest: "a".repeat(64),
-        deadline: Date.now() + 100,
+        remainingMs: 100,
       });
       const domAccess = vi.fn();
       const document = new Proxy(
@@ -429,6 +455,130 @@ describe("archiveChatGptConversation", () => {
     expect(menuButton.dispatchEvent).toHaveBeenCalled();
     expect(document.querySelectorAll).toHaveBeenCalledTimes(1);
   });
+  test("reserves fallback time to recheck affinity and confirm the Unarchive menu state", async () => {
+    const expectedAccountDigest = createHash("sha256").update("account-a").digest("hex");
+    const expression = buildArchiveConversationExpressionForTest({
+      expectedConversationId: "abc",
+      expectedAccountDigest,
+      remainingMs: 2_000,
+    });
+    let now = 0;
+    let menuOpen = false;
+    let archived = false;
+    class EventStub {
+      constructor(readonly type: string) {}
+    }
+    class FakeElement {
+      constructor(
+        readonly label: string,
+        private readonly onClick?: () => void,
+      ) {}
+
+      get textContent() {
+        return this.label;
+      }
+
+      dispatchEvent = vi.fn((event: EventStub) => {
+        if (event.type === "click") this.onClick?.();
+        return true;
+      });
+
+      getAttribute(name: string) {
+        return name === "aria-label" ? this.label : null;
+      }
+
+      getBoundingClientRect() {
+        return { left: 1160, right: 1180, top: 10, width: 20, height: 20 };
+      }
+    }
+    const menuButton = new FakeElement("More", () => {
+      menuOpen = true;
+    });
+    const archiveItem = new FakeElement("Archive", () => {
+      archived = true;
+      menuOpen = false;
+    });
+    const unarchiveItem = new FakeElement("Unarchive");
+    class FakeMenu extends FakeElement {
+      querySelectorAll() {
+        return menuOpen ? [archived ? unarchiveItem : archiveItem] : [];
+      }
+    }
+    const menu = new FakeMenu("");
+    const document = {
+      querySelectorAll: vi.fn((selector: string) => {
+        if (selector === 'button,[role="button"]') return [menuButton];
+        if (selector === '[role="menu"]') return menuOpen ? [menu] : [];
+        return [];
+      }),
+      dispatchEvent: vi.fn(),
+    };
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ user: { id: "account-a" } }),
+    });
+    const evaluate = new Function(
+      "location",
+      "document",
+      "fetch",
+      "HTMLElement",
+      "getComputedStyle",
+      "window",
+      "PointerEvent",
+      "MouseEvent",
+      "KeyboardEvent",
+      "Date",
+      "setTimeout",
+      "clearTimeout",
+      "crypto",
+      "globalThis",
+      `return ${expression};`,
+    ) as (
+      location: { href: string },
+      document: object,
+      fetch: typeof globalThis.fetch,
+      HTMLElement: typeof FakeElement,
+      getComputedStyle: () => { visibility: string; display: string },
+      window: { innerWidth: number },
+      PointerEvent: typeof EventStub,
+      MouseEvent: typeof EventStub,
+      KeyboardEvent: typeof EventStub,
+      Date: { now: () => number },
+      setTimeout: (callback: () => void, ms: number) => number,
+      clearTimeout: (timeout: number) => void,
+      crypto: Crypto,
+      pageGlobal: { crypto: Crypto },
+    ) => Promise<{ status: string; reason?: string }>;
+    const pageCrypto = globalThis.crypto;
+    const result = await evaluate(
+      { href: "https://chatgpt.com/c/abc" },
+      document,
+      fetch as never,
+      FakeElement,
+      () => ({ visibility: "visible", display: "block" }),
+      { innerWidth: 1200 },
+      EventStub,
+      EventStub,
+      EventStub,
+      { now: () => now },
+      (callback, ms) => {
+        if (ms <= 500) {
+          now += ms;
+          callback();
+        }
+        return 1;
+      },
+      () => undefined,
+      pageCrypto,
+      { crypto: pageCrypto },
+    );
+
+    expect(result).toMatchObject({ status: "archived" });
+    expect(archived).toBe(true);
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(menuButton.dispatchEvent).toHaveBeenCalledTimes(10);
+    expect(archiveItem.dispatchEvent).toHaveBeenCalled();
+  });
 
   test("keeps the archive expression scoped to Archive actions", () => {
     const expression = buildArchiveConversationExpressionForTest();
@@ -439,7 +589,8 @@ describe("archiveChatGptConversation", () => {
     expect(expression).toContain("hasUnarchiveMenuItem");
     expect(expression).toContain("PointerEvent");
     expect(expression).toContain("waitForArchiveConfirmation");
-    expect(expression).toContain("const deadline =");
+    expect(expression).toContain("const remainingMs =");
+    expect(expression).toContain("const confirmationDeadline =");
     expect(expression).toContain("AbortController");
     expect(expression).toContain("Promise.withResolvers");
     expect(expression).toContain("archive-not-confirmed");

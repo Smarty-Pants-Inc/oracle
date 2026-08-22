@@ -151,6 +151,7 @@ describe("remote expected account email guard", () => {
       neutralClient.Runtime,
       "owner@example.test",
       "Oracle remote browser initialization",
+      expect.any(Number),
     );
     expect(closeVerificationTarget).toHaveBeenCalledOnce();
     expect(liveTabMocks.connectToExistingChatGptTab).not.toHaveBeenCalled();

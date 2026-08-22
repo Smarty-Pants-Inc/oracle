@@ -335,24 +335,58 @@ export async function listRemoteChromeTargets(options: {
 }
 
 async function closeRemoteTargetAndConfirm(browser: ChromeClient, targetId: string): Promise<void> {
+  const browserEvents = browser as ChromeClient & {
+    removeListener?: (event: string, listener: (event: { targetId?: string }) => void) => void;
+  };
+  let destroyed = false;
+  let listening = false;
+  let resolveTargetDestroyed: (() => void) | undefined;
+  const targetDestroyed = new Promise<void>((resolve) => {
+    resolveTargetDestroyed = resolve;
+  });
+  const onTargetDestroyed = (event: { targetId?: string }) => {
+    if (event.targetId === targetId) {
+      destroyed = true;
+      resolveTargetDestroyed?.();
+    }
+  };
   try {
-    const result = await browser.Target.closeTarget({ targetId });
-    if (result.success === false) {
-      throw new Error("Remote Chrome target cleanup failed.");
-    }
-  } catch (error) {
+    browser.on?.("Target.targetDestroyed", onTargetDestroyed);
+    listening = true;
+  } catch {
+    // Polling remains available when the browser connection cannot subscribe.
+  }
+  let closeError: unknown;
+  try {
     try {
-      const remaining = await browser.Target.getTargets();
-      if (!(remaining.targetInfos ?? []).some((target) => target.targetId === targetId)) return;
-    } catch {
-      // Preserve the close failure when target state cannot be confirmed.
+      const result = await browser.Target.closeTarget({ targetId });
+      if (result.success === false) {
+        throw new Error("Remote Chrome target cleanup failed.");
+      }
+    } catch (error) {
+      closeError = error;
     }
-    throw error;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      await Promise.race([delay(25), targetDestroyed]);
+      if (destroyed) return;
+      try {
+        const remaining = await browser.Target.getTargets();
+        if (!(remaining.targetInfos ?? []).some((target) => target.targetId === targetId)) return;
+      } catch {
+        // Continue polling until the bounded cleanup window expires.
+      }
+    }
+  } finally {
+    if (listening) {
+      try {
+        browserEvents.removeListener?.("Target.targetDestroyed", onTargetDestroyed);
+      } catch {
+        // Listener cleanup is best effort.
+      }
+    }
   }
-  const remaining = await browser.Target.getTargets();
-  if ((remaining.targetInfos ?? []).some((target) => target.targetId === targetId)) {
-    throw new Error("Remote Chrome target cleanup was not confirmed.");
-  }
+  if (closeError) throw closeError;
+  throw new Error("Remote Chrome target cleanup was not confirmed.");
 }
 
 export async function connectToRemoteChromeTarget(

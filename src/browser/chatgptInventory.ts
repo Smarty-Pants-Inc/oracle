@@ -1,5 +1,9 @@
 import type { ChromeClient } from "./types.js";
-import { closeTab, connectToRemoteChromeTarget } from "./chromeLifecycle.js";
+import {
+  closeTab,
+  connectToRemoteChromeTarget,
+  type RemoteChromeConnection,
+} from "./chromeLifecycle.js";
 import {
   browserIdFromWebSocketEndpoint,
   resolveRemoteChromeBrowserIdentity,
@@ -9,6 +13,9 @@ const CHATGPT_ORIGIN = "https://chatgpt.com";
 const CHATGPT_CONVERSATIONS_URL = `${CHATGPT_ORIGIN}/backend-api/conversations`;
 const CHATGPT_SESSION_URL = `${CHATGPT_ORIGIN}/api/auth/session`;
 const INVENTORY_RETRY_DELAYS_MS = [15_000, 45_000, 120_000, 240_000] as const;
+const INVENTORY_DEFAULT_TIMEOUT_MS =
+  30_000 + INVENTORY_RETRY_DELAYS_MS.reduce((total, delay) => total + delay, 0);
+const INVENTORY_CLEANUP_STEP_TIMEOUT_MS = 2_000;
 async function runBeforeInventoryDeadline<T>(
   operation: () => Promise<T>,
   deadline: number,
@@ -28,6 +35,17 @@ async function runBeforeInventoryDeadline<T>(
   } finally {
     clearTimeout(timer);
   }
+}
+function remainingInventoryOperationMs(deadline: number): number {
+  return Math.max(0, deadline - Date.now());
+}
+
+async function runInventoryCleanup<T>(operation: () => Promise<T>, action: string): Promise<T> {
+  return await runBeforeInventoryDeadline(
+    operation,
+    Date.now() + INVENTORY_CLEANUP_STEP_TIMEOUT_MS,
+    action,
+  );
 }
 
 export interface ChatGptInventoryOptions {
@@ -429,11 +447,13 @@ export function buildChatGptInventoryPageExpression(
   archived: boolean,
   offset: number,
   limit: number,
-  deadline = Date.now() + 30_000,
+  budgetMs = 30_000,
 ): string {
+  const pageBudgetMs = Math.max(0, Math.floor(budgetMs));
   return `(() => (async () => {
     try {
-      const DEADLINE = ${JSON.stringify(deadline)};
+      const budgetMs = ${JSON.stringify(pageBudgetMs)};
+      const deadline = Date.now() + budgetMs;
       const url = new URL(${JSON.stringify(CHATGPT_CONVERSATIONS_URL)});
       url.searchParams.set('offset', ${JSON.stringify(String(offset))});
       url.searchParams.set('limit', ${JSON.stringify(String(limit))});
@@ -443,7 +463,7 @@ export function buildChatGptInventoryPageExpression(
       if (!inventory || typeof inventory.fetchPage !== 'function') {
         return { ok: false, reason: 'auth' };
       }
-      return await inventory.fetchPage(url.href, DEADLINE);
+      return await inventory.fetchPage(url.href, deadline);
     } catch {
       return { ok: false, reason: 'request' };
     }
@@ -471,10 +491,12 @@ async function evaluateInventoryIdentity(
   deadline: number,
 ): Promise<InventoryIdentity> {
   const outcome = await runBeforeInventoryDeadline(
-    () =>
-      Runtime.evaluate({
+    () => {
+      const budgetMs = remainingInventoryOperationMs(deadline);
+      return Runtime.evaluate({
         expression: `(() => {
-      const deadline = ${JSON.stringify(deadline)};
+      const budgetMs = ${JSON.stringify(budgetMs)};
+      const deadline = Date.now() + budgetMs;
       const inventory = window.__oracleChatGptInventory;
       return inventory && typeof inventory.${method} === "function"
         ? inventory.${method}(deadline)
@@ -482,7 +504,8 @@ async function evaluateInventoryIdentity(
     })()`,
         awaitPromise: true,
         returnByValue: true,
-      }),
+      });
+    },
     deadline,
     action,
   );
@@ -531,7 +554,12 @@ async function evaluateInventoryPage(
     const outcome = await runBeforeInventoryDeadline(
       () =>
         Runtime.evaluate({
-          expression: buildChatGptInventoryPageExpression(archived, offset, limit, deadline),
+          expression: buildChatGptInventoryPageExpression(
+            archived,
+            offset,
+            limit,
+            remainingInventoryOperationMs(deadline),
+          ),
           awaitPromise: true,
           returnByValue: true,
         }),
@@ -628,30 +656,42 @@ export async function captureChatGptConversationInventory(
   if (browserIdFromWebSocketEndpoint(browserWSEndpoint) !== browserId) {
     throw new Error("ChatGPT inventory browser id does not match its WebSocket.");
   }
-  const liveIdentity = await resolveRemoteChromeBrowserIdentity({
-    host: options.host,
-    port: options.port,
-  });
-  if (liveIdentity.browserId !== browserId) {
-    throw new Error("Remote Chrome browser identity changed before ChatGPT inventory.");
+  const timeoutMs = options.timeoutMs ?? INVENTORY_DEFAULT_TIMEOUT_MS;
+  const pageSize = options.pageSize ?? 100;
+  if (!Number.isInteger(pageSize) || pageSize <= 0) {
+    throw new Error("ChatGPT inventory page size must be a positive integer.");
   }
-  const connection = await connectToRemoteChromeTarget(options.host, options.port, () => {}, {
-    targetUrl: "https://chatgpt.com/",
-    browserWSEndpoint: liveIdentity.browserWSEndpoint,
-    closeTargetOnDispose: false,
-  });
-  const { Page, Runtime } = connection.client;
+  const deadline = Date.now() + timeoutMs;
+  let connection: RemoteChromeConnection | undefined;
   let cleanupRequired = false;
   let captureScriptIdentifier: string | undefined;
   let result: ChatGptInventoryResult | undefined;
   let operationError: unknown;
   try {
-    const timeoutMs = options.timeoutMs ?? 30_000;
-    const deadline = Date.now() + timeoutMs;
-    const pageSize = options.pageSize ?? 100;
-    if (!Number.isInteger(pageSize) || pageSize <= 0) {
-      throw new Error("ChatGPT inventory page size must be a positive integer.");
+    const liveIdentity = await runBeforeInventoryDeadline(
+      () =>
+        resolveRemoteChromeBrowserIdentity({
+          host: options.host,
+          port: options.port,
+        }),
+      deadline,
+      "resolving the remote Chrome browser identity for ChatGPT inventory",
+    );
+    if (liveIdentity.browserId !== browserId) {
+      throw new Error("Remote Chrome browser identity changed before ChatGPT inventory.");
     }
+    connection = await runBeforeInventoryDeadline(
+      () =>
+        connectToRemoteChromeTarget(options.host, options.port, () => {}, {
+          targetUrl: "https://chatgpt.com/",
+          browserWSEndpoint: liveIdentity.browserWSEndpoint,
+          closeTargetOnDispose: false,
+          approvalWaitMs: remainingInventoryOperationMs(deadline),
+        }),
+      deadline,
+      "opening the disposable ChatGPT inventory target",
+    );
+    const { Page, Runtime } = connection.client;
     const authCaptureHook = buildChatGptInventoryAuthCaptureHook();
     await runBeforeInventoryDeadline(
       () => Page.enable(),
@@ -730,41 +770,57 @@ export async function captureChatGptConversationInventory(
     operationError = error;
   }
   const cleanupErrors: unknown[] = [];
-  if (cleanupRequired) {
+  if (connection) {
+    const { Page, Runtime } = connection.client;
+    if (cleanupRequired) {
+      try {
+        const cleanup = await runInventoryCleanup(
+          () =>
+            Runtime.evaluate({
+              expression: buildChatGptInventoryCleanupExpression(),
+              awaitPromise: false,
+              returnByValue: true,
+            }),
+          "cleaning up ChatGPT inventory authorization capture",
+        );
+        if (cleanup.exceptionDetails || cleanup.result?.value !== true) {
+          throw new Error("ChatGPT inventory authorization cleanup was not confirmed.");
+        }
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    if (captureScriptIdentifier) {
+      try {
+        await runInventoryCleanup(
+          () => Page.removeScriptToEvaluateOnNewDocument({ identifier: captureScriptIdentifier }),
+          "removing ChatGPT inventory authorization capture",
+        );
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
     try {
-      const cleanup = await Runtime.evaluate({
-        expression: buildChatGptInventoryCleanupExpression(),
-        awaitPromise: false,
-        returnByValue: true,
-      });
-      if (cleanup.exceptionDetails || cleanup.result?.value !== true) {
-        throw new Error("ChatGPT inventory authorization cleanup was not confirmed.");
+      await runInventoryCleanup(
+        () => connection.close(),
+        "closing the ChatGPT inventory connection",
+      );
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    try {
+      const closed = connection.targetId
+        ? await runInventoryCleanup(
+            () => closeTab(options.port, connection.targetId!, () => {}, options.host),
+            "closing the disposable ChatGPT inventory target",
+          )
+        : false;
+      if (!closed) {
+        throw new Error("ChatGPT inventory target cleanup was not confirmed.");
       }
     } catch (error) {
       cleanupErrors.push(error);
     }
-  }
-  if (captureScriptIdentifier) {
-    try {
-      await Page.removeScriptToEvaluateOnNewDocument({ identifier: captureScriptIdentifier });
-    } catch (error) {
-      cleanupErrors.push(error);
-    }
-  }
-  try {
-    await connection.close();
-  } catch (error) {
-    cleanupErrors.push(error);
-  }
-  try {
-    if (
-      !connection.targetId ||
-      !(await closeTab(options.port, connection.targetId, () => {}, options.host))
-    ) {
-      throw new Error("ChatGPT inventory target cleanup was not confirmed.");
-    }
-  } catch (error) {
-    cleanupErrors.push(error);
   }
   const closeError =
     cleanupErrors.length > 1

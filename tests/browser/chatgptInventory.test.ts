@@ -115,6 +115,14 @@ describe("ChatGPT conversation inventory", () => {
     ).toThrow(/item 0 has no conversation id/i);
   });
 
+  test("derives the page deadline from a local remaining-time budget", () => {
+    const expression = buildChatGptInventoryPageExpression(false, 0, 100, 1_234);
+
+    expect(expression).toContain("const budgetMs = 1234;");
+    expect(expression).toContain("const deadline = Date.now() + budgetMs;");
+    expect(expression).not.toContain("const deadline = 1234;");
+  });
+
   test("rejects a restarted browser before opening inventory", async () => {
     vi.stubGlobal(
       "fetch",
@@ -136,6 +144,75 @@ describe("ChatGPT conversation inventory", () => {
       }),
     ).rejects.toThrow(/browser identity changed before ChatGPT inventory/i);
     expect(chromeMocks.connectToRemoteChromeTarget).not.toHaveBeenCalled();
+  });
+
+  test("starts the inventory deadline before remote browser identity resolution", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise<never>(() => undefined)),
+    );
+
+    const capture = captureChatGptConversationInventory({
+      host: "127.0.0.1",
+      port: 9223,
+      browserId: "browser-a",
+      browserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+      expectedEmail: "owner@example.test",
+      timeoutMs: 100,
+    });
+    const failure = capture.catch((error: unknown) => error);
+
+    await vi.advanceTimersByTimeAsync(100);
+
+    const error = await failure;
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(
+      /timed out while resolving the remote Chrome browser identity/i,
+    );
+    expect(chromeMocks.connectToRemoteChromeTarget).not.toHaveBeenCalled();
+  });
+
+  test("bounds stalled disposable target setup by the inventory deadline", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    let signalTargetConnectionStarted!: () => void;
+    const targetConnectionStarted = new Promise<void>((resolve) => {
+      signalTargetConnectionStarted = resolve;
+    });
+
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ webSocketDebuggerUrl: browserWSEndpoint }),
+      }),
+    );
+    chromeMocks.connectToRemoteChromeTarget.mockImplementation(() => {
+      signalTargetConnectionStarted();
+      return new Promise<never>(() => undefined);
+    });
+
+    const capture = captureChatGptConversationInventory({
+      host: "127.0.0.1",
+      port: 9223,
+      browserId: "browser-a",
+      browserWSEndpoint,
+      expectedEmail: "owner@example.test",
+      timeoutMs: 100,
+    });
+    const failure = capture.catch((error: unknown) => error);
+
+    await targetConnectionStarted;
+    await vi.advanceTimersByTimeAsync(100);
+
+    const error = await failure;
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(
+      /timed out while opening the disposable ChatGPT inventory target/i,
+    );
   });
 
   test("binds retained authorization before replaying authenticated GET inventory requests", async () => {
@@ -326,11 +403,16 @@ describe("ChatGPT conversation inventory", () => {
       evaluated.filter((expression) => expression.includes("inventory.fetchPage")),
     ).toHaveLength(3);
     expect(inventoryCalls).toBe(3);
-    const pageDeadlines = evaluated
+    const pageBudgets = evaluated
       .filter((expression) => expression.includes("inventory.fetchPage"))
-      .map((expression) => /const DEADLINE = (\d+);/.exec(expression)?.[1]);
-    expect(pageDeadlines).not.toContain(undefined);
-    expect(new Set(pageDeadlines).size).toBe(1);
+      .map((expression) => /const budgetMs = (\d+);/.exec(expression)?.[1]);
+    expect(pageBudgets).not.toContain(undefined);
+    expect(pageBudgets.every((budget) => Number(budget) > 0)).toBe(true);
+    expect(
+      evaluated
+        .filter((expression) => expression.includes("inventory.fetchPage"))
+        .every((expression) => expression.includes("const deadline = Date.now() + budgetMs;")),
+    ).toBe(true);
     expect(evaluated.join("\n")).not.toMatch(/\b(?:POST|PUT|PATCH|DELETE)\b/);
 
     inventoryCalls = 0;
@@ -344,6 +426,121 @@ describe("ChatGPT conversation inventory", () => {
         expectedEmail: "owner@example.test",
       }),
     ).rejects.toThrow(/target cleanup was not confirmed/i);
+  });
+
+  test("keeps every fallback retry reachable with the default inventory timeout", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const accountDigest = "a".repeat(64);
+    const activeUrl =
+      "https://chatgpt.com/backend-api/conversations?offset=0&limit=100&order=updated&is_archived=false";
+    const archivedUrl =
+      "https://chatgpt.com/backend-api/conversations?offset=0&limit=100&order=updated&is_archived=true";
+    let activeAttempts = 0;
+    let signalFirstPage!: () => void;
+    const firstPage = new Promise<void>((resolve) => {
+      signalFirstPage = resolve;
+    });
+
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ webSocketDebuggerUrl: browserWSEndpoint }),
+      }),
+    );
+    const Runtime = {
+      evaluate: vi.fn(({ expression }: { expression: string }) => {
+        if (expression.includes("document.readyState")) {
+          return Promise.resolve({
+            result: { value: { href: "https://chatgpt.com/", readyState: "complete" } },
+          });
+        }
+        if (expression.includes("Boolean(window.__oracleChatGptInventory?.ready)")) {
+          return Promise.resolve({ result: { value: true } });
+        }
+        if (
+          expression.includes("inventory.readCookieIdentity(") ||
+          expression.includes("inventory.bindRetainedAuthorization(")
+        ) {
+          return Promise.resolve({
+            result: {
+              value: {
+                ok: true,
+                status: 200,
+                url: "https://chatgpt.com/api/auth/session",
+                redirected: false,
+                accountDigest,
+                email: "owner@example.test",
+              },
+            },
+          });
+        }
+        if (expression.includes("inventory.fetchPage")) {
+          const archived = expression.includes('is_archived\', "true"');
+          if (!archived) {
+            activeAttempts += 1;
+            if (activeAttempts <= 4) {
+              if (activeAttempts === 1) signalFirstPage();
+              return Promise.resolve({
+                result: {
+                  value: {
+                    ok: false,
+                    status: 429,
+                    reason: "http",
+                    url: activeUrl,
+                    redirected: false,
+                  },
+                },
+              });
+            }
+          }
+          return Promise.resolve({
+            result: {
+              value: {
+                ok: true,
+                status: 200,
+                url: archived ? archivedUrl : activeUrl,
+                redirected: false,
+                body: { items: [], total: 0, limit: 100, offset: 0 },
+              },
+            },
+          });
+        }
+        if (expression.includes("const inventory = window.__oracleChatGptInventory;")) {
+          return Promise.resolve({ result: { value: true } });
+        }
+        return Promise.resolve({ result: { value: undefined } });
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    const Page = {
+      enable: vi.fn(async () => undefined),
+      addScriptToEvaluateOnNewDocument: vi.fn(async () => ({ identifier: "inventory-hook" })),
+      removeScriptToEvaluateOnNewDocument: vi.fn(async () => undefined),
+      navigate: vi.fn(async () => ({ frameId: "inventory-frame" })),
+    };
+    chromeMocks.connectToRemoteChromeTarget.mockResolvedValue({
+      client: { Page, Runtime },
+      targetId: "inventory-target",
+      browserWSEndpoint,
+      close: vi.fn(async () => undefined),
+    });
+
+    const capture = captureChatGptConversationInventory({
+      host: "127.0.0.1",
+      port: 9223,
+      browserId: "browser-a",
+      browserWSEndpoint,
+      expectedEmail: "owner@example.test",
+    });
+
+    await firstPage;
+    await vi.runAllTimersAsync();
+
+    await expect(capture).resolves.toEqual({ accountDigest, items: [] });
+    expect(activeAttempts).toBe(5);
+    expect(Date.now()).toBe(420_000);
   });
   test("uses one inventory deadline through a retry and stalled page request", async () => {
     const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
@@ -459,7 +656,8 @@ describe("ChatGPT conversation inventory", () => {
     await vi.advanceTimersByTimeAsync(100);
     await vi.advanceTimersByTimeAsync(100);
     await stalledPageStarted;
-    expect(stalledPageExpression).toContain("const DEADLINE = 250");
+    expect(stalledPageExpression).toContain("const budgetMs = 50;");
+    expect(stalledPageExpression).toContain("const deadline = Date.now() + budgetMs;");
     expect(buildChatGptInventoryAuthCaptureHook()).toContain("controller = new AbortController()");
     expect(buildChatGptInventoryAuthCaptureHook()).toContain("signal: controller.signal");
 
@@ -478,6 +676,87 @@ describe("ChatGPT conversation inventory", () => {
       expect.any(Function),
       "127.0.0.1",
     );
+  });
+
+  test("bounds stalled cleanup steps and still attempts later disposable-target cleanup", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const cleanupEvents: string[] = [];
+    let signalNavigationStarted!: () => void;
+    const navigationStarted = new Promise<void>((resolve) => {
+      signalNavigationStarted = resolve;
+    });
+
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ webSocketDebuggerUrl: browserWSEndpoint }),
+      }),
+    );
+    const Runtime = {
+      evaluate: vi.fn(({ expression }: { expression: string }) => {
+        if (expression.includes("const inventory = window.__oracleChatGptInventory;")) {
+          cleanupEvents.push("authorization-cleanup");
+          return new Promise<never>(() => undefined);
+        }
+        return Promise.resolve({ result: { value: undefined } });
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    const Page = {
+      enable: vi.fn(async () => undefined),
+      addScriptToEvaluateOnNewDocument: vi.fn(async () => ({ identifier: "inventory-hook" })),
+      removeScriptToEvaluateOnNewDocument: vi.fn(() => {
+        cleanupEvents.push("remove-script");
+        return new Promise<never>(() => undefined);
+      }),
+      navigate: vi.fn(() => {
+        signalNavigationStarted();
+        return new Promise<never>(() => undefined);
+      }),
+    };
+    const close = vi.fn(() => {
+      cleanupEvents.push("detach");
+      return new Promise<never>(() => undefined);
+    });
+    chromeMocks.connectToRemoteChromeTarget.mockResolvedValue({
+      client: { Page, Runtime },
+      targetId: "inventory-target",
+      browserWSEndpoint,
+      close,
+    });
+    chromeMocks.closeTab.mockImplementation(() => {
+      cleanupEvents.push("close-target");
+      return new Promise<never>(() => undefined);
+    });
+
+    const capture = captureChatGptConversationInventory({
+      host: "127.0.0.1",
+      port: 9223,
+      browserId: "browser-a",
+      browserWSEndpoint,
+      expectedEmail: "owner@example.test",
+      timeoutMs: 100,
+    });
+    const failure = capture.catch((error: unknown) => error);
+
+    await navigationStarted;
+    await vi.advanceTimersByTimeAsync(100);
+    await vi.runAllTimersAsync();
+
+    await expect(failure).resolves.toBeInstanceOf(AggregateError);
+    expect(cleanupEvents).toEqual([
+      "authorization-cleanup",
+      "remove-script",
+      "detach",
+      "close-target",
+    ]);
+    expect(Page.removeScriptToEvaluateOnNewDocument).toHaveBeenCalledWith({
+      identifier: "inventory-hook",
+    });
+    expect(close).toHaveBeenCalledOnce();
+    expect(chromeMocks.closeTab).toHaveBeenCalledOnce();
   });
 
   test.each([

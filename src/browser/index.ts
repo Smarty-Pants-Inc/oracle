@@ -1369,6 +1369,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   let isolatedTargetId: string | null = null;
   let ownsTarget = true;
   const startedAt = Date.now();
+  const accountAffinityDeadline = startedAt + config.timeoutMs;
+  const remainingAccountAffinityMs = () =>
+    Math.max(0, Math.min(config.inputTimeoutMs, accountAffinityDeadline - Date.now()));
   let answerText = "";
   let answerMarkdown = "";
   let answerHtml = "";
@@ -1647,7 +1650,12 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       process.env.ORACLE_WRAPPER_EXPECTED_ACCOUNT_EMAIL?.trim().toLowerCase();
     if (wrapperExpectedEmail) {
       await raceWithDisconnect(
-        assertChatGptAccountEmail(Runtime, wrapperExpectedEmail, "Oracle prompt submission"),
+        assertChatGptAccountEmail(
+          Runtime,
+          wrapperExpectedEmail,
+          "Oracle prompt submission",
+          remainingAccountAffinityMs(),
+        ),
       );
     }
     if (config.archiveConversations !== "never") {
@@ -1664,7 +1672,14 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     const assertPageAffinity = async (action: string): Promise<void> => {
       await assertAttachedConversation(action);
       if (wrapperExpectedEmail) {
-        await raceWithDisconnect(assertChatGptAccountEmail(Runtime, wrapperExpectedEmail, action));
+        await raceWithDisconnect(
+          assertChatGptAccountEmail(
+            Runtime,
+            wrapperExpectedEmail,
+            action,
+            remainingAccountAffinityMs(),
+          ),
+        );
       }
     };
     logger(
@@ -3414,6 +3429,9 @@ async function runRemoteBrowserMode(
     }
   };
   const startedAt = Date.now();
+  const accountAffinityDeadline = startedAt + config.timeoutMs;
+  const remainingAccountAffinityMs = () =>
+    Math.max(0, Math.min(config.inputTimeoutMs, accountAffinityDeadline - Date.now()));
   let answerText = "";
   let answerMarkdown = "";
   let answerHtml = "";
@@ -3451,6 +3469,7 @@ async function runRemoteBrowserMode(
           Runtime,
           initialWrapperExpectedEmail,
           "Oracle remote browser initialization",
+          remainingAccountAffinityMs(),
         );
       } catch (error) {
         accountVerificationFailed = true;
@@ -3603,7 +3622,12 @@ async function runRemoteBrowserMode(
     const wrapperExpectedEmail =
       process.env.ORACLE_WRAPPER_EXPECTED_ACCOUNT_EMAIL?.trim().toLowerCase();
     const observedAccountDigest = wrapperExpectedEmail
-      ? await assertChatGptAccountEmail(Runtime, wrapperExpectedEmail, "Oracle prompt submission")
+      ? await assertChatGptAccountEmail(
+          Runtime,
+          wrapperExpectedEmail,
+          "Oracle prompt submission",
+          remainingAccountAffinityMs(),
+        )
       : await readChatGptAccountDigest(Runtime);
     if (expectedAccountDigest && observedAccountDigest !== expectedAccountDigest) {
       throw new BrowserAutomationError(
@@ -3625,7 +3649,12 @@ async function runRemoteBrowserMode(
     const assertPageAffinity = async (action: string): Promise<void> => {
       await assertAttachedConversation(action);
       if (wrapperExpectedEmail) {
-        await assertChatGptAccountEmail(Runtime, wrapperExpectedEmail, action);
+        await assertChatGptAccountEmail(
+          Runtime,
+          wrapperExpectedEmail,
+          action,
+          remainingAccountAffinityMs(),
+        );
       }
       await assertRemoteChatGptAccountAffinity(Runtime, config.remoteChromeAccountDigest, action);
     };
@@ -3964,6 +3993,8 @@ async function runRemoteBrowserMode(
         answerChars: researchResult.text.length,
         chromePort: port,
         chromeHost: host,
+        chromeBrowserWSEndpoint: browserWSEndpoint,
+        chatGptAccountDigest: config.remoteChromeAccountDigest ?? undefined,
         chromeTargetId: remoteTargetId ?? undefined,
         tabUrl: lastUrl,
         conversationId: runConversationId,

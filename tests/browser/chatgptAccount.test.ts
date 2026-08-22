@@ -21,15 +21,27 @@ describe("ChatGPT account affinity", () => {
       email: " OWNER@EXAMPLE.TEST ",
     });
 
-    await expect(readChatGptAccountIdentity(Runtime)).resolves.toEqual({
+    await expect(readChatGptAccountIdentity(Runtime, 250)).resolves.toEqual({
       accountDigest,
       email: "owner@example.test",
     });
     await expect(
-      assertChatGptAccountEmail(Runtime, "OWNER@example.test", "inventory"),
+      assertChatGptAccountEmail(Runtime, "OWNER@example.test", "inventory", 250),
     ).resolves.toBe(accountDigest);
-    expect(vi.mocked(Runtime.evaluate).mock.calls[0]?.[0]?.expression).toContain(
-      "/api/auth/session",
+    const expression = vi.mocked(Runtime.evaluate).mock.calls[0]?.[0]?.expression;
+    expect(expression).toContain("/api/auth/session");
+    expect(expression).toContain("AbortController");
+    expect(expression).toContain("signal: controller.signal");
+    expect(expression).toContain("const timeoutMs = 250");
+  });
+
+  test("fails closed when the host-side account identity evaluation exceeds its budget", async () => {
+    const Runtime = {
+      evaluate: vi.fn(() => Promise.race([])),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(readChatGptAccountIdentity(Runtime, 1)).rejects.toThrow(
+      "Timed out while reading authenticated ChatGPT account identity.",
     );
   });
 

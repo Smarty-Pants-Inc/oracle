@@ -79,6 +79,34 @@ describe("handleSessionCommand", () => {
     );
   });
 
+  test("writes the loaded canonical metadata id after a successful attach", async () => {
+    const command = createCommandWithOptions({ hours: 24, limit: 10, all: false });
+    const deps = createDeps();
+    deps.readSession.mockResolvedValue({ id: "canonical-session-id" });
+
+    await handleSessionCommand("directory-key", command, deps);
+
+    expect(deps.attachSession).toHaveBeenCalledWith(
+      "directory-key",
+      expect.objectContaining({ renderMarkdown: false }),
+    );
+    expect(deps.writeSessionIdReceipt).toHaveBeenCalledWith("canonical-session-id");
+  });
+
+  test("keeps attach's missing-session behavior without writing a receipt", async () => {
+    const command = createCommandWithOptions({ hours: 24, limit: 10, all: false });
+    const deps = createDeps();
+    deps.readSession.mockResolvedValue(null);
+    deps.attachSession.mockImplementation(async () => {
+      process.exitCode = 1;
+    });
+
+    await handleSessionCommand("missing", command, deps);
+
+    expect(deps.attachSession).toHaveBeenCalledOnce();
+    expect(deps.writeSessionIdReceipt).not.toHaveBeenCalled();
+  });
+
   test("does not write a receipt when attach reports failure", async () => {
     const command = createCommandWithOptions({ hours: 24, limit: 10, all: false });
     const deps = createDeps();

@@ -655,6 +655,113 @@ describe("connectToRemoteChromeTarget", () => {
     expect(browserClient.Target.getTargets).toHaveBeenCalledOnce();
     expect(browserClient.close).toHaveBeenCalledOnce();
   });
+  test("polls until a stale remote target snapshot clears after close", async () => {
+    vi.useFakeTimers();
+    try {
+      const browserClient = {
+        Target: {
+          createTarget: vi.fn(async () => ({ targetId: "target-poll" })),
+          attachToTarget: vi.fn(async () => ({ sessionId: "session-poll" })),
+          detachFromTarget: vi.fn(async () => ({})),
+          closeTarget: vi.fn(async () => ({ success: true })),
+          getTargets: vi
+            .fn()
+            .mockResolvedValueOnce({
+              targetInfos: [{ targetId: "target-poll", type: "page", url: "https://chatgpt.com/" }],
+            })
+            .mockResolvedValueOnce({ targetInfos: [] }),
+        },
+        Network: { enable: vi.fn(async () => ({})) },
+        Page: { enable: vi.fn(async () => ({})), navigate: vi.fn(async () => ({})) },
+        Runtime: { enable: vi.fn(async () => ({})), evaluate: vi.fn(async () => ({ result: {} })) },
+        Input: { dispatchKeyEvent: vi.fn(async () => ({})) },
+        DOM: { enable: vi.fn(async () => ({})) },
+        on: vi.fn(),
+        once: vi.fn(),
+        removeListener: vi.fn(),
+        close: vi.fn(async () => {}),
+      };
+      cdpMock.mockResolvedValue(browserClient);
+      const { connectToRemoteChromeTarget } = await import("../../src/browser/chromeLifecycle.js");
+      const connection = await connectToRemoteChromeTarget(
+        "127.0.0.1",
+        9222,
+        vi.fn<(message: string) => void>(),
+        {
+          browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+          targetUrl: "https://chatgpt.com/",
+          closeTargetOnDispose: true,
+        },
+      );
+
+      const closing = connection.close();
+      await vi.advanceTimersByTimeAsync(50);
+
+      await expect(closing).resolves.toBeUndefined();
+      expect(browserClient.Target.getTargets).toHaveBeenCalledTimes(2);
+      expect(browserClient.close).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("accepts a targetDestroyed event during remote target cleanup", async () => {
+    vi.useFakeTimers();
+    try {
+      let targetDestroyed: ((event: { targetId?: string }) => void) | undefined;
+      const browserClient = {
+        Target: {
+          createTarget: vi.fn(async () => ({ targetId: "target-destroyed" })),
+          attachToTarget: vi.fn(async () => ({ sessionId: "session-destroyed" })),
+          detachFromTarget: vi.fn(async () => ({})),
+          closeTarget: vi.fn(async () => {
+            targetDestroyed?.({ targetId: "target-destroyed" });
+            return { success: true };
+          }),
+          getTargets: vi.fn(async () => ({
+            targetInfos: [
+              { targetId: "target-destroyed", type: "page", url: "https://chatgpt.com/" },
+            ],
+          })),
+        },
+        Network: { enable: vi.fn(async () => ({})) },
+        Page: { enable: vi.fn(async () => ({})), navigate: vi.fn(async () => ({})) },
+        Runtime: { enable: vi.fn(async () => ({})), evaluate: vi.fn(async () => ({ result: {} })) },
+        Input: { dispatchKeyEvent: vi.fn(async () => ({})) },
+        DOM: { enable: vi.fn(async () => ({})) },
+        on: vi.fn((event: string, listener: (event: { targetId?: string }) => void) => {
+          if (event === "Target.targetDestroyed") targetDestroyed = listener;
+        }),
+        once: vi.fn(),
+        removeListener: vi.fn(),
+        close: vi.fn(async () => {}),
+      };
+      cdpMock.mockResolvedValue(browserClient);
+      const { connectToRemoteChromeTarget } = await import("../../src/browser/chromeLifecycle.js");
+      const connection = await connectToRemoteChromeTarget(
+        "127.0.0.1",
+        9222,
+        vi.fn<(message: string) => void>(),
+        {
+          browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+          targetUrl: "https://chatgpt.com/",
+          closeTargetOnDispose: true,
+        },
+      );
+
+      const closing = connection.close();
+      await vi.advanceTimersByTimeAsync(25);
+
+      await expect(closing).resolves.toBeUndefined();
+      expect(browserClient.Target.getTargets).not.toHaveBeenCalled();
+      expect(browserClient.removeListener).toHaveBeenCalledWith(
+        "Target.targetDestroyed",
+        expect.any(Function),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   test("surfaces dedicated remote-target disposal failures", async () => {
     const browserClient = {

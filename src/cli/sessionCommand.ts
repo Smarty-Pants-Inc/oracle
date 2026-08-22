@@ -220,13 +220,14 @@ export async function handleSessionCommand(
   const renderMarkdown = Boolean(
     sessionOptions.render || sessionOptions.renderMarkdown || autoRender,
   );
+  const metadata = await deps.readSession(sessionId);
   await deps.attachSession(sessionId, {
     renderMarkdown,
     renderPrompt: !sessionOptions.hidePrompt,
     model: sessionOptions.model,
   });
-  if (!process.exitCode) {
-    await deps.writeSessionIdReceipt(sessionId);
+  if (!process.exitCode && metadata) {
+    await deps.writeSessionIdReceipt(metadata.id);
   }
 }
 

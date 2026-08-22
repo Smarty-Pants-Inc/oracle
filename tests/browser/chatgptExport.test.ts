@@ -210,6 +210,98 @@ describe("ChatGPT conversation export helpers", () => {
     expect(fetch).toHaveBeenCalledOnce();
   });
 
+  test("derives the exact-GET deadline in the page clock from a relative budget", async () => {
+    const userId = "approved-user";
+    const expectedDigest = createHash("sha256").update(userId).digest("hex");
+    const jwtPayload = Buffer.from(
+      JSON.stringify({
+        "https://api.openai.com/auth": { chatgpt_user_id: userId },
+        "https://api.openai.com/profile": { email: "owner@example.test" },
+      }),
+    ).toString("base64url");
+    const expression = buildReadOnlyConversationGetExpressionForTest(
+      "https://chatgpt.com/backend-api/conversation/conv-1",
+      expectedDigest,
+      "owner@example.test",
+      250,
+    );
+    const digest = Uint8Array.from(Buffer.from(expectedDigest, "hex"));
+    const pageCrypto = { subtle: { digest: async () => digest } };
+    let signalBackendStarted: () => void;
+    const backendStarted = new Promise<void>((resolve) => {
+      signalBackendStarted = resolve;
+    });
+    let scheduledMs: number | undefined;
+    let timeoutCallback: (() => void) | undefined;
+    const pageFetch = vi.fn((input: string, init?: { signal?: AbortSignal }) => {
+      if (input === "/api/auth/session") {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            user: { id: userId, email: "owner@example.test" },
+            accessToken: `header.${jwtPayload}.signature`,
+          }),
+        });
+      }
+      if (input !== "https://chatgpt.com/backend-api/conversation/conv-1") {
+        throw new Error(`Unexpected fetch URL: ${input}`);
+      }
+      signalBackendStarted();
+      return new Promise<never>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+    });
+    const run = Function(
+      "window",
+      "location",
+      "fetch",
+      "Date",
+      "setTimeout",
+      "clearTimeout",
+      "crypto",
+      "globalThis",
+      `return ${expression};`,
+    ) as (
+      window: object,
+      location: { href: string },
+      fetch: (input: string, init?: { signal?: AbortSignal }) => Promise<unknown>,
+      Date: { now: () => number },
+      setTimeout: (callback: () => void, ms: number) => number,
+      clearTimeout: (timeout: number) => void,
+      crypto: typeof pageCrypto,
+      pageGlobal: { crypto: typeof pageCrypto },
+    ) => Promise<unknown>;
+
+    const result = run(
+      {},
+      { href: "https://chatgpt.com/" },
+      pageFetch,
+      { now: () => 10_000_000 },
+      (callback, ms) => {
+        timeoutCallback = callback;
+        scheduledMs = ms;
+        return 1;
+      },
+      () => undefined,
+      pageCrypto,
+      { crypto: pageCrypto },
+    );
+    const reachedBackend = await Promise.race([
+      backendStarted.then(() => true),
+      result.then(
+        () => false,
+        () => false,
+      ),
+    ]);
+
+    expect(reachedBackend).toBe(true);
+    expect(expression).toContain("const REMAINING_MS = 250");
+    expect(expression).toContain("const DEADLINE = Date.now() + REMAINING_MS");
+    expect(scheduledMs).toBe(250);
+    timeoutCallback?.();
+    await expect(result).rejects.toThrow(/exact GET timed out/i);
+  });
+
   test("capture hooks expose deterministic raw-body cleanup", () => {
     const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
     const hook = buildScopedBackendCaptureHook(targetApiUrl);
