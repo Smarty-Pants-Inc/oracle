@@ -5,6 +5,7 @@ import type {
   BrowserResearchMode,
   ChromeClient,
 } from "../types.js";
+import { MAX_CHATGPT_ACCOUNT_ID_LENGTH } from "../chatgptAccount.js";
 
 const ARCHIVE_HOST_HANDOFF_MS = 250;
 const ARCHIVE_CONFIRMATION_BUDGET_MS = 1_000;
@@ -117,9 +118,8 @@ export async function archiveChatGptConversation(
       error,
     };
   }
-  const hostDeadline = Date.now() + resolvedRemainingMs;
-  const pageDeadline = hostDeadline - ARCHIVE_HOST_HANDOFF_MS;
-  if (pageDeadline - Date.now() < ARCHIVE_CONFIRMATION_BUDGET_MS) {
+  const pageRemainingMs = resolvedRemainingMs - ARCHIVE_HOST_HANDOFF_MS;
+  if (pageRemainingMs < ARCHIVE_CONFIRMATION_BUDGET_MS) {
     const error = "Archive deadline has insufficient confirmation budget.";
     logger(`[browser] ChatGPT archive skipped (${error}).`);
     return {
@@ -146,7 +146,7 @@ export async function archiveChatGptConversation(
           expectedOrigin: affinity.origin,
           expectedConversationId: affinity.conversationId,
           expectedAccountDigest,
-          deadline: pageDeadline,
+          remainingMs: pageRemainingMs,
         }),
         awaitPromise: true,
         returnByValue: true,
@@ -214,19 +214,14 @@ function buildArchiveConversationExpression({
   expectedOrigin,
   expectedConversationId,
   expectedAccountDigest,
-  deadline,
   remainingMs,
 }: {
   expectedOrigin: string;
   expectedConversationId: string;
   expectedAccountDigest?: string;
-  deadline?: number;
-  remainingMs?: number;
+  remainingMs: number;
 }): string {
-  const deadlineExpression =
-    typeof deadline === "number" && Number.isFinite(deadline)
-      ? JSON.stringify(Math.floor(deadline))
-      : `Date.now() + ${JSON.stringify(Math.max(0, Math.floor(remainingMs ?? 0)))}`;
+  const deadlineExpression = `Date.now() + ${JSON.stringify(Math.max(0, Math.floor(remainingMs)))}`;
   return `(() => {
     const expectedOrigin = ${JSON.stringify(expectedOrigin)};
     const expectedConversationId = ${JSON.stringify(expectedConversationId)};
@@ -271,7 +266,9 @@ function buildArchiveConversationExpression({
               Date.now() >= cutoff
             ) return null;
             const body = await response.json();
-            const userId = typeof body?.user?.id === 'string' ? body.user.id.trim() : '';
+            const rawUserId = typeof body?.user?.id === 'string' ? body.user.id : '';
+            const userId =
+              rawUserId.length > 0 && rawUserId.length <= ${MAX_CHATGPT_ACCOUNT_ID_LENGTH} ? rawUserId.trim() : '';
             if (!userId || !globalThis.crypto?.subtle) return null;
             const bytes = new Uint8Array(await crypto.subtle.digest(
               'SHA-256', new TextEncoder().encode(userId),

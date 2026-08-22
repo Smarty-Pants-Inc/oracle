@@ -3,6 +3,8 @@ import type { ChromeClient } from "../../src/browser/types.js";
 import {
   assertChatGptAccountAffinity,
   assertChatGptAccountEmail,
+  normalizeChatGptAccountDigest,
+  normalizeChatGptAccountEmail,
   readChatGptAccountIdentity,
 } from "../../src/browser/chatgptAccount.js";
 
@@ -33,6 +35,15 @@ describe("ChatGPT account affinity", () => {
     expect(expression).toContain("AbortController");
     expect(expression).toContain("signal: controller.signal");
     expect(expression).toContain("const timeoutMs = 250");
+    expect(expression).toContain("rawUserId.length > 0 && rawUserId.length <= 512");
+    expect(expression).toContain("rawEmail.length <= 320");
+  });
+
+  test("rejects malformed and oversized account identity fields", () => {
+    expect(normalizeChatGptAccountDigest("a".repeat(65))).toBeUndefined();
+    expect(normalizeChatGptAccountDigest("not-a-digest")).toBeUndefined();
+    expect(normalizeChatGptAccountEmail("owner@example")).toBeUndefined();
+    expect(normalizeChatGptAccountEmail(`${"a".repeat(310)}@example.test`)).toBeUndefined();
   });
 
   test("fails closed when the host-side account identity evaluation exceeds its budget", async () => {

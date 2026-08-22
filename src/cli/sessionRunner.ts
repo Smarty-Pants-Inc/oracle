@@ -52,6 +52,8 @@ import { estimateTokenCount } from "../browser/utils.js";
 import type { BrowserLogger } from "../browser/types.js";
 import { formatElapsed } from "../oracle/format.js";
 import { formatBrowserReattachGuidance } from "./reattachGuidance.js";
+import { normalizeChatGptAccountDigest } from "../browser/chatgptAccount.js";
+import { browserIdFromWebSocketEndpoint } from "../browser/profileState.js";
 
 const isTty = process.stdout.isTTY;
 const dim = (text: string): string => (isTty ? kleur.dim(text) : text);
@@ -68,6 +70,51 @@ export interface SessionRunParams {
   notifications?: NotificationSettings;
   browserDeps?: BrowserSessionRunnerDeps;
   muteStdout?: boolean;
+}
+
+function applyRuntimeAffinityToBrowserConfig(
+  browserConfig: BrowserSessionConfig,
+  runtime: BrowserRuntimeMetadata,
+): BrowserRuntimeMetadata {
+  const accountDigest =
+    runtime.chatGptAccountDigest === undefined
+      ? undefined
+      : normalizeChatGptAccountDigest(runtime.chatGptAccountDigest);
+  if (runtime.chatGptAccountDigest !== undefined && !accountDigest) {
+    throw new Error("ChatGPT account identity is invalid.");
+  }
+  const normalizedRuntime = accountDigest
+    ? { ...runtime, chatGptAccountDigest: accountDigest }
+    : runtime;
+  if (!browserConfig.remoteChrome) {
+    return normalizedRuntime;
+  }
+  if (accountDigest) {
+    if (
+      browserConfig.remoteChromeAccountDigest &&
+      browserConfig.remoteChromeAccountDigest !== accountDigest
+    ) {
+      throw new Error("Stored remote Chrome account identity is conflicting.");
+    }
+    browserConfig.remoteChromeAccountDigest = accountDigest;
+  }
+  const browserWSEndpoint = normalizedRuntime.chromeBrowserWSEndpoint?.trim();
+  if (!browserWSEndpoint) {
+    return normalizedRuntime;
+  }
+  const browserId = browserIdFromWebSocketEndpoint(browserWSEndpoint);
+  if (browserConfig.remoteChromeBrowserId && browserConfig.remoteChromeBrowserId !== browserId) {
+    throw new Error("Stored remote Chrome browser identity is conflicting.");
+  }
+  if (
+    browserConfig.remoteChromeBrowserWSEndpoint &&
+    browserConfig.remoteChromeBrowserWSEndpoint !== browserWSEndpoint
+  ) {
+    throw new Error("Stored remote Chrome browser identity is conflicting.");
+  }
+  browserConfig.remoteChromeBrowserId = browserId;
+  browserConfig.remoteChromeBrowserWSEndpoint = browserWSEndpoint;
+  return normalizedRuntime;
 }
 
 export async function performSessionRun({
@@ -117,12 +164,10 @@ export async function performSessionRun({
           runtime: BrowserRuntimeMetadata,
           modelSelection?: BrowserModelSelectionEvidence,
         ) => {
-          if (runtime.chatGptAccountDigest && browserConfig.remoteChrome) {
-            browserConfig.remoteChromeAccountDigest ??= runtime.chatGptAccountDigest;
-          }
+          const persistedRuntime = applyRuntimeAffinityToBrowserConfig(browserConfig, runtime);
           const browser = {
             config: browserConfig,
-            runtime,
+            runtime: persistedRuntime,
             ...(modelSelection ? { modelSelection } : {}),
           };
           await sessionStore.updateSession(sessionMeta.id, {
@@ -164,6 +209,7 @@ export async function performSessionRun({
           usage: result.usage,
         });
       }
+      const persistedRuntime = applyRuntimeAffinityToBrowserConfig(browserConfig, result.runtime);
       await sessionStore.updateSession(sessionMeta.id, {
         status: "completed",
         completedAt: new Date().toISOString(),
@@ -172,7 +218,7 @@ export async function performSessionRun({
         errorMessage: undefined,
         browser: {
           config: browserConfig,
-          runtime: result.runtime,
+          runtime: persistedRuntime,
           archive: result.archive,
           modelSelection: result.modelSelection,
           warnings: result.warnings,

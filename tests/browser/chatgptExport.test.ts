@@ -174,6 +174,31 @@ describe("ChatGPT conversation export helpers", () => {
     expect(expression).not.toContain("sessionStorage");
   });
 
+  test("rejects invalid expected affinity and bounds JWT segments before decoding", () => {
+    expect(() =>
+      buildReadOnlyConversationGetExpressionForTest(
+        "https://chatgpt.com/backend-api/conversation/conv-1",
+        "a".repeat(65),
+        "owner@example.test",
+      ),
+    ).toThrow(/account affinity is invalid/i);
+    expect(() =>
+      buildReadOnlyConversationGetExpressionForTest(
+        "https://chatgpt.com/backend-api/conversation/conv-1",
+        "a".repeat(64),
+        "owner@example",
+      ),
+    ).toThrow(/account affinity is invalid/i);
+
+    const expression = buildReadOnlyConversationGetExpressionForTest(
+      "https://chatgpt.com/backend-api/conversation/conv-1",
+      "a".repeat(64),
+      "owner@example.test",
+    );
+    expect(expression).toContain("const MAX_JWT_SEGMENT_LENGTH = 8192");
+    expect(expression.indexOf("match.slice(1).some")).toBeLessThan(expression.indexOf("atob("));
+  });
+
   test("rejects a mismatched bearer identity inside the exact GET expression", async () => {
     const userId = "approved-user";
     const expectedDigest = createHash("sha256").update(userId).digest("hex");

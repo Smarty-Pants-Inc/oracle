@@ -20,7 +20,15 @@ import {
   resolveRemoteChromeBrowserIdentity,
 } from "./profileState.js";
 import { closeTab, connectToRemoteChromeTarget } from "./chromeLifecycle.js";
-import { assertChatGptAccountAffinity, readChatGptAccountIdentity } from "./chatgptAccount.js";
+import {
+  assertChatGptAccountAffinity,
+  MAX_CHATGPT_ACCOUNT_ID_LENGTH,
+  MAX_CHATGPT_ACCOUNT_EMAIL_LENGTH,
+  MAX_CHATGPT_JWT_SEGMENT_LENGTH,
+  normalizeChatGptAccountDigest,
+  normalizeChatGptAccountEmail,
+  readChatGptAccountIdentity,
+} from "./chatgptAccount.js";
 
 const execFileAsync = promisify(execFile);
 const WINDOWS_EXPORT_UNAVAILABLE_MESSAGE =
@@ -556,11 +564,23 @@ export function buildReadOnlyConversationGetExpressionForTest(
   ) {
     throw new Error("Expected an exact ChatGPT backend conversation URL.");
   }
+  const normalizedDigest =
+    expectedAccountDigest === undefined
+      ? undefined
+      : normalizeChatGptAccountDigest(expectedAccountDigest);
+  const normalizedEmail =
+    expectedEmail === undefined ? undefined : normalizeChatGptAccountEmail(expectedEmail);
+  if (
+    (expectedAccountDigest !== undefined && !normalizedDigest) ||
+    (expectedEmail !== undefined && !normalizedEmail)
+  ) {
+    throw new Error("Expected ChatGPT account affinity is invalid.");
+  }
   return buildReadOnlyConversationGetExpression(
     targetApiUrl,
     decodeURIComponent(url.pathname.slice(prefix.length)),
-    expectedAccountDigest,
-    expectedEmail,
+    normalizedDigest,
+    normalizedEmail,
     remainingMs,
   );
 }
@@ -579,8 +599,12 @@ function buildReadOnlyConversationGetExpression(
   const SESSION_TARGET = "https://chatgpt.com/api/auth/session";
   const EXPECTED_CONVERSATION_ID = ${jsString(expectedConversationId)};
   const EXPECTED_ACCOUNT_DIGEST = ${JSON.stringify(expectedAccountDigest ?? null)};
-  const EXPECTED_EMAIL = ${JSON.stringify(expectedEmail?.trim().toLowerCase() || null)};
+  const EXPECTED_EMAIL = ${JSON.stringify(expectedEmail ?? null)};
   const REMAINING_MS = ${JSON.stringify(pageBudgetMs)};
+  const MAX_ACCOUNT_ID_LENGTH = ${MAX_CHATGPT_ACCOUNT_ID_LENGTH};
+  const MAX_EMAIL_LENGTH = ${MAX_CHATGPT_ACCOUNT_EMAIL_LENGTH};
+  const MAX_JWT_SEGMENT_LENGTH = ${MAX_CHATGPT_JWT_SEGMENT_LENGTH};
+  const EMAIL_PATTERN = /^[^@\\s]{1,64}@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
   const DEADLINE = Date.now() + REMAINING_MS;
   const timeoutError = () => new Error("Authenticated ChatGPT exact GET timed out.");
   if (new URL(location.href).origin !== "https://chatgpt.com") {
@@ -601,33 +625,40 @@ function buildReadOnlyConversationGetExpression(
       clearTimeout(timeout);
     }
   };
-  const digestUserId = async (userId) => {
-    if (typeof userId !== "string" || !userId.trim() || !globalThis.crypto?.subtle) return null;
+  const normalizeEmail = (value) => {
+    const email = typeof value === "string" ? value.trim().toLowerCase() : "";
+    return email.length <= MAX_EMAIL_LENGTH && EMAIL_PATTERN.test(email) ? email : "";
+  };
+  const normalizeUserId = (value) => {
+    const userId = typeof value === "string" ? value.trim() : "";
+    return userId.length > 0 && userId.length <= MAX_ACCOUNT_ID_LENGTH ? userId : "";
+  };
+  const digestUserId = async (value) => {
+    const userId = normalizeUserId(value);
+    if (!userId || !globalThis.crypto?.subtle) return null;
     const bytes = new Uint8Array(await crypto.subtle.digest(
-      "SHA-256", new TextEncoder().encode(userId.trim()),
+      "SHA-256", new TextEncoder().encode(userId),
     ));
     return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
   };
   const sessionIdentity = async (session) => {
-    const userId = typeof session?.user?.id === "string" ? session.user.id.trim() : "";
-    const email = typeof session?.user?.email === "string"
-      ? session.user.email.trim().toLowerCase()
-      : "";
+    const userId = normalizeUserId(session?.user?.id);
+    const email = normalizeEmail(session?.user?.email);
     const accountDigest = await digestUserId(userId);
     return accountDigest && email ? { accountDigest, email } : null;
   };
   const bearerIdentity = async (accessToken) => {
     try {
       const match = /^([A-Za-z0-9_-]+)\\.([A-Za-z0-9_-]+)\\.([A-Za-z0-9_-]+)$/.exec(accessToken);
-      if (!match) return null;
+      if (!match || match.slice(1).some((segment) => segment.length > MAX_JWT_SEGMENT_LENGTH)) return null;
       const encoded = match[2].replace(/-/g, "+").replace(/_/g, "/");
       const payload = JSON.parse(atob(encoded.padEnd(Math.ceil(encoded.length / 4) * 4, "=")));
       const auth = payload?.["https://api.openai.com/auth"];
       const profile = payload?.["https://api.openai.com/profile"];
       const userIds = [auth?.chatgpt_user_id, auth?.user_id]
-        .filter((value) => typeof value === "string" && value.trim())
-        .map((value) => value.trim());
-      const email = typeof profile?.email === "string" ? profile.email.trim().toLowerCase() : "";
+        .map(normalizeUserId)
+        .filter(Boolean);
+      const email = normalizeEmail(profile?.email);
       if (!email || userIds.length === 0 || userIds.some((value) => value !== userIds[0])) return null;
       const accountDigest = await digestUserId(userIds[0]);
       return accountDigest ? { accountDigest, email } : null;
@@ -888,7 +919,10 @@ function buildChatGptAccountDigestExpression(remainingMs: number): string {
     ) return null;
     const body = await response.json();
     if (controller.signal.aborted || Date.now() >= deadline) return null;
-    const userId = typeof body?.user?.id === 'string' ? body.user.id.trim() : '';
+    const rawUserId = typeof body?.user?.id === 'string' ? body.user.id.trim() : '';
+    const userId = rawUserId.length > 0 && rawUserId.length <= ${MAX_CHATGPT_ACCOUNT_ID_LENGTH}
+      ? rawUserId
+      : '';
     if (!userId || !globalThis.crypto?.subtle) return null;
     const bytes = new Uint8Array(await crypto.subtle.digest(
       'SHA-256', new TextEncoder().encode(userId),
@@ -912,10 +946,11 @@ async function readChatGptAccountDigestWithEvaluator(
     buildChatGptAccountDigestExpression(remainingMs),
     "ChatGPT account identity",
   );
-  if (typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest)) {
+  const normalizedDigest = normalizeChatGptAccountDigest(digest);
+  if (!normalizedDigest) {
     throw new Error("Authenticated ChatGPT account identity is unavailable.");
   }
-  return digest;
+  return normalizedDigest;
 }
 
 async function cleanupCaptureWithEvaluator(
@@ -1881,8 +1916,16 @@ export async function captureApprovedChatGptConversationBackend(
   const port = options.port ?? DEFAULT_REMOTE_CHROME_PORT;
   const expectedBrowserId = options.browserId?.trim();
   let browserWSEndpoint = options.browserWSEndpoint?.trim();
-  const expectedAccountDigest = options.accountDigest?.trim();
-  const expectedEmail = options.expectedEmail?.trim().toLowerCase();
+  const rawExpectedAccountDigest = options.accountDigest;
+  const expectedAccountDigest = normalizeChatGptAccountDigest(rawExpectedAccountDigest);
+  const rawExpectedEmail = options.expectedEmail;
+  const expectedEmail = normalizeChatGptAccountEmail(rawExpectedEmail);
+  if (
+    (rawExpectedAccountDigest !== undefined && !expectedAccountDigest) ||
+    (rawExpectedEmail !== undefined && !expectedEmail)
+  ) {
+    throw new Error("ChatGPT export account affinity is invalid.");
+  }
   if (expectedBrowserId || browserWSEndpoint || expectedAccountDigest || expectedEmail) {
     if (!expectedBrowserId || !browserWSEndpoint || !expectedAccountDigest) {
       throw new Error(
@@ -1898,7 +1941,7 @@ export async function captureApprovedChatGptConversationBackend(
       throw new Error("ChatGPT export browser id does not match its WebSocket.");
     }
     browserWSEndpoint = configuredIdentity.browserWSEndpoint;
-    if (!/^[a-f0-9]{64}$/.test(expectedAccountDigest)) {
+    if (!expectedAccountDigest) {
       throw new Error("ChatGPT export account identity is invalid.");
     }
     const liveIdentity = await runBeforeDeadline(

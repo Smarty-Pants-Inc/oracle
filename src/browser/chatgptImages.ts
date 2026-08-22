@@ -141,7 +141,9 @@ function buildAssistantImageExpression(minTurnIndex?: number): string {
 export async function readAssistantGeneratedImages(
   Runtime: ChromeClient["Runtime"],
   minTurnIndex?: number,
+  assertPageAffinity?: (action: string) => Promise<void>,
 ): Promise<BrowserGeneratedImage[]> {
+  await assertPageAffinity?.("generated image DOM read");
   const { result } = await Runtime.evaluate({
     expression: buildAssistantImageExpression(minTurnIndex),
     returnByValue: true,
@@ -165,11 +167,13 @@ export async function readAssistantGeneratedImages(
 async function readAssistantGeneratedImagesWithFallback(
   Runtime: ChromeClient["Runtime"],
   minTurnIndex?: number | null,
+  assertPageAffinity?: (action: string) => Promise<void>,
 ): Promise<BrowserGeneratedImage[]> {
-  const filteredImages = await readAssistantGeneratedImages(
-    Runtime,
-    minTurnIndex ?? undefined,
-  ).catch(() => []);
+  const readImages = async (minimumTurnIndex: number | undefined, action: string) => {
+    await assertPageAffinity?.(action);
+    return await readAssistantGeneratedImages(Runtime, minimumTurnIndex).catch(() => []);
+  };
+  const filteredImages = await readImages(minTurnIndex ?? undefined, "generated image DOM read");
   if (
     filteredImages.length > 0 ||
     typeof minTurnIndex !== "number" ||
@@ -178,10 +182,9 @@ async function readAssistantGeneratedImagesWithFallback(
     return filteredImages;
   }
 
-  const [fallbackImages, fallbackSnapshot] = await Promise.all([
-    readAssistantGeneratedImages(Runtime).catch(() => []),
-    readAssistantSnapshot(Runtime).catch(() => null),
-  ]);
+  const fallbackImages = await readImages(undefined, "generated image fallback DOM read");
+  await assertPageAffinity?.("generated image fallback snapshot read");
+  const fallbackSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
   const fallbackTurnIndex =
     typeof fallbackSnapshot?.turnIndex === "number" ? fallbackSnapshot.turnIndex : null;
   const nearBoundary =
@@ -286,7 +289,9 @@ async function buildCookieHeader(Network: ChromeClient["Network"]): Promise<stri
 async function fetchGeneratedImageInBrowserContext(
   Runtime: ChromeClient["Runtime"],
   url: string,
+  assertPageAffinity?: (action: string) => Promise<void>,
 ): Promise<{ buffer: Buffer; contentType: string | null; finalUrl: string }> {
+  await assertPageAffinity?.("generated image browser download");
   const expression = `
     (async () => {
       const url = ${JSON.stringify(url)};
@@ -345,6 +350,7 @@ export async function saveChatGptGeneratedImages(params: {
   images: BrowserGeneratedImage[];
   outputPath: string;
   logger?: BrowserLogger;
+  assertPageAffinity?: (action: string) => Promise<void>;
 }): Promise<{
   saved: boolean;
   imageCount: number;
@@ -354,8 +360,11 @@ export async function saveChatGptGeneratedImages(params: {
   const { Network, Runtime, images, outputPath, logger } = params;
   if (!images.length) return { saved: false, imageCount: 0, savedImages: [], errors: [] };
 
+  await params.assertPageAffinity?.("generated image cookie read");
+
   const cookieHeader = await buildCookieHeader(Network);
   if (!cookieHeader) {
+    await params.assertPageAffinity?.("generated image artifact final return");
     return {
       saved: false,
       imageCount: images.length,
@@ -370,15 +379,17 @@ export async function saveChatGptGeneratedImages(params: {
 
   for (let index = 0; index < images.length; index += 1) {
     const image = images[index];
+    await params.assertPageAffinity?.("generated image download");
+    let imageUrl: string;
+    let contentType: string | null = null;
+    let finalUrl: string;
+    let buffer: Buffer;
     try {
-      const imageUrl = normalizeGeneratedImageUrl(image.url);
+      imageUrl = normalizeGeneratedImageUrl(image.url) ?? "";
       if (!imageUrl) {
         throw new Error("rejected non-ChatGPT generated image URL");
       }
-      let contentType: string | null = null;
-      let finalUrl = imageUrl;
-      let buffer: Buffer;
-
+      finalUrl = imageUrl;
       try {
         const response = await fetch(imageUrl, {
           headers: {
@@ -402,24 +413,38 @@ export async function saveChatGptGeneratedImages(params: {
         logger?.(
           `[browser] ChatGPT generated image download failed via Node fetch; retrying in browser context (${image.fileId ?? imageUrl}: ${message}).`,
         );
-        const browserFetch = await fetchGeneratedImageInBrowserContext(Runtime, imageUrl);
+        const browserFetch = await fetchGeneratedImageInBrowserContext(
+          Runtime,
+          imageUrl,
+          params.assertPageAffinity,
+        );
         contentType = browserFetch.contentType;
         finalUrl = browserFetch.finalUrl;
         buffer = browserFetch.buffer;
       }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      errors.push(`${image.fileId ?? image.url}: ${message}`);
+      logger?.(
+        `[browser] Failed to save generated image ${index + 1}/${images.length}: ${message}`,
+      );
+      continue;
+    }
 
+    await params.assertPageAffinity?.("generated image artifact save");
+    try {
       const extension = contentTypeToExtension(contentType);
       const targetPath = resolveSiblingImagePath(path.resolve(outputPath), index, extension);
-      await fs.writeFile(targetPath, buffer);
+      await fs.writeFile(targetPath, buffer!);
       savedImages.push({
         kind: "image",
         path: targetPath,
         label: index === 0 ? "Generated image" : `Generated image ${index + 1}`,
         mimeType: contentType ?? undefined,
-        sizeBytes: buffer.length,
-        sourceUrl: imageUrl,
-        url: imageUrl,
-        finalUrl,
+        sizeBytes: buffer!.length,
+        sourceUrl: imageUrl!,
+        url: imageUrl!,
+        finalUrl: finalUrl!,
         alt: image.alt,
         width: image.width,
         height: image.height,
@@ -434,6 +459,7 @@ export async function saveChatGptGeneratedImages(params: {
     }
   }
 
+  await params.assertPageAffinity?.("generated image artifact final return");
   return {
     saved: savedImages.length > 0,
     imageCount: images.length,
@@ -450,7 +476,9 @@ async function saveGeneratedImageButtonArtifacts(params: {
   logger?: BrowserLogger;
   minTurnIndex?: number | null;
   targetPath: string;
+  assertPageAffinity?: (action: string) => Promise<void>;
 }): Promise<SavedBrowserImage[]> {
+  await params.assertPageAffinity?.("generated image download button fallback");
   const buttonDownloads = await saveAssistantDownloadButtonArtifacts({
     Browser: params.Browser,
     Client: params.Client,
@@ -461,9 +489,11 @@ async function saveGeneratedImageButtonArtifacts(params: {
     allowGenericDownloadLabels: true,
     downloadPath: path.dirname(params.targetPath),
     minTurnIndex: params.minTurnIndex,
+    assertPageAffinity: params.assertPageAffinity,
   });
   const buttonImages: SavedBrowserImage[] = [];
   for (const download of buttonDownloads) {
+    await params.assertPageAffinity?.("generated image button artifact save");
     const contents = await fs.readFile(download.path);
     const detected = detectImageFile(contents);
     if (!detected) {
@@ -530,6 +560,8 @@ export async function collectGeneratedImageArtifacts(params: {
   Network: ChromeClient["Network"];
   logger?: BrowserLogger;
   minTurnIndex?: number | null;
+  expectedConversationId?: string;
+  assertPageAffinity?: (action: string) => Promise<void>;
   sessionId?: string;
   generateImagePath?: string;
   outputPath?: string;
@@ -544,14 +576,17 @@ export async function collectGeneratedImageArtifacts(params: {
   answerText: string;
 }> {
   const explicitTargetPath = params.generateImagePath ?? params.outputPath;
+  await params.assertPageAffinity?.("generated image artifact collection");
   let generatedImages = await readAssistantGeneratedImagesWithFallback(
     params.Runtime,
     params.minTurnIndex ?? undefined,
+    params.assertPageAffinity,
   );
   let latestAnswerText = params.answerText;
 
   if (explicitTargetPath && generatedImages.length === 0) {
     await params.checkBlockingUiWarning?.();
+    await params.assertPageAffinity?.("generated image button fallback");
     const targetPath = path.resolve(explicitTargetPath);
     const buttonImages = await saveGeneratedImageButtonArtifacts({
       Browser: params.Browser,
@@ -561,21 +596,26 @@ export async function collectGeneratedImageArtifacts(params: {
       logger: params.logger,
       minTurnIndex: params.minTurnIndex,
       targetPath,
+      assertPageAffinity: params.assertPageAffinity,
     });
     if (buttonImages.length > 0) {
+      await params.assertPageAffinity?.("generated image artifact final return");
       return formatButtonImageArtifacts(buttonImages, latestAnswerText);
     }
     const deadline = Date.now() + resolveGeneratedImageWaitTimeoutMs(params.waitTimeoutMs);
     while (Date.now() < deadline) {
       await delay(1500);
       await params.checkBlockingUiWarning?.();
+      await params.assertPageAffinity?.("generated image artifact polling");
       generatedImages = await readAssistantGeneratedImagesWithFallback(
         params.Runtime,
         params.minTurnIndex ?? undefined,
+        params.assertPageAffinity,
       );
       if (generatedImages.length > 0) {
         break;
       }
+      await params.assertPageAffinity?.("generated image fallback answer read");
       const latestSnapshot = await readAssistantSnapshot(
         params.Runtime,
         params.minTurnIndex ?? undefined,
@@ -596,8 +636,10 @@ export async function collectGeneratedImageArtifacts(params: {
         logger: params.logger,
         minTurnIndex: params.minTurnIndex,
         targetPath,
+        assertPageAffinity: params.assertPageAffinity,
       });
       if (delayedButtonImages.length > 0) {
+        await params.assertPageAffinity?.("generated image artifact final return");
         return formatButtonImageArtifacts(delayedButtonImages, latestAnswerText);
       }
     }
@@ -610,6 +652,7 @@ export async function collectGeneratedImageArtifacts(params: {
     );
   }
   if (imageCount === 0) {
+    await params.assertPageAffinity?.("generated image artifact final return");
     return {
       generatedImages,
       savedImages: [],
@@ -630,6 +673,7 @@ export async function collectGeneratedImageArtifacts(params: {
     Runtime: params.Runtime,
     images: generatedImages,
     outputPath: targetPath,
+    assertPageAffinity: params.assertPageAffinity,
     logger: params.logger,
   });
   if (!saved.saved) {
@@ -641,9 +685,11 @@ export async function collectGeneratedImageArtifacts(params: {
         Runtime: params.Runtime,
         logger: params.logger,
         minTurnIndex: params.minTurnIndex,
+        assertPageAffinity: params.assertPageAffinity,
         targetPath: path.resolve(explicitTargetPath),
       });
       if (buttonImages.length > 0) {
+        await params.assertPageAffinity?.("generated image artifact final return");
         return formatButtonImageArtifacts(buttonImages, latestAnswerText);
       }
     }
@@ -656,6 +702,7 @@ export async function collectGeneratedImageArtifacts(params: {
     params.logger?.(
       `[browser] Auto-save for generated images failed; returning metadata only.${detail}`,
     );
+    await params.assertPageAffinity?.("generated image artifact final return");
     return {
       generatedImages,
       savedImages: [],
@@ -670,6 +717,7 @@ export async function collectGeneratedImageArtifacts(params: {
     saved.savedImages.length > 1
       ? `\n\n*Generated ${saved.imageCount} image(s). Saved ${saved.savedImages.length} file(s) starting at: ${primaryPath}*`
       : `\n\n*Generated ${saved.imageCount} image(s). Saved to: ${primaryPath}*`;
+  await params.assertPageAffinity?.("generated image artifact final return");
   return {
     generatedImages,
     savedImages: saved.savedImages,

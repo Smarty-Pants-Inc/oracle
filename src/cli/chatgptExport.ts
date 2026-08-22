@@ -10,7 +10,7 @@ import {
   conversationIdFromChatGptUrl,
 } from "../browser/chatgptExport.js";
 import { DEFAULT_REMOTE_CHROME_HOST, DEFAULT_REMOTE_CHROME_PORT } from "../browser/liveTabs.js";
-import { extractStableConversationIdFromUrl } from "../browser/conversationUrl.js";
+import { normalizeChatGptAccountDigest } from "../browser/chatgptAccount.js";
 import { sessionStore, type SessionMetadata } from "../sessionStore.js";
 import { bindRemoteChromeBrowserWebSocketEndpoint } from "../browser/profileState.js";
 import {
@@ -64,21 +64,45 @@ function storedConversationUrls(metadata: SessionMetadata): Array<string | null 
     browserConfig?.url,
   ];
 }
+function storedConversationIds(metadata: SessionMetadata): Set<string> {
+  const ids = new Set<string>();
+  for (const id of [
+    metadata.browser?.harvest?.conversationId,
+    metadata.browser?.runtime?.conversationId,
+  ]) {
+    if (typeof id === "string" && id.trim()) {
+      ids.add(id.trim());
+    }
+  }
+  for (const url of storedConversationUrls(metadata)) {
+    if (typeof url !== "string") continue;
+    try {
+      ids.add(conversationIdFromChatGptUrl(url));
+    } catch {
+      // Ignore URLs that are not exact ChatGPT conversation URLs.
+    }
+  }
+  return ids;
+}
+
 function sessionMatchesConversation(metadata: SessionMetadata, conversationId: string): boolean {
-  return (
-    metadata.browser?.harvest?.conversationId === conversationId ||
-    metadata.browser?.runtime?.conversationId === conversationId ||
-    storedConversationUrls(metadata).some(
-      (url) => extractStableConversationIdFromUrl(url ?? "") === conversationId,
-    )
-  );
+  const ids = storedConversationIds(metadata);
+  if (!ids.has(conversationId)) return false;
+  if (ids.size > 1) {
+    throw new Error("Stored Oracle session has conflicting ChatGPT conversation identities.");
+  }
+  return true;
 }
 
 function storedRemoteChromeAffinities(
   metadata: SessionMetadata,
 ): ChatGptExportRemoteChromeTarget[] {
   const runtimeBrowserWSEndpoint = metadata.browser?.runtime?.chromeBrowserWSEndpoint?.trim();
-  const runtimeAccountDigest = metadata.browser?.runtime?.chatGptAccountDigest?.trim();
+  const rawRuntimeAccountDigest = metadata.browser?.runtime?.chatGptAccountDigest;
+  const runtimeAccountDigest = normalizeChatGptAccountDigest(rawRuntimeAccountDigest);
+  if (rawRuntimeAccountDigest !== undefined && !runtimeAccountDigest) {
+    throw new Error("Stored remote Chrome account identity is invalid.");
+  }
   const affinities = new Map<string, ChatGptExportRemoteChromeTarget>();
   for (const config of [metadata.options?.browserConfig, metadata.browser?.config]) {
     const endpoint = config?.remoteChrome;
@@ -90,7 +114,11 @@ function storedRemoteChromeAffinities(
     }
     const configuredBrowserId = config?.remoteChromeBrowserId?.trim();
     const configuredBrowserWSEndpoint = config?.remoteChromeBrowserWSEndpoint?.trim();
-    const configuredAccountDigest = config?.remoteChromeAccountDigest?.trim();
+    const rawConfiguredAccountDigest = config?.remoteChromeAccountDigest;
+    const configuredAccountDigest = normalizeChatGptAccountDigest(rawConfiguredAccountDigest);
+    if (rawConfiguredAccountDigest !== undefined && !configuredAccountDigest) {
+      throw new Error("Stored remote Chrome account identity is invalid.");
+    }
     if (
       configuredAccountDigest &&
       runtimeAccountDigest &&

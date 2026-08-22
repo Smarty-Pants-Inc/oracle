@@ -4,6 +4,7 @@ import type * as Cookies from "../../src/browser/cookies.js";
 import type * as DeepResearch from "../../src/browser/actions/deepResearch.js";
 import type * as PageActions from "../../src/browser/pageActions.js";
 import type * as ProviderDomFlow from "../../src/browser/providerDomFlow.js";
+import type * as ProfileState from "../../src/browser/profileState.js";
 
 const chromeMocks = vi.hoisted(() => ({
   closeTab: vi.fn(),
@@ -31,6 +32,9 @@ const pageActionMocks = vi.hoisted(() => ({
 const providerFlowMocks = vi.hoisted(() => ({
   runProviderSubmissionFlow: vi.fn(),
 }));
+const profileStateMocks = vi.hoisted(() => ({
+  resolveRemoteChromeBrowserIdentity: vi.fn(),
+}));
 
 vi.mock("../../src/browser/chromeLifecycle.js", async (importOriginal) => ({
   ...(await importOriginal<typeof ChromeLifecycle>()),
@@ -51,6 +55,10 @@ vi.mock("../../src/browser/pageActions.js", async (importOriginal) => ({
 vi.mock("../../src/browser/providerDomFlow.js", async (importOriginal) => ({
   ...(await importOriginal<typeof ProviderDomFlow>()),
   ...providerFlowMocks,
+}));
+vi.mock("../../src/browser/profileState.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof ProfileState>()),
+  ...profileStateMocks,
 }));
 
 import { runBrowserMode } from "../../src/browser/index.js";
@@ -74,6 +82,7 @@ describe("remote Deep Research completion affinity", () => {
     pageActionMocks.readAssistantSnapshot.mockReset();
     pageActionMocks.readChatGptAccountDigest.mockReset();
     providerFlowMocks.runProviderSubmissionFlow.mockReset();
+    profileStateMocks.resolveRemoteChromeBrowserIdentity.mockReset();
   });
 
   test("returns the learned remote Chrome affinity after Deep Research succeeds", async () => {
@@ -97,6 +106,10 @@ describe("remote Deep Research completion affinity", () => {
     };
 
     vi.stubEnv("ORACLE_WRAPPER_REMOTE_ONLY", "0");
+    profileStateMocks.resolveRemoteChromeBrowserIdentity.mockResolvedValue({
+      browserId: "browser-a",
+      browserWSEndpoint,
+    });
     chromeMocks.connectToRemoteChrome.mockResolvedValue({
       client,
       targetId: "remote-target",

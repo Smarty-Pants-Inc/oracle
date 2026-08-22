@@ -523,24 +523,67 @@ describe("resumeBrowserSession", () => {
     }
   });
 
-  test("fails closed when runtime account affinity outlives remote config", async () => {
-    const recoverSession = vi.fn(async () => ({
-      answerText: "must not recover",
-      answerMarkdown: "must not recover",
+  test("revalidates a locally persisted account digest without remote affinity", async () => {
+    const accountDigest = "a".repeat(64);
+    const runtime = {
+      chromePort: 9223,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "target-a",
+      tabUrl: "https://chatgpt.com/c/abc",
+      chatGptAccountDigest: accountDigest,
+    };
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => ({
+      result: {
+        value:
+          expression === "location.href"
+            ? runtime.tabUrl
+            : expression.includes("/api/auth/session")
+              ? accountDigest
+              : 2,
+      },
     }));
+    const connect = vi.fn(async () => ({
+      Runtime: { enable: vi.fn(), evaluate },
+      DOM: { enable: vi.fn() },
+      close: vi.fn(async () => {}),
+    })) as unknown as (options?: unknown) => Promise<ChromeClient>;
+
     await expect(
-      resumeBrowserSession(
-        {
-          chromePort: 9223,
-          chromeHost: "127.0.0.1",
-          chromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
-          chatGptAccountDigest: "a".repeat(64),
-        },
-        {},
-        vi.fn() as BrowserLogger,
-        { recoverSession },
-      ),
-    ).rejects.toThrow(/browser and account identity/i);
+      resumeBrowserSession(runtime, { timeoutMs: 2_000 }, vi.fn() as BrowserLogger, {
+        listTargets: vi.fn(async () => [
+          { targetId: "target-a", type: "page", url: runtime.tabUrl },
+        ]),
+        connect,
+        waitForAssistantResponse: vi.fn(async () => ({
+          text: "attached",
+          html: "",
+          meta: { messageId: "m1", turnId: "conversation-turn-1" },
+        })),
+        captureAssistantMarkdown: vi.fn(async () => "attached-md"),
+        waitForConversationHydration: vi.fn(async () => 2),
+      }),
+    ).resolves.toMatchObject({ answerMarkdown: "attached-md" });
+
+    expect(
+      vi
+        .mocked(evaluate)
+        .mock.calls.some(([options]) =>
+          String(options?.expression ?? "").includes("/api/auth/session"),
+        ),
+    ).toBe(true);
+  });
+
+  test("rejects a malformed stored local account digest before recovery", async () => {
+    const recoverSession = vi.fn(async () => ({
+      answerText: "fallback",
+      answerMarkdown: "fallback",
+    }));
+
+    await expect(
+      resumeBrowserSession({ chatGptAccountDigest: "not-a-digest" }, {}, vi.fn() as BrowserLogger, {
+        recoverSession,
+      }),
+    ).rejects.toThrow(/stored ChatGPT account identity is invalid/i);
     expect(recoverSession).not.toHaveBeenCalled();
   });
 

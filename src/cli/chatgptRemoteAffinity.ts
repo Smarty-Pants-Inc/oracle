@@ -1,3 +1,7 @@
+import {
+  normalizeChatGptAccountDigest,
+  normalizeChatGptAccountEmail,
+} from "../browser/chatgptAccount.js";
 import { bindRemoteChromeBrowserWebSocketEndpoint } from "../browser/profileState.js";
 
 export const CHATGPT_ACCOUNT_BOUND_WRAPPER_ENV = "ORACLE_WRAPPER_CHATGPT_ACCOUNT_BOUND";
@@ -73,7 +77,7 @@ export function resolveChatGptRemoteEmailAffinity(
   const remoteChrome = options.remoteChrome?.trim();
   const browserId = options.remoteChromeBrowserId?.trim();
   const browserWSEndpoint = options.remoteChromeBrowserWs?.trim();
-  const expectedEmail = options.expectedEmail?.trim().toLowerCase();
+  const expectedEmail = normalizeChatGptAccountEmail(options.expectedEmail);
   if (!remoteChrome || !browserId || !browserWSEndpoint || !expectedEmail) {
     throw new Error(
       `The account-bound inventory wrapper requires --remote-chrome, --remote-chrome-browser-id, --remote-chrome-browser-ws, and --expected-email together (${CHATGPT_ACCOUNT_BOUND_WRAPPER_ENV}=1).`,
@@ -99,14 +103,11 @@ export function resolveChatGptRemoteAccountAffinity(
   options: ChatGptRemoteAffinityCliOptions,
 ): ChatGptRemoteAccountAffinity {
   const affinity = resolveChatGptRemoteEmailAffinity(options);
-  const accountDigest = options.remoteChromeAccountDigest?.trim();
+  const accountDigest = normalizeChatGptAccountDigest(options.remoteChromeAccountDigest);
   if (!accountDigest) {
     throw new Error(
-      `The account-bound export wrapper also requires --remote-chrome-account-digest (${CHATGPT_ACCOUNT_BOUND_WRAPPER_ENV}=1).`,
+      `The account-bound export wrapper requires a valid --remote-chrome-account-digest (${CHATGPT_ACCOUNT_BOUND_WRAPPER_ENV}=1).`,
     );
-  }
-  if (!/^[a-f0-9]{64}$/.test(accountDigest)) {
-    throw new Error("Remote Chrome account identity is invalid.");
   }
   return { ...affinity, accountDigest };
 }

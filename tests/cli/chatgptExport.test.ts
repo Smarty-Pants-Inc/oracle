@@ -63,6 +63,31 @@ describe("ChatGPT export endpoint affinity", () => {
     ).toEqual(affinity("127.0.0.1", 9228, "browser-a"));
   });
 
+  test("rejects conflicting stored conversation identities", () => {
+    expect(() =>
+      resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-conflict", [
+        session("conflicting", {
+          harvest: { conversationId: "thread-conflict" },
+          runtime: { conversationId: "different-thread" },
+          config: config("127.0.0.1", 9223, "browser-a"),
+        }),
+      ]),
+    ).toThrow(/conflicting ChatGPT conversation identities/i);
+  });
+
+  test("does not match a conversation id from a noncanonical stored URL", () => {
+    expect(() =>
+      resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-untrusted-url", [
+        session("untrusted-url", {
+          config: {
+            url: "https://example.invalid/c/thread-untrusted-url",
+            ...config("127.0.0.1", 9223, "browser-a"),
+          },
+        }),
+      ]),
+    ).toThrow(/no stored browser session matches/i);
+  });
+
   test("deduplicates a parent and follow-up stored on the same browser affinity", () => {
     const browserConfig = config("127.0.0.1", 9224, "browser-a");
     expect(

@@ -50,6 +50,25 @@ describe("ChatGPT account-bound wrapper CLI affinity", () => {
   });
 
   test.each([
+    { expectedEmail: "owner@example" },
+    { expectedEmail: `${"a".repeat(310)}@example.test` },
+    { remoteChromeAccountDigest: "a".repeat(65) },
+  ])("rejects malformed account affinity ingress: %o", (invalid) => {
+    expect(() =>
+      resolveChatGptRemoteAccountAffinity({
+        remoteChrome: "127.0.0.1:9223",
+        remoteChromeBrowserId: "browser-a",
+        remoteChromeBrowserWs: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+        remoteChromeAccountDigest: "a".repeat(64),
+        expectedEmail: "owner@example.test",
+        ...invalid,
+      }),
+    ).toThrow(
+      /account-bound inventory wrapper requires|account-bound export wrapper requires a valid/i,
+    );
+  });
+
+  test.each([
     "ws://attacker.invalid:9223/devtools/browser/browser-a",
     "ws://127.0.0.1:9444/devtools/browser/browser-a",
     "ws://user@127.0.0.1:9223/devtools/browser/browser-a",

@@ -351,10 +351,16 @@ function normalizePerfTraceArgs(args: string[]): {
 const doctorArgIndex = routingCliArgs.indexOf("doctor");
 const doctorJsonRequested =
   doctorArgIndex >= 0 && routingCliArgs.slice(doctorArgIndex).includes("--json");
+const chatGptCommandIndex = routingCliArgs.findIndex(
+  (arg) => arg === "chatgpt-inventory" || arg === "chatgpt-export",
+);
+const chatGptJsonRequested =
+  chatGptCommandIndex >= 0 && routingCliArgs.slice(chatGptCommandIndex).includes("--json");
 const docsArgIndex = routingCliArgs.indexOf("docs");
 const docsCheckRequested = docsArgIndex >= 0 && routingCliArgs[docsArgIndex + 1] === "check";
 const suppressIntro =
   doctorJsonRequested ||
+  chatGptJsonRequested ||
   docsCheckRequested ||
   (routingCliArgs[0] === "bridge" &&
     (routingCliArgs[1] === "codex-config" || routingCliArgs[1] === "claude-config"));

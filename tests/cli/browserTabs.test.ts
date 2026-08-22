@@ -46,7 +46,7 @@ describe("browser tab CLI helpers", () => {
     );
   });
 
-  test("keeps complete affinities distinct and skips incomplete legacy sessions", () => {
+  test("keeps remote affinities distinct and treats a local digest as local", () => {
     const remoteSession = (id: string, browserId: string, accountDigest: string, port = 9223) =>
       ({
         id,
@@ -143,7 +143,7 @@ describe("browser tab CLI helpers", () => {
       },
     ]);
 
-    const incompleteRuntimeAffinity = {
+    const localRuntimeDigest = {
       ...runtimeOnly,
       browser: {
         runtime: {
@@ -153,7 +153,26 @@ describe("browser tab CLI helpers", () => {
         },
       },
     } as SessionMetadata;
-    expect(collectUniqueEndpointsForTest([incompleteRuntimeAffinity])).toEqual([]);
+    expect(
+      collectUniqueEndpointsForTest([localRuntimeDigest]).filter(
+        (endpoint) => endpoint.port === 9224,
+      ),
+    ).toEqual([{ host: "127.0.0.1", port: 9224 }]);
+
+    const malformedLocalRuntimeDigest = {
+      ...localRuntimeDigest,
+      browser: {
+        runtime: {
+          ...localRuntimeDigest.browser!.runtime,
+          chatGptAccountDigest: "not-a-digest",
+        },
+      },
+    } as SessionMetadata;
+    expect(
+      collectUniqueEndpointsForTest([malformedLocalRuntimeDigest]).filter(
+        (endpoint) => endpoint.port === 9224,
+      ),
+    ).toEqual([]);
 
     expect(collectUniqueEndpointsForTest([])).toEqual([{ host: "127.0.0.1", port: 9222 }]);
   });

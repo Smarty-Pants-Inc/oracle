@@ -424,6 +424,48 @@ describe("recoverConversationTab flow", () => {
     expect(closeTab).not.toHaveBeenCalled();
     expect(chrome.kill).not.toHaveBeenCalled();
   });
+
+  test("uses its cleanup allowance and reports an unconfirmed target cleanup after readiness times out", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const closeTab = vi.fn(() => new Promise<never>(() => undefined));
+    vi.doMock("../../src/browser/liveTabs.js", () => ({
+      extractConversationIdFromUrl: (url: string) =>
+        url.includes("/c/") ? url.split("/c/")[1] : null,
+      openChatGptTarget: vi.fn(async () => "target-cleanup-timeout"),
+      harvestChatGptTab: vi.fn(() => new Promise<never>(() => undefined)),
+    }));
+    vi.doMock("../../src/browser/index.js", () => ({
+      acquireManualLoginChromeForRun: vi.fn(),
+      isImageOnlyUiChromeText: () => false,
+    }));
+    vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
+      closeTab,
+      connectToRemoteChromeTarget: vi.fn(),
+    }));
+
+    try {
+      const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
+      const pending = recoverConversationTab(meta, logger, {
+        existingEndpoint: { host: "127.0.0.1", port: 9222 },
+        readyTimeoutMs: 100,
+      });
+      const outcome = pending.then(
+        () => new Error("Expected recovery target cleanup to remain unconfirmed."),
+        (error: unknown) => error,
+      );
+
+      await vi.advanceTimersByTimeAsync(100);
+      expect(closeTab).toHaveBeenCalledWith(9222, "target-cleanup-timeout", logger, "127.0.0.1");
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      const error = await outcome;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toMatch(/conversation recovery and target cleanup failed/i);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   test("kills a Chrome allocation that resolves after the recovery deadline", async () => {
     let resolveLateLaunch!: (value: {
       chrome: { port: number; kill: () => Promise<void>; process: { unref: () => void } };

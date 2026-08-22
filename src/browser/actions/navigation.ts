@@ -8,6 +8,7 @@ import {
 import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
+import { MAX_CHATGPT_ACCOUNT_ID_LENGTH } from "../chatgptAccount.js";
 const DEFAULT_ACCOUNT_DIGEST_TIMEOUT_MS = 10_000;
 const ACCOUNT_DIGEST_TIMEOUT_ERROR =
   "Timed out while reading authenticated ChatGPT account identity.";
@@ -581,7 +582,10 @@ export async function readChatGptAccountDigest(
               Date.now() >= deadline
             ) return null;
             const body = await response.json();
-            const userId = typeof body?.user?.id === 'string' ? body.user.id.trim() : '';
+            const rawUserId = typeof body?.user?.id === 'string' ? body.user.id.trim() : '';
+            const userId = rawUserId.length > 0 && rawUserId.length <= ${MAX_CHATGPT_ACCOUNT_ID_LENGTH}
+              ? rawUserId
+              : '';
             if (!userId || !globalThis.crypto?.subtle) return null;
             const bytes = new Uint8Array(await crypto.subtle.digest(
               'SHA-256', new TextEncoder().encode(userId),

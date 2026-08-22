@@ -146,7 +146,7 @@ describe("browser follow-up resolution", () => {
     ).rejects.toThrow(/browser and account identity/i);
   });
 
-  test("rejects runtime-only remote affinity without its stored endpoint", async () => {
+  test("keeps runtime-only account affinity on the local browser path", async () => {
     const metadata: SessionMetadata = {
       ...baseMetadata,
       mode: "browser",
@@ -159,9 +159,17 @@ describe("browser follow-up resolution", () => {
         },
       },
     };
-    await expect(
-      resolveBrowserFollowupReference("session-1", { readSession: vi.fn(async () => metadata) }),
-    ).rejects.toThrow(/browser and account identity/i);
+
+    const result = await resolveBrowserFollowupReference("session-1", {
+      readSession: vi.fn(async () => metadata),
+    });
+
+    expect(result?.browserConfig).toMatchObject({
+      url: "https://chatgpt.com/",
+      resumeConversationUrl: "https://chatgpt.com/c/runtime-only-thread",
+    });
+    expect(result?.browserConfig).not.toHaveProperty("remoteChrome");
+    expect(result?.browserConfig).not.toHaveProperty("remoteChromeAccountDigest");
   });
 
   test("fails closed for wrapper-routed sessions with only host and port", async () => {

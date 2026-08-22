@@ -86,6 +86,7 @@ describe("account-bound ChatGPT command CLI wiring", () => {
     expect(result.code).toBe(1);
     expect(result.stderr).toContain("Remote Chrome browser id does not match");
     expect(result.stderr).not.toContain("required option '--remote-chrome");
+    expect(result.stdout).not.toContain("🧿 oracle");
   });
 
   test.each([
@@ -121,6 +122,7 @@ describe("account-bound ChatGPT command CLI wiring", () => {
       expect(result.stderr).toContain("Remote Chrome browser id does not match");
       expect(result.stderr).not.toContain("required option '--remote-chrome");
       expect(result.stderr).not.toMatch(/--timeout must be|\.trim is not a function/i);
+      expect(result.stdout).not.toContain("🧿 oracle");
     },
   );
 

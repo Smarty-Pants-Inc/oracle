@@ -46,6 +46,7 @@ import {
   type TargetInfoLite,
 } from "./reattachHelpers.js";
 import { waitForDeepResearchCompletion } from "./actions/deepResearch.js";
+import { normalizeChatGptAccountDigest } from "./chatgptAccount.js";
 
 export interface ReattachDeps {
   listTargets?: () => Promise<TargetInfoLite[]>;
@@ -125,9 +126,17 @@ export async function resumeBrowserSession(
 
   const expectedBrowserId = config?.remoteChromeBrowserId?.trim();
   const configuredBrowserWSEndpoint = config?.remoteChromeBrowserWSEndpoint?.trim();
-  const expectedAccountDigest = config?.remoteChromeAccountDigest?.trim();
+  const rawExpectedAccountDigest = config?.remoteChromeAccountDigest;
+  const expectedAccountDigest = normalizeChatGptAccountDigest(rawExpectedAccountDigest);
+  if (rawExpectedAccountDigest != null && !expectedAccountDigest) {
+    throw new Error("Stored remote Chrome account identity is invalid.");
+  }
   const runtimeBrowserWSEndpoint = runtime.chromeBrowserWSEndpoint?.trim();
-  const runtimeAccountDigest = runtime.chatGptAccountDigest?.trim();
+  const rawRuntimeAccountDigest = runtime.chatGptAccountDigest;
+  const runtimeAccountDigest = normalizeChatGptAccountDigest(rawRuntimeAccountDigest);
+  if (rawRuntimeAccountDigest != null && !runtimeAccountDigest) {
+    throw new Error("Stored ChatGPT account identity is invalid.");
+  }
   const configuredRemoteChrome = config?.remoteChrome ?? undefined;
   const wrapperRemoteSession = process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1";
   const identityBoundRemoteSession = Boolean(
@@ -135,9 +144,9 @@ export async function resumeBrowserSession(
     configuredRemoteChrome ||
     expectedBrowserId ||
     configuredBrowserWSEndpoint ||
-    expectedAccountDigest ||
-    runtimeAccountDigest,
+    expectedAccountDigest,
   );
+  const localAccountBoundSession = !identityBoundRemoteSession && Boolean(runtimeAccountDigest);
   if (identityBoundRemoteSession) {
     if (
       !expectedBrowserId ||
@@ -151,9 +160,6 @@ export async function resumeBrowserSession(
     }
     if (browserIdFromWebSocketEndpoint(configuredBrowserWSEndpoint) !== expectedBrowserId) {
       throw new Error("Stored remote Chrome browser identity does not match its WebSocket.");
-    }
-    if (!/^[a-f0-9]{64}$/.test(expectedAccountDigest)) {
-      throw new Error("Stored remote Chrome account identity is invalid.");
     }
     if (
       runtimeBrowserWSEndpoint &&
@@ -247,11 +253,8 @@ export async function resumeBrowserSession(
     const expectedConversationId = reattachConversationId(runtime);
     const storedAccountDigest = identityBoundRemoteSession
       ? expectedAccountDigest
-      : runtime.chatGptAccountDigest?.trim();
-    const expectedReattachAccountDigest =
-      storedAccountDigest && /^[a-f0-9]{64}$/.test(storedAccountDigest)
-        ? storedAccountDigest
-        : undefined;
+      : runtimeAccountDigest;
+    const expectedReattachAccountDigest = storedAccountDigest;
     const assertPageAffinity = async (action: string): Promise<void> => {
       await assertReattachPageAffinity(
         Runtime,
@@ -381,7 +384,7 @@ export async function resumeBrowserSession(
     return { answerText: aligned.answerText, answerMarkdown: aligned.answerMarkdown };
   } catch (error) {
     await closeAttached();
-    if (identityBoundRemoteSession) {
+    if (identityBoundRemoteSession || localAccountBoundSession) {
       throw error;
     }
     const message = error instanceof Error ? error.message : String(error);
@@ -479,11 +482,7 @@ async function resumeBrowserSessionViaNewChrome(
   const timeoutMs = resolved.timeoutMs ?? 120_000;
   const responseDeadline = Date.now() + timeoutMs;
   const expectedConversationId = reattachConversationId(runtime);
-  const runtimeAccountDigest = runtime.chatGptAccountDigest?.trim();
-  const expectedAccountDigest =
-    runtimeAccountDigest && /^[a-f0-9]{64}$/.test(runtimeAccountDigest)
-      ? runtimeAccountDigest
-      : undefined;
+  const expectedAccountDigest = normalizeChatGptAccountDigest(runtime.chatGptAccountDigest);
   const assertPageAffinity = async (action: string): Promise<void> => {
     await assertReattachPageAffinity(
       Runtime,

@@ -123,6 +123,15 @@ describe("ChatGPT conversation inventory", () => {
     expect(expression).not.toContain("const deadline = 1234;");
   });
 
+  test("bounds account and JWT fields before inventory authorization decoding", () => {
+    const hook = buildChatGptInventoryAuthCaptureHook();
+
+    expect(hook).toContain("const MAX_ACCOUNT_ID_LENGTH = 512");
+    expect(hook).toContain("const MAX_EMAIL_LENGTH = 320");
+    expect(hook).toContain("const MAX_JWT_SEGMENT_LENGTH = 8192");
+    expect(hook.indexOf("match.slice(1).some")).toBeLessThan(hook.indexOf("atob("));
+  });
+
   test("rejects a restarted browser before opening inventory", async () => {
     vi.stubGlobal(
       "fetch",

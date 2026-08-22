@@ -1,10 +1,10 @@
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type * as ChromeLifecycle from "../../src/browser/chromeLifecycle.js";
 import type * as Cookies from "../../src/browser/cookies.js";
 import type * as LiveTabs from "../../src/browser/liveTabs.js";
 import type * as PageActions from "../../src/browser/pageActions.js";
+import type * as ProfileState from "../../src/browser/profileState.js";
 import type * as ProviderDomFlow from "../../src/browser/providerDomFlow.js";
-
 const chromeMocks = vi.hoisted(() => ({
   launchChrome: vi.fn(),
 }));
@@ -33,6 +33,9 @@ const pageActionMocks = vi.hoisted(() => ({
 const remoteFileTransferMocks = vi.hoisted(() => ({
   uploadAttachmentViaDataTransfer: vi.fn(),
 }));
+const profileStateMocks = vi.hoisted(() => ({
+  resolveRemoteChromeBrowserIdentity: vi.fn(),
+}));
 
 vi.mock("../../src/browser/chromeLifecycle.js", async (importOriginal) => ({
   ...(await importOriginal<typeof ChromeLifecycle>()),
@@ -51,6 +54,10 @@ vi.mock("../../src/browser/pageActions.js", async (importOriginal) => ({
   ...pageActionMocks,
 }));
 vi.mock("../../src/browser/actions/remoteFileTransfer.js", () => remoteFileTransferMocks);
+vi.mock("../../src/browser/profileState.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof ProfileState>()),
+  ...profileStateMocks,
+}));
 vi.mock("../../src/browser/providerDomFlow.js", async (importOriginal) => ({
   ...(await importOriginal<typeof ProviderDomFlow>()),
   ...providerFlowMocks,
@@ -80,6 +87,7 @@ function resetMocks(): void {
   pageActionMocks.uploadAttachmentFile.mockReset();
   pageActionMocks.waitForAssistantResponse.mockReset();
   remoteFileTransferMocks.uploadAttachmentViaDataTransfer.mockReset();
+  profileStateMocks.resolveRemoteChromeBrowserIdentity.mockReset();
 }
 
 async function runWithRetargetedAttachedConversation(
@@ -265,6 +273,12 @@ async function runUnpinnedAttachmentRetarget(
 }
 
 describe("attached conversation mutation guards", () => {
+  beforeEach(() => {
+    profileStateMocks.resolveRemoteChromeBrowserIdentity.mockResolvedValue({
+      browserId: "browser-a",
+      browserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+    });
+  });
   afterEach(() => {
     vi.unstubAllEnvs();
     resetMocks();

@@ -1,10 +1,10 @@
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type * as ChatGptAccount from "../../src/browser/chatgptAccount.js";
 import type * as ChromeLifecycle from "../../src/browser/chromeLifecycle.js";
 import type * as Cookies from "../../src/browser/cookies.js";
 import type * as LiveTabs from "../../src/browser/liveTabs.js";
 import type * as PageActions from "../../src/browser/pageActions.js";
-
+import type * as ProfileState from "../../src/browser/profileState.js";
 const accountMocks = vi.hoisted(() => ({
   assertChatGptAccountEmail: vi.fn(),
 }));
@@ -24,6 +24,9 @@ const pageActionMocks = vi.hoisted(() => ({
   ensurePromptReady: vi.fn(),
   navigateToChatGPT: vi.fn(),
   readChatGptAccountDigest: vi.fn(),
+}));
+const profileStateMocks = vi.hoisted(() => ({
+  resolveRemoteChromeBrowserIdentity: vi.fn(),
 }));
 
 vi.mock("../../src/browser/chatgptAccount.js", async (importOriginal) => ({
@@ -46,10 +49,20 @@ vi.mock("../../src/browser/pageActions.js", async (importOriginal) => ({
   ...(await importOriginal<typeof PageActions>()),
   ...pageActionMocks,
 }));
+vi.mock("../../src/browser/profileState.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof ProfileState>()),
+  ...profileStateMocks,
+}));
 
 import { runBrowserMode } from "../../src/browser/index.js";
 
 describe("remote expected account email guard", () => {
+  beforeEach(() => {
+    profileStateMocks.resolveRemoteChromeBrowserIdentity.mockResolvedValue({
+      browserId: "browser-a",
+      browserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+    });
+  });
   afterEach(() => {
     vi.unstubAllEnvs();
     accountMocks.assertChatGptAccountEmail.mockReset();
@@ -62,6 +75,7 @@ describe("remote expected account email guard", () => {
     pageActionMocks.ensurePromptReady.mockReset();
     pageActionMocks.navigateToChatGPT.mockReset();
     pageActionMocks.readChatGptAccountDigest.mockReset();
+    profileStateMocks.resolveRemoteChromeBrowserIdentity.mockReset();
   });
 
   test("verifies the expected email on a neutral bound target before resolving tabs or cookies", async () => {

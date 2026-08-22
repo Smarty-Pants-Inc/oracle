@@ -19,6 +19,7 @@ import {
 } from "../browser/recoverConversation.js";
 import { resolveOutputPath } from "./writeOutputPath.js";
 import { browserIdFromWebSocketEndpoint } from "../browser/profileState.js";
+import { normalizeChatGptAccountDigest } from "../browser/chatgptAccount.js";
 
 const LIVE_POLL_MS = 2000;
 const DEFAULT_STALL_THRESHOLD_MS = 60_000;
@@ -95,7 +96,8 @@ function hasRemoteAffinityMarker(meta: SessionMetadata | null | undefined): bool
       config?.remoteChromeBrowserId?.trim() ||
       config?.remoteChromeBrowserWSEndpoint?.trim() ||
       config?.remoteChromeAccountDigest?.trim() ||
-      runtime?.chatGptAccountDigest?.trim(),
+      (runtime?.chromeBrowserWSEndpoint?.trim() &&
+        normalizeChatGptAccountDigest(runtime.chatGptAccountDigest)),
     )
   );
 }
@@ -108,6 +110,16 @@ function sessionBrowserEndpoint(
   const remote = config?.remoteChrome;
   const host = runtime.chromeHost ?? remote?.host;
   const port = runtime.chromePort ?? remote?.port;
+  const rawConfiguredAccountDigest = config?.remoteChromeAccountDigest;
+  const configuredAccountDigest = normalizeChatGptAccountDigest(rawConfiguredAccountDigest);
+  if (rawConfiguredAccountDigest !== undefined && !configuredAccountDigest) {
+    throw new Error("Stored remote Chrome account identity is invalid.");
+  }
+  const rawRuntimeAccountDigest = runtime.chatGptAccountDigest;
+  const runtimeAccountDigest = normalizeChatGptAccountDigest(rawRuntimeAccountDigest);
+  if (rawRuntimeAccountDigest !== undefined && !runtimeAccountDigest) {
+    throw new Error("Stored ChatGPT account identity is invalid.");
+  }
   const requiresAffinity = hasRemoteAffinityMarker(meta);
   if (!host || !port) {
     if (requiresAffinity) {
@@ -118,8 +130,6 @@ function sessionBrowserEndpoint(
   if (!requiresAffinity) return { host, port };
   const configuredBrowserWSEndpoint = config?.remoteChromeBrowserWSEndpoint?.trim();
   const runtimeBrowserWSEndpoint = runtime.chromeBrowserWSEndpoint?.trim();
-  const configuredAccountDigest = config?.remoteChromeAccountDigest?.trim();
-  const runtimeAccountDigest = runtime.chatGptAccountDigest?.trim();
   if (
     configuredAccountDigest &&
     runtimeAccountDigest &&
@@ -131,9 +141,6 @@ function sessionBrowserEndpoint(
   const accountDigest = runtimeAccountDigest ?? configuredAccountDigest;
   if (!browserWSEndpoint || !accountDigest) {
     throw new Error("Stored remote Chrome browser and account identity is incomplete.");
-  }
-  if (!/^[a-f0-9]{64}$/.test(accountDigest)) {
-    throw new Error("Stored remote Chrome account identity is invalid.");
   }
   const browserId = browserIdFromWebSocketEndpoint(browserWSEndpoint);
   const configuredBrowserId = config?.remoteChromeBrowserId?.trim();

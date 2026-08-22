@@ -569,6 +569,45 @@ describe("closeBlankChromeTabs", () => {
     );
   });
 
+  test("closes a browser websocket client that resolves after approval timeout", async () => {
+    vi.useFakeTimers();
+    const lateClient = { close: vi.fn(async () => {}) };
+    let resolveClient!: (client: typeof lateClient) => void;
+    cdpMock.mockImplementationOnce(
+      () =>
+        new Promise<typeof lateClient>((resolve) => {
+          resolveClient = resolve;
+        }),
+    );
+
+    try {
+      const { connectToRemoteChrome } = await import("../../src/browser/chromeLifecycle.js");
+      const pending = connectToRemoteChrome(
+        "127.0.0.1",
+        9222,
+        vi.fn<(message: string) => void>(),
+        "https://chatgpt.com/",
+        "ws://127.0.0.1:9222/devtools/browser/abc",
+        { approvalWaitMs: 20 },
+      );
+      const outcome = pending.then(
+        () => new Error("Expected remote debugging approval to time out."),
+        (error: unknown) => error,
+      );
+
+      await vi.advanceTimersByTimeAsync(20);
+      const error = await outcome;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toMatch(/waited 20ms for Chrome remote debugging approval/i);
+
+      resolveClient(lateClient);
+      await Promise.resolve();
+      expect(lateClient.close).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("retries immediate 403 responses while waiting for remote debugging approval", async () => {
     vi.useFakeTimers();
     const browserClient = {
@@ -654,6 +693,63 @@ describe("connectToRemoteChromeTarget", () => {
     });
     expect(browserClient.Target.getTargets).toHaveBeenCalledOnce();
     expect(browserClient.close).toHaveBeenCalledOnce();
+  });
+
+  test("bounds target attachment and cleans up a target created before timeout", async () => {
+    vi.useFakeTimers();
+    let resolveAttach!: (result: { sessionId: string }) => void;
+    const browserClient = {
+      Target: {
+        createTarget: vi.fn(async () => ({ targetId: "target-attach-timeout" })),
+        attachToTarget: vi.fn(
+          () =>
+            new Promise<{ sessionId: string }>((resolve) => {
+              resolveAttach = resolve;
+            }),
+        ),
+        detachFromTarget: vi.fn(async () => ({})),
+        closeTarget: vi.fn(async () => ({ success: true })),
+        getTargets: vi.fn(async () => ({ targetInfos: [] })),
+      },
+      close: vi.fn(async () => {}),
+    };
+    cdpMock.mockResolvedValue(browserClient);
+
+    try {
+      const { connectToRemoteChromeTarget } = await import("../../src/browser/chromeLifecycle.js");
+      const pending = connectToRemoteChromeTarget(
+        "127.0.0.1",
+        9222,
+        vi.fn<(message: string) => void>(),
+        {
+          browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+          targetUrl: "https://chatgpt.com/",
+          closeTargetOnDispose: false,
+        },
+      );
+      const outcome = pending.then(
+        () => new Error("Expected remote target attachment to time out."),
+        (error: unknown) => error,
+      );
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(50);
+      const error = await outcome;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toMatch(/timed out attaching to remote Chrome target/i);
+      expect(browserClient.Target.closeTarget).toHaveBeenCalledWith({
+        targetId: "target-attach-timeout",
+      });
+      expect(browserClient.close).toHaveBeenCalledOnce();
+
+      resolveAttach({ sessionId: "late-session" });
+      await Promise.resolve();
+      expect(browserClient.Target.detachFromTarget).toHaveBeenCalledWith({
+        sessionId: "late-session",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
   test("polls until a stale remote target snapshot clears after close", async () => {
     vi.useFakeTimers();
@@ -800,6 +896,44 @@ describe("connectToRemoteChromeTarget", () => {
     expect(browserClient.Target.closeTarget).toHaveBeenCalledWith({ targetId: "target-cleanup" });
     expect(browserClient.close).toHaveBeenCalledOnce();
   });
+
+  test("bounds non-dedicated remote connection cleanup", async () => {
+    vi.useRealTimers();
+    const browserClient = {
+      Target: {
+        attachToTarget: vi.fn(async () => ({ sessionId: "existing-session" })),
+        detachFromTarget: vi.fn(() => new Promise<never>(() => undefined)),
+      },
+      on: vi.fn(),
+      once: vi.fn(),
+      removeListener: vi.fn(),
+      close: vi.fn(() => new Promise<never>(() => undefined)),
+    };
+    cdpMock.mockResolvedValue(browserClient);
+
+    const { connectToRemoteChromeTarget } = await import("../../src/browser/chromeLifecycle.js");
+    const connection = await connectToRemoteChromeTarget(
+      "127.0.0.1",
+      9222,
+      vi.fn<(message: string) => void>(),
+      {
+        browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+        targetId: "existing-target",
+        closeTargetOnDispose: false,
+      },
+    );
+    const error = await connection.close().then(
+      () => new Error("Expected remote connection cleanup to time out."),
+      (error: unknown) => error,
+    );
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/remote Chrome connection cleanup failed/i);
+    expect(browserClient.Target.detachFromTarget).toHaveBeenCalledWith({
+      sessionId: "existing-session",
+    });
+    expect(browserClient.close).toHaveBeenCalledOnce();
+  }, 2_000);
   test("bounds hung CDP commands while destroying a dedicated remote target", async () => {
     vi.useFakeTimers();
     try {

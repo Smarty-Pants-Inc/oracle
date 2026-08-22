@@ -1329,6 +1329,90 @@ describe("performSessionRun", () => {
     });
   });
 
+  test("persists a local account digest in successful browser runtime metadata", async () => {
+    const accountDigest = "a".repeat(64);
+    vi.mocked(runBrowserSessionExecution).mockResolvedValue({
+      usage: { inputTokens: 1, outputTokens: 1, reasoningTokens: 0, totalTokens: 2 },
+      elapsedMs: 1,
+      runtime: { chatGptAccountDigest: accountDigest, tabUrl: "https://chatgpt.com/c/local" },
+      answerText: "ok",
+    });
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate?.browser?.runtime).toMatchObject({ chatGptAccountDigest: accountDigest });
+    expect(finalUpdate?.browser?.config).not.toHaveProperty("remoteChromeAccountDigest");
+  });
+
+  test("persists resolved affinity for a direct raw remote Chrome run", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const accountDigest = "a".repeat(64);
+    vi.mocked(runBrowserSessionExecution).mockResolvedValue({
+      usage: { inputTokens: 1, outputTokens: 1, reasoningTokens: 0, totalTokens: 2 },
+      elapsedMs: 1,
+      runtime: {
+        chromeHost: "127.0.0.1",
+        chromePort: 9223,
+        chromeBrowserWSEndpoint: browserWSEndpoint,
+        chatGptAccountDigest: accountDigest,
+        tabUrl: "https://chatgpt.com/c/remote",
+      },
+      answerText: "ok",
+    });
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { remoteChrome: { host: "127.0.0.1", port: 9223 } },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate?.browser?.config).toMatchObject({
+      remoteChromeBrowserId: "browser-a",
+      remoteChromeBrowserWSEndpoint: browserWSEndpoint,
+      remoteChromeAccountDigest: accountDigest,
+    });
+    expect(finalUpdate?.browser?.runtime).toMatchObject({
+      chromeBrowserWSEndpoint: browserWSEndpoint,
+      chatGptAccountDigest: accountDigest,
+    });
+  });
+
+  test("rejects a malformed local runtime account digest before persistence", async () => {
+    vi.mocked(runBrowserSessionExecution).mockImplementationOnce(async (_args, deps) => {
+      await deps?.persistRuntimeHint?.({ chatGptAccountDigest: "not-a-digest" });
+      throw new Error("unreachable");
+    });
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow(/ChatGPT account identity is invalid/i);
+  });
+
   test("keeps session running when browser connection is lost", async () => {
     const automationError = new BrowserAutomationError(
       "Chrome DevTools client disconnected before oracle finished; the browser target appears still alive.",

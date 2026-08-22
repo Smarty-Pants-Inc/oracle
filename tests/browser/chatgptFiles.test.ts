@@ -338,6 +338,26 @@ describe("collectChatGptFileArtifacts", () => {
     setOracleHomeDirOverrideForTest(null);
   });
 
+  test("rejects a retarget before reading downloadable file DOM", async () => {
+    const retargeted = new Error(
+      "ChatGPT conversation changed before downloadable file artifact collection.",
+    );
+    const assertPageAffinity = vi.fn(async () => {
+      throw retargeted;
+    });
+    const runtime = { evaluate: vi.fn() } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      collectChatGptFileArtifacts({
+        Runtime: runtime,
+        Network: {} as ChromeClient["Network"],
+        expectedConversationId: "expected-conversation",
+        assertPageAffinity,
+      }),
+    ).rejects.toBe(retargeted);
+    expect(runtime.evaluate).not.toHaveBeenCalled();
+  });
+
   test("discovers and saves downloadable file artifacts for a browser session", async () => {
     const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-file-collect-"));
     setOracleHomeDirOverrideForTest(tmpHome);

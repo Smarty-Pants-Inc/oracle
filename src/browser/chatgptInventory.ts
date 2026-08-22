@@ -9,6 +9,13 @@ import {
   resolveRemoteChromeBrowserIdentity,
 } from "./profileState.js";
 import { delay } from "./utils.js";
+import {
+  MAX_CHATGPT_ACCOUNT_ID_LENGTH,
+  MAX_CHATGPT_ACCOUNT_EMAIL_LENGTH,
+  MAX_CHATGPT_JWT_SEGMENT_LENGTH,
+  normalizeChatGptAccountDigest,
+  normalizeChatGptAccountEmail,
+} from "./chatgptAccount.js";
 const CHATGPT_ORIGIN = "https://chatgpt.com";
 const CHATGPT_CONVERSATIONS_URL = `${CHATGPT_ORIGIN}/backend-api/conversations`;
 const CHATGPT_SESSION_URL = `${CHATGPT_ORIGIN}/api/auth/session`;
@@ -258,11 +265,23 @@ export function buildChatGptInventoryAuthCaptureHook(): string {
   return `
 (() => {
   const KEY = "__oracleChatGptInventory";
-  if (window[KEY]?.version === 4) return;
+  if (window[KEY]?.version === 5) return;
   try { window[KEY]?.cleanup?.(); } catch {}
   const ORIGIN = ${JSON.stringify(CHATGPT_ORIGIN)};
   const CONVERSATIONS_PATH = "/backend-api/conversations";
   const SESSION_URL = ${JSON.stringify(CHATGPT_SESSION_URL)};
+  const MAX_ACCOUNT_ID_LENGTH = ${MAX_CHATGPT_ACCOUNT_ID_LENGTH};
+  const MAX_EMAIL_LENGTH = ${MAX_CHATGPT_ACCOUNT_EMAIL_LENGTH};
+  const MAX_JWT_SEGMENT_LENGTH = ${MAX_CHATGPT_JWT_SEGMENT_LENGTH};
+  const EMAIL_PATTERN = /^[^@\\s]{1,64}@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+  const normalizeEmail = (value) => {
+    const email = typeof value === "string" ? value.trim().toLowerCase() : "";
+    return email.length <= MAX_EMAIL_LENGTH && EMAIL_PATTERN.test(email) ? email : "";
+  };
+  const normalizeUserId = (value) => {
+    const userId = typeof value === "string" ? value.trim() : "";
+    return userId.length > 0 && userId.length <= MAX_ACCOUNT_ID_LENGTH ? userId : "";
+  };
   const originalFetch = window.fetch;
   let capturedHeaders = null;
   let retainedHeaders = null;
@@ -279,15 +298,15 @@ export function buildChatGptInventoryAuthCaptureHook(): string {
     try {
       const authorization = headers.get("authorization")?.trim() ?? "";
       const match = /^Bearer\\s+([A-Za-z0-9_-]+)\\.([A-Za-z0-9_-]+)\\.([A-Za-z0-9_-]+)$/i.exec(authorization);
-      if (!match) return null;
+      if (!match || match.slice(1).some((segment) => segment.length > MAX_JWT_SEGMENT_LENGTH)) return null;
       const encoded = match[2].replace(/-/g, "+").replace(/_/g, "/");
       const payload = JSON.parse(atob(encoded.padEnd(Math.ceil(encoded.length / 4) * 4, "=")));
       const auth = payload?.["https://api.openai.com/auth"];
       const profile = payload?.["https://api.openai.com/profile"];
       const userIds = [auth?.chatgpt_user_id, auth?.user_id]
-        .filter((value) => typeof value === "string" && value.trim())
-        .map((value) => value.trim());
-      const email = typeof profile?.email === "string" ? profile.email.trim().toLowerCase() : "";
+        .map(normalizeUserId)
+        .filter(Boolean);
+      const email = normalizeEmail(profile?.email);
       if (!email || userIds.length === 0 || userIds.some((value) => value !== userIds[0])) {
         return null;
       }
@@ -367,12 +386,8 @@ export function buildChatGptInventoryAuthCaptureHook(): string {
       redirected: response.redirected,
     });
     try {
-      const userId = typeof response.body?.user?.id === "string"
-        ? response.body.user.id.trim()
-        : "";
-      const email = typeof response.body?.user?.email === "string"
-        ? response.body.user.email.trim().toLowerCase()
-        : "";
+      const userId = normalizeUserId(response.body?.user?.id);
+      const email = normalizeEmail(response.body?.user?.email);
       if (!userId || !email || !globalThis.crypto?.subtle) return identityFailure();
       const bytes = new Uint8Array(await crypto.subtle.digest(
         "SHA-256", new TextEncoder().encode(userId),
@@ -390,7 +405,7 @@ export function buildChatGptInventoryAuthCaptureHook(): string {
     }
   };
   const inventory = {
-    version: 4,
+    version: 5,
     get ready() { return capturedHeaders instanceof Headers; },
     async readCookieIdentity(deadline) {
       return readIdentity(new Headers({ accept: "application/json" }), "include", deadline);
@@ -556,17 +571,11 @@ async function evaluateInventoryIdentity(
     const suffix = typeof envelope?.status === "number" ? ` (HTTP ${envelope.status})` : "";
     throw new Error(`${action} request failed${suffix}.`);
   }
-  const accountDigest = envelope.accountDigest;
-  const rawEmail = envelope.email;
-  if (
-    typeof accountDigest !== "string" ||
-    !/^[a-f0-9]{64}$/.test(accountDigest) ||
-    typeof rawEmail !== "string"
-  ) {
+  const accountDigest = normalizeChatGptAccountDigest(envelope?.accountDigest);
+  const email = normalizeChatGptAccountEmail(envelope?.email);
+  if (!accountDigest || !email) {
     throw new Error(`${action} is unavailable.`);
   }
-  const email = rawEmail.trim().toLowerCase();
-  if (!email) throw new Error(`${action} is unavailable.`);
   if (email !== expectedEmail) {
     throw new Error(`Authenticated ChatGPT email changed before ${action}.`);
   }
@@ -681,9 +690,11 @@ export async function captureChatGptConversationInventory(
 ): Promise<ChatGptInventoryResult> {
   const browserId = options.browserId.trim();
   const browserWSEndpoint = options.browserWSEndpoint.trim();
-  const expectedEmail = options.expectedEmail.trim().toLowerCase();
+  const expectedEmail = normalizeChatGptAccountEmail(options.expectedEmail);
   if (!browserId || !browserWSEndpoint || !expectedEmail) {
-    throw new Error("ChatGPT inventory requires complete browser identity and expected email.");
+    throw new Error(
+      "ChatGPT inventory requires complete browser identity and a valid expected email.",
+    );
   }
   if (browserIdFromWebSocketEndpoint(browserWSEndpoint) !== browserId) {
     throw new Error("ChatGPT inventory browser id does not match its WebSocket.");

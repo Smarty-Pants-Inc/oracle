@@ -254,6 +254,7 @@ describe("archiveChatGptConversation", () => {
       expectedConversationId: "abc",
       expectedAccountDigest,
     });
+    expect(expression).toContain("rawUserId.length > 0 && rawUserId.length <= 512");
     const domAccess = vi.fn();
     const document = new Proxy(
       {},
@@ -625,6 +626,7 @@ describe("archiveChatGptConversation", () => {
     expect(expression).toContain("response.redirected");
     expect(expression).toContain("response.url !== target");
     expect(expression).toContain("archive-not-confirmed");
+    expect(expression).toContain("const deadline = Date.now() + 10000;");
     expect(expression).toContain("archive");
     expect(expression).not.toContain("delete");
   });

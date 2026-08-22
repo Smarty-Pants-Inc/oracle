@@ -83,6 +83,19 @@ describe("remote browser identity", () => {
       vi.unstubAllGlobals();
     }
   });
+
+  test("gives each account affinity probe a fresh input timeout after a long response", () => {
+    vi.useFakeTimers();
+    try {
+      const runStartedAt = Date.now();
+      vi.advanceTimersByTime(10 * 60_000);
+
+      expect(Date.now() - runStartedAt).toBe(10 * 60_000);
+      expect(__test__.resolveAccountAffinityProbeTimeoutMs(250)).toBe(250);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   test("rechecks the stored account digest at the requested action boundary", async () => {
     const digest = "a".repeat(64);
     const runtime = {

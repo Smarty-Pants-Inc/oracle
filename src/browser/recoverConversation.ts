@@ -23,6 +23,7 @@ import { delay } from "./utils.js";
 
 const DEFAULT_READY_TIMEOUT_MS = 30_000;
 const READY_POLL_MS = 1_000;
+const RECOVERY_CLEANUP_ALLOWANCE_MS = 1_000;
 
 function remainingRecoveryOperationMs(deadline: number): number {
   return Math.max(0, deadline - Date.now());
@@ -62,18 +63,12 @@ async function runBeforeRecoveryDeadline<T>(
   }
 }
 
-async function runRecoveryCleanupBeforeDeadline(
-  operation: () => Promise<unknown>,
-  deadline: number,
-  action: string,
-): Promise<void> {
-  if (remainingRecoveryOperationMs(deadline) <= 0) {
-    void Promise.resolve()
-      .then(operation)
-      .catch(() => undefined);
-    return;
-  }
-  await runBeforeRecoveryDeadline(operation, deadline, action);
+async function runRecoveryCleanup<T>(operation: () => Promise<T>, action: string): Promise<T> {
+  return await runBeforeRecoveryDeadline(
+    operation,
+    Date.now() + RECOVERY_CLEANUP_ALLOWANCE_MS,
+    action,
+  );
 }
 
 export interface RecoveredConversation {
@@ -178,15 +173,10 @@ async function closeRecoveryTarget(
   endpoint: RecoveryEndpoint,
   targetId: string,
   logger: BrowserLogger,
-  deadline: number,
+  _deadline: number,
 ): Promise<void> {
-  if (remainingRecoveryOperationMs(deadline) <= 0) {
-    void closeTab(endpoint.port, targetId, logger, endpoint.host).catch(() => undefined);
-    return;
-  }
-  const closed = await runBeforeRecoveryDeadline(
+  const closed = await runRecoveryCleanup(
     () => closeTab(endpoint.port, targetId, logger, endpoint.host),
-    deadline,
     "closing the conversation recovery target",
   );
   if (!closed) {
@@ -286,9 +276,8 @@ async function openRecoveryTarget(
       deadline,
       "attaching to the bound conversation recovery target",
       (lateConnection) =>
-        runRecoveryCleanupBeforeDeadline(
+        runRecoveryCleanup(
           () => lateConnection.close(),
-          deadline,
           "closing a late conversation recovery connection",
         ),
     );
@@ -342,9 +331,8 @@ async function openRecoveryTarget(
   const cleanupErrors: unknown[] = [];
   if (connection) {
     try {
-      await runRecoveryCleanupBeforeDeadline(
+      await runRecoveryCleanup(
         () => connection.close(),
-        deadline,
         "closing the conversation recovery connection",
       );
     } catch (error) {
@@ -477,13 +465,13 @@ export async function recoverConversationTab(
         cleanupErrors.push(cleanupError);
       }
     }
-    await runRecoveryCleanupBeforeDeadline(
-      async () => {
+    try {
+      await runRecoveryCleanup(async () => {
         await chrome.kill();
-      },
-      deadline,
-      "closing Chrome after conversation recovery",
-    ).catch(() => undefined);
+      }, "closing Chrome after conversation recovery");
+    } catch (cleanupError) {
+      cleanupErrors.push(cleanupError);
+    }
     if (cleanupErrors.length) {
       throw new AggregateError(
         [error, ...cleanupErrors],

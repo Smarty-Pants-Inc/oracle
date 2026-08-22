@@ -17,6 +17,7 @@ import { isWsl, resolveWslChromeLaunchRoute } from "./wslHost.js";
 const execFileAsync = promisify(execFile);
 const REMOTE_TARGET_CLEANUP_TIMEOUT_MS = 1_000;
 const REMOTE_TARGET_CLEANUP_COMMAND_TIMEOUT_MS = 250;
+const REMOTE_TARGET_ATTACH_TIMEOUT_MS = 5_000;
 
 export interface ChromeLaunchDeps {
   platform?: NodeJS.Platform;
@@ -361,6 +362,37 @@ async function runRemoteTargetCleanupCommand<T>(
   }
 }
 
+async function attachToRemoteTarget(
+  browser: ChromeClient,
+  targetId: string,
+): Promise<Awaited<ReturnType<ChromeClient["Target"]["attachToTarget"]>>> {
+  let timedOut = false;
+  let timeout: NodeJS.Timeout | undefined;
+  const attached = browser.Target.attachToTarget({ targetId, flatten: true });
+  void attached
+    .then((result) => {
+      if (!timedOut) return;
+      return browser.Target.detachFromTarget({ sessionId: result.sessionId }).catch(
+        () => undefined,
+      );
+    })
+    .catch(() => undefined);
+  try {
+    return await Promise.race([
+      attached,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => {
+          timedOut = true;
+          reject(new Error("Timed out attaching to remote Chrome target."));
+        }, REMOTE_TARGET_ATTACH_TIMEOUT_MS);
+        timeout.unref?.();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function closeRemoteTargetAndConfirm(
   browser: ChromeClient,
   targetId: string,
@@ -475,7 +507,7 @@ export async function connectToRemoteChromeTarget(
       createdTarget = true;
       logger("Opened a dedicated remote Chrome tab.");
     }
-    const attached = await browser.Target.attachToTarget({ targetId, flatten: true });
+    const attached = await attachToRemoteTarget(browser, targetId);
     const client = createSessionBoundChromeClient(browser, attached.sessionId);
     return {
       client,
@@ -483,10 +515,27 @@ export async function connectToRemoteChromeTarget(
       browserWSEndpoint,
       close: async () => {
         if (!options.closeTargetOnDispose) {
-          await browser.Target.detachFromTarget({ sessionId: attached.sessionId }).catch(
-            () => undefined,
-          );
-          await browser.close().catch(() => undefined);
+          const cleanupDeadline = Date.now() + REMOTE_TARGET_CLEANUP_TIMEOUT_MS;
+          const cleanupErrors: unknown[] = [];
+          try {
+            await runRemoteTargetCleanupCommand(
+              () => browser.Target.detachFromTarget({ sessionId: attached.sessionId }),
+              cleanupDeadline,
+            );
+          } catch (error) {
+            cleanupErrors.push(error);
+          }
+          try {
+            await runRemoteTargetCleanupCommand(
+              () => browser.close(),
+              Math.max(cleanupDeadline, Date.now() + REMOTE_TARGET_CLEANUP_COMMAND_TIMEOUT_MS),
+            );
+          } catch (error) {
+            cleanupErrors.push(error);
+          }
+          if (cleanupErrors.length > 0) {
+            throw new AggregateError(cleanupErrors, "Remote Chrome connection cleanup failed.");
+          }
           return;
         }
         const cleanupDeadline = Date.now() + REMOTE_TARGET_CLEANUP_TIMEOUT_MS;
@@ -572,12 +621,24 @@ async function connectToBrowserWebSocket(
   while (Date.now() < deadline) {
     const remainingMs = Math.max(1, deadline - Date.now());
     try {
+      let timedOut = false;
       let timeout: NodeJS.Timeout | undefined;
+      const connectionAttempt = CDP({
+        target: browserWSEndpoint,
+        local: true,
+      }) as Promise<ChromeClient>;
+      void connectionAttempt
+        .then((client) => {
+          if (!timedOut) return;
+          return client.close().catch(() => undefined);
+        })
+        .catch(() => undefined);
       try {
         return await Promise.race([
-          CDP({ target: browserWSEndpoint, local: true }) as Promise<ChromeClient>,
+          connectionAttempt,
           new Promise<never>((_resolve, reject) => {
             timeout = setTimeout(() => {
+              timedOut = true;
               reject(new Error("__oracle_remote_debugging_approval_timeout__"));
             }, remainingMs);
             timeout.unref?.();

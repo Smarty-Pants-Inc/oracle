@@ -46,7 +46,11 @@ import {
   waitForUserTurnAttachments,
   readAssistantSnapshot,
 } from "./pageActions.js";
-import { assertChatGptAccountEmail } from "./chatgptAccount.js";
+import {
+  assertChatGptAccountEmail,
+  normalizeChatGptAccountDigest,
+  normalizeChatGptAccountEmail,
+} from "./chatgptAccount.js";
 import { INPUT_SELECTORS } from "./constants.js";
 import { uploadAttachmentViaDataTransfer } from "./actions/remoteFileTransfer.js";
 import { ensureThinkingTime } from "./actions/thinkingTime.js";
@@ -1121,6 +1125,8 @@ function resolveAttachmentUploadTimeoutMs(
 }
 
 export async function runBrowserMode(options: BrowserRunOptions): Promise<BrowserRunResult> {
+  const startedAt = Date.now();
+
   const promptText = options.prompt?.trim();
   if (!promptText) {
     throw new Error("Prompt text is required when using browser mode.");
@@ -1193,6 +1199,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       conversationId,
       promptSubmitted,
       userDataDir,
+      chatGptAccountDigest: chatGptAccountDigest ?? undefined,
       controllerPid: process.pid,
     };
     try {
@@ -1368,10 +1375,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   let browserRuntime: ChromeClient["Runtime"] | null = null;
   let isolatedTargetId: string | null = null;
   let ownsTarget = true;
-  const startedAt = Date.now();
-  const accountAffinityDeadline = startedAt + config.timeoutMs;
-  const remainingAccountAffinityMs = () =>
-    Math.max(0, Math.min(config.inputTimeoutMs, accountAffinityDeadline - Date.now()));
+  const accountAffinityProbeTimeoutMs = () =>
+    resolveAccountAffinityProbeTimeoutMs(config.inputTimeoutMs);
   let answerText = "";
   let answerMarkdown = "";
   let answerHtml = "";
@@ -1469,6 +1474,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
                     : undefined,
                 promptSubmitted,
                 controllerPid: process.pid,
+                chatGptAccountDigest: chatGptAccountDigest ?? undefined,
               },
             }),
           );
@@ -1646,23 +1652,17 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     if (chatMode === "switched") {
       await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
     }
-    const wrapperExpectedEmail =
-      process.env.ORACLE_WRAPPER_EXPECTED_ACCOUNT_EMAIL?.trim().toLowerCase();
-    if (wrapperExpectedEmail) {
-      await raceWithDisconnect(
-        assertChatGptAccountEmail(
-          Runtime,
-          wrapperExpectedEmail,
-          "Oracle prompt submission",
-          remainingAccountAffinityMs(),
-        ),
-      );
-    }
-    if (config.archiveConversations !== "never") {
-      chatGptAccountDigest = await raceWithDisconnect(
-        readChatGptAccountDigest(Runtime, remainingAccountAffinityMs()).catch(() => null),
-      );
-    }
+    const wrapperExpectedEmail = resolveWrapperExpectedAccountEmail();
+    chatGptAccountDigest = await raceWithDisconnect(
+      wrapperExpectedEmail
+        ? assertChatGptAccountEmail(
+            Runtime,
+            wrapperExpectedEmail,
+            "Oracle prompt submission",
+            accountAffinityProbeTimeoutMs(),
+          )
+        : readChatGptAccountDigest(Runtime, accountAffinityProbeTimeoutMs()),
+    );
     const assertAttachedConversation = async (action: string): Promise<void> => {
       const url = await raceWithDisconnect(assertChatGptTabOrigin(Runtime, action));
       if (runConversationId) {
@@ -1677,9 +1677,19 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
             Runtime,
             wrapperExpectedEmail,
             action,
-            remainingAccountAffinityMs(),
+            accountAffinityProbeTimeoutMs(),
           ),
         );
+      }
+      if (
+        !chatGptAccountDigest ||
+        (await raceWithDisconnect(
+          readChatGptAccountDigest(Runtime, accountAffinityProbeTimeoutMs()),
+        )) !== chatGptAccountDigest
+      ) {
+        throw new BrowserAutomationError(`ChatGPT account identity changed before ${action}.`, {
+          stage: "conversation-affinity",
+        });
       }
     };
     logger(
@@ -2121,6 +2131,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         conversationId: runConversationId,
         promptSubmitted,
         controllerPid: process.pid,
+        chatGptAccountDigest: chatGptAccountDigest ?? undefined,
       };
     }
     // Helper to normalize text for echo detection (collapse whitespace, lowercase)
@@ -2230,6 +2241,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
               conversationId: runConversationId,
               promptSubmitted,
               controllerPid: process.pid,
+              chatGptAccountDigest: chatGptAccountDigest ?? undefined,
             },
           },
         );
@@ -2323,6 +2335,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
               conversationId: runConversationId,
               promptSubmitted,
               controllerPid: process.pid,
+              chatGptAccountDigest: chatGptAccountDigest ?? undefined,
             };
             throw await createAssistantTimeoutError({
               Runtime,
@@ -2570,6 +2583,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       outputPath: options.outputPath,
       answerText,
       waitTimeoutMs: options.config?.timeoutMs,
+      expectedConversationId: runConversationId,
+      assertPageAffinity,
       checkBlockingUiWarning: () =>
         throwChatGptUiWarningIfPresent({
           Runtime,
@@ -2586,6 +2601,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
             conversationId: runConversationId,
             promptSubmitted,
             controllerPid: process.pid,
+            chatGptAccountDigest: chatGptAccountDigest ?? undefined,
           },
         }),
     });
@@ -2603,6 +2619,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       logger,
       minTurnIndex: imageArtifactMinTurnIndex,
       sessionId: options.sessionId,
+      expectedConversationId: runConversationId,
+      assertPageAffinity,
     });
     const savedImageArtifacts = appendArtifacts(undefined, imageArtifacts.savedImages);
     const savedBrowserArtifacts = appendArtifacts(savedImageArtifacts, fileArtifacts.savedFiles);
@@ -2658,6 +2676,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       conversationId: runConversationId,
       promptSubmitted,
       controllerPid: process.pid,
+      chatGptAccountDigest: chatGptAccountDigest ?? undefined,
     };
   } catch (error) {
     const normalizedError = error instanceof Error ? error : new Error(String(error));
@@ -2685,6 +2704,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         tabUrl: lastUrl,
         promptSubmitted,
         controllerPid: process.pid,
+        chatGptAccountDigest: chatGptAccountDigest ?? undefined,
       };
       const reuseProfileHint =
         `oracle --engine browser --browser-manual-login ` +
@@ -2794,6 +2814,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
               : undefined,
           promptSubmitted,
           controllerPid: process.pid,
+          chatGptAccountDigest: chatGptAccountDigest ?? undefined,
         },
       },
       normalizedError,
@@ -3286,14 +3307,32 @@ async function maybeReuseRunningChrome(
   } as unknown as LaunchedChrome;
 }
 
+function resolveAccountAffinityProbeTimeoutMs(inputTimeoutMs: number | undefined): number {
+  return typeof inputTimeoutMs === "number" && Number.isFinite(inputTimeoutMs)
+    ? Math.max(0, inputTimeoutMs)
+    : 0;
+}
+
+function resolveWrapperExpectedAccountEmail(): string | undefined {
+  const rawEmail = process.env.ORACLE_WRAPPER_EXPECTED_ACCOUNT_EMAIL;
+  if (!rawEmail?.trim()) return undefined;
+  const email = normalizeChatGptAccountEmail(rawEmail);
+  if (!email) {
+    throw new BrowserAutomationError("Configured ChatGPT account email is invalid.", {
+      stage: "remote-browser-identity",
+    });
+  }
+  return email;
+}
+
 async function assertRemoteChatGptAccountAffinity(
   Runtime: ChromeClient["Runtime"],
   accountDigest: string | null | undefined,
   action: string,
   remainingMs?: number,
 ): Promise<void> {
-  const expectedAccountDigest = accountDigest?.trim();
-  if (!expectedAccountDigest || !/^[a-f0-9]{64}$/.test(expectedAccountDigest)) {
+  const expectedAccountDigest = normalizeChatGptAccountDigest(accountDigest);
+  if (!expectedAccountDigest) {
     throw new BrowserAutomationError(
       `Remote Chrome account identity is unavailable before ${action}.`,
       { stage: "remote-browser-identity" },
@@ -3313,6 +3352,8 @@ async function runRemoteBrowserMode(
   logger: BrowserLogger,
   options: BrowserRunOptions,
 ): Promise<BrowserRunResult> {
+  const startedAt = Date.now();
+
   const remoteChromeConfig = config.remoteChrome;
   if (!remoteChromeConfig) {
     throw new Error(
@@ -3320,14 +3361,17 @@ async function runRemoteBrowserMode(
     );
   }
   const { host, port } = remoteChromeConfig;
-  const expectedBrowserId = config.remoteChromeBrowserId?.trim();
-  const expectedAccountDigest = config.remoteChromeAccountDigest?.trim();
-  if (expectedAccountDigest && !/^[a-f0-9]{64}$/.test(expectedAccountDigest)) {
+  const configuredBrowserId = config.remoteChromeBrowserId?.trim();
+  const configuredAccountDigest = config.remoteChromeAccountDigest;
+  const expectedAccountDigest = normalizeChatGptAccountDigest(configuredAccountDigest);
+  if (configuredAccountDigest != null && !expectedAccountDigest) {
     throw new BrowserAutomationError("Remote Chrome account identity is invalid.", {
       stage: "remote-browser-identity",
     });
   }
+  let expectedBrowserId = configuredBrowserId;
   let browserWSEndpoint = config.remoteChromeBrowserWSEndpoint ?? undefined;
+  const liveIdentity = await resolveRemoteChromeBrowserIdentity({ host, port });
   if (expectedBrowserId) {
     if (!browserWSEndpoint) {
       throw new BrowserAutomationError("Remote Chrome browser identity is missing its WebSocket.", {
@@ -3342,7 +3386,6 @@ async function runRemoteBrowserMode(
         },
       );
     }
-    const liveIdentity = await resolveRemoteChromeBrowserIdentity({ host, port });
     if (liveIdentity.browserId !== expectedBrowserId) {
       throw new BrowserAutomationError(
         "Remote Chrome browser identity changed before attachment.",
@@ -3351,8 +3394,13 @@ async function runRemoteBrowserMode(
         },
       );
     }
-    browserWSEndpoint = liveIdentity.browserWSEndpoint;
-  } else if (process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1") {
+  } else {
+    expectedBrowserId = liveIdentity.browserId;
+    config.remoteChromeBrowserId = expectedBrowserId;
+  }
+  browserWSEndpoint = liveIdentity.browserWSEndpoint;
+  config.remoteChromeBrowserWSEndpoint = browserWSEndpoint;
+  if (process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" && !configuredBrowserId) {
     throw new BrowserAutomationError(
       "The agent wrapper requires a verified remote Chrome browser identity.",
       {
@@ -3429,10 +3477,8 @@ async function runRemoteBrowserMode(
         conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000) ?? null;
     }
   };
-  const startedAt = Date.now();
-  const accountAffinityDeadline = startedAt + config.timeoutMs;
-  const remainingAccountAffinityMs = () =>
-    Math.max(0, Math.min(config.inputTimeoutMs, accountAffinityDeadline - Date.now()));
+  const accountAffinityProbeTimeoutMs = () =>
+    resolveAccountAffinityProbeTimeoutMs(config.inputTimeoutMs);
   let answerText = "";
   let answerMarkdown = "";
   let answerHtml = "";
@@ -3447,8 +3493,7 @@ async function runRemoteBrowserMode(
   const followUpPrompts = normalizeBrowserFollowUpPrompts(options.followUpPrompts);
 
   try {
-    const initialWrapperExpectedEmail =
-      process.env.ORACLE_WRAPPER_EXPECTED_ACCOUNT_EMAIL?.trim().toLowerCase();
+    const initialWrapperExpectedEmail = resolveWrapperExpectedAccountEmail();
     if (initialWrapperExpectedEmail) {
       const accountVerificationConnection = await connectToRemoteChrome(
         host,
@@ -3470,7 +3515,7 @@ async function runRemoteBrowserMode(
           Runtime,
           initialWrapperExpectedEmail,
           "Oracle remote browser initialization",
-          remainingAccountAffinityMs(),
+          accountAffinityProbeTimeoutMs(),
         );
       } catch (error) {
         accountVerificationFailed = true;
@@ -3600,7 +3645,7 @@ async function runRemoteBrowserMode(
       await ensureLoggedIn(Runtime, logger, { remoteSession: true });
       const observedAccountDigest = await readChatGptAccountDigest(
         Runtime,
-        remainingAccountAffinityMs(),
+        accountAffinityProbeTimeoutMs(),
       );
       if (observedAccountDigest !== expectedAccountDigest) {
         throw new BrowserAutomationError(
@@ -3623,16 +3668,15 @@ async function runRemoteBrowserMode(
     }
     await ensureNotBlocked(Runtime, config.headless, logger);
     await ensureLoggedIn(Runtime, logger, { remoteSession: true });
-    const wrapperExpectedEmail =
-      process.env.ORACLE_WRAPPER_EXPECTED_ACCOUNT_EMAIL?.trim().toLowerCase();
+    const wrapperExpectedEmail = resolveWrapperExpectedAccountEmail();
     const observedAccountDigest = wrapperExpectedEmail
       ? await assertChatGptAccountEmail(
           Runtime,
           wrapperExpectedEmail,
           "Oracle prompt submission",
-          remainingAccountAffinityMs(),
+          accountAffinityProbeTimeoutMs(),
         )
-      : await readChatGptAccountDigest(Runtime, remainingAccountAffinityMs());
+      : await readChatGptAccountDigest(Runtime, accountAffinityProbeTimeoutMs());
     if (expectedAccountDigest && observedAccountDigest !== expectedAccountDigest) {
       throw new BrowserAutomationError(
         "Remote Chrome account identity changed before submission.",
@@ -3657,14 +3701,14 @@ async function runRemoteBrowserMode(
           Runtime,
           wrapperExpectedEmail,
           action,
-          remainingAccountAffinityMs(),
+          accountAffinityProbeTimeoutMs(),
         );
       }
       await assertRemoteChatGptAccountAffinity(
         Runtime,
         config.remoteChromeAccountDigest,
         action,
-        remainingAccountAffinityMs(),
+        accountAffinityProbeTimeoutMs(),
       );
     };
     const ensureRunConversationPinnedAfterSubmit = async (
@@ -4116,6 +4160,7 @@ async function runRemoteBrowserMode(
               conversationId: runConversationId,
               promptSubmitted,
               controllerPid: process.pid,
+              chatGptAccountDigest: config.remoteChromeAccountDigest ?? undefined,
             },
           },
         );
@@ -4207,6 +4252,7 @@ async function runRemoteBrowserMode(
               conversationId: runConversationId,
               promptSubmitted,
               controllerPid: process.pid,
+              chatGptAccountDigest: config.remoteChromeAccountDigest ?? undefined,
             };
             throw await createAssistantTimeoutError({
               Runtime,
@@ -4411,6 +4457,8 @@ async function runRemoteBrowserMode(
       outputPath: options.outputPath,
       answerText,
       waitTimeoutMs: options.config?.timeoutMs,
+      expectedConversationId: runConversationId,
+      assertPageAffinity,
       checkBlockingUiWarning: () =>
         throwChatGptUiWarningIfPresent({
           Runtime,
@@ -4427,6 +4475,7 @@ async function runRemoteBrowserMode(
             conversationId: runConversationId,
             promptSubmitted,
             controllerPid: process.pid,
+            chatGptAccountDigest: config.remoteChromeAccountDigest ?? undefined,
           },
         }),
     });
@@ -4444,6 +4493,8 @@ async function runRemoteBrowserMode(
       logger,
       minTurnIndex: imageArtifactMinTurnIndex,
       sessionId: options.sessionId,
+      expectedConversationId: runConversationId,
+      assertPageAffinity,
     });
     const savedImageArtifacts = appendArtifacts(undefined, imageArtifacts.savedImages);
     const savedBrowserArtifacts = appendArtifacts(savedImageArtifacts, fileArtifacts.savedFiles);
@@ -4669,6 +4720,7 @@ export const __test__ = {
   shouldCloseOwnedRunTargetAfterRun,
   shouldKeepLocalBrowserOpen,
   waitForAssistantResponseWithReload,
+  resolveAccountAffinityProbeTimeoutMs,
 };
 export { syncCookies } from "./cookies.js";
 export {

@@ -379,6 +379,27 @@ describe("collectGeneratedImageArtifacts", () => {
     setOracleHomeDirOverrideForTest(null);
   });
 
+  test("rejects a retarget before reading generated image DOM", async () => {
+    const retargeted = new Error(
+      "ChatGPT conversation changed before generated image artifact collection.",
+    );
+    const assertPageAffinity = vi.fn(async () => {
+      throw retargeted;
+    });
+    const runtime = { evaluate: vi.fn() } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      collectGeneratedImageArtifacts({
+        Runtime: runtime,
+        Network: {} as ChromeClient["Network"],
+        expectedConversationId: "expected-conversation",
+        assertPageAffinity,
+        answerText: "",
+      }),
+    ).rejects.toBe(retargeted);
+    expect(runtime.evaluate).not.toHaveBeenCalled();
+  });
+
   test("saves current-turn ChatGPT behavior button image downloads", async () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-image-button-"));
     const outputPath = path.join(tmpDir, "generated.png");

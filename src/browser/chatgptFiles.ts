@@ -454,7 +454,9 @@ function buildAssistantDownloadableFilesExpression(minTurnIndex?: number): strin
 export async function readAssistantDownloadableFiles(
   Runtime: ChromeClient["Runtime"],
   minTurnIndex?: number,
+  assertPageAffinity?: (action: string) => Promise<void>,
 ): Promise<BrowserDownloadableFile[]> {
+  await assertPageAffinity?.("downloadable file DOM read");
   const { result } = await Runtime.evaluate({
     expression: buildAssistantDownloadableFilesExpression(minTurnIndex),
     returnByValue: true,
@@ -669,7 +671,9 @@ async function configureBrowserDownloadPath(params: {
   Page?: ChromeClient["Page"];
   logger?: BrowserLogger;
   downloadPath: string;
+  assertPageAffinity?: (action: string) => Promise<void>;
 }): Promise<boolean> {
+  await params.assertPageAffinity?.("browser download configuration");
   if (params.Client?.send) {
     try {
       await params.Client.send("Browser.setDownloadBehavior", {
@@ -991,6 +995,7 @@ async function clickAssistantDownloadButtons(params: {
   maxClicks?: number;
   timeoutMs?: number;
   logger?: BrowserLogger;
+  assertPageAffinity?: (action: string) => Promise<void>;
 }): Promise<ClickDownloadControlsResult> {
   const expression = buildClickAssistantDownloadButtonsExpression(
     params.minTurnIndex,
@@ -1002,6 +1007,7 @@ async function clickAssistantDownloadButtons(params: {
   let lastInspectedCount = 0;
   let lastSelectedCategory: string | undefined;
   while (Date.now() < deadline) {
+    await params.assertPageAffinity?.("assistant download button DOM read and click");
     const { result } = await params.Runtime.evaluate({
       expression,
       returnByValue: true,
@@ -1060,7 +1066,9 @@ async function clickGeneratedDownloadUrl(params: {
   file: BrowserDownloadableFile;
   downloadUrl: string;
   logger?: BrowserLogger;
+  assertPageAffinity?: (action: string) => Promise<void>;
 }): Promise<ClickDownloadControlsResult> {
+  await params.assertPageAffinity?.("generated file download click");
   const filename = expectedDownloadedFilename(params.file) ?? "download";
   const expression = `(() => {
     const anchor = document.createElement('a');
@@ -1096,7 +1104,11 @@ async function clickGeneratedDownloadUrl(params: {
   };
 }
 
-async function savedBrowserFileFromPath(filePath: string): Promise<SavedBrowserFile> {
+async function savedBrowserFileFromPath(
+  filePath: string,
+  assertPageAffinity?: (action: string) => Promise<void>,
+): Promise<SavedBrowserFile> {
+  await assertPageAffinity?.("browser download artifact save");
   const filename = path.basename(filePath);
   const stat = await fs.stat(filePath);
   const mimeType = mimeTypeFromFilename(filename);
@@ -1131,6 +1143,7 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
   downloadWaitMs?: number;
   minTurnIndex?: number | null;
   sessionId?: string;
+  assertPageAffinity?: (action: string) => Promise<void>;
 }): Promise<SavedBrowserFile[]> {
   if (
     (!params.sessionId && !params.downloadPath) ||
@@ -1141,6 +1154,7 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
   const artifactsDir =
     params.downloadPath ?? resolveSessionArtifactsDir(params.sessionId as string);
   await fs.mkdir(artifactsDir, { recursive: true });
+  await params.assertPageAffinity?.("browser download artifact collection");
   const before = new Set(await fs.readdir(artifactsDir).catch(() => []));
   const configured = await configureBrowserDownloadPath({
     Browser: params.Browser,
@@ -1148,6 +1162,7 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
     Page: params.Page,
     logger: params.logger,
     downloadPath: artifactsDir,
+    assertPageAffinity: params.assertPageAffinity,
   }).catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
     params.logger?.(`[browser] Failed to configure browser download path: ${message}`);
@@ -1172,6 +1187,7 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
       allowGenericDownloadLabels: params.allowGenericDownloadLabels,
       timeoutMs: buttonWaitMs,
       logger: params.logger,
+      assertPageAffinity: params.assertPageAffinity,
     });
     if (clickedResult.clicked.length === 0) {
       params.logger?.(
@@ -1190,7 +1206,9 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
       clickedResult.clicked.length,
       downloadWaitMs,
     );
-    return Promise.all(downloaded.map(savedBrowserFileFromPath));
+    return Promise.all(
+      downloaded.map((filePath) => savedBrowserFileFromPath(filePath, params.assertPageAffinity)),
+    );
   }
 
   let clickedCount = 0;
@@ -1211,6 +1229,7 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
       maxClicks: 1,
       timeoutMs: buttonWaitMs,
       logger: params.logger,
+      assertPageAffinity: params.assertPageAffinity,
     });
     params.logger?.(
       `[browser] Button fallback inspected ${clickResult.inspectedCount} control(s) for ${sanitizeCandidateFilename(
@@ -1238,6 +1257,7 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
           file,
           downloadUrl,
           logger: params.logger,
+          assertPageAffinity: params.assertPageAffinity,
         });
       }
     }
@@ -1288,7 +1308,11 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
     );
   }
 
-  return Promise.all([...new Set(downloadedPaths)].map(savedBrowserFileFromPath));
+  return Promise.all(
+    [...new Set(downloadedPaths)].map((filePath) =>
+      savedBrowserFileFromPath(filePath, params.assertPageAffinity),
+    ),
+  );
 }
 
 interface DownloadedFilePayload {
@@ -1301,6 +1325,7 @@ interface DownloadedFilePayload {
 async function fetchDownloadWithNode(
   downloadUrl: string,
   getCookieHeader: (url: string) => Promise<string>,
+  assertPageAffinity?: (action: string) => Promise<void>,
 ): Promise<DownloadedFilePayload> {
   let currentUrl = new URL(downloadUrl);
   for (let redirects = 0; redirects <= DOWNLOAD_REDIRECT_LIMIT; redirects += 1) {
@@ -1321,6 +1346,7 @@ async function fetchDownloadWithNode(
       }
       headers.cookie = cookieHeader;
     }
+    await assertPageAffinity?.("downloadable file download");
     const response = await fetch(currentUrl, {
       headers,
       redirect: "manual",
@@ -1382,7 +1408,9 @@ async function fetchDownloadWithNode(
 async function fetchDownloadWithBrowser(
   Runtime: ChromeClient["Runtime"],
   downloadUrl: string,
+  assertPageAffinity?: (action: string) => Promise<void>,
 ): Promise<DownloadedFilePayload> {
+  await assertPageAffinity?.("downloadable file browser download");
   const expression = `(() => {
     const downloadUrl = ${JSON.stringify(downloadUrl)};
     const encodeBase64 = (bytes) => {
@@ -1456,6 +1484,7 @@ export async function saveChatGptDownloadableFiles(params: {
   files: BrowserDownloadableFile[];
   sessionId?: string;
   logger?: BrowserLogger;
+  assertPageAffinity?: (action: string) => Promise<void>;
 }): Promise<{
   saved: boolean;
   fileCount: number;
@@ -1475,6 +1504,7 @@ export async function saveChatGptDownloadableFiles(params: {
     if (cached !== undefined) {
       return cached;
     }
+    await params.assertPageAffinity?.("downloadable file cookie read");
     const cookieHeader = await buildCookieHeader(Network, downloadUrl);
     cookieHeaders.set(origin, cookieHeader);
     return cookieHeader;
@@ -1484,6 +1514,7 @@ export async function saveChatGptDownloadableFiles(params: {
   const errors: string[] = [];
   for (let index = 0; index < files.length; index += 1) {
     const file = files[index];
+    await params.assertPageAffinity?.("downloadable file download");
     const explicitDownloadUrl = normalizeChatGptDownloadUrl(file.downloadUrl ?? file.url);
     const sandboxDownloadUrl = downloadUrlFromSandboxUrl(file.sandboxUrl ?? file.url);
     const downloadUrl = explicitDownloadUrl ?? sandboxDownloadUrl;
@@ -1506,8 +1537,12 @@ export async function saveChatGptDownloadableFiles(params: {
     try {
       const downloaded =
         strategy === "browser-fetch"
-          ? await fetchDownloadWithBrowser(params.Runtime as ChromeClient["Runtime"], downloadUrl)
-          : await fetchDownloadWithNode(downloadUrl, getCookieHeader);
+          ? await fetchDownloadWithBrowser(
+              params.Runtime as ChromeClient["Runtime"],
+              downloadUrl,
+              params.assertPageAffinity,
+            )
+          : await fetchDownloadWithNode(downloadUrl, getCookieHeader, params.assertPageAffinity);
       const contentType = downloaded.contentType;
       const filename = resolveDownloadedFilename({
         file,
@@ -1515,6 +1550,7 @@ export async function saveChatGptDownloadableFiles(params: {
         contentType,
         index,
       });
+      await params.assertPageAffinity?.("downloadable file artifact save");
       const artifact = await writeBinaryBrowserArtifact({
         sessionId,
         kind: "file",
@@ -1556,6 +1592,7 @@ export async function saveChatGptDownloadableFiles(params: {
       );
     }
   }
+  await params.assertPageAffinity?.("downloadable file artifact final return");
 
   return {
     saved: savedFiles.length > 0,
@@ -1575,16 +1612,21 @@ export async function collectChatGptFileArtifacts(params: {
   answerText?: string | null;
   logger?: BrowserLogger;
   minTurnIndex?: number | null;
+  expectedConversationId?: string;
+  assertPageAffinity?: (action: string) => Promise<void>;
   sessionId?: string;
 }): Promise<{
   files: BrowserDownloadableFile[];
   savedFiles: SavedBrowserFile[];
   fileCount: number;
 }> {
+  await params.assertPageAffinity?.("downloadable file artifact collection");
   const files = await readAssistantDownloadableFiles(
     params.Runtime,
     params.minTurnIndex ?? undefined,
-  ).catch((error) => {
+    params.assertPageAffinity,
+  ).catch(async (error) => {
+    await params.assertPageAffinity?.("downloadable file DOM read failure");
     const message = error instanceof Error ? error.message : String(error);
     params.logger?.(
       `[browser] Failed to inspect assistant DOM file candidates: ${safeDiagnosticText(message, 180)}`,
@@ -1598,6 +1640,7 @@ export async function collectChatGptFileArtifacts(params: {
   );
   const allFiles = dedupeFiles([...files, ...textFiles]);
   if (allFiles.length === 0) {
+    await params.assertPageAffinity?.("downloadable file artifact final return");
     return { files: [], savedFiles: [], fileCount: 0 };
   }
   params.logger?.(`[browser] Found ${allFiles.length} downloadable file candidate(s).`);
@@ -1617,6 +1660,7 @@ export async function collectChatGptFileArtifacts(params: {
     files: allFiles,
     sessionId: params.sessionId,
     logger: params.logger,
+    assertPageAffinity: params.assertPageAffinity,
   });
   const buttonSavedFiles =
     saved.failedFiles.length > 0
@@ -1630,6 +1674,7 @@ export async function collectChatGptFileArtifacts(params: {
           allowGenericDownloadLabels: saved.savedFiles.length === 0,
           minTurnIndex: params.minTurnIndex,
           sessionId: params.sessionId,
+          assertPageAffinity: params.assertPageAffinity,
         })
       : [];
   const savedFiles = [...saved.savedFiles, ...buttonSavedFiles];
@@ -1644,6 +1689,7 @@ export async function collectChatGptFileArtifacts(params: {
   } else {
     params.logger?.(`[browser] Saved ${savedFiles.length} downloadable file artifact(s).`);
   }
+  await params.assertPageAffinity?.("downloadable file artifact final return");
   return {
     files: allFiles,
     savedFiles,

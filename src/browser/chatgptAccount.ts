@@ -5,6 +5,28 @@ export interface ChatGptAccountIdentity {
   accountDigest: string;
   email: string;
 }
+
+export const MAX_CHATGPT_ACCOUNT_ID_LENGTH = 512;
+export const MAX_CHATGPT_ACCOUNT_EMAIL_LENGTH = 320;
+export const MAX_CHATGPT_JWT_SEGMENT_LENGTH = 8_192;
+
+const CHATGPT_EMAIL_PATTERN =
+  /^[^@\s]{1,64}@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+
+export function normalizeChatGptAccountEmail(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const email = value.trim().toLowerCase();
+  return email.length <= MAX_CHATGPT_ACCOUNT_EMAIL_LENGTH && CHATGPT_EMAIL_PATTERN.test(email)
+    ? email
+    : undefined;
+}
+
+export function normalizeChatGptAccountDigest(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const digest = value.trim().toLowerCase();
+  return /^[a-f0-9]{64}$/.test(digest) ? digest : undefined;
+}
+
 const DEFAULT_ACCOUNT_IDENTITY_TIMEOUT_MS = 10_000;
 const ACCOUNT_IDENTITY_TIMEOUT_ERROR =
   "Timed out while reading authenticated ChatGPT account identity.";
@@ -43,9 +65,15 @@ export async function readChatGptAccountIdentity(
             controller.signal.aborted
           ) return null;
           const body = await response.json();
-          const userId = typeof body?.user?.id === 'string' ? body.user.id.trim() : '';
-          const email = typeof body?.user?.email === 'string'
+          const rawUserId = typeof body?.user?.id === 'string' ? body.user.id.trim() : '';
+          const rawEmail = typeof body?.user?.email === 'string'
             ? body.user.email.trim().toLowerCase()
+            : '';
+          const userId = rawUserId.length > 0 && rawUserId.length <= ${MAX_CHATGPT_ACCOUNT_ID_LENGTH}
+            ? rawUserId
+            : '';
+          const email = rawEmail.length <= ${MAX_CHATGPT_ACCOUNT_EMAIL_LENGTH} && ${CHATGPT_EMAIL_PATTERN}.test(rawEmail)
+            ? rawEmail
             : '';
           if (!userId || !email || !globalThis.crypto?.subtle) return null;
           const bytes = new Uint8Array(await crypto.subtle.digest(
@@ -68,19 +96,12 @@ export async function readChatGptAccountIdentity(
     ACCOUNT_IDENTITY_TIMEOUT_ERROR,
   );
   const identity = outcome.result?.value as Partial<ChatGptAccountIdentity> | null | undefined;
-  if (
-    !identity ||
-    typeof identity.accountDigest !== "string" ||
-    !/^[a-f0-9]{64}$/.test(identity.accountDigest) ||
-    typeof identity.email !== "string" ||
-    !identity.email.trim()
-  ) {
+  const accountDigest = normalizeChatGptAccountDigest(identity?.accountDigest);
+  const email = normalizeChatGptAccountEmail(identity?.email);
+  if (!accountDigest || !email) {
     throw new Error("Authenticated ChatGPT account identity and email are unavailable.");
   }
-  return {
-    accountDigest: identity.accountDigest,
-    email: identity.email.trim().toLowerCase(),
-  };
+  return { accountDigest, email };
 }
 
 export async function assertChatGptAccountEmail(
@@ -89,9 +110,9 @@ export async function assertChatGptAccountEmail(
   action: string,
   remainingMs?: number,
 ): Promise<string> {
-  const normalizedEmail = expectedEmail.trim().toLowerCase();
+  const normalizedEmail = normalizeChatGptAccountEmail(expectedEmail);
   if (!normalizedEmail) {
-    throw new Error("Expected ChatGPT account email is unavailable.");
+    throw new Error("Expected ChatGPT account email is unavailable or invalid.");
   }
   const observed = await readChatGptAccountIdentity(Runtime, remainingMs);
   if (observed.email !== normalizedEmail) {
@@ -107,12 +128,13 @@ export async function assertChatGptAccountAffinity(
   action: string,
   remainingMs?: number,
 ): Promise<string> {
-  const normalizedEmail = expectedEmail.trim().toLowerCase();
-  if (!/^[a-f0-9]{64}$/.test(expectedAccountDigest) || !normalizedEmail) {
+  const normalizedDigest = normalizeChatGptAccountDigest(expectedAccountDigest);
+  const normalizedEmail = normalizeChatGptAccountEmail(expectedEmail);
+  if (!normalizedDigest || !normalizedEmail) {
     throw new Error("Expected ChatGPT account affinity is incomplete or invalid.");
   }
   const observed = await readChatGptAccountIdentity(Runtime, remainingMs);
-  if (observed.accountDigest !== expectedAccountDigest) {
+  if (observed.accountDigest !== normalizedDigest) {
     throw new Error(`Remote Chrome account identity changed before ${action}.`);
   }
   if (observed.email !== normalizedEmail) {
