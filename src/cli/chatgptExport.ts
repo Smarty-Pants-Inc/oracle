@@ -49,13 +49,13 @@ export type ChatGptExportRemoteChromeTarget =
   | ChatGptExportRemoteChromeAffinity;
 
 function storedConversationUrls(metadata: SessionMetadata): Array<string | null | undefined> {
-  const optionsConfig = metadata.options.browserConfig;
+  const optionsConfig = metadata.options?.browserConfig;
   const browserConfig = metadata.browser?.config;
   return [
     metadata.browser?.harvest?.url,
     metadata.browser?.runtime?.tabUrl,
     metadata.browser?.archive?.conversationUrl,
-    metadata.options.browserResumeConversationUrl,
+    metadata.options?.browserResumeConversationUrl,
     optionsConfig?.resumeConversationUrl,
     optionsConfig?.chatgptUrl,
     optionsConfig?.url,
@@ -79,7 +79,7 @@ function storedRemoteChromeAffinities(
 ): ChatGptExportRemoteChromeTarget[] {
   const runtimeBrowserWSEndpoint = metadata.browser?.runtime?.chromeBrowserWSEndpoint?.trim();
   const affinities = new Map<string, ChatGptExportRemoteChromeTarget>();
-  for (const config of [metadata.options.browserConfig, metadata.browser?.config]) {
+  for (const config of [metadata.options?.browserConfig, metadata.browser?.config]) {
     const endpoint = config?.remoteChrome;
     if (!endpoint) continue;
     const host = typeof endpoint.host === "string" ? endpoint.host.trim() : "";

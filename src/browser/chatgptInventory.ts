@@ -8,8 +8,27 @@ import { delay } from "./utils.js";
 const CHATGPT_ORIGIN = "https://chatgpt.com";
 const CHATGPT_CONVERSATIONS_URL = `${CHATGPT_ORIGIN}/backend-api/conversations`;
 const CHATGPT_SESSION_URL = `${CHATGPT_ORIGIN}/api/auth/session`;
-const INVENTORY_RETRY_BUDGET_MS = 8 * 60_000;
 const INVENTORY_RETRY_DELAYS_MS = [15_000, 45_000, 120_000, 240_000] as const;
+async function runBeforeInventoryDeadline<T>(
+  operation: () => Promise<T>,
+  deadline: number,
+  action: string,
+): Promise<T> {
+  const remaining = deadline - Date.now();
+  const timeoutMessage = `Timed out while ${action}.`;
+  if (remaining <= 0) throw new Error(timeoutMessage);
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(timeoutMessage)), remaining);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export interface ChatGptInventoryOptions {
   host: string;
@@ -189,7 +208,7 @@ export function buildChatGptInventoryAuthCaptureHook(): string {
   return `
 (() => {
   const KEY = "__oracleChatGptInventory";
-  if (window[KEY]?.version === 3) return;
+  if (window[KEY]?.version === 4) return;
   try { window[KEY]?.cleanup?.(); } catch {}
   const ORIGIN = ${JSON.stringify(CHATGPT_ORIGIN)};
   const CONVERSATIONS_PATH = "/backend-api/conversations";
@@ -233,16 +252,25 @@ export function buildChatGptInventoryAuthCaptureHook(): string {
       return null;
     }
   };
-  const requestJson = async (rawUrl, headers, credentials) => {
+  const requestJson = async (rawUrl, headers, credentials, deadline) => {
+    let controller = null;
+    let timeout = null;
     try {
       const url = new URL(rawUrl);
       if (url.origin !== ORIGIN) return { ok: false, reason: "origin" };
+      const remaining = deadline - Date.now();
+      if (!Number.isFinite(remaining) || remaining <= 0) {
+        return { ok: false, reason: "timeout" };
+      }
+      controller = new AbortController();
+      timeout = setTimeout(() => controller.abort(), remaining);
       const response = await originalFetch.call(window, url.href, {
         method: "GET",
         credentials,
         cache: "no-store",
         redirect: "error",
         headers,
+        signal: controller.signal,
       });
       const details = {
         status: response.status,
@@ -266,14 +294,20 @@ export function buildChatGptInventoryAuthCaptureHook(): string {
       try {
         return { ok: true, body: await response.json(), ...details };
       } catch {
-        return { ok: false, reason: "json", ...details };
+        return {
+          ok: false,
+          reason: controller.signal.aborted ? "timeout" : "json",
+          ...details,
+        };
       }
     } catch {
-      return { ok: false, reason: "request" };
+      return { ok: false, reason: controller?.signal.aborted ? "timeout" : "request" };
+    } finally {
+      clearTimeout(timeout);
     }
   };
-  const readIdentity = async (headers, credentials) => {
-    const response = await requestJson(SESSION_URL, headers, credentials);
+  const readIdentity = async (headers, credentials, deadline) => {
+    const response = await requestJson(SESSION_URL, headers, credentials, deadline);
     if (!response.ok) return response;
     const identityFailure = () => ({
       ok: false,
@@ -306,17 +340,18 @@ export function buildChatGptInventoryAuthCaptureHook(): string {
     }
   };
   const inventory = {
-    version: 3,
+    version: 4,
     get ready() { return capturedHeaders instanceof Headers; },
-    async readCookieIdentity() {
-      return readIdentity(new Headers({ accept: "application/json" }), "include");
+    async readCookieIdentity(deadline) {
+      return readIdentity(new Headers({ accept: "application/json" }), "include", deadline);
     },
-    async bindRetainedAuthorization() {
+    async bindRetainedAuthorization(deadline) {
       const headers = copyCapturedHeaders();
       if (!headers) return { ok: false, reason: "auth" };
       const cookieIdentity = await readIdentity(
         new Headers({ accept: "application/json" }),
         "include",
+        deadline,
       );
       if (!cookieIdentity.ok) return cookieIdentity;
       const bearerIdentity = await identityFromAuthorization(headers);
@@ -336,14 +371,14 @@ export function buildChatGptInventoryAuthCaptureHook(): string {
       retainedHeaders = new Headers(headers);
       return cookieIdentity;
     },
-    async fetchPage(rawUrl) {
+    async fetchPage(rawUrl, deadline) {
       try {
         const url = new URL(rawUrl);
         if (url.origin !== ORIGIN || url.pathname !== CONVERSATIONS_PATH) {
           return { ok: false, reason: "origin" };
         }
         if (!(retainedHeaders instanceof Headers)) return { ok: false, reason: "auth" };
-        return await requestJson(url.href, new Headers(retainedHeaders), "include");
+        return await requestJson(url.href, new Headers(retainedHeaders), "include", deadline);
       } catch {
         return { ok: false, reason: "request" };
       }
@@ -394,9 +429,11 @@ export function buildChatGptInventoryPageExpression(
   archived: boolean,
   offset: number,
   limit: number,
+  deadline = Date.now() + 30_000,
 ): string {
   return `(() => (async () => {
     try {
+      const DEADLINE = ${JSON.stringify(deadline)};
       const url = new URL(${JSON.stringify(CHATGPT_CONVERSATIONS_URL)});
       url.searchParams.set('offset', ${JSON.stringify(String(offset))});
       url.searchParams.set('limit', ${JSON.stringify(String(limit))});
@@ -406,7 +443,7 @@ export function buildChatGptInventoryPageExpression(
       if (!inventory || typeof inventory.fetchPage !== 'function') {
         return { ok: false, reason: 'auth' };
       }
-      return await inventory.fetchPage(url.href);
+      return await inventory.fetchPage(url.href, DEADLINE);
     } catch {
       return { ok: false, reason: 'request' };
     }
@@ -431,23 +468,33 @@ async function evaluateInventoryIdentity(
   method: "readCookieIdentity" | "bindRetainedAuthorization",
   expectedEmail: string,
   action: string,
+  deadline: number,
 ): Promise<InventoryIdentity> {
-  const outcome = await Runtime.evaluate({
-    expression: `(() => {
+  const outcome = await runBeforeInventoryDeadline(
+    () =>
+      Runtime.evaluate({
+        expression: `(() => {
+      const deadline = ${JSON.stringify(deadline)};
       const inventory = window.__oracleChatGptInventory;
       return inventory && typeof inventory.${method} === "function"
-        ? inventory.${method}()
+        ? inventory.${method}(deadline)
         : { ok: false, reason: "auth" };
     })()`,
-    awaitPromise: true,
-    returnByValue: true,
-  });
+        awaitPromise: true,
+        returnByValue: true,
+      }),
+    deadline,
+    action,
+  );
   if (outcome.exceptionDetails) {
     throw new Error(`${action} request failed in page context.`);
   }
   const envelope = asRecord(outcome.result?.value) as InventoryIdentityEnvelope | null;
   assertExactInventoryResponse(envelope, CHATGPT_SESSION_URL, action);
   if (envelope?.ok !== true) {
+    if (envelope?.reason === "timeout") {
+      throw new Error(`Timed out while ${action}.`);
+    }
     if (envelope?.reason === "identity") {
       throw new Error(`${action} is unavailable.`);
     }
@@ -476,28 +523,37 @@ async function evaluateInventoryPage(
   archived: boolean,
   offset: number,
   limit: number,
-  retryDeadline: number,
+  deadline: number,
 ): Promise<unknown> {
+  const action = "ChatGPT conversation inventory request";
   const expectedUrl = buildChatGptInventoryPageUrl(archived, offset, limit);
   for (let attempt = 0; ; attempt += 1) {
-    const outcome = await Runtime.evaluate({
-      expression: buildChatGptInventoryPageExpression(archived, offset, limit),
-      awaitPromise: true,
-      returnByValue: true,
-    });
+    const outcome = await runBeforeInventoryDeadline(
+      () =>
+        Runtime.evaluate({
+          expression: buildChatGptInventoryPageExpression(archived, offset, limit, deadline),
+          awaitPromise: true,
+          returnByValue: true,
+        }),
+      deadline,
+      action,
+    );
     if (outcome.exceptionDetails) {
-      throw new Error("ChatGPT conversation inventory request failed in page context.");
+      throw new Error(`${action} failed in page context.`);
     }
     const envelope = asRecord(outcome.result?.value) as InventoryPageEnvelope | null;
-    assertExactInventoryResponse(envelope, expectedUrl, "ChatGPT conversation inventory request");
+    assertExactInventoryResponse(envelope, expectedUrl, action);
     if (envelope?.ok === true) return envelope.body;
+    if (envelope?.reason === "timeout") {
+      throw new Error(`Timed out while ${action}.`);
+    }
 
     const status = typeof envelope?.status === "number" ? envelope.status : undefined;
     const retryable = status === 429 || (status !== undefined && status >= 500 && status <= 599);
     const fallbackDelay = INVENTORY_RETRY_DELAYS_MS[attempt];
     if (!retryable || fallbackDelay === undefined) {
       const suffix = status === undefined ? "" : ` (HTTP ${status})`;
-      throw new Error(`ChatGPT conversation inventory request failed${suffix}.`);
+      throw new Error(`${action} failed${suffix}.`);
     }
     const requestedDelay =
       typeof envelope?.retryAfterMs === "number" &&
@@ -505,24 +561,28 @@ async function evaluateInventoryPage(
       envelope.retryAfterMs >= 0
         ? envelope.retryAfterMs
         : fallbackDelay;
-    const remaining = retryDeadline - Date.now();
+    const remaining = deadline - Date.now();
     if (requestedDelay >= remaining) {
-      throw new Error(`ChatGPT conversation inventory request failed (HTTP ${status}).`);
+      throw new Error(`Timed out while retrying ${action}.`);
     }
-    await delay(requestedDelay);
+    await runBeforeInventoryDeadline(() => delay(requestedDelay), deadline, `retrying ${action}`);
   }
 }
 
 async function waitForChatGptDocument(
   Runtime: ChromeClient["Runtime"],
-  timeoutMs: number,
+  deadline: number,
 ): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const outcome = await Runtime.evaluate({
-      expression: `({ href: location.href, readyState: document.readyState })`,
-      returnByValue: true,
-    });
+    const outcome = await runBeforeInventoryDeadline(
+      () =>
+        Runtime.evaluate({
+          expression: `({ href: location.href, readyState: document.readyState })`,
+          returnByValue: true,
+        }),
+      deadline,
+      "waiting for the disposable ChatGPT inventory page",
+    );
     const state = asRecord(outcome.result?.value);
     if (
       typeof state?.href === "string" &&
@@ -531,23 +591,27 @@ async function waitForChatGptDocument(
     ) {
       return;
     }
-    await delay(100);
+    await delay(Math.min(100, Math.max(0, deadline - Date.now())));
   }
   throw new Error("Timed out waiting for the disposable ChatGPT inventory page.");
 }
 
 async function waitForAuthenticatedInventoryRequest(
   Runtime: ChromeClient["Runtime"],
-  timeoutMs: number,
+  deadline: number,
 ): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const outcome = await Runtime.evaluate({
-      expression: "Boolean(window.__oracleChatGptInventory?.ready)",
-      returnByValue: true,
-    });
+    const outcome = await runBeforeInventoryDeadline(
+      () =>
+        Runtime.evaluate({
+          expression: "Boolean(window.__oracleChatGptInventory?.ready)",
+          returnByValue: true,
+        }),
+      deadline,
+      "waiting for an authenticated ChatGPT conversation request",
+    );
     if (outcome.result?.value === true) return;
-    await delay(100);
+    await delay(Math.min(100, Math.max(0, deadline - Date.now())));
   }
   throw new Error("Timed out waiting for an authenticated ChatGPT conversation request.");
 }
@@ -583,34 +647,54 @@ export async function captureChatGptConversationInventory(
   let operationError: unknown;
   try {
     const timeoutMs = options.timeoutMs ?? 30_000;
+    const deadline = Date.now() + timeoutMs;
     const pageSize = options.pageSize ?? 100;
     if (!Number.isInteger(pageSize) || pageSize <= 0) {
       throw new Error("ChatGPT inventory page size must be a positive integer.");
     }
     const authCaptureHook = buildChatGptInventoryAuthCaptureHook();
-    await Page.enable();
+    await runBeforeInventoryDeadline(
+      () => Page.enable(),
+      deadline,
+      "preparing the ChatGPT inventory target",
+    );
     cleanupRequired = true;
-    await Runtime.evaluate({
-      expression: authCaptureHook,
-      awaitPromise: false,
-      returnByValue: true,
-    });
-    const registration = await Page.addScriptToEvaluateOnNewDocument({ source: authCaptureHook });
+    await runBeforeInventoryDeadline(
+      () =>
+        Runtime.evaluate({
+          expression: authCaptureHook,
+          awaitPromise: false,
+          returnByValue: true,
+        }),
+      deadline,
+      "installing ChatGPT inventory authorization capture",
+    );
+    const registration = await runBeforeInventoryDeadline(
+      () => Page.addScriptToEvaluateOnNewDocument({ source: authCaptureHook }),
+      deadline,
+      "registering ChatGPT inventory authorization capture",
+    );
     captureScriptIdentifier = registration.identifier;
-    await Page.navigate({ url: "https://chatgpt.com/" });
-    await waitForChatGptDocument(Runtime, timeoutMs);
-    await waitForAuthenticatedInventoryRequest(Runtime, timeoutMs);
+    await runBeforeInventoryDeadline(
+      () => Page.navigate({ url: "https://chatgpt.com/" }),
+      deadline,
+      "navigating the ChatGPT inventory target",
+    );
+    await waitForChatGptDocument(Runtime, deadline);
+    await waitForAuthenticatedInventoryRequest(Runtime, deadline);
     const cookieIdentity = await evaluateInventoryIdentity(
       Runtime,
       "readCookieIdentity",
       expectedEmail,
       "ChatGPT inventory cookie identity",
+      deadline,
     );
     const bearerIdentity = await evaluateInventoryIdentity(
       Runtime,
       "bindRetainedAuthorization",
       expectedEmail,
       "ChatGPT inventory bearer identity",
+      deadline,
     );
     if (
       bearerIdentity.email !== cookieIdentity.email ||
@@ -620,13 +704,12 @@ export async function captureChatGptConversationInventory(
         "Retained ChatGPT authorization does not match the authenticated ChatGPT account.",
       );
     }
-    const retryDeadline = Date.now() + INVENTORY_RETRY_BUDGET_MS;
     const active = await paginateChatGptConversationList(
-      (offset) => evaluateInventoryPage(Runtime, false, offset, pageSize, retryDeadline),
+      (offset) => evaluateInventoryPage(Runtime, false, offset, pageSize, deadline),
       false,
     );
     const archived = await paginateChatGptConversationList(
-      (offset) => evaluateInventoryPage(Runtime, true, offset, pageSize, retryDeadline),
+      (offset) => evaluateInventoryPage(Runtime, true, offset, pageSize, deadline),
       true,
     );
     const completionIdentity = await evaluateInventoryIdentity(
@@ -634,6 +717,7 @@ export async function captureChatGptConversationInventory(
       "readCookieIdentity",
       expectedEmail,
       "ChatGPT inventory completion cookie identity",
+      deadline,
     );
     if (
       completionIdentity.email !== cookieIdentity.email ||

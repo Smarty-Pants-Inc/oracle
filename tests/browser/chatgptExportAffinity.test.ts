@@ -48,6 +48,7 @@ describe("ChatGPT export account receipt", () => {
 
   afterEach(async () => {
     vi.unstubAllGlobals();
+    vi.useRealTimers();
     liveTabMocks.connectToExistingChatGptTab.mockReset();
     liveTabMocks.openChatGptTarget.mockReset();
     lifecycleMocks.closeTab.mockReset();
@@ -434,6 +435,23 @@ describe("ChatGPT export account receipt", () => {
       },
     });
     expect(result).not.toHaveProperty("accountDigest");
+    const payload = JSON.parse(await fs.readFile(result.payloadPath, "utf8"));
+    const markdown = await fs.readFile(result.markdownPath, "utf8");
+    const manifest = JSON.parse(await fs.readFile(result.manifestPath, "utf8"));
+    expect(payload).toMatchObject({
+      capture_route: "authenticated-affinity-bound-exact-get",
+      extraction_method: "authenticated-affinity-bound-exact-get",
+      backend_probe: { method: "authenticated-affinity-bound-exact-get" },
+    });
+    expect(markdown).toContain("- Capture route: authenticated-affinity-bound-exact-get");
+    expect(manifest).toMatchObject({
+      capture_route: "authenticated-affinity-bound-exact-get",
+      extraction_method: "authenticated-affinity-bound-exact-get",
+      backend_probe: { method: "authenticated-affinity-bound-exact-get" },
+    });
+    expect(`${JSON.stringify(payload)}\n${markdown}\n${JSON.stringify(manifest)}`).not.toContain(
+      "document_start_fetch_clone_on_reload",
+    );
     const exactGetExpressions = evaluatedExpressions.filter((expression) =>
       expression.includes('kind: "authenticated-exact-get"'),
     );
@@ -454,6 +472,99 @@ describe("ChatGPT export account receipt", () => {
     expect(liveTabMocks.openChatGptTarget).not.toHaveBeenCalled();
     expect(archiveMocks.archiveChatGptConversation).not.toHaveBeenCalled();
     expect(close).toHaveBeenCalledOnce();
+  });
+
+  test("uses the remaining export deadline for a stalled exact GET and still cleans up", async () => {
+    const outDir = await freshOutputDir("oracle-chatgpt-export-timeout-");
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const accountDigest = "a".repeat(64);
+    const events: string[] = [];
+    let exactGetExpression = "";
+    let documentChecks = 0;
+    let signalExactGetStarted: () => void;
+    const exactGetStarted = new Promise<void>((resolve) => {
+      signalExactGetStarted = resolve;
+    });
+
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ webSocketDebuggerUrl: browserWSEndpoint }),
+      }),
+    );
+    const Runtime = {
+      evaluate: vi.fn(({ expression }: { expression: string }) => {
+        if (expression === "document.readyState") {
+          documentChecks += 1;
+          return Promise.resolve({
+            result: { value: documentChecks === 1 ? "loading" : "complete" },
+          });
+        }
+        if (expression === "location.href" || expression.includes('typeof location === "object"')) {
+          return Promise.resolve({ result: { value: "https://chatgpt.com/" } });
+        }
+        if (expression === "document.title") {
+          return Promise.resolve({ result: { value: "ChatGPT" } });
+        }
+        if (expression.includes('kind: "authenticated-exact-get"')) {
+          exactGetExpression = expression;
+          signalExactGetStarted();
+          return new Promise<never>(() => undefined);
+        }
+        if (expression.includes("/api/auth/session")) {
+          return Promise.resolve({
+            result: { value: { accountDigest, email: "owner@example.test" } },
+          });
+        }
+        if (expression.includes("sessionStorage.removeItem")) {
+          events.push("cleanup");
+          return Promise.resolve({ result: { value: true } });
+        }
+        throw new Error(`Unexpected Runtime.evaluate expression: ${expression.slice(0, 80)}`);
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    const close = vi.fn(async () => {
+      events.push("close");
+    });
+    lifecycleMocks.connectToRemoteChromeTarget.mockResolvedValue({
+      client: { Runtime, Page: { enable: vi.fn(async () => undefined) } },
+      targetId: "target-timeout",
+      browserWSEndpoint,
+      close,
+    });
+
+    const capture = captureApprovedChatGptConversationBackend({
+      targetUrl: "https://chatgpt.com/c/conv-active",
+      outDir,
+      host: "127.0.0.1",
+      port: 9223,
+      browserId: "browser-a",
+      browserWSEndpoint,
+      accountDigest,
+      expectedEmail: "owner@example.test",
+      knownArchived: false,
+      timeoutMs: 250,
+    });
+    const captureFailure = capture.catch((error: unknown) => error);
+
+    await vi.advanceTimersByTimeAsync(100);
+    await exactGetStarted;
+    expect(exactGetExpression).toContain("const DEADLINE = 250");
+    expect(exactGetExpression).toContain('requestWithinDeadline(\n    "/api/auth/session",');
+    expect(exactGetExpression).toContain("requestWithinDeadline(\n    TARGET,");
+    expect(exactGetExpression).toContain("signal: controller.signal");
+
+    await vi.advanceTimersByTimeAsync(150);
+    const failure = await captureFailure;
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toMatch(
+      /timed out waiting for authenticated ChatGPT exact GET/i,
+    );
+    expect(documentChecks).toBe(2);
+    expect(events).toEqual(["cleanup", "close"]);
   });
 
   test("cleans captured exact-GET state when the CDP result handoff fails", async () => {
@@ -704,7 +815,7 @@ describe("ChatGPT export account receipt", () => {
         `const EXPECTED_EMAIL = ${expectedEmail ? `"${expectedEmail}"` : "null"}`,
       );
       expect(exactGetExpressions[0]).toContain('method: "GET"');
-      expect(exactGetExpressions[0]).toContain('fetch("/api/auth/session"');
+      expect(exactGetExpressions[0]).toContain('requestWithinDeadline(\n    "/api/auth/session",');
       expect(exactGetExpressions[0]).toContain(
         'headers.set("authorization", "Bearer " + accessToken)',
       );

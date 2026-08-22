@@ -3595,7 +3595,7 @@ async function runRemoteBrowserMode(
 
     if (config.resumeConversationUrl) {
       await navigateToChatGPT(Page, Runtime, config.resumeConversationUrl, logger);
-    } else if (!attachedExistingTab && !expectedAccountDigest) {
+    } else if (!attachedExistingTab) {
       await navigateToChatGPT(Page, Runtime, config.url, logger);
     }
     await ensureNotBlocked(Runtime, config.headless, logger);

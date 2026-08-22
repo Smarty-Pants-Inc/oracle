@@ -107,11 +107,13 @@ describe("archiveChatGptConversation", () => {
       }),
     };
     const logger = vi.fn();
+    const deadline = Date.now() + 10_000;
 
     await expect(
       archiveChatGptConversation(runtime as never, logger as never, {
         mode: "auto",
         conversationUrl: "https://chatgpt.com/c/abc",
+        deadline,
       }),
     ).resolves.toMatchObject({
       mode: "auto",
@@ -120,7 +122,11 @@ describe("archiveChatGptConversation", () => {
       conversationUrl: "https://chatgpt.com/c/abc",
     });
     expect(runtime.evaluate).toHaveBeenCalledWith(
-      expect.objectContaining({ awaitPromise: true, returnByValue: true }),
+      expect.objectContaining({
+        awaitPromise: true,
+        expression: expect.stringContaining(`const deadline = ${deadline};`),
+        returnByValue: true,
+      }),
     );
   });
 
@@ -297,6 +303,57 @@ describe("archiveChatGptConversation", () => {
     ).resolves.toMatchObject({ status: "skipped", reason: "affinity-mismatch" });
     expect(domAccess).not.toHaveBeenCalled();
   });
+  test("bounds a stalled account-affinity probe by the caller deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(0);
+      const expression = buildArchiveConversationExpressionForTest({
+        expectedConversationId: "abc",
+        expectedAccountDigest: "a".repeat(64),
+        deadline: Date.now() + 100,
+      });
+      const domAccess = vi.fn();
+      const document = new Proxy(
+        {},
+        {
+          get() {
+            domAccess();
+            throw new Error("DOM mutation path reached");
+          },
+        },
+      );
+      const fetch = vi.fn(
+        (_url: unknown, init?: RequestInit) =>
+          new Promise<never>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+              once: true,
+            });
+          }),
+      );
+      const evaluate = new Function("location", "document", "fetch", `return ${expression};`) as (
+        location: { href: string },
+        document: object,
+        fetch: typeof globalThis.fetch,
+      ) => Promise<{
+        status: string;
+        reason?: string;
+      }>;
+
+      const result = evaluate({ href: "https://chatgpt.com/c/abc" }, document, fetch as never);
+      await vi.advanceTimersByTimeAsync(100);
+
+      await expect(result).resolves.toMatchObject({
+        status: "skipped",
+        reason: "affinity-mismatch",
+      });
+      expect(fetch).toHaveBeenCalledTimes(1);
+      const [, requestInit] = fetch.mock.calls[0] as [string, RequestInit];
+      expect(requestInit.signal?.aborted).toBe(true);
+      expect(domAccess).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   test("rechecks account affinity after opening the menu and before archive mutation", async () => {
     const expectedAccountDigest = createHash("sha256").update("account-a").digest("hex");
@@ -349,7 +406,7 @@ describe("archiveChatGptConversation", () => {
       window: { innerWidth: number },
       PointerEvent: typeof EventStub,
       MouseEvent: typeof EventStub,
-      setTimeout: (callback: () => void) => number,
+      setTimeout: (callback: () => void, ms?: number) => number,
     ) => Promise<{ status: string; reason?: string }>;
 
     await expect(
@@ -362,8 +419,8 @@ describe("archiveChatGptConversation", () => {
         { innerWidth: 1200 },
         EventStub,
         EventStub,
-        (callback) => {
-          callback();
+        (callback, ms) => {
+          if (ms === 350) callback();
           return 0;
         },
       ),
@@ -382,7 +439,9 @@ describe("archiveChatGptConversation", () => {
     expect(expression).toContain("hasUnarchiveMenuItem");
     expect(expression).toContain("PointerEvent");
     expect(expression).toContain("waitForArchiveConfirmation");
-    expect(expression).toContain("Date.now() + 10_000");
+    expect(expression).toContain("const deadline =");
+    expect(expression).toContain("AbortController");
+    expect(expression).toContain("Promise.withResolvers");
     expect(expression).toContain("archive-not-confirmed");
     expect(expression).toContain("archive");
     expect(expression).not.toContain("delete");

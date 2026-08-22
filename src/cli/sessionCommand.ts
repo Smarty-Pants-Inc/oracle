@@ -48,6 +48,7 @@ interface SessionCommandDependencies {
     sessionId: string,
     options?: BrowserLiveTailOptions,
   ) => Promise<unknown>;
+  readSession: (sessionId: string) => Promise<{ id: string } | null>;
   usesDefaultStatusFilters: (cmd: Command) => boolean;
   deleteSessionsOlderThan: (options?: {
     hours?: number;
@@ -67,6 +68,7 @@ const defaultDependencies: SessionCommandDependencies = {
   usesDefaultStatusFilters,
   deleteSessionsOlderThan: (options) => sessionStore.deleteOlderThan(options),
   getSessionPaths: (sessionId) => sessionStore.getPaths(sessionId),
+  readSession: (sessionId) => sessionStore.readSession(sessionId),
   writeSessionIdReceipt,
 };
 
@@ -179,21 +181,24 @@ export async function handleSessionCommand(
     }
     // Commander sets `recover: false` when --no-recover is passed; default is `true`.
     const recoverIfMissing = sessionOptions.recover !== false;
+    const metadata = await deps.readSession(sessionId);
+    if (!metadata) {
+      throw new Error(`No session found with ID ${sessionId}.`);
+    }
     if (harvestRequested) {
       await deps.harvestSessionBrowserOutput(sessionId, {
         writeOutputPath,
         browserTabRef,
         recoverIfMissing,
       });
-      await deps.writeSessionIdReceipt(sessionId);
-      return;
+    } else {
+      await deps.liveTailSessionBrowserOutput(sessionId, {
+        writeOutputPath,
+        browserTabRef,
+        recoverIfMissing,
+      });
     }
-    await deps.liveTailSessionBrowserOutput(sessionId, {
-      writeOutputPath,
-      browserTabRef,
-      recoverIfMissing,
-    });
-    await deps.writeSessionIdReceipt(sessionId);
+    await deps.writeSessionIdReceipt(metadata.id);
     return;
   }
   if (!sessionId) {

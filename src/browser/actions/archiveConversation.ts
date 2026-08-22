@@ -79,10 +79,12 @@ export async function archiveChatGptConversation(
     mode,
     conversationUrl,
     expectedAccountDigest,
+    deadline,
   }: {
     mode: BrowserArchiveMode;
     conversationUrl?: string | null;
     expectedAccountDigest?: string;
+    deadline?: number;
   },
 ): Promise<BrowserArchiveResult> {
   const affinity = resolveArchiveConversationAffinity(conversationUrl);
@@ -96,11 +98,14 @@ export async function archiveChatGptConversation(
       error: "originating conversation identity is unavailable",
     };
   }
+  const resolvedDeadline =
+    typeof deadline === "number" && Number.isFinite(deadline) ? deadline : Date.now() + 10_000;
   const evaluated = await Runtime.evaluate({
     expression: buildArchiveConversationExpression({
       expectedOrigin: affinity.origin,
       expectedConversationId: affinity.conversationId,
       expectedAccountDigest,
+      deadline: resolvedDeadline,
     }),
     awaitPromise: true,
     returnByValue: true,
@@ -135,11 +140,16 @@ export function buildArchiveConversationExpressionForTest(options?: {
   expectedOrigin?: string;
   expectedConversationId?: string;
   expectedAccountDigest?: string;
+  deadline?: number;
 }): string {
   return buildArchiveConversationExpression({
     expectedOrigin: options?.expectedOrigin ?? "https://chatgpt.com",
     expectedConversationId: options?.expectedConversationId ?? "abc",
     expectedAccountDigest: options?.expectedAccountDigest,
+    deadline:
+      typeof options?.deadline === "number" && Number.isFinite(options.deadline)
+        ? options.deadline
+        : Date.now() + 10_000,
   });
 }
 
@@ -147,15 +157,18 @@ function buildArchiveConversationExpression({
   expectedOrigin,
   expectedConversationId,
   expectedAccountDigest,
+  deadline,
 }: {
   expectedOrigin: string;
   expectedConversationId: string;
   expectedAccountDigest?: string;
+  deadline: number;
 }): string {
   return `(() => {
     const expectedOrigin = ${JSON.stringify(expectedOrigin)};
     const expectedConversationId = ${JSON.stringify(expectedConversationId)};
     const expectedAccountDigest = ${JSON.stringify(expectedAccountDigest ?? null)};
+    const deadline = ${JSON.stringify(deadline)};
     let conversationUrl = typeof location === 'object' ? location.href : null;
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     const normalize = (value) =>
@@ -164,21 +177,32 @@ function buildArchiveConversationExpression({
         .trim()
         .toLowerCase();
     const readAccountDigest = async () => {
-      if (!expectedAccountDigest) return null;
+      if (!expectedAccountDigest || Date.now() >= deadline) return null;
+      const controller = new AbortController();
+      const { promise: timeout, resolve: resolveTimeout } = Promise.withResolvers();
+      const timeoutId = setTimeout(() => {
+        controller.abort();
+        resolveTimeout(null);
+      }, Math.max(0, deadline - Date.now()));
       try {
-        const response = await fetch('/api/auth/session', {
-          cache: 'no-store', credentials: 'include',
-        });
-        if (!response.ok) return null;
-        const body = await response.json();
-        const userId = typeof body?.user?.id === 'string' ? body.user.id.trim() : '';
-        if (!userId || !globalThis.crypto?.subtle) return null;
-        const bytes = new Uint8Array(await crypto.subtle.digest(
-          'SHA-256', new TextEncoder().encode(userId),
-        ));
-        return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
-      } catch {
-        return null;
+        return await Promise.race([
+          (async () => {
+            const response = await fetch('/api/auth/session', {
+              cache: 'no-store', credentials: 'include', signal: controller.signal,
+            });
+            if (!response.ok) return null;
+            const body = await response.json();
+            const userId = typeof body?.user?.id === 'string' ? body.user.id.trim() : '';
+            if (!userId || !globalThis.crypto?.subtle) return null;
+            const bytes = new Uint8Array(await crypto.subtle.digest(
+              'SHA-256', new TextEncoder().encode(userId),
+            ));
+            return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+          })().catch(() => null),
+          timeout,
+        ]);
+      } finally {
+        clearTimeout(timeoutId);
       }
     };
     const hasExpectedAffinity = async () => {
@@ -306,15 +330,14 @@ function buildArchiveConversationExpression({
 	        visibleText.includes('archiwum')
 	      );
 	    };
-	    const waitForArchiveConfirmation = async () => {
-	      const deadline = Date.now() + 10_000;
-	      while (Date.now() < deadline) {
-	        if (conversationUrl && location.href !== conversationUrl) return true;
-	        if (hasArchiveConfirmation()) return true;
-	        await sleep(150);
-	      }
-	      return false;
-	    };
+    const waitForArchiveConfirmation = async () => {
+      while (Date.now() < deadline) {
+        if (conversationUrl && location.href !== conversationUrl) return true;
+        if (hasArchiveConfirmation()) return true;
+        await sleep(150);
+      }
+      return false;
+    };
 	    const verifyArchivedStateFromMenu = async () => {
 	      const menuButton = findConversationMenuButton();
 	      if (!menuButton) return false;

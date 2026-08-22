@@ -117,6 +117,39 @@ describe("ChatGPT export endpoint affinity", () => {
     });
   });
 
+  test("resolves legacy metadata without options from browser config and runtime affinity", () => {
+    const browserWSEndpoint = ws("browser-legacy", "127.0.0.1", 9230);
+    const legacy = {
+      id: "legacy",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      status: "completed",
+      browser: {
+        config: {
+          url: "https://chatgpt.com/c/thread-legacy-options",
+          remoteChrome: { host: "127.0.0.1", port: 9230 },
+        },
+        runtime: {
+          chromeBrowserWSEndpoint: browserWSEndpoint,
+          chatGptAccountDigest: accountDigest,
+        },
+      },
+    } as SessionMetadata;
+
+    expect(
+      resolveChatGptExportRemoteChromeForSession(
+        "https://chatgpt.com/c/thread-legacy-options",
+        "legacy-directory-key",
+        legacy,
+      ),
+    ).toEqual({
+      host: "127.0.0.1",
+      port: 9230,
+      browserId: "browser-legacy",
+      browserWSEndpoint,
+      accountDigest,
+    });
+  });
+
   test("uses the named originating session when one conversation has multiple affinities", () => {
     const targetUrl = "https://chatgpt.com/c/thread-session-bound";
     const primary = session("primary", {

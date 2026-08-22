@@ -37,6 +37,7 @@ function createDeps() {
     attachSession: vi.fn(),
     harvestSessionBrowserOutput: vi.fn(),
     liveTailSessionBrowserOutput: vi.fn(),
+    readSession: vi.fn().mockResolvedValue({ id: "abc" }),
     usesDefaultStatusFilters: vi.fn(),
     deleteSessionsOlderThan: vi.fn(),
     getSessionPaths: vi.fn(),
@@ -215,7 +216,7 @@ describe("handleSessionCommand", () => {
     expect(process.exitCode).toBe(1);
   });
 
-  test("harvests browser output when requested", async () => {
+  test("harvests browser output and writes its metadata id to the receipt", async () => {
     const command = createCommandWithOptions({
       hours: 24,
       limit: 10,
@@ -225,19 +226,21 @@ describe("handleSessionCommand", () => {
       browserTab: "current",
     } as StatusOptions);
     const deps = createDeps();
+    deps.readSession.mockResolvedValue({ id: "canonical-harvest" });
 
-    await handleSessionCommand("abc", command, deps);
+    await handleSessionCommand("legacy-harvest-directory", command, deps);
 
-    expect(deps.harvestSessionBrowserOutput).toHaveBeenCalledWith("abc", {
+    expect(deps.readSession).toHaveBeenCalledWith("legacy-harvest-directory");
+    expect(deps.harvestSessionBrowserOutput).toHaveBeenCalledWith("legacy-harvest-directory", {
       writeOutputPath: "/tmp/out.md",
       browserTabRef: "current",
       recoverIfMissing: true,
     });
-    expect(deps.writeSessionIdReceipt).toHaveBeenCalledWith("abc");
+    expect(deps.writeSessionIdReceipt).toHaveBeenCalledWith("canonical-harvest");
     expect(deps.liveTailSessionBrowserOutput).not.toHaveBeenCalled();
   });
 
-  test("tails browser output when requested", async () => {
+  test("tails browser output and writes its metadata id to the receipt", async () => {
     const command = createCommandWithOptions({
       hours: 24,
       limit: 10,
@@ -246,15 +249,17 @@ describe("handleSessionCommand", () => {
       browserTab: "tab-123",
     } as StatusOptions);
     const deps = createDeps();
+    deps.readSession.mockResolvedValue({ id: "canonical-live" });
 
-    await handleSessionCommand("abc", command, deps);
+    await handleSessionCommand("legacy-live-directory", command, deps);
 
-    expect(deps.liveTailSessionBrowserOutput).toHaveBeenCalledWith("abc", {
+    expect(deps.readSession).toHaveBeenCalledWith("legacy-live-directory");
+    expect(deps.liveTailSessionBrowserOutput).toHaveBeenCalledWith("legacy-live-directory", {
       writeOutputPath: undefined,
       browserTabRef: "tab-123",
       recoverIfMissing: true,
     });
-    expect(deps.writeSessionIdReceipt).toHaveBeenCalledWith("abc");
+    expect(deps.writeSessionIdReceipt).toHaveBeenCalledWith("canonical-live");
     expect(deps.harvestSessionBrowserOutput).not.toHaveBeenCalled();
   });
 

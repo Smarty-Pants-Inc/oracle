@@ -146,8 +146,54 @@ interface CapturePollResult {
   hit?: CaptureHitSummary | null;
   hits?: CaptureHitSummary[];
 }
+interface CaptureProvenance {
+  captureRoute: string;
+  extractionMethod: string;
+  backendProbeMethod: string;
+  limitation: string;
+  manifestNonClaim: string;
+}
+
+const RELOAD_CAPTURE_PROVENANCE: CaptureProvenance = {
+  captureRoute: "document-start-fetch-clone-on-reload",
+  extractionMethod: "backend-fetch-capture-during-page-load",
+  backendProbeMethod: "document_start_fetch_clone_on_reload",
+  limitation:
+    "Captures ChatGPT backend conversation JSON for the exact approved conversation id during the page's own load request.",
+  manifestNonClaim:
+    "The hook captured only the exact target backend conversation URL during page load.",
+};
+
+const EXACT_GET_CAPTURE_PROVENANCE: CaptureProvenance = {
+  captureRoute: "authenticated-affinity-bound-exact-get",
+  extractionMethod: "authenticated-affinity-bound-exact-get",
+  backendProbeMethod: "authenticated-affinity-bound-exact-get",
+  limitation:
+    "Captures ChatGPT backend conversation JSON with an authenticated, account-affinity-bound exact GET for the approved conversation URL.",
+  manifestNonClaim:
+    "The authenticated, account-affinity-bound exact GET fetched only the exact target backend conversation URL.",
+};
 
 type EvaluateExpression = <T>(expression: string, timeoutLabel?: string) => Promise<T>;
+async function runBeforeDeadline<T>(
+  operation: () => Promise<T>,
+  deadline: number,
+  timeoutMessage: string,
+): Promise<T> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new Error(timeoutMessage);
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(timeoutMessage)), remaining);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 const SECRET_PATTERNS: Array<{ label: string; pattern: RegExp }> = [
   { label: "OPENAI_API_KEY assignment", pattern: /OPENAI_API_KEY\s*[:=]\s*\S+/i },
@@ -427,6 +473,7 @@ export function buildReadOnlyConversationGetExpressionForTest(
   targetApiUrl: string,
   expectedAccountDigest?: string,
   expectedEmail?: string,
+  deadline = Date.now() + 45_000,
 ): string {
   const url = new URL(targetApiUrl);
   const prefix = "/backend-api/conversation/";
@@ -444,14 +491,16 @@ export function buildReadOnlyConversationGetExpressionForTest(
     decodeURIComponent(url.pathname.slice(prefix.length)),
     expectedAccountDigest,
     expectedEmail,
+    deadline,
   );
 }
 
 function buildReadOnlyConversationGetExpression(
   targetApiUrl: string,
   expectedConversationId: string,
-  expectedAccountDigest?: string,
-  expectedEmail?: string,
+  expectedAccountDigest: string | undefined,
+  expectedEmail: string | undefined,
+  deadline: number,
 ): string {
   return `
 (async () => {
@@ -459,6 +508,23 @@ function buildReadOnlyConversationGetExpression(
   const EXPECTED_CONVERSATION_ID = ${jsString(expectedConversationId)};
   const EXPECTED_ACCOUNT_DIGEST = ${JSON.stringify(expectedAccountDigest ?? null)};
   const EXPECTED_EMAIL = ${JSON.stringify(expectedEmail?.trim().toLowerCase() || null)};
+  const DEADLINE = ${JSON.stringify(deadline)};
+  const timeoutError = () => new Error("Authenticated ChatGPT exact GET timed out.");
+  const requestWithinDeadline = async (input, init, readBody) => {
+    const remaining = DEADLINE - Date.now();
+    if (!Number.isFinite(remaining) || remaining <= 0) throw timeoutError();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), remaining);
+    try {
+      const response = await fetch(input, { ...init, signal: controller.signal });
+      return { response, body: await readBody(response) };
+    } catch (error) {
+      if (controller.signal.aborted || Date.now() >= DEADLINE) throw timeoutError();
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
   const digestUserId = async (userId) => {
     if (typeof userId !== "string" || !userId.trim() || !globalThis.crypto?.subtle) return null;
     const bytes = new Uint8Array(await crypto.subtle.digest(
@@ -493,14 +559,19 @@ function buildReadOnlyConversationGetExpression(
       return null;
     }
   };
-  const sessionResponse = await fetch("/api/auth/session", {
-    method: "GET",
-    cache: "no-store",
-    credentials: "include",
-    redirect: "error"
-  });
-  if (!sessionResponse.ok) throw new Error("Authenticated ChatGPT session is unavailable.");
-  const session = await sessionResponse.json();
+  const { body: session } = await requestWithinDeadline(
+    "/api/auth/session",
+    {
+      method: "GET",
+      cache: "no-store",
+      credentials: "include",
+      redirect: "error"
+    },
+    async (response) => {
+      if (!response.ok) throw new Error("Authenticated ChatGPT session is unavailable.");
+      return await response.json();
+    },
+  );
   const accessToken = typeof session?.accessToken === "string" ? session.accessToken.trim() : "";
   if (!accessToken) throw new Error("Authenticated ChatGPT access token is unavailable.");
   const cookieIdentity = await sessionIdentity(session);
@@ -517,18 +588,21 @@ function buildReadOnlyConversationGetExpression(
   }
   const headers = new Headers({ accept: "application/json" });
   headers.set("authorization", "Bearer " + accessToken);
-  const response = await fetch(TARGET, {
-    method: "GET",
-    cache: "no-store",
-    credentials: "include",
-    redirect: "error",
-    headers
-  });
+  const { response, body: text } = await requestWithinDeadline(
+    TARGET,
+    {
+      method: "GET",
+      cache: "no-store",
+      credentials: "include",
+      redirect: "error",
+      headers
+    },
+    async (response) => await response.text(),
+  );
   const responseUrl = new URL(response.url, location.href).href;
   if (response.redirected || responseUrl !== TARGET) {
     throw new Error("Authenticated ChatGPT exact GET left the approved backend URL.");
   }
-  const text = await response.text();
   let parsed = null;
   try { parsed = JSON.parse(text); } catch {}
   const conversationId = typeof parsed?.conversation_id === "string" ? parsed.conversation_id : null;
@@ -558,13 +632,17 @@ function buildReadOnlyConversationGetExpression(
 `.trim();
 }
 
-async function waitForDocument(Runtime: ChromeClient["Runtime"], timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
+async function waitForDocument(Runtime: ChromeClient["Runtime"], deadline: number): Promise<void> {
   while (Date.now() < deadline) {
-    const ready = await evaluateByValue<string>(Runtime, "document.readyState", "document ready");
-    const href = await evaluateByValue<string>(Runtime, "location.href", "document URL");
+    const ready = await evaluateByValue<string>(
+      Runtime,
+      "document.readyState",
+      "document ready",
+      deadline,
+    );
+    const href = await evaluateByValue<string>(Runtime, "location.href", "document URL", deadline);
     if (isChatGptUrl(href) && (ready === "interactive" || ready === "complete")) return;
-    await delay(100);
+    await delay(Math.min(100, Math.max(0, deadline - Date.now())));
   }
   throw new Error("Timed out waiting for ChatGPT document readiness.");
 }
@@ -608,12 +686,18 @@ async function evaluateByValue<T>(
   Runtime: ChromeClient["Runtime"],
   expression: string,
   timeoutLabel = "Runtime.evaluate",
+  deadline?: number,
 ): Promise<T> {
-  const result = await Runtime.evaluate({
-    expression,
-    awaitPromise: false,
-    returnByValue: true,
-  });
+  const evaluate = () =>
+    Runtime.evaluate({
+      expression,
+      awaitPromise: false,
+      returnByValue: true,
+    });
+  const result =
+    deadline === undefined
+      ? await evaluate()
+      : await runBeforeDeadline(evaluate, deadline, `Timed out waiting for ${timeoutLabel}.`);
   if (result.exceptionDetails) {
     throw new Error(`${timeoutLabel} failed: ${JSON.stringify(result.exceptionDetails)}`);
   }
@@ -807,6 +891,7 @@ export async function retrieveCapturedTextWithEvaluator(
   targetApiUrl: string,
   chars: number,
   chunkSize: number,
+  deadline?: number,
 ): Promise<string> {
   assertValidExportChunkSize(chunkSize);
   const parts: string[] = [];
@@ -825,13 +910,13 @@ export async function retrieveCapturedTextWithEvaluator(
 })()
 `;
     let part: string | null = null;
-    const deadline = Date.now() + 15_000;
-    while (Date.now() < deadline) {
+    const chunkDeadline = deadline ?? Date.now() + 15_000;
+    while (Date.now() < chunkDeadline) {
       part = await evaluate<string | null>(expression, "capture chunk");
       if (typeof part === "string") {
         break;
       }
-      await delay(250);
+      await delay(Math.min(250, Math.max(0, chunkDeadline - Date.now())));
     }
     if (typeof part !== "string") {
       throw new Error(`Missing captured text chunk ${start}:${end}`);
@@ -846,13 +931,15 @@ async function retrieveCapturedText(
   targetApiUrl: string,
   chars: number,
   chunkSize: number,
+  deadline?: number,
 ): Promise<string> {
   return retrieveCapturedTextWithEvaluator(
     <T>(expression: string, timeoutLabel?: string) =>
-      evaluateByValue<T>(Runtime, expression, timeoutLabel),
+      evaluateByValue<T>(Runtime, expression, timeoutLabel, deadline),
     targetApiUrl,
     chars,
     chunkSize,
+    deadline,
   );
 }
 
@@ -948,6 +1035,7 @@ export function backendToPayload(
   targetUrl: string,
   rawSha256: string,
   rawBytes: number,
+  provenance: CaptureProvenance = RELOAD_CAPTURE_PROVENANCE,
 ): JsonRecord {
   const mapping = backend.mapping ?? {};
   const currentPath = pathFromMapping(mapping, backend.current_node);
@@ -1028,16 +1116,17 @@ export function backendToPayload(
     conversation_id: backend.conversation_id,
     expected_conversation_id: expectedConversationId,
     scope_ok: backend.conversation_id === expectedConversationId,
-    extraction_method: "backend-fetch-capture-during-page-load",
+    capture_route: provenance.captureRoute,
+    extraction_method: provenance.extractionMethod,
     limitations: [
-      "Captures ChatGPT backend conversation JSON for the exact approved conversation id during the page's own load request.",
+      provenance.limitation,
       "Does not read browser cookies, localStorage, profile stores, or unrelated conversation history.",
       "Includes backend-only nodes such as tool events, thoughts, reasoning recaps, and hidden/system messages when present in the conversation payload.",
       "Does not claim real-world authorship or content beyond the captured ChatGPT backend payload.",
     ],
     backend_probe: {
       attempted: true,
-      method: "document_start_fetch_clone_on_reload",
+      method: provenance.backendProbeMethod,
       status: "captured",
       raw_backend_sha256: rawSha256,
       raw_backend_size_bytes: rawBytes,
@@ -1065,6 +1154,7 @@ function markdownForPayload(payload: JsonRecord): string {
     `- Title: ${payload.title ?? ""}`,
     `- Exported at: ${payload.exported_at ?? ""}`,
     `- Extraction method: ${payload.extraction_method ?? ""}`,
+    `- Capture route: ${payload.capture_route ?? ""}`,
     `- Raw backend SHA-256: ${payload.raw_backend_sha256 ?? ""}`,
     "",
     "## Non-Claims",
@@ -1264,6 +1354,7 @@ async function writeBundle({
       expected_conversation_id: payload.expected_conversation_id,
       scope_ok: payload.scope_ok === true,
       extraction_method: payload.extraction_method,
+      capture_route: payload.capture_route,
       turn_count: stats.turn_count,
       user_turns: stats.user_turns,
       assistant_turns: stats.assistant_turns,
@@ -1274,7 +1365,9 @@ async function writeBundle({
       files,
       non_claims: [
         "No cookies, localStorage, profile stores, or unrelated history were read.",
-        "The hook captured only the exact target backend conversation URL during page load.",
+        payload.capture_route === EXACT_GET_CAPTURE_PROVENANCE.captureRoute
+          ? EXACT_GET_CAPTURE_PROVENANCE.manifestNonClaim
+          : RELOAD_CAPTURE_PROVENANCE.manifestNonClaim,
       ],
     });
     const redactionReport = await buildRedactionReport(outDir, [
@@ -1318,6 +1411,7 @@ async function finalizeCapturedExport({
   outDir,
   targetId,
   tabUrl,
+  provenance = RELOAD_CAPTURE_PROVENANCE,
   captureInfo,
 }: {
   backend: BackendConversation;
@@ -1327,6 +1421,7 @@ async function finalizeCapturedExport({
   outDir: string;
   targetId: string;
   tabUrl: string;
+  provenance?: CaptureProvenance;
   captureInfo: JsonRecord;
 }): Promise<Omit<ChatGptConversationExportResult, "archiveRecovery" | "postExportArchive">> {
   const conversationId = conversationIdFromChatGptUrl(targetUrl);
@@ -1335,7 +1430,13 @@ async function finalizeCapturedExport({
   }
   const rawBackendSha256 = hashText(rawText);
   const rawBackendSizeBytes = Buffer.byteLength(rawText, "utf8");
-  const payload = backendToPayload(backend, targetUrl, rawBackendSha256, rawBackendSizeBytes);
+  const payload = backendToPayload(
+    backend,
+    targetUrl,
+    rawBackendSha256,
+    rawBackendSizeBytes,
+    provenance,
+  );
   const bundle = await writeBundle({
     outDir,
     rawText,
@@ -1370,7 +1471,6 @@ async function finalizeCapturedExport({
     stats,
   };
 }
-
 async function disposeChatGptExportConnection(client: ChromeClient): Promise<void> {
   await client.close();
 }
@@ -1380,18 +1480,25 @@ async function evaluateReadOnlyConversationGet(
   targetApiUrl: string,
   conversationId: string,
   expectedAccountDigest: string,
-  expectedEmail?: string,
+  expectedEmail: string | undefined,
+  deadline: number,
 ): Promise<CaptureHitSummary> {
-  const outcome = await Runtime.evaluate({
-    expression: buildReadOnlyConversationGetExpression(
-      targetApiUrl,
-      conversationId,
-      expectedAccountDigest,
-      expectedEmail,
-    ),
-    awaitPromise: true,
-    returnByValue: true,
-  });
+  const outcome = await runBeforeDeadline(
+    () =>
+      Runtime.evaluate({
+        expression: buildReadOnlyConversationGetExpression(
+          targetApiUrl,
+          conversationId,
+          expectedAccountDigest,
+          expectedEmail,
+          deadline,
+        ),
+        awaitPromise: true,
+        returnByValue: true,
+      }),
+    deadline,
+    "Timed out waiting for authenticated ChatGPT exact GET.",
+  );
   if (outcome.exceptionDetails) {
     throw new Error(
       `Read-only conversation GET failed: ${JSON.stringify(outcome.exceptionDetails)}`,
@@ -1414,7 +1521,7 @@ async function captureChatGptConversationReadOnly({
   browserWSEndpoint,
   accountDigest,
   expectedEmail,
-  timeoutMs,
+  deadline,
   chunkSize,
 }: {
   targetUrl: string;
@@ -1426,7 +1533,7 @@ async function captureChatGptConversationReadOnly({
   browserWSEndpoint: string;
   accountDigest: string;
   expectedEmail?: string;
-  timeoutMs: number;
+  deadline: number;
   chunkSize: number;
 }): Promise<ChatGptConversationExportResult> {
   const conversationId = conversationIdFromChatGptUrl(targetUrl);
@@ -1453,20 +1560,35 @@ async function captureChatGptConversationReadOnly({
       throw new Error("Read-only ChatGPT export target identity changed during connection.");
     }
     const { Page, Runtime } = opened.client;
-    await Page.enable();
-    await waitForDocument(Runtime, timeoutMs);
-    const tabUrl = await evaluateByValue<string>(Runtime, "location.href", "export target URL");
+    await runBeforeDeadline(
+      () => Page.enable(),
+      deadline,
+      "Timed out preparing the read-only ChatGPT export target.",
+    );
+    await waitForDocument(Runtime, deadline);
+    const tabUrl = await evaluateByValue<string>(
+      Runtime,
+      "location.href",
+      "export target URL",
+      deadline,
+    );
     const tabTitle = await evaluateByValue<string>(
       Runtime,
       "document.title",
       "export target title",
+      deadline,
     );
 
-    await assertChatGptExportAccountAffinity(
-      Runtime,
-      accountDigest,
-      "ChatGPT export exact GET",
-      expectedEmail,
+    await runBeforeDeadline(
+      () =>
+        assertChatGptExportAccountAffinity(
+          Runtime,
+          accountDigest,
+          "ChatGPT export exact GET",
+          expectedEmail,
+        ),
+      deadline,
+      "Timed out validating ChatGPT export exact GET account affinity.",
     );
 
     let hit: CaptureHitSummary | undefined;
@@ -1479,20 +1601,28 @@ async function captureChatGptConversationReadOnly({
         conversationId,
         accountDigest,
         expectedEmail,
+        deadline,
       );
     } catch (error) {
       getError = error;
     }
     let postGetAffinityError: unknown;
-    try {
-      await assertChatGptExportAccountAffinity(
-        Runtime,
-        accountDigest,
-        "ChatGPT export exact GET completion",
-        expectedEmail,
-      );
-    } catch (error) {
-      postGetAffinityError = error;
+    if (Date.now() < deadline) {
+      try {
+        await runBeforeDeadline(
+          () =>
+            assertChatGptExportAccountAffinity(
+              Runtime,
+              accountDigest,
+              "ChatGPT export exact GET completion",
+              expectedEmail,
+            ),
+          deadline,
+          "Timed out validating ChatGPT export exact GET completion account affinity.",
+        );
+      } catch (error) {
+        postGetAffinityError = error;
+      }
     }
     if (getError && postGetAffinityError) {
       throw new AggregateError(
@@ -1517,7 +1647,13 @@ async function captureChatGptConversationReadOnly({
       );
     }
 
-    const rawText = await retrieveCapturedText(Runtime, targetApiUrl, hit.chars, chunkSize);
+    const rawText = await retrieveCapturedText(
+      Runtime,
+      targetApiUrl,
+      hit.chars,
+      chunkSize,
+      deadline,
+    );
     const backend = JSON.parse(rawText) as BackendConversation;
     const result = await finalizeCapturedExport({
       backend,
@@ -1527,6 +1663,7 @@ async function captureChatGptConversationReadOnly({
       outDir,
       targetId,
       tabUrl,
+      provenance: EXACT_GET_CAPTURE_PROVENANCE,
       captureInfo: {
         captured_at: new Date().toISOString(),
         target_url: targetUrl,
@@ -1601,6 +1738,7 @@ export async function captureApprovedChatGptConversationBackend(
   const host = options.host ?? DEFAULT_REMOTE_CHROME_HOST;
   const port = options.port ?? DEFAULT_REMOTE_CHROME_PORT;
   const timeoutMs = options.timeoutMs ?? 45_000;
+  const deadline = Date.now() + timeoutMs;
   const expectedBrowserId = options.browserId?.trim();
   let browserWSEndpoint = options.browserWSEndpoint?.trim();
   const expectedAccountDigest = options.accountDigest?.trim();
@@ -1657,7 +1795,7 @@ export async function captureApprovedChatGptConversationBackend(
       browserWSEndpoint: readOnlyAccountAffinity.browserWSEndpoint,
       accountDigest: readOnlyAccountAffinity.accountDigest,
       expectedEmail: readOnlyAccountAffinity.expectedEmail,
-      timeoutMs,
+      deadline,
       chunkSize,
     });
   }
@@ -1715,7 +1853,7 @@ export async function captureApprovedChatGptConversationBackend(
       try {
         const { Page, Runtime } = opened.client;
         await Page.enable();
-        await waitForDocument(Runtime, timeoutMs);
+        await waitForDocument(Runtime, Date.now() + timeoutMs);
         await assertChatGptExportAccountAffinity(
           Runtime,
           expectedAccountDigest,
@@ -1724,7 +1862,7 @@ export async function captureApprovedChatGptConversationBackend(
         );
         await Page.navigate({ url: options.targetUrl });
         const tabUrl = await waitForConversationUrl(Runtime, conversationId, timeoutMs);
-        await waitForDocument(Runtime, timeoutMs);
+        await waitForDocument(Runtime, Date.now() + timeoutMs);
         resolved = {
           client: opened.client,
           targetId,
@@ -1759,7 +1897,7 @@ export async function captureApprovedChatGptConversationBackend(
         browserWSEndpoint,
         accountDigest: expectedAccountDigest,
         expectedEmail,
-        timeoutMs,
+        deadline,
         chunkSize,
       });
     } else {
@@ -1859,6 +1997,7 @@ export async function captureApprovedChatGptConversationBackend(
         mode: "always",
         conversationUrl: options.targetUrl,
         expectedAccountDigest,
+        deadline,
       });
       if (!postExportArchive.archived) {
         throw new Error(`Post-export archive failed: ${JSON.stringify(postExportArchive)}`);

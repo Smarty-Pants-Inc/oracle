@@ -9,6 +9,7 @@ const accountMocks = vi.hoisted(() => ({
   assertChatGptAccountEmail: vi.fn(),
 }));
 const chromeMocks = vi.hoisted(() => ({
+  closeTab: vi.fn(),
   connectToRemoteChrome: vi.fn(),
 }));
 const cookieMocks = vi.hoisted(() => ({
@@ -20,7 +21,9 @@ const liveTabMocks = vi.hoisted(() => ({
 const pageActionMocks = vi.hoisted(() => ({
   ensureLoggedIn: vi.fn(),
   ensureNotBlocked: vi.fn(),
+  ensurePromptReady: vi.fn(),
   navigateToChatGPT: vi.fn(),
+  readChatGptAccountDigest: vi.fn(),
 }));
 
 vi.mock("../../src/browser/chatgptAccount.js", async (importOriginal) => ({
@@ -50,12 +53,15 @@ describe("remote expected account email guard", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     accountMocks.assertChatGptAccountEmail.mockReset();
+    chromeMocks.closeTab.mockReset();
     chromeMocks.connectToRemoteChrome.mockReset();
     cookieMocks.clearStaleChatGptConversationCookies.mockReset();
     liveTabMocks.connectToExistingChatGptTab.mockReset();
     pageActionMocks.ensureLoggedIn.mockReset();
     pageActionMocks.ensureNotBlocked.mockReset();
+    pageActionMocks.ensurePromptReady.mockReset();
     pageActionMocks.navigateToChatGPT.mockReset();
+    pageActionMocks.readChatGptAccountDigest.mockReset();
   });
 
   test("verifies the expected email on a neutral bound target before resolving tabs or cookies", async () => {
@@ -222,5 +228,64 @@ describe("remote expected account email guard", () => {
     expect(close).toHaveBeenCalledOnce();
     expect(liveTabMocks.connectToExistingChatGptTab).not.toHaveBeenCalled();
     expect(cookieMocks.clearStaleChatGptConversationCookies).not.toHaveBeenCalled();
+  });
+  test("navigates a fresh verified remote target to its configured project before submission", async () => {
+    const accountDigest = "a".repeat(64);
+    const projectUrl = "https://chatgpt.com/g/g-p-test/project";
+    const stop = new Error("stop after configured target navigation");
+    const client = {
+      DOM: undefined,
+      Emulation: { setFocusEmulationEnabled: vi.fn().mockResolvedValue({}) },
+      Input: {},
+      Network: { enable: vi.fn().mockResolvedValue({}) },
+      Page: { enable: vi.fn().mockResolvedValue({}) },
+      Runtime: { enable: vi.fn().mockResolvedValue({}) },
+      Target: {},
+      close: vi.fn().mockResolvedValue(undefined),
+      on: vi.fn(),
+    };
+
+    vi.stubEnv("ORACLE_WRAPPER_EXPECTED_ACCOUNT_EMAIL", "");
+    vi.stubEnv("ORACLE_WRAPPER_REMOTE_ONLY", "0");
+    chromeMocks.connectToRemoteChrome.mockResolvedValue({
+      client,
+      targetId: "fresh-target",
+      close: vi.fn().mockResolvedValue(undefined),
+    });
+    chromeMocks.closeTab.mockResolvedValue(true);
+    cookieMocks.clearStaleChatGptConversationCookies.mockResolvedValue(0);
+    pageActionMocks.ensureLoggedIn.mockResolvedValue(undefined);
+    pageActionMocks.ensureNotBlocked.mockResolvedValue(undefined);
+    pageActionMocks.ensurePromptReady.mockRejectedValue(stop);
+    pageActionMocks.navigateToChatGPT.mockResolvedValue(undefined);
+    pageActionMocks.readChatGptAccountDigest.mockResolvedValue(accountDigest);
+
+    const error = await runBrowserMode({
+      prompt: "must not submit",
+      config: {
+        archiveConversations: "never",
+        modelStrategy: "ignore",
+        remoteChrome: { host: "127.0.0.1", port: 9223 },
+        remoteChromeAccountDigest: accountDigest,
+        url: projectUrl,
+      },
+    }).catch((error: unknown) => error);
+
+    expect(error).toBe(stop);
+    expect(pageActionMocks.readChatGptAccountDigest).toHaveBeenCalledTimes(2);
+    expect(pageActionMocks.navigateToChatGPT).toHaveBeenNthCalledWith(
+      1,
+      client.Page,
+      client.Runtime,
+      "https://chatgpt.com/",
+      expect.any(Function),
+    );
+    expect(pageActionMocks.navigateToChatGPT).toHaveBeenNthCalledWith(
+      2,
+      client.Page,
+      client.Runtime,
+      projectUrl,
+      expect.any(Function),
+    );
   });
 });

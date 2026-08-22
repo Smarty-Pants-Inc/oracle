@@ -24,6 +24,7 @@ describe("ChatGPT conversation inventory", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 
   test("parses the common list schema and paginates by offset", async () => {
@@ -172,7 +173,7 @@ describe("ChatGPT conversation inventory", () => {
         if (expression.includes("Boolean(window.__oracleChatGptInventory?.ready)")) {
           return { result: { value: true } };
         }
-        if (expression.includes("? inventory.readCookieIdentity()")) {
+        if (expression.includes("inventory.readCookieIdentity(")) {
           return {
             result: {
               value: {
@@ -186,7 +187,7 @@ describe("ChatGPT conversation inventory", () => {
             },
           };
         }
-        if (expression.includes("? inventory.bindRetainedAuthorization()")) {
+        if (expression.includes("inventory.bindRetainedAuthorization(")) {
           return {
             result: {
               value: {
@@ -300,8 +301,11 @@ describe("ChatGPT conversation inventory", () => {
     expect(authCaptureHook).not.toContain('readIdentity(headers, "omit")');
     expect(authCaptureHook).toContain('redirect: "error"');
     expect(authCaptureHook).toContain("url: response.url");
-    expect(authCaptureHook).toContain("async readCookieIdentity()");
-    expect(authCaptureHook).toContain("async bindRetainedAuthorization()");
+    expect(authCaptureHook).toContain("async readCookieIdentity(deadline)");
+    expect(authCaptureHook).toContain("async bindRetainedAuthorization(deadline)");
+    expect(authCaptureHook).toContain("const remaining = deadline - Date.now()");
+    expect(authCaptureHook).toContain("new AbortController()");
+    expect(authCaptureHook).toContain("signal: controller.signal");
     expect(authCaptureHook).toContain('method: "GET"');
     expect(authCaptureHook).toContain('response.headers.get("retry-after")');
     expect(authCaptureHook).not.toMatch(/\b(?:POST|PUT|PATCH|DELETE)\b/);
@@ -311,7 +315,7 @@ describe("ChatGPT conversation inventory", () => {
       "url.searchParams.set('is_archived', \"true\")",
     );
     const bearerIdentityIndex = evaluated.findIndex((expression) =>
-      expression.includes("? inventory.bindRetainedAuthorization()"),
+      expression.includes("inventory.bindRetainedAuthorization("),
     );
     const inventoryRequestIndex = evaluated.findIndex((expression) =>
       expression.includes("inventory.fetchPage"),
@@ -322,6 +326,11 @@ describe("ChatGPT conversation inventory", () => {
       evaluated.filter((expression) => expression.includes("inventory.fetchPage")),
     ).toHaveLength(3);
     expect(inventoryCalls).toBe(3);
+    const pageDeadlines = evaluated
+      .filter((expression) => expression.includes("inventory.fetchPage"))
+      .map((expression) => /const DEADLINE = (\d+);/.exec(expression)?.[1]);
+    expect(pageDeadlines).not.toContain(undefined);
+    expect(new Set(pageDeadlines).size).toBe(1);
     expect(evaluated.join("\n")).not.toMatch(/\b(?:POST|PUT|PATCH|DELETE)\b/);
 
     inventoryCalls = 0;
@@ -335,6 +344,140 @@ describe("ChatGPT conversation inventory", () => {
         expectedEmail: "owner@example.test",
       }),
     ).rejects.toThrow(/target cleanup was not confirmed/i);
+  });
+  test("uses one inventory deadline through a retry and stalled page request", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const accountDigest = "a".repeat(64);
+    const activeUrl =
+      "https://chatgpt.com/backend-api/conversations?offset=0&limit=100&order=updated&is_archived=false";
+    const events: string[] = [];
+    let documentChecks = 0;
+    let pageCalls = 0;
+    let stalledPageExpression = "";
+    let signalStalledPageStarted!: () => void;
+    const stalledPageStarted = new Promise<void>((resolve) => {
+      signalStalledPageStarted = resolve;
+    });
+
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ webSocketDebuggerUrl: browserWSEndpoint }),
+      }),
+    );
+    const Runtime = {
+      evaluate: vi.fn(({ expression }: { expression: string }) => {
+        if (expression.includes("inventory.cleanup")) {
+          events.push("cleanup");
+          return Promise.resolve({ result: { value: true } });
+        }
+        if (expression.includes("readyState: document.readyState")) {
+          documentChecks += 1;
+          return Promise.resolve({
+            result: {
+              value: {
+                href: "https://chatgpt.com/",
+                readyState: documentChecks === 1 ? "loading" : "complete",
+              },
+            },
+          });
+        }
+        if (expression.includes("Boolean(window.__oracleChatGptInventory?.ready)")) {
+          return Promise.resolve({ result: { value: true } });
+        }
+        if (
+          expression.includes("inventory.readCookieIdentity(") ||
+          expression.includes("inventory.bindRetainedAuthorization(")
+        ) {
+          return Promise.resolve({
+            result: {
+              value: {
+                ok: true,
+                status: 200,
+                url: "https://chatgpt.com/api/auth/session",
+                redirected: false,
+                accountDigest,
+                email: "owner@example.test",
+              },
+            },
+          });
+        }
+        if (expression.includes("inventory.fetchPage")) {
+          pageCalls += 1;
+          if (pageCalls === 1) {
+            return Promise.resolve({
+              result: {
+                value: {
+                  ok: false,
+                  status: 429,
+                  reason: "http",
+                  retryAfterMs: 100,
+                  url: activeUrl,
+                  redirected: false,
+                },
+              },
+            });
+          }
+          stalledPageExpression = expression;
+          signalStalledPageStarted();
+          return new Promise<never>(() => undefined);
+        }
+        return Promise.resolve({ result: { value: undefined } });
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    const Page = {
+      enable: vi.fn(async () => undefined),
+      addScriptToEvaluateOnNewDocument: vi.fn(async () => ({ identifier: "inventory-hook" })),
+      removeScriptToEvaluateOnNewDocument: vi.fn(async () => {
+        events.push("remove-script");
+      }),
+      navigate: vi.fn(async () => ({ frameId: "inventory-frame" })),
+    };
+    const close = vi.fn(async () => {
+      events.push("detach");
+    });
+    chromeMocks.connectToRemoteChromeTarget.mockResolvedValue({
+      client: { Page, Runtime },
+      targetId: "inventory-target",
+      browserWSEndpoint,
+      close,
+    });
+
+    const capture = captureChatGptConversationInventory({
+      host: "127.0.0.1",
+      port: 9223,
+      browserId: "browser-a",
+      browserWSEndpoint,
+      expectedEmail: "owner@example.test",
+      timeoutMs: 250,
+    });
+    const captureFailure = capture.catch((error: unknown) => error);
+
+    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(100);
+    await stalledPageStarted;
+    expect(stalledPageExpression).toContain("const DEADLINE = 250");
+    expect(buildChatGptInventoryAuthCaptureHook()).toContain("controller = new AbortController()");
+    expect(buildChatGptInventoryAuthCaptureHook()).toContain("signal: controller.signal");
+
+    await vi.advanceTimersByTimeAsync(50);
+    const failure = await captureFailure;
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toMatch(
+      /timed out while ChatGPT conversation inventory request/i,
+    );
+    expect(documentChecks).toBe(2);
+    expect(pageCalls).toBe(2);
+    expect(events).toEqual(["cleanup", "remove-script", "detach"]);
+    expect(chromeMocks.closeTab).toHaveBeenCalledWith(
+      9223,
+      "inventory-target",
+      expect.any(Function),
+      "127.0.0.1",
+    );
   });
 
   test.each([
@@ -394,7 +537,7 @@ describe("ChatGPT conversation inventory", () => {
         if (expression.includes("Boolean(window.__oracleChatGptInventory?.ready)")) {
           return { result: { value: true } };
         }
-        if (expression.includes("? inventory.readCookieIdentity()")) {
+        if (expression.includes("inventory.readCookieIdentity(")) {
           return {
             result: {
               value: {
@@ -408,7 +551,7 @@ describe("ChatGPT conversation inventory", () => {
             },
           };
         }
-        if (expression.includes("? inventory.bindRetainedAuthorization()")) {
+        if (expression.includes("inventory.bindRetainedAuthorization(")) {
           return { result: { value: bearerIdentity } };
         }
         if (expression.includes("inventory.fetchPage")) inventoryRequestStarted = true;
@@ -467,8 +610,8 @@ describe("ChatGPT conversation inventory", () => {
           return { result: { value: true } };
         }
         if (
-          expression.includes("? inventory.readCookieIdentity()") ||
-          expression.includes("? inventory.bindRetainedAuthorization()")
+          expression.includes("inventory.readCookieIdentity(") ||
+          expression.includes("inventory.bindRetainedAuthorization(")
         ) {
           return {
             result: {
