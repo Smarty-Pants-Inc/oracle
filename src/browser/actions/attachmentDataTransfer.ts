@@ -8,6 +8,7 @@ export async function transferAttachmentViaDataTransfer(
   runtime: ChromeClient["Runtime"],
   attachment: BrowserAttachment,
   selector: string,
+  beforeFileInputMutation?: () => Promise<void> | void,
 ): Promise<{ fileName: string; size: number }> {
   const fileContent = await readFile(attachment.path);
   if (fileContent.length > MAX_DATA_TRANSFER_BYTES) {
@@ -86,6 +87,8 @@ export async function transferAttachmentViaDataTransfer(
     fileInput.dispatchEvent(new Event('change', { bubbles: true }));
     return { success: true, fileName: file.name, size: file.size };
   })()`;
+
+  await beforeFileInputMutation?.();
 
   const evalResult = await runtime.evaluate({ expression, returnByValue: true });
   if (evalResult.exceptionDetails) {

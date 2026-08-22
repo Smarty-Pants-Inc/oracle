@@ -1453,6 +1453,7 @@ async function fetchDownloadWithBrowser(
 export async function saveChatGptDownloadableFiles(params: {
   Network: ChromeClient["Network"];
   Runtime?: ChromeClient["Runtime"];
+  browserTransport?: "cdp" | "obu";
   files: BrowserDownloadableFile[];
   sessionId?: string;
   logger?: BrowserLogger;
@@ -1496,7 +1497,10 @@ export async function saveChatGptDownloadableFiles(params: {
       continue;
     }
     const strategy: DirectDownloadStrategy =
-      params.Runtime && sandboxDownloadUrl && !explicitDownloadUrl ? "browser-fetch" : "node-fetch";
+      params.browserTransport === "obu" ||
+      (params.Runtime && sandboxDownloadUrl && !explicitDownloadUrl)
+        ? "browser-fetch"
+        : "node-fetch";
     logger?.(
       `[browser] Download candidate ${index + 1}/${files.length}: ${describeDownloadableCandidate(
         file,
@@ -1504,6 +1508,11 @@ export async function saveChatGptDownloadableFiles(params: {
       )} strategy=${strategy}`,
     );
     try {
+      if (strategy === "browser-fetch" && !params.Runtime) {
+        throw new ChatGptDownloadError(
+          "Main-Chrome file download requires an attached browser context.",
+        );
+      }
       const downloaded =
         strategy === "browser-fetch"
           ? await fetchDownloadWithBrowser(params.Runtime as ChromeClient["Runtime"], downloadUrl)
@@ -1572,6 +1581,7 @@ export async function collectChatGptFileArtifacts(params: {
   Page?: ChromeClient["Page"];
   Runtime: ChromeClient["Runtime"];
   Network: ChromeClient["Network"];
+  browserTransport?: "cdp" | "obu";
   answerText?: string | null;
   logger?: BrowserLogger;
   minTurnIndex?: number | null;
@@ -1614,6 +1624,7 @@ export async function collectChatGptFileArtifacts(params: {
   const saved = await saveChatGptDownloadableFiles({
     Network: params.Network,
     Runtime: params.Runtime,
+    browserTransport: params.browserTransport,
     files: allFiles,
     sessionId: params.sessionId,
     logger: params.logger,

@@ -7,11 +7,17 @@ import {
   captureApprovedChatGptConversationBackend,
   captureApprovedChatGptConversationBackendViaObu,
   conversationIdFromChatGptUrl,
+  type ChatGptExportTurnAffinity,
 } from "../browser/chatgptExport.js";
-import { DEFAULT_REMOTE_CHROME_HOST, DEFAULT_REMOTE_CHROME_PORT } from "../browser/liveTabs.js";
 import { extractStableConversationIdFromUrl } from "../browser/conversationUrl.js";
 import { sessionStore, type SessionMetadata } from "../sessionStore.js";
 import { browserIdFromWebSocketEndpoint } from "../browser/profileState.js";
+import {
+  hasStoredOpenBrowserUseAffinity,
+  resolveStoredOpenBrowserUseAffinity,
+  type StoredOpenBrowserUseAffinity,
+} from "../browser/openBrowserUse.js";
+import { asOracleUserError } from "../oracle/errors.js";
 
 export interface ChatGptExportCliOptions {
   targetUrl?: string;
@@ -19,8 +25,6 @@ export interface ChatGptExportCliOptions {
   out?: string;
   browserTab?: string;
   remoteChrome?: string;
-  obuSessionId?: string;
-  obuTabId?: string;
   timeout?: string;
   chunkSize?: string;
   recoverArchived?: boolean;
@@ -40,6 +44,17 @@ export type ChatGptExportRemoteChromeTarget =
   | { host: string; port: number }
   | ChatGptExportRemoteChromeAffinity;
 
+export type ChatGptExportBrowserTarget =
+  | {
+      transport: "cdp";
+      affinity: ChatGptExportRemoteChromeTarget;
+      turnAffinity?: ChatGptExportTurnAffinity;
+    }
+  | {
+      transport: "obu";
+      affinity: StoredOpenBrowserUseAffinity;
+      turnAffinity: ChatGptExportTurnAffinity;
+    };
 function storedConversationUrls(metadata: SessionMetadata): Array<string | null | undefined> {
   const optionsConfig = metadata.options.browserConfig;
   const browserConfig = metadata.browser?.config;
@@ -112,6 +127,97 @@ function storedRemoteChromeAffinities(
     affinities.set(`${host.toLowerCase()}:${port}\t${browserId}\t${accountDigest}`, affinity);
   }
   return [...affinities.values()];
+}
+function storedOpenBrowserUseAffinity(
+  metadata: SessionMetadata,
+  targetUrl: string,
+): StoredOpenBrowserUseAffinity | null {
+  const runtime = metadata.browser?.runtime;
+  const configs = [metadata.options.browserConfig, metadata.browser?.config];
+  if (!hasStoredOpenBrowserUseAffinity({ runtime, configs })) return null;
+  return resolveStoredOpenBrowserUseAffinity({
+    runtime,
+    configs,
+    conversationUrl: targetUrl,
+    conversationUrls: storedConversationUrls(metadata),
+    conversationIds: [metadata.browser?.harvest?.conversationId],
+  });
+}
+
+function storedExportTurnAffinity(metadata: SessionMetadata): ChatGptExportTurnAffinity | null {
+  const runtime = metadata.browser?.runtime;
+  const promptMessageId = runtime?.promptMessageId?.trim();
+  const assistantMessageId = runtime?.assistantMessageId?.trim();
+  return promptMessageId && assistantMessageId ? { promptMessageId, assistantMessageId } : null;
+}
+
+function resolveStoredChatGptExportTarget(
+  targetUrl: string,
+  sessions: SessionMetadata[],
+): ChatGptExportBrowserTarget {
+  const conversationId = conversationIdFromChatGptUrl(targetUrl);
+  const matches = sessions.filter((metadata) =>
+    sessionMatchesConversation(metadata, conversationId),
+  );
+  if (matches.length === 0) {
+    throw new Error(`No stored browser session matches ChatGPT conversation ${conversationId}.`);
+  }
+  const targets = new Map<string, ChatGptExportBrowserTarget>();
+  for (const metadata of matches) {
+    const turnAffinity = storedExportTurnAffinity(metadata);
+    const obuAffinity = storedOpenBrowserUseAffinity(metadata, targetUrl);
+    if (obuAffinity) {
+      if (!turnAffinity) {
+        throw new Error(
+          `Stored Oracle session ${metadata.id} has no exact prompt/assistant branch affinity for export.`,
+        );
+      }
+      targets.set(
+        `obu\t${obuAffinity.sessionId}\t${obuAffinity.tabId}\t${obuAffinity.accountDigest}\t${obuAffinity.workspaceDigest}\t${turnAffinity.promptMessageId}\t${turnAffinity.assistantMessageId}`,
+        { transport: "obu", affinity: obuAffinity, turnAffinity },
+      );
+      continue;
+    }
+    for (const affinity of storedRemoteChromeAffinities(metadata)) {
+      const browserId = "browserId" in affinity ? affinity.browserId : "";
+      const accountDigest = "accountDigest" in affinity ? affinity.accountDigest : "";
+      const branchKey = turnAffinity
+        ? `${turnAffinity.promptMessageId}\t${turnAffinity.assistantMessageId}`
+        : "";
+      targets.set(
+        `cdp\t${affinity.host}:${affinity.port}\t${browserId}\t${accountDigest}\t${branchKey}`,
+        { transport: "cdp", affinity, ...(turnAffinity ? { turnAffinity } : {}) },
+      );
+    }
+  }
+  if (targets.size !== 1) {
+    throw new Error(
+      `Matched ChatGPT conversation ${conversationId} has conflicting stored browser affinities.`,
+    );
+  }
+  return targets.values().next().value as ChatGptExportBrowserTarget;
+}
+
+export function resolveChatGptExportBrowserTargetForSession(
+  targetUrl: string,
+  sessionId: string,
+  metadata: SessionMetadata | null,
+): ChatGptExportBrowserTarget {
+  const conversationId = conversationIdFromChatGptUrl(targetUrl);
+  if (!metadata) throw new Error(`Stored Oracle session ${sessionId} was not found.`);
+  if (!sessionMatchesConversation(metadata, conversationId)) {
+    throw new Error(
+      `Stored Oracle session ${sessionId} does not match ChatGPT conversation ${conversationId}.`,
+    );
+  }
+  return resolveStoredChatGptExportTarget(targetUrl, [metadata]);
+}
+
+export function resolveChatGptExportBrowserTarget(
+  targetUrl: string,
+  sessions: SessionMetadata[],
+): ChatGptExportBrowserTarget {
+  return resolveStoredChatGptExportTarget(targetUrl, sessions);
 }
 
 /** Resolves a target conversation to its single recorded browser affinity. */
@@ -254,12 +360,9 @@ export async function handleChatGptExportCommand(options: ChatGptExportCliOption
     throw new Error("--target-url is required.");
   }
   conversationIdFromChatGptUrl(targetUrl);
-  if (
-    process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" &&
-    (options.remoteChrome !== undefined || options.obuSessionId || options.obuTabId)
-  ) {
+  if (process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" && options.remoteChrome !== undefined) {
     throw new Error(
-      "The agent wrapper resolves exports from stored session affinity; remove explicit remote Chrome and OBU endpoint overrides.",
+      "The agent wrapper resolves exports from stored session affinity; remove explicit remote Chrome endpoint overrides.",
     );
   }
   const explicitRemoteChrome =
@@ -268,50 +371,99 @@ export async function handleChatGptExportCommand(options: ChatGptExportCliOption
   if (options.timeout && (!Number.isFinite(timeoutMs) || Number(timeoutMs) <= 0)) {
     throw new Error("--timeout must be a duration like 45s, 2m, or 500ms.");
   }
-  if (options.obuSessionId && !options.obuTabId) {
-    throw new Error("--obu-session-id requires --obu-tab-id.");
+  const browserTarget: ChatGptExportBrowserTarget = explicitRemoteChrome
+    ? { transport: "cdp", affinity: explicitRemoteChrome }
+    : options.sessionId
+      ? resolveChatGptExportBrowserTargetForSession(
+          targetUrl,
+          options.sessionId,
+          await sessionStore.readSession(options.sessionId),
+        )
+      : resolveChatGptExportBrowserTarget(targetUrl, await sessionStore.listSessions());
+  if (browserTarget.transport === "obu" && options.recoverArchived === false) {
+    throw new Error(
+      "--no-recover-archived is unavailable for main-Chrome exports; remove it or use the legacy CDP export path.",
+    );
   }
-  const remoteChromeAffinity = options.obuTabId
-    ? { host: DEFAULT_REMOTE_CHROME_HOST, port: DEFAULT_REMOTE_CHROME_PORT }
-    : explicitRemoteChrome
-      ? explicitRemoteChrome
-      : options.sessionId
-        ? resolveChatGptExportRemoteChromeForSession(
-            targetUrl,
-            options.sessionId,
-            await sessionStore.readSession(options.sessionId),
-          )
-        : resolveChatGptExportRemoteChrome(targetUrl, await sessionStore.listSessions());
-  const { host, port } = remoteChromeAffinity;
   const outDir = path.resolve(expandPath(options.out ?? defaultOutputDir(targetUrl)));
   const chunkSize = parsePositiveInteger(options.chunkSize, "--chunk-size");
-  const result = options.obuTabId
-    ? await captureApprovedChatGptConversationBackendViaObu({
-        targetUrl,
-        outDir,
-        sessionId: options.obuSessionId,
-        tabId: options.obuTabId,
-        timeoutMs,
-        chunkSize,
-      })
-    : await captureApprovedChatGptConversationBackend({
-        targetUrl,
-        outDir,
-        tabRef: options.browserTab ?? targetUrl,
-        host,
-        port,
-        browserId: "browserId" in remoteChromeAffinity ? remoteChromeAffinity.browserId : undefined,
-        browserWSEndpoint:
-          "browserWSEndpoint" in remoteChromeAffinity
-            ? remoteChromeAffinity.browserWSEndpoint
-            : undefined,
-        accountDigest:
-          "accountDigest" in remoteChromeAffinity ? remoteChromeAffinity.accountDigest : undefined,
-        timeoutMs,
-        chunkSize,
-        recoverArchived: options.recoverArchived,
-        archiveAfterExport: options.archiveAfterExport,
-      });
+  const remoteChromeIdentity =
+    browserTarget.transport === "cdp" && "browserId" in browserTarget.affinity
+      ? (browserTarget.affinity as ChatGptExportRemoteChromeAffinity)
+      : undefined;
+  const result = await (async () => {
+    try {
+      return browserTarget.transport === "obu"
+        ? await captureApprovedChatGptConversationBackendViaObu({
+            targetUrl,
+            outDir,
+            oracleSessionId: options.sessionId,
+            obuSessionId: browserTarget.affinity.sessionId,
+            obuTabId: browserTarget.affinity.tabId,
+            email: browserTarget.affinity.email,
+            workspaceName: browserTarget.affinity.workspaceName,
+            accountDigest: browserTarget.affinity.accountDigest,
+            workspaceDigest: browserTarget.affinity.workspaceDigest,
+            turnAffinity: browserTarget.turnAffinity,
+            timeoutMs,
+            chunkSize,
+            archiveAfterExport: options.archiveAfterExport,
+          })
+        : await captureApprovedChatGptConversationBackend({
+            targetUrl,
+            outDir,
+            tabRef: options.browserTab ?? targetUrl,
+            host: browserTarget.affinity.host,
+            port: browserTarget.affinity.port,
+            browserId: remoteChromeIdentity?.browserId,
+            browserWSEndpoint: remoteChromeIdentity?.browserWSEndpoint,
+            accountDigest: remoteChromeIdentity?.accountDigest,
+            timeoutMs,
+            chunkSize,
+            turnAffinity: browserTarget.turnAffinity,
+            recoverArchived: options.recoverArchived,
+            archiveAfterExport: options.archiveAfterExport,
+          });
+    } catch (error) {
+      if (options.sessionId) {
+        const metadata = await sessionStore.readSession(options.sessionId);
+        const userError = asOracleUserError(error);
+        const message = error instanceof Error ? error.message : String(error);
+        const operationError = userError
+          ? {
+              category: userError.category,
+              message: userError.message,
+              details: { ...userError.details, oracleOperation: "chatgpt-export" },
+            }
+          : {
+              category: "browser-automation",
+              message,
+              details: { oracleOperation: "chatgpt-export" },
+            };
+        const browser = {
+          ...(metadata?.browser ?? {}),
+          operationErrors: {
+            ...(metadata?.browser?.operationErrors ?? {}),
+            "chatgpt-export": operationError,
+          },
+        };
+        await sessionStore.updateSession(options.sessionId, { browser }).catch(() => undefined);
+      }
+      throw error;
+    }
+  })();
+  if (options.sessionId) {
+    const metadata = await sessionStore.readSession(options.sessionId);
+    if (metadata?.browser?.operationErrors?.["chatgpt-export"]) {
+      const operationErrors = { ...metadata.browser.operationErrors };
+      delete operationErrors["chatgpt-export"];
+      const browser = {
+        ...metadata.browser,
+        operationErrors: Object.keys(operationErrors).length > 0 ? operationErrors : undefined,
+      };
+      await sessionStore.updateSession(options.sessionId, { browser }).catch(() => undefined);
+    }
+  }
 
   if (options.json) {
     console.log(JSON.stringify(result, null, 2));
@@ -335,6 +487,12 @@ export async function handleChatGptExportCommand(options: ChatGptExportCliOption
   console.log(
     `Counts: ${result.turnCount} turns, ${result.mappingCount} mapping nodes, ${result.currentPathNodeCount} current-path nodes`,
   );
+  for (const warning of result.warnings ?? []) {
+    console.log(chalk.yellow(`Warning (${warning.code}): ${warning.message}`));
+    if (warning.details) {
+      console.log(chalk.dim(`Warning details: ${JSON.stringify(warning.details)}`));
+    }
+  }
   console.log(
     chalk.dim(
       "Non-claim: Oracle did not read cookies, localStorage, browser profiles, or unrelated ChatGPT history; it captured only the approved backend conversation URL during page load.",

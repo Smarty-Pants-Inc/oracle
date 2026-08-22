@@ -37,7 +37,7 @@ describe("browser conversation archive policy", () => {
       resolveBrowserArchiveDecision({
         mode: "auto",
         chatgptUrl: "https://chatgpt.com/",
-        conversationUrl: "https://chatgpt.com/g/g-p-demo/project/c/abc",
+        conversationUrl: "https://chatgpt.com/g/g-p-demo/c/abc",
       }),
     ).toMatchObject({ shouldArchive: true, reason: "successful-one-shot" });
   });
@@ -89,6 +89,8 @@ describe("browser conversation archive policy", () => {
   test("detects ChatGPT project URLs", () => {
     expect(isProjectChatgptUrl("https://chatgpt.com/g/g-p-demo/project")).toBe(true);
     expect(isProjectChatgptUrl("https://chatgpt.com/g/g-p-demo/project?model=gpt-5")).toBe(true);
+    expect(isProjectChatgptUrl("https://chatgpt.com/g/g-p-demo/c/abc")).toBe(true);
+    expect(isProjectChatgptUrl("https://chatgpt.com/g/g-p-demo/project/c/abc")).toBe(false);
     expect(isProjectChatgptUrl("https://chatgpt.com/c/abc")).toBe(false);
   });
 
@@ -177,7 +179,11 @@ describe("archiveChatGptConversation", () => {
     });
   });
 
-  test.each(["https://attacker.example/c/abc", "https://chatgpt.com:8443/c/abc"])(
+  test.each([
+    "https://attacker.example/c/abc",
+    "https://chatgpt.com:8443/c/abc",
+    "https://chatgpt.com/g/g-p-demo/project/c/abc",
+  ])(
     "rejects noncanonical conversation URL %s before evaluating the page",
     async (conversationUrl) => {
       const runtime = { evaluate: vi.fn() };

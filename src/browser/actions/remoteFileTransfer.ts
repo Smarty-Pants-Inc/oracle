@@ -11,7 +11,11 @@ import { transferAttachmentViaDataTransfer } from "./attachmentDataTransfer.js";
  * Used when browser is on a different machine than CLI
  */
 export async function uploadAttachmentViaDataTransfer(
-  deps: { runtime: ChromeClient["Runtime"]; dom?: ChromeClient["DOM"] },
+  deps: {
+    runtime: ChromeClient["Runtime"];
+    dom?: ChromeClient["DOM"];
+    beforeFileInputMutation?: () => Promise<void> | void;
+  },
   attachment: BrowserAttachment,
   logger: BrowserLogger,
 ): Promise<void> {
@@ -43,6 +47,7 @@ export async function uploadAttachmentViaDataTransfer(
     runtime,
     attachment,
     fileInputSelector,
+    deps.beforeFileInputMutation,
   );
 
   logger(`File transferred: ${transferResult.fileName} (${transferResult.size} bytes)`);

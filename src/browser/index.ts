@@ -24,6 +24,7 @@ import {
   ensureChromePageTargetAfterClose,
   closeBlankChromeTabs,
 } from "./chromeLifecycle.js";
+import type { RemoteChromeConnection } from "./chromeLifecycle.js";
 import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
 import {
   navigateToChatGPT,
@@ -59,12 +60,18 @@ import {
 } from "./actions/deepResearch.js";
 import { estimateTokenCount, withRetries, delay } from "./utils.js";
 import { formatElapsed } from "../oracle/format.js";
-import type { BrowserModelSelectionEvidence } from "../sessionStore.js";
+import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionStore.js";
 import { CHATGPT_URL, DEFAULT_MODEL_STRATEGY } from "./constants.js";
 import type { LaunchedChrome } from "chrome-launcher";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import { alignPromptEchoPair, buildPromptEchoMatcher } from "./reattachHelpers.js";
-import { buildConversationTurnCountExpression } from "./conversationTurns.js";
+import {
+  buildConversationTurnCountExpression,
+  captureConversationUserTurnBinding,
+  hashConversationTurnText,
+  readBoundConversationTurn,
+  type ConversationTurnBinding,
+} from "./conversationTurns.js";
 import type { ProfileRunLock } from "./profileState.js";
 import {
   cleanupStaleProfileState,
@@ -122,6 +129,15 @@ import {
   extractStableConversationIdFromUrl as extractConversationIdFromUrl,
   isStableConversationUrl as isConversationUrl,
 } from "./conversationUrl.js";
+import { assertChatGptIdentity } from "./chatgptAccountRouter.js";
+import {
+  acquireOpenBrowserUseRunLock,
+  connectOpenBrowserUseTab,
+  prepareOpenBrowserUseChatGptRoute,
+  registerOpenBrowserUseTerminationHooks,
+  prepareOpenBrowserUseConversationRoute,
+  type OpenBrowserUseConnection,
+} from "./openBrowserUse.js";
 
 export type { BrowserAutomationConfig, BrowserRunOptions, BrowserRunResult } from "./types.js";
 export { CHATGPT_URL, DEFAULT_MODEL_STRATEGY, DEFAULT_MODEL_TARGET } from "./constants.js";
@@ -1073,16 +1089,23 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   const fallbackSubmission = options.fallbackSubmission;
 
   let config = resolveBrowserConfig(options.config);
-  if (process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" && !config.remoteChrome) {
+  if (
+    process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" &&
+    !config.remoteChrome &&
+    config.browserTransport !== "obu"
+  ) {
     throw new BrowserAutomationError(
-      "The agent wrapper requires a stored or wrapper-selected remote Chrome endpoint; refusing to launch or attach local Chrome.",
+      "The agent wrapper requires a stored or wrapper-selected existing-browser transport; refusing to launch or attach local Chrome.",
       { stage: "background-browser-policy" },
     );
   }
   const usingCopiedProfile = Boolean(config.copyProfileSource);
-  if (usingCopiedProfile && (config.attachRunning || config.remoteChrome)) {
+  if (
+    usingCopiedProfile &&
+    (config.attachRunning || config.remoteChrome || config.browserTransport === "obu")
+  ) {
     throw new BrowserAutomationError(
-      "--copy-profile requires a locally launched Chrome instance and cannot be combined with attach-running or remote Chrome.",
+      "--copy-profile requires a locally launched Chrome instance and cannot be combined with attach-running, remote Chrome, or Open Browser Use.",
       { stage: "profile-config" },
     );
   }
@@ -1176,7 +1199,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     };
   }
 
-  if (!config.remoteChrome && !config.manualLogin) {
+  if (config.browserTransport !== "obu" && !config.remoteChrome && !config.manualLogin) {
     const preferredPort = config.debugPort ?? DEFAULT_DEBUG_PORT;
     const availablePort = await pickAvailableDebugPort(preferredPort, logger);
     if (availablePort !== preferredPort) {
@@ -1187,14 +1210,14 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     config = { ...config, debugPort: availablePort };
   }
 
-  // Remote Chrome mode - connect to existing browser
-  if (config.remoteChrome) {
-    // Warn about ignored local-only options
-    const ignoredFlags = listIgnoredRemoteChromeFlags(config);
-    if (ignoredFlags.length > 0) {
-      logger(`Note: --remote-chrome ignores local Chrome flags (${ignoredFlags.join(", ")}).`);
+  // Existing browser transport: remote CDP or the single main-Chrome OBU bridge.
+  if (config.browserTransport === "obu" || config.remoteChrome) {
+    if (config.remoteChrome) {
+      const ignoredFlags = listIgnoredRemoteChromeFlags(config);
+      if (ignoredFlags.length > 0) {
+        logger(`Note: --remote-chrome ignores local Chrome flags (${ignoredFlags.join(", ")}).`);
+      }
     }
-
     return runRemoteBrowserMode(promptText, attachments, config, logger, options);
   }
 
@@ -3102,30 +3125,118 @@ async function assertRemoteChatGptAccountAffinity(
     });
   }
 }
+async function assertConnectedChatGptAffinity(
+  Runtime: ChromeClient["Runtime"],
+  config: ResolvedBrowserConfig,
+  action: string,
+  expectedScopeUrl = config.resumeConversationUrl ?? config.url,
+): Promise<void> {
+  if (config.browserTransport !== "obu") {
+    await assertRemoteChatGptAccountAffinity(Runtime, config.remoteChromeAccountDigest, action);
+    return;
+  }
+  const email = config.chatGptAccountEmail?.trim();
+  const workspaceName = config.chatGptWorkspaceName?.trim();
+  const accountDigest = config.chatGptAccountDigest?.trim();
+  const workspaceDigest = config.chatGptWorkspaceDigest?.trim();
+  if (!email || !workspaceName || !accountDigest || !workspaceDigest) {
+    throw new BrowserAutomationError(
+      `Main Chrome account/workspace affinity is unavailable before ${action}.`,
+      { stage: "main-chrome-account-router", code: "account-affinity-unavailable" },
+    );
+  }
+  await assertChatGptIdentity(Runtime, {
+    email,
+    workspaceName,
+    accountDigest,
+    workspaceDigest,
+  });
+  await ensureChatGptScopeRetained(Runtime, expectedScopeUrl);
+}
+
+async function assertResumeTurnAffinity(
+  Runtime: ChromeClient["Runtime"],
+  binding: ConversationTurnBinding,
+  action: string,
+): Promise<void> {
+  const hasPrompt = Boolean(
+    binding.promptDigest ||
+    binding.promptTurnId ||
+    binding.promptMessageId ||
+    Number.isInteger(binding.promptTurnIndex),
+  );
+  const hasAssistant = Boolean(
+    binding.assistantTurnId ||
+    binding.assistantMessageId ||
+    Number.isInteger(binding.assistantTurnIndex),
+  );
+  if (!hasPrompt || !hasAssistant) {
+    throw new BrowserAutomationError(
+      `Stored ChatGPT branch affinity is incomplete before ${action}.`,
+      { stage: "chatgpt-turn-affinity", code: "resume-turn-affinity-incomplete" },
+    );
+  }
+  const resolved = await readBoundConversationTurn(Runtime, binding);
+  if (resolved.status !== "matched" || !resolved.turn.assistant) {
+    const status = resolved.status === "matched" ? "missing" : resolved.status;
+    throw new BrowserAutomationError(
+      `The stored ChatGPT prompt/assistant branch is ${status} before ${action}.`,
+      { stage: "chatgpt-turn-affinity", code: `turn-affinity-${status}` },
+    );
+  }
+  if (resolved.turn.hasLaterUserTurn) {
+    throw new BrowserAutomationError(
+      `The stored ChatGPT branch advanced before ${action}; refusing to send into another branch.`,
+      { stage: "chatgpt-turn-affinity", code: "turn-affinity-advanced" },
+    );
+  }
+}
+
+async function persistRuntimeHintForTransport(
+  usingObu: boolean,
+  logger: BrowserLogger,
+  persist: () => Promise<void>,
+): Promise<void> {
+  try {
+    await persist();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger(`Failed to persist runtime hint: ${message}`);
+    if (usingObu) {
+      throw new BrowserAutomationError(
+        "Failed to persist exact main-Chrome session affinity.",
+        { stage: "session-persistence", code: "runtime-hint-persist-failed" },
+        error,
+      );
+    }
+  }
+}
 
 async function runRemoteBrowserMode(
   promptText: string,
   attachments: BrowserAttachment[],
-  config: ReturnType<typeof resolveBrowserConfig>,
+  config: ResolvedBrowserConfig,
   logger: BrowserLogger,
   options: BrowserRunOptions,
 ): Promise<BrowserRunResult> {
+  const usingObu = config.browserTransport === "obu";
   const remoteChromeConfig = config.remoteChrome;
-  if (!remoteChromeConfig) {
+  if (!usingObu && !remoteChromeConfig) {
     throw new Error(
-      "Remote Chrome configuration missing. Pass --remote-chrome <host:port> to use this mode.",
+      "Existing browser configuration missing. Pass --remote-chrome <host:port> or use the wrapper-selected OBU transport.",
     );
   }
-  const { host, port } = remoteChromeConfig;
+  const host = remoteChromeConfig?.host ?? "127.0.0.1";
+  const port = remoteChromeConfig?.port ?? 0;
   const expectedBrowserId = config.remoteChromeBrowserId?.trim();
-  const expectedAccountDigest = config.remoteChromeAccountDigest?.trim();
-  if (expectedAccountDigest && !/^[a-f0-9]{64}$/.test(expectedAccountDigest)) {
+  const expectedRemoteAccountDigest = config.remoteChromeAccountDigest?.trim();
+  if (expectedRemoteAccountDigest && !/^[a-f0-9]{64}$/.test(expectedRemoteAccountDigest)) {
     throw new BrowserAutomationError("Remote Chrome account identity is invalid.", {
       stage: "remote-browser-identity",
     });
   }
   let browserWSEndpoint = config.remoteChromeBrowserWSEndpoint ?? undefined;
-  if (expectedBrowserId) {
+  if (!usingObu && expectedBrowserId) {
     if (!browserWSEndpoint) {
       throw new BrowserAutomationError("Remote Chrome browser identity is missing its WebSocket.", {
         stage: "remote-browser-identity",
@@ -3134,9 +3245,7 @@ async function runRemoteBrowserMode(
     if (browserIdFromWebSocketEndpoint(browserWSEndpoint) !== expectedBrowserId) {
       throw new BrowserAutomationError(
         "Remote Chrome browser identity does not match its WebSocket.",
-        {
-          stage: "remote-browser-identity",
-        },
+        { stage: "remote-browser-identity" },
       );
     }
     const liveIdentity = await resolveRemoteChromeBrowserIdentity({ host, port });
@@ -3151,74 +3260,140 @@ async function runRemoteBrowserMode(
       );
     }
     browserWSEndpoint = liveIdentity.browserWSEndpoint;
-  } else if (process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1") {
+  } else if (!usingObu && process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1") {
     throw new BrowserAutomationError(
       "The agent wrapper requires a verified remote Chrome browser identity.",
-      {
-        stage: "remote-browser-identity",
-      },
+      { stage: "remote-browser-identity" },
+    );
+  }
+
+  const expectedEmail = config.chatGptAccountEmail?.trim().toLowerCase();
+  const expectedWorkspace = config.chatGptWorkspaceName?.trim();
+  const expectedObuAccountDigest = config.chatGptAccountDigest?.trim();
+  const expectedObuWorkspaceDigest = config.chatGptWorkspaceDigest?.trim();
+  if (usingObu && (!expectedEmail || !expectedWorkspace)) {
+    throw new BrowserAutomationError(
+      "Main Chrome routing requires an exact ChatGPT account email and workspace.",
+      { stage: "main-chrome-account-router", code: "account-route-incomplete" },
+    );
+  }
+  for (const [label, digest] of [
+    ["account", expectedObuAccountDigest],
+    ["workspace", expectedObuWorkspaceDigest],
+  ] as const) {
+    if (digest && !/^[a-f0-9]{64}$/.test(digest)) {
+      throw new BrowserAutomationError(`Stored ChatGPT ${label} identity is invalid.`, {
+        stage: "main-chrome-account-router",
+        code: `${label}-identity-invalid`,
+      });
+    }
+  }
+  if (
+    usingObu &&
+    config.resumeConversationUrl &&
+    (!expectedObuAccountDigest || !expectedObuWorkspaceDigest)
+  ) {
+    throw new BrowserAutomationError(
+      "Stored main-Chrome session has no verified account/workspace identity; start a fresh browser conversation through the wrapper.",
+      { stage: "main-chrome-account-router", code: "account-affinity-unavailable" },
     );
   }
   if (
+    !usingObu &&
     process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" &&
     config.resumeConversationUrl &&
-    !expectedAccountDigest
+    !expectedRemoteAccountDigest
   ) {
     throw new BrowserAutomationError(
       "Stored remote Chrome session has no verified account identity; start a fresh browser conversation through the agent wrapper.",
       { stage: "remote-browser-identity" },
     );
   }
-  logger(`Connecting to remote Chrome at ${host}:${port}`);
+  logger(
+    usingObu
+      ? "Connecting to main Chrome through Open Browser Use"
+      : `Connecting to remote Chrome at ${host}:${port}`,
+  );
 
   let client: ChromeClient | null = null;
   let browserRuntime: ChromeClient["Runtime"] | null = null;
   let remoteTargetId: string | null = null;
   let tabLease: BrowserTabLease | null = null;
   let lastUrl: string | undefined;
+  let pinnedChatGptScopeUrl = config.resumeConversationUrl ?? config.url;
   let promptSubmitted = false;
+  let pendingConversationAffinity = false;
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
   let attachedExistingTab = false;
   let attachedTabDescription: string | null = null;
   let ownsTarget = true;
   let conversationUrlMonitor: ConversationUrlMonitor | null = null;
+  let connection: RemoteChromeConnection | null = null;
+  let obuConnection: OpenBrowserUseConnection | null = null;
+  let obuConnectionReady: Promise<OpenBrowserUseConnection> | null = null;
+  let obuRunLock: ProfileRunLock | null = null;
+  let removeObuTerminationHooks: (() => void) | null = null;
+  const chromeProfileRoot = config.remoteChromeProfileRoot ?? undefined;
+  let promptBinding: ConversationTurnBinding = {};
+  let pendingResumeTurnBinding = config.resumeTurnBinding ?? null;
+  const followUpPrompts = normalizeBrowserFollowUpPrompts(options.followUpPrompts);
   const runtimeHintCb = options.runtimeHintCb;
-  const emitRuntimeHint = async () => {
-    if (!runtimeHintCb) return;
-    try {
-      await runtimeHintCb(
-        {
+  const buildRuntimeMetadata = (): BrowserRuntimeMetadata => ({
+    browserTransport: usingObu ? "obu" : "cdp",
+    ...(usingObu
+      ? {
+          obuSessionId: obuConnection?.sessionId ?? config.obuSessionId ?? undefined,
+          obuTabId: obuConnection?.tabId ?? config.obuTabId ?? undefined,
+          chatGptAccountEmail: config.chatGptAccountEmail ?? undefined,
+          chatGptWorkspaceName: config.chatGptWorkspaceName ?? undefined,
+          chatGptWorkspaceDigest: config.chatGptWorkspaceDigest ?? undefined,
+        }
+      : {
           chromePort: port,
           chromeHost: host,
           chromeBrowserWSEndpoint: browserWSEndpoint,
-          chatGptAccountDigest: config.remoteChromeAccountDigest ?? undefined,
           chromeProfileRoot,
           chromeTargetId: remoteTargetId ?? undefined,
-          tabUrl: lastUrl,
-          conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-          promptSubmitted,
-          controllerPid: process.pid,
-        },
-        modelSelectionEvidence,
-      );
+        }),
+    chatGptAccountDigest: usingObu
+      ? (config.chatGptAccountDigest ?? undefined)
+      : (config.remoteChromeAccountDigest ?? undefined),
+    ...promptBinding,
+    tabUrl: lastUrl,
+    conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+    promptSubmitted,
+    controllerPid: process.pid,
+  });
+  const emitRuntimeHint = async () => {
+    if (!runtimeHintCb) return;
+    await persistRuntimeHintForTransport(usingObu, logger, async () => {
+      await runtimeHintCb(buildRuntimeMetadata(), modelSelectionEvidence);
       await tabLease?.update({
         chromeHost: host,
         chromePort: port,
         chromeTargetId: remoteTargetId ?? undefined,
         tabUrl: lastUrl,
       });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logger(`Failed to persist runtime hint: ${message}`);
-    }
+    });
   };
   const markPromptSubmitted = async (): Promise<void> => {
-    if (promptSubmitted) {
-      return;
-    }
     promptSubmitted = true;
+    pendingResumeTurnBinding = null;
+    if (usingObu && conversationUrlMonitor) {
+      const captured = await conversationUrlMonitor.update(
+        "post-submit",
+        Math.min(config.inputTimeoutMs, 15_000),
+      );
+      pendingConversationAffinity = !captured;
+      if (!captured) {
+        logger(
+          "[browser] Stable conversation URL is delayed; verifying the committed user turn before failing closed.",
+        );
+      }
+    } else {
+      void conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000);
+    }
     await emitRuntimeHint();
-    void conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000);
   };
   const startedAt = Date.now();
   let answerText = "";
@@ -3229,61 +3404,116 @@ async function runRemoteBrowserMode(
   let preserveBrowserOnError = false;
   let stopThinkingMonitor: (() => void) | null = null;
   let removeDialogHandler: (() => void) | null = null;
-  let connection: Awaited<ReturnType<typeof connectToRemoteChrome>> | null = null;
-  const chromeProfileRoot = config.remoteChromeProfileRoot ?? undefined;
-  const followUpPrompts = normalizeBrowserFollowUpPrompts(options.followUpPrompts);
+  let runFailure: BrowserAutomationError | null = null;
+  const finalizeCompletedObuTab = async (): Promise<BrowserRunResult["warnings"]> => {
+    if (!usingObu || !obuConnection) return undefined;
+    try {
+      await obuConnection.finalize(false);
+      return undefined;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const details = error instanceof BrowserAutomationError ? error.details : undefined;
+      logger(`[browser] Completed answer captured, but task-tab finalization failed: ${message}`);
+      return [
+        {
+          code: "obu-tab-finalize-failed",
+          severity: "warning",
+          message,
+          ...(details ? { details: { ...details } } : {}),
+        },
+      ];
+    }
+  };
 
   try {
-    const remoteLeaseProfileDir = config.browserTabRef
-      ? null
-      : resolveRemoteTabLeaseProfileDir(config);
-    if (remoteLeaseProfileDir) {
-      await mkdir(remoteLeaseProfileDir, { recursive: true });
-      tabLease = await acquireBrowserTabLease(remoteLeaseProfileDir, {
-        maxConcurrentTabs: config.maxConcurrentTabs,
-        timeoutMs: config.timeoutMs,
+    if (usingObu) {
+      if (config.browserTabRef) {
+        throw new BrowserAutomationError(
+          "--browser-tab cannot address main Chrome; use stored Open Browser Use affinity.",
+          { stage: "open-browser-use", code: "tab-affinity-conflict" },
+        );
+      }
+      obuRunLock = await acquireOpenBrowserUseRunLock({
+        timeoutMs: config.profileLockTimeoutMs,
         logger,
         sessionId: options.sessionId,
-        chromeHost: host,
-        chromePort: port,
       });
-    }
-    if (config.browserTabRef) {
-      const attached = await connectToExistingChatGptTab({
-        host,
-        port,
-        ref: config.browserTabRef,
-        browserId: expectedBrowserId,
-        browserWSEndpoint,
-        accountDigest: expectedAccountDigest,
-      });
-      client = attached.client;
-      remoteTargetId = attached.targetId ?? null;
-      lastUrl = attached.tab.url || lastUrl;
-      attachedExistingTab = true;
-      ownsTarget = false;
-      attachedTabDescription = `Attached to existing remote ChatGPT tab ${attached.targetId}${attached.tab.url ? ` (${attached.tab.url})` : ""}`;
-    } else {
-      connection = await connectToRemoteChrome(
-        host,
-        port,
-        logger,
-        "about:blank",
-        browserWSEndpoint,
-        {
-          approvalWaitMs: config.attachRunning && browserWSEndpoint ? 20_000 : undefined,
+      removeObuTerminationHooks = registerOpenBrowserUseTerminationHooks({
+        connection: () => obuConnection ?? obuConnectionReady,
+        releaseLock: async () => {
+          await obuRunLock?.release();
+          obuRunLock = null;
         },
-      );
-      client = connection.client;
-      remoteTargetId = connection.targetId ?? null;
-      ownsTarget = true;
-    }
-    if (tabLease && remoteTargetId) {
-      await tabLease.update({
-        chromeHost: host,
-        chromePort: port,
-        chromeTargetId: remoteTargetId,
+        logger,
       });
+      obuConnectionReady = connectOpenBrowserUseTab({
+        oracleSessionId: options.sessionId,
+        obuSessionId: config.obuSessionId,
+        obuTabId: config.obuTabId,
+        conversationUrl: config.resumeConversationUrl,
+        timeoutMs: config.inputTimeoutMs,
+        logger,
+      });
+      obuConnection = await obuConnectionReady;
+      client = obuConnection.client;
+      config.obuSessionId = obuConnection.sessionId;
+      config.obuTabId = obuConnection.tabId;
+      lastUrl = obuConnection.tabUrl || lastUrl;
+      attachedExistingTab = !obuConnection.created;
+      ownsTarget = true;
+      attachedTabDescription = `${attachedExistingTab ? "Reclaimed" : "Opened"} main-Chrome Oracle tab ${obuConnection.sessionId}:${obuConnection.tabId}`;
+    } else {
+      const remoteLeaseProfileDir = config.browserTabRef
+        ? null
+        : resolveRemoteTabLeaseProfileDir(config);
+      if (remoteLeaseProfileDir) {
+        await mkdir(remoteLeaseProfileDir, { recursive: true });
+        tabLease = await acquireBrowserTabLease(remoteLeaseProfileDir, {
+          maxConcurrentTabs: config.maxConcurrentTabs,
+          timeoutMs: config.timeoutMs,
+          logger,
+          sessionId: options.sessionId,
+          chromeHost: host,
+          chromePort: port,
+        });
+      }
+      if (config.browserTabRef) {
+        const attached = await connectToExistingChatGptTab({
+          host,
+          port,
+          ref: config.browserTabRef,
+          browserId: expectedBrowserId,
+          browserWSEndpoint,
+          accountDigest: expectedRemoteAccountDigest,
+        });
+        client = attached.client;
+        remoteTargetId = attached.targetId ?? null;
+        lastUrl = attached.tab.url || lastUrl;
+        attachedExistingTab = true;
+        ownsTarget = false;
+        attachedTabDescription = `Attached to existing remote ChatGPT tab ${attached.targetId}${attached.tab.url ? ` (${attached.tab.url})` : ""}`;
+      } else {
+        connection = await connectToRemoteChrome(
+          host,
+          port,
+          logger,
+          "about:blank",
+          browserWSEndpoint,
+          {
+            approvalWaitMs: config.attachRunning && browserWSEndpoint ? 20_000 : undefined,
+          },
+        );
+        client = connection.client;
+        remoteTargetId = connection.targetId ?? null;
+        ownsTarget = true;
+      }
+      if (tabLease && remoteTargetId) {
+        await tabLease.update({
+          chromeHost: host,
+          chromePort: port,
+          chromeTargetId: remoteTargetId,
+        });
+      }
     }
     const markConnectionLost = () => {
       connectionClosedUnexpectedly = true;
@@ -3291,13 +3521,14 @@ async function runRemoteBrowserMode(
     client.on("disconnect", markConnectionLost);
     const { Network, Page, Runtime, Input, DOM, Target } = client;
 
+    browserRuntime = Runtime;
     const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
     if (DOM && typeof DOM.enable === "function") {
       domainEnablers.push(DOM.enable());
     }
     await Promise.all(domainEnablers);
     removeDialogHandler = installJavaScriptDialogAutoDismissal(Page, logger);
-    await enableFocusEmulation(client, logger, "remote target");
+    await enableFocusEmulation(client, logger, usingObu ? "main-Chrome OBU tab" : "remote target");
 
     const activeConversationUrlMonitor = createConversationUrlMonitor({
       readUrl: async () => {
@@ -3308,6 +3539,10 @@ async function runRemoteBrowserMode(
         return typeof result?.value === "string" ? result.value : null;
       },
       persistUrl: async (url) => {
+        if (usingObu) {
+          await ensureChatGptScopeRetained(Runtime, pinnedChatGptScopeUrl);
+          pinnedChatGptScopeUrl = url;
+        }
         lastUrl = url;
         await emitRuntimeHint();
       },
@@ -3315,49 +3550,80 @@ async function runRemoteBrowserMode(
     });
     conversationUrlMonitor = activeConversationUrlMonitor;
 
-    // Skip cookie sync for remote Chrome - it already has cookies.
-    // For a stored session, verify the signed-in account before touching its conversation state.
-    if (expectedAccountDigest) {
-      if (!attachedExistingTab) {
-        await navigateToChatGPT(Page, Runtime, CHATGPT_URL, logger);
+    if (usingObu) {
+      if (!obuConnection || !expectedEmail || !expectedWorkspace) {
+        throw new BrowserAutomationError("Main Chrome routing state is incomplete.", {
+          stage: "main-chrome-account-router",
+          code: "account-route-incomplete",
+        });
+      }
+      logger("Skipping cookie sync and browser-wide cookie cleanup for main Chrome");
+      const routeOptions = {
+        connection: obuConnection,
+        expectation: {
+          email: expectedEmail,
+          workspaceName: expectedWorkspace,
+          accountDigest: expectedObuAccountDigest,
+          workspaceDigest: expectedObuWorkspaceDigest,
+        },
+        targetUrl: config.resumeConversationUrl ?? config.url,
+        logger,
+      };
+      const identity = config.resumeConversationUrl
+        ? await prepareOpenBrowserUseConversationRoute(routeOptions)
+        : await prepareOpenBrowserUseChatGptRoute(routeOptions);
+      config.chatGptAccountEmail = identity.email;
+      config.chatGptWorkspaceName = identity.workspaceName;
+      config.chatGptAccountDigest = identity.accountDigest;
+      config.chatGptWorkspaceDigest = identity.workspaceDigest;
+    } else {
+      // Remote Chrome already owns its cookies. For a stored session, verify the
+      // signed-in account before touching its conversation state.
+      if (expectedRemoteAccountDigest) {
+        if (!attachedExistingTab) {
+          await navigateToChatGPT(Page, Runtime, CHATGPT_URL, logger);
+        }
+        await ensureNotBlocked(Runtime, config.headless, logger);
+        await ensureLoggedIn(Runtime, logger, { remoteSession: true });
+        const observedAccountDigest = await readChatGptAccountDigest(Runtime);
+        if (observedAccountDigest !== expectedRemoteAccountDigest) {
+          throw new BrowserAutomationError(
+            "Remote Chrome account identity changed before submission.",
+            { stage: "remote-browser-identity" },
+          );
+        }
+      }
+      logger("Skipping cookie sync for remote Chrome (using existing session)");
+      await clearStaleChatGptConversationCookies(Network, Target, logger, {
+        preserveConversationIds: conversationCookieIdsToPreserve(config, lastUrl),
+      });
+      if (config.resumeConversationUrl) {
+        await navigateToChatGPT(Page, Runtime, config.resumeConversationUrl, logger);
+      } else if (!attachedExistingTab && !expectedRemoteAccountDigest) {
+        await navigateToChatGPT(Page, Runtime, config.url, logger);
       }
       await ensureNotBlocked(Runtime, config.headless, logger);
       await ensureLoggedIn(Runtime, logger, { remoteSession: true });
       const observedAccountDigest = await readChatGptAccountDigest(Runtime);
-      if (observedAccountDigest !== expectedAccountDigest) {
+      if (expectedRemoteAccountDigest && observedAccountDigest !== expectedRemoteAccountDigest) {
         throw new BrowserAutomationError(
           "Remote Chrome account identity changed before submission.",
-          {
-            stage: "remote-browser-identity",
-          },
+          { stage: "remote-browser-identity" },
         );
       }
-    }
-    logger("Skipping cookie sync for remote Chrome (using existing session)");
-    await clearStaleChatGptConversationCookies(Network, Target, logger, {
-      preserveConversationIds: conversationCookieIdsToPreserve(config, lastUrl),
-    });
-
-    if (config.resumeConversationUrl) {
-      await navigateToChatGPT(Page, Runtime, config.resumeConversationUrl, logger);
-    } else if (!attachedExistingTab && !expectedAccountDigest) {
-      await navigateToChatGPT(Page, Runtime, config.url, logger);
+      if (!expectedRemoteAccountDigest) {
+        config.remoteChromeAccountDigest = observedAccountDigest;
+      }
     }
     await ensureNotBlocked(Runtime, config.headless, logger);
     await ensureLoggedIn(Runtime, logger, { remoteSession: true });
-    await assertWrapperExpectedChatGptAccount(Runtime);
-    const observedAccountDigest = await readChatGptAccountDigest(Runtime);
-    if (expectedAccountDigest && observedAccountDigest !== expectedAccountDigest) {
-      throw new BrowserAutomationError(
-        "Remote Chrome account identity changed before submission.",
-        {
-          stage: "remote-browser-identity",
-        },
-      );
-    }
-    if (!expectedAccountDigest) {
-      config.remoteChromeAccountDigest = observedAccountDigest;
-    }
+    if (!usingObu) await assertWrapperExpectedChatGptAccount(Runtime);
+    await assertConnectedChatGptAffinity(
+      Runtime,
+      config,
+      "prompt preparation",
+      pinnedChatGptScopeUrl,
+    );
     if (attachedTabDescription) logger(attachedTabDescription);
     await emitRuntimeHint();
     await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
@@ -3367,12 +3633,25 @@ async function runRemoteBrowserMode(
         expectedConversationUrl: config.resumeConversationUrl,
       });
     }
+    if (pendingResumeTurnBinding) {
+      await assertResumeTurnAffinity(
+        Runtime,
+        pendingResumeTurnBinding,
+        "resumed conversation hydration",
+      );
+    }
     const chatMode = await ensureChatMode(Runtime, Input, config.inputTimeoutMs, logger, {
       resetWorkConversation:
         attachedExistingTab && !config.resumeConversationUrl
           ? async () => {
               await navigateToChatGPT(Page, Runtime, config.url, logger);
               await ensureNotBlocked(Runtime, config.headless, logger);
+              await assertConnectedChatGptAffinity(
+                Runtime,
+                config,
+                "conversation reset",
+                pinnedChatGptScopeUrl,
+              );
               await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
             }
           : undefined,
@@ -3392,10 +3671,10 @@ async function runRemoteBrowserMode(
       if (typeof result?.value === "string") {
         lastUrl = result.value;
       }
-      await emitRuntimeHint();
     } catch {
-      // ignore
+      // The URL hint is optional; exact OBU session persistence below is not.
     }
+    await emitRuntimeHint();
 
     const modelStrategy = config.modelStrategy ?? DEFAULT_MODEL_STRATEGY;
     if (config.desiredModel && modelStrategy !== "ignore" && !config.resumeConversationUrl) {
@@ -3450,10 +3729,14 @@ async function runRemoteBrowserMode(
     }
 
     const submitOnce = async (prompt: string, submissionAttachments: BrowserAttachment[]) => {
-      await assertRemoteChatGptAccountAffinity(
+      if (pendingResumeTurnBinding) {
+        await assertResumeTurnAffinity(Runtime, pendingResumeTurnBinding, "submission preparation");
+      }
+      await assertConnectedChatGptAffinity(
         Runtime,
-        config.remoteChromeAccountDigest,
+        config,
         "submission preparation",
+        pinnedChatGptScopeUrl,
       );
       const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
       const baselineAssistantText =
@@ -3472,13 +3755,28 @@ async function runRemoteBrowserMode(
         await clearComposerAttachments(Runtime, 5_000, logger);
         // Use remote file transfer for remote Chrome (reads local files and injects via CDP)
         for (const attachment of submissionAttachments) {
-          await assertRemoteChatGptAccountAffinity(
+          await assertConnectedChatGptAffinity(
             Runtime,
-            config.remoteChromeAccountDigest,
+            config,
             "attachment upload",
+            pinnedChatGptScopeUrl,
           );
           logger(`Uploading attachment: ${attachment.displayPath}`);
-          await uploadAttachmentViaDataTransfer({ runtime: Runtime, dom: DOM }, attachment, logger);
+          await uploadAttachmentViaDataTransfer(
+            {
+              runtime: Runtime,
+              dom: DOM,
+              beforeFileInputMutation: () =>
+                assertConnectedChatGptAffinity(
+                  Runtime,
+                  config,
+                  "attachment file input",
+                  pinnedChatGptScopeUrl,
+                ),
+            },
+            attachment,
+            logger,
+          );
           await delay(500);
         }
         // Scale timeout based on number of files: base 30s + 15s per additional file
@@ -3508,6 +3806,18 @@ async function runRemoteBrowserMode(
         );
       }
       let baselineTurns = await readConversationTurnCount(Runtime, logger);
+      const promptTurnBoundary = baselineTurns;
+      const preparePromptSend = async () => {
+        if (pendingResumeTurnBinding) {
+          await assertResumeTurnAffinity(Runtime, pendingResumeTurnBinding, "prompt send");
+        }
+        promptBinding =
+          promptTurnBoundary == null
+            ? { promptDigest: hashConversationTurnText(prompt) }
+            : { promptTurnIndex: promptTurnBoundary };
+        await emitRuntimeHint();
+        await assertConnectedChatGptAffinity(Runtime, config, "prompt send", pinnedChatGptScopeUrl);
+      };
       const providerState: Record<string, unknown> = {
         runtime: Runtime,
         input: Input,
@@ -3517,17 +3827,14 @@ async function runRemoteBrowserMode(
         attachmentTimeoutMs: config.attachmentTimeoutMs ?? undefined,
         baselineTurns: baselineTurns ?? undefined,
         attachmentNames: attachmentExpectations,
+        beforePromptSubmit: preparePromptSend,
         onPromptSubmitted: markPromptSubmitted,
       };
       const deepResearchTargetBaseline =
         deepResearch && client
           ? await captureDeepResearchTargetBaseline(client, logger)
           : undefined;
-      await assertRemoteChatGptAccountAffinity(
-        Runtime,
-        config.remoteChromeAccountDigest,
-        "submission",
-      );
+      await assertConnectedChatGptAffinity(Runtime, config, "submission", pinnedChatGptScopeUrl);
       await runProviderSubmissionFlow(chatgptDomProvider, {
         prompt,
         evaluate: async () => undefined,
@@ -3535,11 +3842,45 @@ async function runRemoteBrowserMode(
         log: logger,
         state: providerState,
       });
-      await markPromptSubmitted();
       const providerBaselineTurns = providerState.baselineTurns;
       if (typeof providerBaselineTurns === "number" && Number.isFinite(providerBaselineTurns)) {
         baselineTurns = providerBaselineTurns;
       }
+      const committedBinding = await captureConversationUserTurnBinding(
+        Runtime,
+        prompt,
+        Math.max(0, promptTurnBoundary ?? 0),
+      );
+      if (!committedBinding) {
+        throw new BrowserAutomationError(
+          "ChatGPT accepted the prompt, but Oracle could not bind the committed user turn.",
+          {
+            stage: "chatgpt-turn-affinity",
+            code: "turn-affinity-unavailable",
+            runtime: buildRuntimeMetadata(),
+          },
+        );
+      }
+      promptBinding = committedBinding;
+      if (usingObu && pendingConversationAffinity) {
+        const captured = await activeConversationUrlMonitor.update(
+          "post-commit",
+          Math.min(config.inputTimeoutMs, 15_000),
+        );
+        pendingConversationAffinity = !captured;
+        if (!captured) {
+          await emitRuntimeHint();
+          throw new BrowserAutomationError(
+            "ChatGPT accepted the prompt but did not expose a stable conversation URL; the exact main-Chrome task tab and committed user turn were preserved for recovery.",
+            {
+              stage: "chatgpt-scope",
+              code: "conversation-affinity-unavailable",
+              runtime: buildRuntimeMetadata(),
+            },
+          );
+        }
+      }
+      await emitRuntimeHint();
       return {
         baselineTurns,
         baselineAssistantText,
@@ -3550,6 +3891,12 @@ async function runRemoteBrowserMode(
     const reloadPromptComposer = async () => {
       logger("[browser] Composer became unresponsive; reloading page and retrying once.");
       await Page.reload({ ignoreCache: true });
+      await assertConnectedChatGptAffinity(
+        Runtime,
+        config,
+        "composer reload",
+        pinnedChatGptScopeUrl,
+      );
       await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
     };
 
@@ -3574,6 +3921,30 @@ async function runRemoteBrowserMode(
     deepResearchTargetKeys = submission.deepResearchTargetKeys ?? [];
     deepResearchTargetBaselineCaptured = submission.deepResearchTargetBaselineCaptured ?? false;
     const imageArtifactMinTurnIndex = baselineTurns;
+    const bindExactAssistantTurn = async () => {
+      const resolved = await readBoundConversationTurn(Runtime, promptBinding);
+      if (resolved.status !== "matched") {
+        throw new BrowserAutomationError(
+          `The committed ChatGPT user turn is ${resolved.status}; refusing to bind another assistant branch.`,
+          { stage: "chatgpt-turn-affinity", code: `turn-affinity-${resolved.status}` },
+        );
+      }
+      const assistant = resolved.turn.assistant;
+      if (!assistant) {
+        throw new BrowserAutomationError(
+          "The committed ChatGPT user turn has no assistant response to bind.",
+          { stage: "chatgpt-turn-affinity", code: "assistant-affinity-unavailable" },
+        );
+      }
+      promptBinding = {
+        ...promptBinding,
+        assistantTurnIndex: assistant.index,
+        ...(assistant.turnId ? { assistantTurnId: assistant.turnId } : {}),
+        ...(assistant.messageId ? { assistantMessageId: assistant.messageId } : {}),
+      };
+      await emitRuntimeHint();
+      return assistant;
+    };
     if (deepResearch) {
       await waitForResearchPlanAutoConfirm(Runtime, logger);
       const researchResult = await waitForDeepResearchCompletion(
@@ -3589,6 +3960,13 @@ async function runRemoteBrowserMode(
         },
       );
       await activeConversationUrlMonitor.update("post-deep-research", 15_000).catch(() => false);
+      await assertConnectedChatGptAffinity(
+        Runtime,
+        config,
+        "Deep Research capture",
+        pinnedChatGptScopeUrl,
+      );
+      await bindExactAssistantTurn();
       const durationMs = Date.now() - startedAt;
       const tokens = estimateTokenCount(researchResult.text);
       const reportArtifact = await saveOptionalArtifact(
@@ -3618,11 +3996,12 @@ async function runRemoteBrowserMode(
         Runtime,
         logger,
         config,
-        accountDigest: config.remoteChromeAccountDigest,
+        accountDigest: usingObu ? config.chatGptAccountDigest : config.remoteChromeAccountDigest,
         conversationUrl: lastUrl,
         followUpCount: 0,
         requiredArtifactsSaved: Boolean(reportArtifact && transcriptArtifact),
       });
+      const warnings = await finalizeCompletedObuTab();
       runStatus = "complete";
       return {
         answerText: researchResult.text,
@@ -3631,23 +4010,18 @@ async function runRemoteBrowserMode(
         artifacts: savedArtifacts,
         archive,
         modelSelection: modelSelectionEvidence,
+        warnings,
         tookMs: durationMs,
         answerTokens: tokens,
         answerChars: researchResult.text.length,
-        chromePort: port,
-        chromeHost: host,
-        chromeTargetId: remoteTargetId ?? undefined,
-        tabUrl: lastUrl,
-        conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-        promptSubmitted,
-        controllerPid: process.pid,
+        ...buildRuntimeMetadata(),
       };
     }
     // Helper to normalize text for echo detection (collapse whitespace, lowercase)
     const normalizeForComparison = (text: string): string =>
       text.toLowerCase().replace(/\s+/g, " ").trim();
     const expectedConversationId = () =>
-      lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined;
+      extractConversationIdFromUrl(pinnedChatGptScopeUrl) ?? undefined;
     const waitForFreshAssistantResponse = async (baselineNormalized: string, timeoutMs: number) => {
       const baselinePrefix =
         baselineNormalized.length >= 80
@@ -3703,6 +4077,10 @@ async function runRemoteBrowserMode(
       await delay(recheckDelayMs);
       const conversationUrl = await readConversationUrl(Runtime);
       if (conversationUrl && isConversationUrl(conversationUrl)) {
+        if (usingObu) {
+          await ensureChatGptScopeRetained(Runtime, pinnedChatGptScopeUrl);
+          pinnedChatGptScopeUrl = conversationUrl;
+        }
         lastUrl = conversationUrl;
         logger(`[browser] Rechecking assistant response at ${conversationUrl}`);
         await Page.navigate({ url: conversationUrl });
@@ -3718,6 +4096,21 @@ async function runRemoteBrowserMode(
         logger(`[browser] Session validation failed: ${sessionValid.reason}`);
         // Update session metadata to indicate login is needed
         await emitRuntimeHint();
+        if (usingObu) {
+          throw new BrowserAutomationError(
+            `ChatGPT login for ${config.chatGptAccountEmail} expired in main Chrome. Sign in to that account, select the “${config.chatGptWorkspaceName}” workspace, then resume this Oracle session.`,
+            {
+              stage: "assistant-recheck",
+              code: "login-required",
+              conversationUrl: conversationUrl || lastUrl || null,
+              sessionStatus: "needs_login",
+              validationReason: sessionValid.reason,
+              expectedEmail: config.chatGptAccountEmail,
+              expectedWorkspace: config.chatGptWorkspaceName,
+              runtime: buildRuntimeMetadata(),
+            },
+          );
+        }
         throw new BrowserAutomationError(
           `ChatGPT session expired during recheck: ${sessionValid.reason}. ` +
             `Conversation URL: ${conversationUrl || lastUrl || "unknown"}. ` +
@@ -3729,20 +4122,16 @@ async function runRemoteBrowserMode(
               sessionStatus: "needs_login",
               validationReason: sessionValid.reason,
             },
-            runtime: {
-              chromeHost: host,
-              chromePort: port,
-              chromeBrowserWSEndpoint: browserWSEndpoint,
-              chromeProfileRoot,
-              chromeTargetId: remoteTargetId ?? undefined,
-              tabUrl: lastUrl,
-              conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-              promptSubmitted,
-              controllerPid: process.pid,
-            },
+            runtime: buildRuntimeMetadata(),
           },
         );
       }
+      await assertConnectedChatGptAffinity(
+        Runtime,
+        config,
+        "assistant recheck",
+        pinnedChatGptScopeUrl,
+      );
       await emitRuntimeHint();
       const timeoutMs = recheckTimeoutMs > 0 ? recheckTimeoutMs : config.timeoutMs;
       const rechecked = await waitWithThinkingMonitor(() =>
@@ -3816,17 +4205,7 @@ async function runRemoteBrowserMode(
                 sessionId: options.sessionId,
               },
             ).catch(() => undefined);
-            const runtime = {
-              chromePort: port,
-              chromeHost: host,
-              chromeBrowserWSEndpoint: browserWSEndpoint,
-              chromeProfileRoot,
-              chromeTargetId: remoteTargetId ?? undefined,
-              tabUrl: lastUrl,
-              conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-              promptSubmitted,
-              controllerPid: process.pid,
-            };
+            const runtime = buildRuntimeMetadata();
             throw await createAssistantTimeoutError({
               Runtime,
               logger,
@@ -3840,6 +4219,12 @@ async function runRemoteBrowserMode(
         }
       }
       await activeConversationUrlMonitor.update("post-response", 15_000).catch(() => false);
+      await assertConnectedChatGptAffinity(
+        Runtime,
+        config,
+        `${label} capture`,
+        pinnedChatGptScopeUrl,
+      );
       const baselineNormalized = baselineAssistantText
         ? normalizeForComparison(baselineAssistantText)
         : "";
@@ -3861,7 +4246,7 @@ async function runRemoteBrowserMode(
         }
       }
       let turnAnswerText = turnAnswer.text;
-      const turnAnswerHtml = turnAnswer.html ?? "";
+      let turnAnswerHtml = turnAnswer.html ?? "";
 
       const copiedMarkdown = await withRetries(
         async () => {
@@ -3960,6 +4345,22 @@ async function runRemoteBrowserMode(
           turnAnswerMarkdown = bestText;
         }
       }
+      const exactAssistant = await bindExactAssistantTurn();
+      const exactMarkdown =
+        exactAssistant.messageId || exactAssistant.turnId
+          ? await captureAssistantMarkdown(
+              Runtime,
+              { messageId: exactAssistant.messageId, turnId: exactAssistant.turnId },
+              logger,
+            ).catch(() => null)
+          : null;
+      if (exactAssistant.text) {
+        turnAnswerText = exactAssistant.text;
+        turnAnswerMarkdown = exactMarkdown ?? exactAssistant.text;
+      } else if (exactMarkdown) {
+        turnAnswerMarkdown = exactMarkdown;
+      }
+      turnAnswerHtml = exactAssistant.html ?? turnAnswerHtml;
       return {
         label,
         answerText: turnAnswerText,
@@ -4006,13 +4407,14 @@ async function runRemoteBrowserMode(
       answerMarkdown = formatted.answerMarkdown;
       answerHtml = "";
     }
-    const canSaveBrowserDownloadsLocally = isLocalChromeHost(host);
+    const canSaveBrowserDownloadsLocally = !usingObu && isLocalChromeHost(host);
     const imageArtifacts = await collectGeneratedImageArtifacts({
       Browser: canSaveBrowserDownloadsLocally ? client.Browser : undefined,
       Client: canSaveBrowserDownloadsLocally ? client : undefined,
       Page: canSaveBrowserDownloadsLocally ? Page : undefined,
       Runtime,
       Network,
+      browserTransport: usingObu ? "obu" : "cdp",
       logger,
       minTurnIndex: imageArtifactMinTurnIndex,
       sessionId: options.sessionId,
@@ -4026,17 +4428,7 @@ async function runRemoteBrowserMode(
           logger,
           stage: "image-artifact-wait",
           waitTarget: "generated image artifacts",
-          runtime: {
-            chromePort: port,
-            chromeHost: host,
-            chromeBrowserWSEndpoint: browserWSEndpoint,
-            chromeProfileRoot,
-            chromeTargetId: remoteTargetId ?? undefined,
-            tabUrl: lastUrl,
-            conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-            promptSubmitted,
-            controllerPid: process.pid,
-          },
+          runtime: buildRuntimeMetadata(),
         }),
     });
     answerText = imageArtifacts.answerText || answerText;
@@ -4044,11 +4436,12 @@ async function runRemoteBrowserMode(
       answerMarkdown += imageArtifacts.markdownSuffix;
     }
     const fileArtifacts = await collectChatGptFileArtifacts({
-      Browser: client.Browser,
+      Browser: usingObu ? undefined : client.Browser,
       Client: client,
       Page,
       Runtime,
       Network,
+      browserTransport: usingObu ? "obu" : "cdp",
       answerText: [answerText, answerMarkdown, answerHtml].filter(Boolean).join("\n"),
       logger,
       minTurnIndex: imageArtifactMinTurnIndex,
@@ -4073,7 +4466,7 @@ async function runRemoteBrowserMode(
       Runtime,
       logger,
       config,
-      accountDigest: config.remoteChromeAccountDigest,
+      accountDigest: usingObu ? config.chatGptAccountDigest : config.remoteChromeAccountDigest,
       conversationUrl: lastUrl,
       followUpCount: followUpPrompts.length,
       requiredArtifactsSaved:
@@ -4085,6 +4478,7 @@ async function runRemoteBrowserMode(
     const answerChars = answerText.length;
     const answerTokens = estimateTokenCount(answerMarkdown);
 
+    const warnings = await finalizeCompletedObuTab();
     runStatus = "complete";
     return {
       answerText,
@@ -4093,18 +4487,7 @@ async function runRemoteBrowserMode(
       tookMs: durationMs,
       answerTokens,
       answerChars,
-      browserTransport: "cdp",
-      chromePid: undefined,
-      chromePort: port,
-      chromeHost: host,
-      chromeBrowserWSEndpoint: browserWSEndpoint,
-      chatGptAccountDigest: config.remoteChromeAccountDigest ?? undefined,
-      chromeProfileRoot,
-      userDataDir: undefined,
-      chromeTargetId: remoteTargetId ?? undefined,
-      tabUrl: lastUrl,
-      conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
-      promptSubmitted,
+      ...buildRuntimeMetadata(),
       artifacts: savedArtifacts,
       generatedImages: imageArtifacts.generatedImages,
       savedImages: imageArtifacts.savedImages,
@@ -4112,6 +4495,7 @@ async function runRemoteBrowserMode(
       savedFiles: fileArtifacts.savedFiles,
       archive,
       modelSelection: modelSelectionEvidence,
+      warnings,
       controllerPid: process.pid,
     };
   } catch (error) {
@@ -4119,33 +4503,61 @@ async function runRemoteBrowserMode(
     const socketClosed = connectionClosedUnexpectedly || isWebSocketClosureError(normalizedError);
     connectionClosedUnexpectedly = connectionClosedUnexpectedly || socketClosed;
     const preservedErrorKind = classifyPreservedBrowserError(normalizedError, config.headless);
+    const routeFailure =
+      normalizedError instanceof BrowserAutomationError &&
+      (normalizedError.details?.stage === "main-chrome-account-router" ||
+        normalizedError.details?.stage === "chatgpt-scope" ||
+        normalizedError.details?.stage === "open-browser-use");
 
     if (!socketClosed) {
-      const archive = browserRuntime
-        ? await maybeArchiveInterruptedConversation({
-            Runtime: browserRuntime,
-            logger,
-            config,
-            accountDigest: config.remoteChromeAccountDigest,
-            conversationUrl: lastUrl,
-            followUpCount: followUpPrompts.length,
-          })
-        : null;
+      const archive =
+        browserRuntime && !routeFailure
+          ? await maybeArchiveInterruptedConversation({
+              Runtime: browserRuntime,
+              logger,
+              config,
+              accountDigest: usingObu
+                ? config.chatGptAccountDigest
+                : config.remoteChromeAccountDigest,
+              conversationUrl: lastUrl,
+              followUpCount: followUpPrompts.length,
+            })
+          : null;
       if (archive?.conversationUrl) {
         lastUrl = archive.conversationUrl;
         await emitRuntimeHint();
       }
       preserveBrowserOnError =
         promptSubmitted ||
-        preservedErrorKind === "cloudflare-challenge" ||
-        (preservedErrorKind === "reattachable-capture" && archive?.archived !== true);
+        (!routeFailure &&
+          (preservedErrorKind === "cloudflare-challenge" ||
+            (preservedErrorKind === "reattachable-capture" && archive?.archived !== true)));
       logger(`Failed to complete ChatGPT run: ${normalizedError.message}`);
       if ((config.debug || process.env.CHATGPT_DEVTOOLS_TRACE === "1") && normalizedError.stack) {
         logger(normalizedError.stack);
       }
-      throw withInterruptedArchiveDetails(normalizedError, archive);
+      const interruptedError = withInterruptedArchiveDetails(normalizedError, archive);
+      if (interruptedError instanceof BrowserAutomationError) runFailure = interruptedError;
+      throw interruptedError;
     }
-
+    if (usingObu) {
+      const recoveryRuntime = buildRuntimeMetadata();
+      const recoverable =
+        promptSubmitted && Boolean(obuConnection) && Boolean(recoveryRuntime.conversationId);
+      preserveBrowserOnError = recoverable;
+      runFailure = new BrowserAutomationError(
+        recoverable
+          ? "Open Browser Use disconnected from main Chrome after prompt submission. The Oracle tab was preserved; restore the bridge, then resume the stored session."
+          : "Open Browser Use disconnected before exact ChatGPT conversation affinity was available. Restore the bridge and inspect the stored session before retrying.",
+        {
+          stage: "connection-lost",
+          recoverableDisconnect: recoverable,
+          disconnectCause: "obu-bridge-disconnect",
+          runtime: recoveryRuntime,
+        },
+      );
+      throw runFailure;
+    }
     const liveness = await probeChromeTargetLiveness({
       host,
       port,
@@ -4154,82 +4566,95 @@ async function runRemoteBrowserMode(
     });
     const recoverable = isRecoverableChromeDisconnect(liveness);
     preserveBrowserOnError = recoverable && promptSubmitted;
+    const matchedUrl = liveness.matchedUrl ?? lastUrl;
     throw new BrowserAutomationError(connectionLostUserMessage({ recoverable, remote: true }), {
       stage: "connection-lost",
       recoverableDisconnect: recoverable,
       disconnectCause: recoverable ? "cdp-client-disconnect" : "chrome-closed",
       runtime: {
-        chromeHost: host,
-        chromePort: port,
-        chromeBrowserWSEndpoint: browserWSEndpoint,
-        chatGptAccountDigest: config.remoteChromeAccountDigest ?? undefined,
-        chromeProfileRoot,
-        chromeTargetId: remoteTargetId ?? undefined,
-        tabUrl: liveness.matchedUrl ?? lastUrl,
-        conversationId:
-          (liveness.matchedUrl ?? lastUrl)
-            ? extractConversationIdFromUrl(liveness.matchedUrl ?? lastUrl ?? "")
-            : undefined,
-        promptSubmitted,
-        controllerPid: process.pid,
+        ...buildRuntimeMetadata(),
+        tabUrl: matchedUrl,
+        conversationId: matchedUrl ? extractConversationIdFromUrl(matchedUrl) : undefined,
       },
     });
   } finally {
     await conversationUrlMonitor?.stop();
-    try {
-      await closeRemoteConnectionAfterRun({
-        connectionClosedUnexpectedly,
-        connection,
-        client,
-        runStatus,
-      });
-    } catch {
-      // ignore
-    }
     removeDialogHandler?.();
-    const keepRemoteBrowser = Boolean(config.keepBrowser);
-    const shouldCloseOwnedRemoteTarget = shouldCloseOwnedRunTargetAfterRun({
-      runStatus,
-      ownsTarget,
-      keepBrowser: keepRemoteBrowser,
-      closeOwnedTabOnComplete: options.closeOwnedTabOnComplete,
-      preserveForRecovery: preserveBrowserOnError,
-    });
-    const closeOwnedRemoteTarget = async () => {
-      if (!shouldCloseOwnedRemoteTarget || !remoteTargetId) {
-        return;
-      }
-      const safeToClose =
-        !keepRemoteBrowser ||
-        Boolean(await ensureChromePageTargetAfterClose(port, remoteTargetId, logger, host));
-      if (!safeToClose) {
-        logger(
-          `[browser] Leaving completed remote browser tab open because Chrome has no replacement page target.`,
-        );
-        return;
-      }
-      const closeConfirmed = await closeTab(port, remoteTargetId, logger, host);
-      if (!closeConfirmed && keepRemoteBrowser) {
-        const replacementTargetId = await createChromePageTarget(port, logger, host);
-        if (!replacementTargetId) {
-          logger(
-            `[browser] Remote Chrome page retention could not be verified after closing ${remoteTargetId}.`,
-          );
+    removeObuTerminationHooks?.();
+    removeObuTerminationHooks = null;
+    if (usingObu) {
+      const keepObuTab = runStatus !== "complete" && preserveBrowserOnError;
+      try {
+        await obuConnection?.finalize(keepObuTab);
+      } catch (error) {
+        if (runFailure?.details) {
+          (runFailure.details as Record<string, unknown>).cleanupFailure =
+            error instanceof BrowserAutomationError
+              ? { message: error.message, details: error.details }
+              : { message: error instanceof Error ? error.message : String(error) };
+        } else {
+          const message = error instanceof Error ? error.message : String(error);
+          logger(`[browser] Failed to finalize main-Chrome Oracle tab: ${message}`);
         }
       }
-    };
-    if (tabLease) {
-      const handle = tabLease;
-      tabLease = null;
-      await handle
-        .release({ onRelease: async () => closeOwnedRemoteTarget() })
-        .catch(() => undefined);
+      await obuRunLock?.release().catch(() => undefined);
+      obuRunLock = null;
     } else {
-      await closeOwnedRemoteTarget();
+      try {
+        await closeRemoteConnectionAfterRun({
+          connectionClosedUnexpectedly,
+          connection,
+          client,
+          runStatus,
+        });
+      } catch {
+        // ignore
+      }
+      const keepRemoteBrowser = Boolean(config.keepBrowser);
+      const shouldCloseOwnedRemoteTarget = shouldCloseOwnedRunTargetAfterRun({
+        runStatus,
+        ownsTarget,
+        keepBrowser: keepRemoteBrowser,
+        closeOwnedTabOnComplete: options.closeOwnedTabOnComplete,
+        preserveForRecovery: preserveBrowserOnError,
+      });
+      const closeOwnedRemoteTarget = async () => {
+        if (!shouldCloseOwnedRemoteTarget || !remoteTargetId) {
+          return;
+        }
+        const safeToClose =
+          !keepRemoteBrowser ||
+          Boolean(await ensureChromePageTargetAfterClose(port, remoteTargetId, logger, host));
+        if (!safeToClose) {
+          logger(
+            `[browser] Leaving completed remote browser tab open because Chrome has no replacement page target.`,
+          );
+          return;
+        }
+        const closeConfirmed = await closeTab(port, remoteTargetId, logger, host);
+        if (!closeConfirmed && keepRemoteBrowser) {
+          const replacementTargetId = await createChromePageTarget(port, logger, host);
+          if (!replacementTargetId) {
+            logger(
+              `[browser] Remote Chrome page retention could not be verified after closing ${remoteTargetId}.`,
+            );
+          }
+        }
+      };
+      if (tabLease) {
+        const handle = tabLease;
+        tabLease = null;
+        await handle
+          .release({ onRelease: async () => closeOwnedRemoteTarget() })
+          .catch(() => undefined);
+      } else {
+        await closeOwnedRemoteTarget();
+      }
     }
-    // Don't kill remote Chrome - it's not ours to manage
     const totalSeconds = (Date.now() - startedAt) / 1000;
-    logger(`Remote session complete • ${totalSeconds.toFixed(1)}s total`);
+    logger(
+      `${usingObu ? "Main Chrome" : "Remote"} session complete • ${totalSeconds.toFixed(1)}s total`,
+    );
   }
 }
 
@@ -4239,6 +4664,8 @@ export { resolveBrowserConfig, DEFAULT_BROWSER_CONFIG } from "./config.js";
 // biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
 export const __test__ = {
   assertRemoteChatGptAccountAffinity,
+  assertResumeTurnAffinity,
+  persistRuntimeHintForTransport,
   assertManualLoginProfileReadyForRun,
   closeRemoteConnectionAfterRun,
   classifyChatGptUiWarningText,

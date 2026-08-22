@@ -42,6 +42,13 @@ describe("runBrowserSessionExecution", () => {
         answerText: "ok",
         answerMarkdown: "ok",
         artifacts: [{ kind: "transcript" as const, path: "/tmp/transcript.md" }],
+        warnings: [
+          {
+            code: "obu-tab-finalize-failed",
+            severity: "warning" as const,
+            message: "Task-tab finalization failed after answer capture.",
+          },
+        ],
         tookMs: 1000,
         answerTokens: 12,
         answerChars: 20,
@@ -79,6 +86,7 @@ describe("runBrowserSessionExecution", () => {
     });
     expect(result.runtime).toMatchObject({ chromePid: undefined, conversationId: "foo" });
     expect(result.artifacts).toEqual([{ kind: "transcript", path: "/tmp/transcript.md" }]);
+    expect(result.warnings).toEqual([expect.objectContaining({ code: "obu-tab-finalize-failed" })]);
     expect(persistRuntimeHint).toHaveBeenCalledWith(
       expect.objectContaining({ chromePort: 9999, chromeHost: "127.0.0.1", chromeTargetId: "t-1" }),
       expect.objectContaining({ resolvedLabel: "Pro", verified: true }),

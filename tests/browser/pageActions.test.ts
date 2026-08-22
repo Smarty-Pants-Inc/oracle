@@ -254,33 +254,45 @@ describe("ensureChatGptScopeRetained", () => {
     ).resolves.toBeUndefined();
   });
 
-  test("enforces exact conversation identity for project conversation URLs", async () => {
+  test("accepts the first conversation created inside the requested project", async () => {
     const runtime = {
       evaluate: vi.fn().mockResolvedValue({
-        result: { value: "https://chatgpt.com/g/g-p-test/project/c/abc" },
+        result: { value: "https://chatgpt.com/g/g-p-test/c/abc" },
       }),
     } as unknown as ChromeClient["Runtime"];
 
     await expect(
-      ensureChatGptScopeRetained(runtime, "https://chatgpt.com/g/g-p-test/project/c/abc"),
+      ensureChatGptScopeRetained(runtime, "https://chatgpt.com/g/g-p-test/project"),
+    ).resolves.toBeUndefined();
+  });
+
+  test("enforces exact conversation identity for project conversation URLs", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: { value: "https://chatgpt.com/g/g-p-test/c/abc" },
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      ensureChatGptScopeRetained(runtime, "https://chatgpt.com/g/g-p-test/c/abc"),
     ).resolves.toBeUndefined();
   });
 
   test("rejects same-project but wrong-conversation targets", async () => {
     const runtime = {
       evaluate: vi.fn().mockResolvedValue({
-        result: { value: "https://chatgpt.com/g/g-p-test/project/c/def" },
+        result: { value: "https://chatgpt.com/g/g-p-test/c/def" },
       }),
     } as unknown as ChromeClient["Runtime"];
 
     await expect(
-      ensureChatGptScopeRetained(runtime, "https://chatgpt.com/g/g-p-test/project/c/abc"),
+      ensureChatGptScopeRetained(runtime, "https://chatgpt.com/g/g-p-test/c/abc"),
     ).rejects.toMatchObject({
       details: {
         stage: "chatgpt-scope",
         code: "scope-mismatch",
-        expectedUrl: "https://chatgpt.com/g/g-p-test/project/c/abc",
-        actualUrl: "https://chatgpt.com/g/g-p-test/project/c/def",
+        expectedUrl: "https://chatgpt.com/g/g-p-test/c/abc",
+        actualUrl: "https://chatgpt.com/g/g-p-test/c/def",
       },
     });
   });
@@ -300,6 +312,22 @@ describe("ensureChatGptScopeRetained", () => {
         actualUrl: "https://chatgpt.com/",
       },
     });
+  });
+  test("rejects encoded conversation path aliases before probing the tab", async () => {
+    const runtime = {
+      evaluate: vi.fn(),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      ensureChatGptScopeRetained(runtime, "https://chatgpt.com/%63/abc"),
+    ).rejects.toMatchObject({
+      details: {
+        stage: "chatgpt-scope",
+        code: "scope-mismatch",
+        expectedUrl: "https://chatgpt.com/%63/abc",
+      },
+    });
+    expect(runtime.evaluate).not.toHaveBeenCalled();
   });
 });
 
@@ -565,7 +593,7 @@ describe("ensureChatMode", () => {
     ["root", "/c/root-work-thread", "/c/root-work-thread", "Root task, Work"],
     [
       "project",
-      "/g/example/project/c/project-work-thread",
+      "/g/example/c/project-work-thread",
       "/c/project-work-thread",
       "Project task, chat in project Example, Work",
     ],

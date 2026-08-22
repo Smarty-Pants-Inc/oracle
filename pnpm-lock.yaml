@@ -67,6 +67,9 @@ importers:
       markdansi:
         specifier: 0.3.2
         version: 0.3.2
+      open-browser-use-sdk:
+        specifier: 0.1.41
+        version: 0.1.41
       openai:
         specifier: ^7.3.0
         version: 7.3.0(ws@8.21.1)(zod@4.4.3)
@@ -1975,6 +1978,10 @@ packages:
 
   oniguruma-to-es@4.3.6:
     resolution: {integrity: sha512-csuQ9x3Yr0cEIs/Zgx/OEt9iBw9vqIunAPQkx19R/fiMq2oGVTgcMqO/V3Ybqefr1TBvosI6jU539ksaBULJyA==}
+
+  open-browser-use-sdk@0.1.41:
+    resolution: {integrity: sha512-4Qf/0/akDboxrlVuJ+scxrNt1OZ5uSdU10eYeV43k8o1cGEosc3ZtTopBNGpE9l3IhuEPvrN8KawPBr02VKKXw==}
+    engines: {node: '>=18'}
 
   openai@7.3.0:
     resolution: {integrity: sha512-FLnIAkDEP3grs+BSDpqxEWVR37yG97/hs95lajF8SnHuA5nqtssh0uJVXbPhODNEoZqar+nEd+fIeGJgwoLUmg==}
@@ -4085,6 +4092,8 @@ snapshots:
       oniguruma-parser: 0.12.2
       regex: 6.1.0
       regex-recursion: 6.0.2
+
+  open-browser-use-sdk@0.1.41: {}
 
   openai@7.3.0(ws@8.21.1)(zod@4.4.3):
     optionalDependencies:

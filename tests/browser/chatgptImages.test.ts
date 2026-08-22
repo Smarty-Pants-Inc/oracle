@@ -333,6 +333,46 @@ describe("saveChatGptGeneratedImages", () => {
     );
   });
 
+  test("keeps main-Chrome image cookies inside the browser context", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-images-obu-"));
+    const network = {
+      getCookies: vi.fn().mockRejectedValue(new Error("must not read cookies")),
+    } as unknown as ChromeClient["Network"];
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: {
+          value: {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            contentType: "image/png",
+            finalUrl: "https://chatgpt.com/backend-api/estuary/content?id=file_obu",
+            b64: Buffer.from([4, 3, 2, 1]).toString("base64"),
+          },
+        },
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    globalThis.fetch = vi.fn();
+
+    const result = await saveChatGptGeneratedImages({
+      Network: network,
+      Runtime: runtime,
+      browserTransport: "obu",
+      images: [
+        {
+          url: "https://chatgpt.com/backend-api/estuary/content?id=file_obu",
+          fileId: "file_obu",
+        },
+      ],
+      outputPath: path.join(tmpDir, "generated.png"),
+    });
+
+    expect(result.saved).toBe(true);
+    expect(network.getCookies).not.toHaveBeenCalled();
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(runtime.evaluate).toHaveBeenCalledOnce();
+  });
+
   test("rejects non-ChatGPT image URLs before attaching cookies", async () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-images-"));
     const network = {

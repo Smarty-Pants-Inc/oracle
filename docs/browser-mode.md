@@ -1,9 +1,10 @@
 # Browser Mode
 
-Oracle’s `--engine browser` supports three execution paths:
+Oracle’s `--engine browser` supports four execution paths:
 
-- **ChatGPT launcher mode** (GPT-\* models): Oracle launches a separate hidden Chrome instance and drives the ChatGPT web UI over CDP.
-- **ChatGPT remote-CDP mode** (GPT-\* models): Oracle connects only to an explicitly supplied, dedicated browser via `--remote-chrome`.
+- **ChatGPT launcher mode** (GPT-* models): Oracle launches a separate hidden Chrome instance and drives the ChatGPT web UI over CDP.
+- **ChatGPT remote-CDP mode** (GPT-* models): Oracle connects only to an explicitly supplied, dedicated browser via `--remote-chrome`.
+- **ChatGPT Open Browser Use mode** (GPT-* models): a trusted wrapper routes one already-running Chrome between exact logged-in accounts and workspaces through the Open Browser Use SDK.
 - **Gemini web mode** (Gemini models): talks directly to `gemini.google.com` using your signed-in Chrome cookies (no ChatGPT automation).
 
 If you’re running Gemini, also see `docs/gemini.md`.
@@ -42,29 +43,37 @@ oracle --engine browser \
 
 You can pass the same payload inline (`--browser-inline-cookies '<json or base64>'`) or via env (`ORACLE_BROWSER_COOKIES_JSON`, `ORACLE_BROWSER_COOKIES_FILE`). Cloudflare cookies (`cf_clearance`, `__cf_bm`, etc.) are only needed when you hit a challenge.
 
-## Quick example: dedicated background Chrome CDP
+## Main Chrome with wrapper-routed accounts
 
-Use a separate Oracle-only profile and background app instance. Never point
-Oracle at the primary/user browser.
+On a workstation whose main Chrome has the Open Browser Use extension/native
+host, use a trusted wrapper to inject the hidden transport and identity flags.
+Callers must not supply these flags directly.
 
 ```bash
-open -g -j -n "/Applications/Google Chrome.app" --args \
-  --remote-debugging-port=9222 \
-  --user-data-dir="$HOME/.oracle/browser-profile-hidden" \
-  about:blank
-
-oracle --engine browser \
-  --remote-chrome 127.0.0.1:9222 \
-  --model "GPT-5.6 Sol Pro" \
-  -p "Summarize the last assistant response in one paragraph"
+oracle accounts
+oracle user --engine browser -p "Direct user-requested review" --file "src/**"
+oracle agent --engine browser -p "Agent-chosen second opinion" --file "src/**"
 ```
 
-Notes:
+The wrapper maps each request origin to an exact email and workspace. Oracle
+serializes the entire account-sensitive run, creates or reclaims only its
+task-owned tab, changes the active account/workspace when needed, and verifies
+the routed identity before every send or mutation. It persists only route labels,
+SHA-256 digests of the authenticated user/workspace IDs, and exact task lineage.
+Follow-up, reattachment, and harvest/live-tail reuse the stored account,
+workspace, tab, thread, committed user turn, and paired assistant branch. Export
+uses that stored route/thread/branch affinity in a fresh task-owned tab. If the
+saved physical tab is gone or the conversation URL is delayed, continuation
+recovers only from the exact stored tab or exact thread and records the verified
+replacement. Missing or conflicting affinity fails closed. A process signal
+preserves the exact task tab for reattach before it releases the routing lock.
 
-- Local headful launches use the same `open -g -j -n` hidden/background mechanism automatically.
-- `--browser-attach-running` is disabled by this fork's background-only policy.
-- Remote mode opens a fresh Oracle-owned tab and closes only that tab after a successful run.
-- If a dedicated hidden launch cannot be guaranteed, Oracle fails closed instead of using a visible fallback.
+`oracle accounts` proves that the Open Browser Use bridge is connected and that
+the extension/native host reports the SDK-compatible version `0.1.41`. It does
+not prove either ChatGPT login. Every real route separately proves its
+login/workspace. When a login expires, the error names the exact account and
+workspace that the operator must restore in main Chrome. Oracle never falls
+back to another route.
 
 ## Export an approved existing conversation
 
@@ -78,17 +87,21 @@ oracle chatgpt-export \
   --out ~/Documents/chatgpt-conversation-exports/review
 ```
 
-The command scopes capture to that exact backend conversation URL and writes
-raw JSON, normalized JSON, Markdown, a manifest, and checksums. `--session-id`
-uses only that Oracle session's stored browser UUID, refreshed WebSocket, and
-SHA-256 digest of the originating ChatGPT user id; the raw id and session payload
-never leave the page context. Omit it only when the conversation has one globally
-unique stored affinity. `--remote-chrome` is an explicit raw-CLI endpoint and does
-not provide stored-session affinity checks. The command does not read cookies,
-local storage, browser profiles, or unrelated history. Archived targets are
-recovered only for the exact approved id and re-archived after export; use
-`--no-recover-archived` to disable recovery. `--archive-after-export` is an
-explicit mutation that archives an active conversation after a successful export.
+The command writes raw JSON, normalized JSON, Markdown, a manifest, and checksums.
+`--session-id` uses only that Oracle session's stored browser affinity. For Open
+Browser Use sessions, the stored route and tab lineage authorize the exact
+email/workspace, identity digests, conversation, committed prompt message, and
+paired assistant message. Export selects the backend path that ends at that
+assistant message and verifies the prompt is its user ancestor; it does not
+follow a later child branch merely because ChatGPT marks it current. Capture
+uses a fresh task-owned OBU tab so it cannot close or mutate the originating
+handoff tab. Caller-supplied unbound OBU tab IDs are refused. For remote CDP
+sessions, stored affinity includes the browser UUID, refreshed WebSocket, and
+authenticated account digest. Raw IDs and session payloads never leave the page
+context. Omit `--session-id` only when the conversation has one globally unique
+stored affinity. The command does not read cookies, local storage, browser
+profiles, or unrelated history. Archived-target recovery and post-export
+archiving remain available only on the legacy CDP path.
 
 ## Current Pipeline
 
@@ -96,12 +109,13 @@ explicit mutation that archives an active conversation after a successful export
 2. **Automation stack** – code lives under `src/browser/`:
    - Launcher mode starts a separate hidden macOS Chrome app with `open -g -j -n` and connects with `chrome-remote-interface`.
    - Remote mode connects only to an explicitly supplied dedicated Chrome CDP endpoint and opens an Oracle-owned tab.
+   - Open Browser Use mode connects through `open-browser-use-sdk`, scopes every CDP call/event to one task-owned tab, and serializes account switching through one durable main-Chrome lock.
    - Launcher mode can optionally copy cookies from the requested browser profile via Oracle’s built-in cookie reader (Keychain/DPAPI aware) so you stay signed in.
-   - Navigates to `chatgpt.com`, switches the model to the requested GPT-5.5 / GPT-5.4 / GPT-5.2 variant, optionally activates Deep Research, pastes the prompt, waits for completion, and copies the markdown via the built-in “copy turn” button.
-   - Probes the cookie-authenticated `/api/auth/session` endpoint in the ChatGPT tab. Remote CDP sessions hash `user.id` inside the page with SHA-256 and return only that digest for account affinity; tokens, names, email, the raw id, and the session payload are never persisted or logged. General login detection can still fall back to `/backend-api/me` and visible composer plus profile/history signals, but a remote session cannot be affinity-bound unless the digest probe succeeds.
-   - When `--file` inputs would push the pasted composer content over ~60k characters, we switch to uploading attachments (optionally bundled) and wait for ChatGPT to re-enable the send button before submitting the combined system+user prompt.
+   - Navigates to `chatgpt.com`, switches the model, optionally activates Deep Research, pastes the prompt, waits for completion, and copies the assistant Markdown.
+   - Open Browser Use routes fetch `/api/auth/session` only in page context, persist email/workspace route labels plus SHA-256 user/workspace digests, and fail closed if any identity changes before a send, follow-up, harvest, export, or archive mutation.
+   - When `--file` inputs would push the pasted composer content over ~60k characters, Oracle switches to uploads and waits for ChatGPT to re-enable Send.
    - Launcher mode cleans up the temporary profile unless `--browser-keep-browser` is passed.
-3. **Session integration** – browser sessions use the normal log writer, add `mode: "browser"` plus `browser.config/runtime` metadata, and persist Chrome pid/port or WebSocket attach metadata, the Oracle-owned target/tab URL, and only a SHA-256 digest of the authenticated ChatGPT user id. Remote follow-ups, reattach, harvest/live inspection, and session-derived exports revalidate the browser UUID and account digest before using the stored conversation.
+3. **Session integration** – browser sessions use the normal log writer and persist transport-specific affinity. Open Browser Use sessions record only their task-owned tab lineage, exact account/workspace route plus digests, full prompt digest, committed user-turn index/IDs, paired assistant-turn index/IDs, and exact conversation. New sends, follow-ups, reattach, named harvest/live inspection, and exports all revalidate this affinity; answer capture and export stay on the bound branch instead of trusting the latest visible or backend-current turn.
 4. **Usage accounting** – we estimate input tokens with the same tokenizer used for API runs and estimate output tokens via `estimateTokenCount`. `oracle status` therefore shows comparable cost/timing info even though the call ran through the browser.
 
 ### CLI Options
@@ -110,6 +124,7 @@ explicit mutation that archives an active conversation after a successful export
 - `--browser-chrome-profile`, `--browser-chrome-path`: cookie source + binary override (defaults to the standard `"Default"` Chrome profile so existing ChatGPT logins carry over).
 - `--browser-cookie-path`: explicit path to the Chrome/Chromium/Edge `Cookies` SQLite DB. Handy when you launch a fork via `--browser-chrome-path` and want to copy its session cookies; see [docs/chromium-forks.md](chromium-forks.md) for examples.
 - `--remote-chrome <host:port>`: connect to a dedicated background Chrome CDP endpoint. `--browser-attach-running` is rejected so Oracle cannot discover or control the primary browser.
+- Open Browser Use routing flags are intentionally hidden and wrapper-owned: `--browser-transport obu`, `--browser-account-email`, `--browser-workspace-name`, and stored session/tab/digest flags. Do not expose or accept them from untrusted callers.
 - `--chatgpt-url`: override the ChatGPT base URL. Works with the root homepage (`https://chatgpt.com/`), Temporary Chat (`https://chatgpt.com/?temporary-chat=true`), **or** a specific workspace/folder link such as `https://chatgpt.com/g/.../project`. `--browser-url` stays as a hidden alias.
 - `--browser-timeout`, `--browser-input-timeout`, `--browser-attachment-timeout`: `1200s (20m)`/`60s`/`45s` defaults. The attachment timeout controls upload/readiness before clicking Send and can also be set with `ORACLE_BROWSER_ATTACHMENT_TIMEOUT` or `browser.attachmentTimeoutMs`. Durations accept `ms`, `s`, `m`, or `h` and can be chained (`1h2m10s`).
 - `--browser-recheck-delay`, `--browser-recheck-timeout`: after an assistant timeout, wait the delay, revisit the conversation, and retry capture (default recheck timeout 120s). Useful for Pro runs that finish later.
@@ -122,10 +137,10 @@ explicit mutation that archives an active conversation after a successful export
 - `--browser-model-strategy <select|current|ignore>`: control ChatGPT model selection. `select` (default) switches to the requested model; `current` keeps the active model and logs its label; `ignore` skips the picker entirely. (Ignored for Gemini web runs.)
 - Temporary Chat can reduce account-sidebar clutter for one-shot browser consults, but it is a different ChatGPT workflow: Oracle skips archive attempts there and the local transcript/artifacts are the durable record. Verify live behavior before relying on Project Sources, Deep Research reports, or multi-turn persistence.
 - `--browser-thinking-time <light|standard|extended|heavy>`: set the ChatGPT thinking-time intensity (Thinking/Pro models only). You can also set a default in `~/.oracle/config.json` via `browser.thinkingTime`.
-- GPT-5.5 Pro Extended is verified from the selected item in ChatGPT's standalone Pro/Thinking effort pill or compatible Intelligence/model-picker menu. A run **fails closed** if Extended cannot be confirmed rather than silently submitting at a weaker effort. Detection failures write a bounded, redacted model-picker diagnostic to the normal session log.
+- Pro Extended is verified from the selected item in ChatGPT's standalone Pro/Thinking effort pill or compatible Intelligence/model-picker menu. A run **fails closed** if Extended cannot be confirmed rather than silently submitting at a weaker effort. Detection failures write a bounded, redacted model-picker diagnostic to the normal session log.
 - `--browser-research deep`: activate ChatGPT Deep Research before submitting the prompt. Use this for broad public-web research and final cited reports, not as a replacement for GPT-5.x Pro Heavy code review or pure reasoning.
 - `--browser-follow-up <prompt>`: submit another prompt in the same ChatGPT conversation after the initial answer. Repeat the flag for multi-turn reviews such as “challenge your recommendation”, “compare against this constraint”, then “give the final decision”. Deep Research has its own report lifecycle, so browser follow-ups are rejected when `--browser-research deep` is enabled.
-- `--followup <session-id>`: reopen the exact saved ChatGPT conversation from a completed browser session. Oracle inherits the parent browser profile, configuration, and model, then verifies the browser UUID, signed-in account digest, thread, and prior turns before submitting.
+- `--followup <session-id>`: reopen the exact saved ChatGPT conversation from a completed browser session. Open Browser Use sessions restore and verify the stored account, workspace, tab lineage, and thread; if the saved tab is gone, Oracle recovers the thread in a fresh task-owned OBU session. Remote CDP sessions verify the browser UUID, signed-in account digest, thread, and prior turns before submitting.
 - `--browser-archive <auto|always|never>`: archive completed ChatGPT conversations after local artifacts are saved. The default `auto` archives only successful one-shot chats and skips project, Deep Research, multi-turn, failed, and incomplete sessions.
 - `--browser-port <port>` (alias: `--browser-debug-port`; env: `ORACLE_BROWSER_PORT`/`ORACLE_BROWSER_DEBUG_PORT`): pin the DevTools port (handy on WSL/Windows firewalls). When omitted, a random open port is chosen.
 - `ORACLE_CHATGPT_ACCOUNT_EMAIL`: exact saved-account email to select if ChatGPT shows its “Welcome back” account picker. Set it on the machine running browser automation. Oracle never logs the address; without it, Oracle selects only a single unambiguous saved account and fails closed when several are present.
@@ -292,6 +307,13 @@ When Codex, Claude Code, or another Oracle caller share the same manual-login pr
 
 Use `--browser-max-concurrent-tabs <n>`, `browser.maxConcurrentTabs`, or `ORACLE_BROWSER_MAX_CONCURRENT_TABS` to tune the soft limit. Precedence is explicit CLI/config value, then environment, then the default of `3`; invalid or non-positive environment values fall back instead of disabling the cap. Keep the value modest: too many concurrent ChatGPT tabs can make the UI unstable or trigger account-side throttling. Oracle also serializes manual-login Chrome startup for the shared profile, then reuses the first reachable DevTools session instead of racing multiple Chrome launches against the same `user-data-dir`. The short profile lock still serializes the send/upload moment so separate agents do not type into the same composer.
 
+Wrapper-routed Open Browser Use runs use a stricter rule: the whole
+account-sensitive run holds one global main-Chrome lock. This intentionally
+serializes user and agent routes so one tab cannot change the active ChatGPT
+account or workspace underneath another run. Incomplete submitted tabs are
+handed off for reattachment; completed task-owned tabs are finalized. Named
+live-tail keeps the same lock and connection for its full polling lifetime.
+
 For live concurrency smoke, the most stable path is one already-running signed-in Chrome with remote debugging enabled, plus `--remote-chrome <host:port>`. Direct parallel launch is supported defensively, but a persistent shared Chrome gives clearer ownership and avoids account/login churn across agents.
 
 ## Remote Chrome Sessions (headless/server workflows)
@@ -402,15 +424,15 @@ This mode is ideal when you have a macOS VM (or spare Mac mini) logged into Chat
 
 ## Testing Notes
 
-- ChatGPT automation smoke: `pnpm test:browser` (Open Browser Use CLI/MCP
-  readiness, plus live ChatGPT open/read/finalize smoke through `obu mcp` when
-  the Open Browser Use backend is connected). Use `pnpm test:browser:live` to
-  require the live smoke.
-- Upload automation smoke: `scripts/browser-smoke-upload-only.sh` validates
-  the Open Browser Use file chooser upload path against a local page. Chrome
-  must allow file URL access for the Open Browser Use extension.
-- Gemini web (cookie) smoke: `ORACLE_LIVE_TEST=1 pnpm vitest run tests/live/gemini-web-live.test.ts` (requires a signed-in Chrome profile at `gemini.google.com`)
-- `pnpm test --filter browser` does not exist yet; manual runs with `--engine browser -v` are the current validation path.
-- Most legacy browser-engine lifting lives under `src/browser/`. The local
-  Chrome smoke now validates through Open Browser Use MCP first; do not use the
-  old cookie/DevTools smoke as substitute evidence.
+- Deterministic Open Browser Use coverage: `pnpm vitest run tests/browser/openBrowserUse.test.ts tests/browser/chatgptAccountRouter.test.ts tests/browser/conversationTurns.test.ts tests/browser/reattach.test.ts tests/browser/liveTabs.test.ts tests/cli/followup.test.ts tests/cli/chatgptExport.test.ts tests/cli/chatgptExportCommand.test.ts tests/cli/browserTabs.test.ts tests/cli/browserTabsObu.test.ts tests/cli/browserTabsRecover.test.ts tests/oracle/agentDiagnostics.test.ts`.
+- Full static and unit checks: `pnpm check` and `pnpm test`.
+- Bridge-only preflight: `oracle accounts`; this verifies the SDK/native-host
+  bridge and fixed route labels but does not send a ChatGPT prompt or prove that
+  either login is still valid.
+- Live account switching, prompt submission, follow-up, harvest, export, and
+  cleanup are opt-in supervised trials. Do not substitute a bridge preflight or
+  legacy cookie/CDP smoke for those user-visible checks.
+- Upload automation smoke: `scripts/browser-smoke-upload-only.sh` validates the
+  Open Browser Use file chooser upload path against a local page. Chrome must
+  allow file URL access for the Open Browser Use extension.
+- Gemini web (cookie) smoke: `ORACLE_LIVE_TEST=1 pnpm vitest run tests/live/gemini-web-live.test.ts` (requires a signed-in Chrome profile at `gemini.google.com`).

@@ -62,7 +62,11 @@ import {
 } from "../src/cli/options.js";
 import { copyToClipboard } from "../src/cli/clipboard.js";
 import { buildMarkdownBundle } from "../src/cli/markdownBundle.js";
-import { shouldDetachSession, stopDetachedWorker } from "../src/cli/detach.js";
+import {
+  buildDetachedSessionExecArgs,
+  shouldDetachSession,
+  stopDetachedWorker,
+} from "../src/cli/detach.js";
 import { applyHiddenAliases } from "../src/cli/hiddenAliases.js";
 import type { BrowserSessionRunnerDeps } from "../src/browser/sessionRunner.js";
 import { isMediaFile } from "../src/browser/prompt.js";
@@ -99,6 +103,7 @@ import {
   resolveBrowserFollowupReference,
   type BrowserFollowupResolution,
 } from "../src/cli/followup.js";
+import { verifyOpenBrowserUseBridge } from "../src/browser/openBrowserUse.js";
 
 interface CliOptions extends OptionValues {
   prompt?: string;
@@ -345,10 +350,14 @@ function normalizePerfTraceArgs(args: string[]): {
 const doctorArgIndex = routingCliArgs.indexOf("doctor");
 const doctorJsonRequested =
   doctorArgIndex >= 0 && routingCliArgs.slice(doctorArgIndex).includes("--json");
+const accountsArgIndex = routingCliArgs.indexOf("accounts");
+const accountsJsonRequested =
+  accountsArgIndex >= 0 && routingCliArgs.slice(accountsArgIndex).includes("--json");
 const docsArgIndex = routingCliArgs.indexOf("docs");
 const docsCheckRequested = docsArgIndex >= 0 && routingCliArgs[docsArgIndex + 1] === "check";
 const suppressIntro =
   doctorJsonRequested ||
+  accountsJsonRequested ||
   docsCheckRequested ||
   (routingCliArgs[0] === "bridge" &&
     (routingCliArgs[1] === "codex-config" || routingCliArgs[1] === "claude-config"));
@@ -881,6 +890,52 @@ program
       "Exact remote Chrome browser WebSocket supplied by the agent wrapper.",
     ).hideHelp(),
   )
+  .addOption(
+    new Option(
+      "--browser-transport <transport>",
+      "Browser transport selected by the agent wrapper.",
+    )
+      .choices(["cdp", "obu"])
+      .hideHelp(),
+  )
+  .addOption(
+    new Option(
+      "--browser-obu-session-id <id>",
+      "Open Browser Use session affinity supplied by the agent wrapper or stored session.",
+    ).hideHelp(),
+  )
+  .addOption(
+    new Option(
+      "--browser-obu-tab-id <id>",
+      "Open Browser Use tab affinity supplied by the agent wrapper or stored session.",
+    )
+      .argParser(parseIntOption)
+      .hideHelp(),
+  )
+  .addOption(
+    new Option(
+      "--browser-account-email <email>",
+      "Exact ChatGPT account email supplied by the agent wrapper.",
+    ).hideHelp(),
+  )
+  .addOption(
+    new Option(
+      "--browser-workspace-name <name>",
+      "Exact ChatGPT workspace supplied by the agent wrapper.",
+    ).hideHelp(),
+  )
+  .addOption(
+    new Option(
+      "--browser-account-digest <sha256>",
+      "Stored ChatGPT account digest supplied by the agent wrapper or session.",
+    ).hideHelp(),
+  )
+  .addOption(
+    new Option(
+      "--browser-workspace-digest <sha256>",
+      "Stored ChatGPT workspace digest supplied by the agent wrapper or session.",
+    ).hideHelp(),
+  )
   .option(
     "--browser-tab <ref>",
     "Reuse an existing ChatGPT tab by ref (current, target id, full URL, or title substring) instead of opening a new tab.",
@@ -1082,6 +1137,33 @@ addProjectSourcesCommonOptions(
 });
 
 program
+  .command("accounts")
+  .description("Check the main-Chrome bridge used by wrapper-routed ChatGPT accounts.")
+  .option("--json", "Print structured JSON.", false)
+  .action(async function (this: Command) {
+    await verifyOpenBrowserUseBridge();
+    const routes = {
+      user: {
+        email: process.env.ORACLE_WRAPPER_USER_ACCOUNT_EMAIL ?? "(wrapper route unavailable)",
+        workspace: process.env.ORACLE_WRAPPER_USER_WORKSPACE_NAME ?? "(wrapper route unavailable)",
+      },
+      agent: {
+        email: process.env.ORACLE_WRAPPER_AGENT_ACCOUNT_EMAIL ?? "(wrapper route unavailable)",
+        workspace: process.env.ORACLE_WRAPPER_AGENT_WORKSPACE_NAME ?? "(wrapper route unavailable)",
+      },
+    };
+    const note = "Bridge connected. Each real route verifies its exact login and workspace.";
+    if (this.opts().json) {
+      console.log(JSON.stringify({ ok: true, transport: "obu", routes, note }, null, 2));
+      return;
+    }
+    console.log("Main Chrome bridge: connected");
+    console.log(`user: ${routes.user.email} / ${routes.user.workspace}`);
+    console.log(`agent: ${routes.agent.email} / ${routes.agent.workspace}`);
+    console.log(note);
+  });
+
+program
   .command("chatgpt-export")
   .description("Export an approved existing ChatGPT conversation by capturing its backend payload.")
   .requiredOption(
@@ -1104,8 +1186,6 @@ program
     "--remote-chrome <host:port>",
     "Explicit raw-CLI Chrome DevTools endpoint override; when omitted, resolve the endpoint from stored session affinity.",
   )
-  .option("--obu-session-id <id>", "Open Browser Use session id for OBU-managed tabs.")
-  .option("--obu-tab-id <id>", "Open Browser Use tab id for an approved OBU-managed tab.")
   .option(
     "--timeout <duration>",
     "Time to wait for the reload-time backend response (default 45s).",
@@ -1113,11 +1193,11 @@ program
   .option("--chunk-size <chars>", "Characters to retrieve per CDP chunk (default 250000).")
   .option(
     "--no-recover-archived",
-    "Disable automatic exact-conversation recovery from ChatGPT Archived Chats.",
+    "Legacy CDP only: disable automatic exact-conversation recovery from ChatGPT Archived Chats.",
   )
   .option(
     "--archive-after-export",
-    "Archive the exact conversation only after its export succeeds.",
+    "Archive the exact conversation after its export succeeds.",
     false,
   )
   .option("--json", "Print structured JSON result.", false)
@@ -2635,7 +2715,7 @@ async function launchDetachedSession(
 ): Promise<number> {
   return new Promise((resolve, reject) => {
     try {
-      const args = ["--", CLI_ENTRYPOINT, "--exec-session", sessionId];
+      const args = buildDetachedSessionExecArgs(process.execArgv, CLI_ENTRYPOINT, sessionId);
       const env = {
         ...buildDetachedPerfTraceEnv(process.env, perfTraceArgs.value, sessionId),
         ORACLE_DETACHED_START_GATE: "1",

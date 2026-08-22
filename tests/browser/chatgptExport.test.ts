@@ -1,4 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
+import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import {
   assertChatGptExportMutationAffinityForTest,
   backendToPayload,
@@ -7,6 +8,7 @@ import {
   buildArchivedConversationRecoveryHookForTest,
   captureApprovedChatGptConversationBackend,
   buildScopedBackendCaptureHook,
+  finalizeCompletedOpenBrowserUseExport,
   contentToText,
   conversationIdFromChatGptUrl,
   isSameConversationUrl,
@@ -30,6 +32,12 @@ describe("ChatGPT conversation export helpers", () => {
     expect(() => conversationIdFromChatGptUrl("https://chatgpt.com/")).toThrow(/specific/i);
     expect(() => conversationIdFromChatGptUrl("https://chatgpt.com/g/example/project")).toThrow(
       /specific/i,
+    );
+    expect(() => conversationIdFromChatGptUrl("https://chatgpt.com:444/c/abc")).toThrow(
+      /chatgpt\.com\/c/,
+    );
+    expect(() => conversationIdFromChatGptUrl("https://chatgpt.com/%63/abc")).toThrow(
+      /chatgpt\.com\/c/,
     );
   });
 
@@ -58,6 +66,30 @@ describe("ChatGPT conversation export helpers", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  test("keeps a completed OBU export when task-tab cleanup fails", async () => {
+    const finalize = vi.fn().mockRejectedValue(
+      new BrowserAutomationError("Failed to finalize the task-owned main-Chrome Oracle tab.", {
+        stage: "open-browser-use",
+        code: "tab-finalize-failed",
+        recoveryHandle: { transport: "obu", sessionId: "export-session", tabId: 9 },
+      }),
+    );
+
+    await expect(finalizeCompletedOpenBrowserUseExport({ finalize })).resolves.toEqual([
+      {
+        code: "obu-tab-finalize-failed",
+        severity: "warning",
+        message: expect.stringContaining("Export completed"),
+        details: {
+          stage: "open-browser-use",
+          code: "tab-finalize-failed",
+          recoveryHandle: { transport: "obu", sessionId: "export-session", tabId: 9 },
+        },
+      },
+    ]);
+    expect(finalize).toHaveBeenCalledWith(false);
   });
 
   test("derives exact backend conversation URL and scope check", () => {
@@ -238,5 +270,83 @@ describe("ChatGPT conversation export helpers", () => {
         expect.objectContaining({ role: "assistant", text: "Answer" }),
       ]),
     );
+  });
+
+  test("exports the exact stored prompt and assistant branch after later child turns", () => {
+    const backend = {
+      title: "Branched thread",
+      conversation_id: "conv-1",
+      current_node: "assistant-child",
+      mapping: {
+        root: { id: "root", parent: null, children: ["user-parent"], message: null },
+        "user-parent": {
+          id: "user-parent",
+          parent: "root",
+          children: ["assistant-parent"],
+          message: {
+            id: "prompt-message",
+            author: { role: "user" },
+            content: { content_type: "text", parts: ["Parent question"] },
+            metadata: {},
+          },
+        },
+        "assistant-parent": {
+          id: "assistant-parent",
+          parent: "user-parent",
+          children: ["user-child"],
+          message: {
+            id: "assistant-message",
+            author: { role: "assistant" },
+            content: { content_type: "text", parts: ["Parent answer"] },
+            metadata: {},
+          },
+        },
+        "user-child": {
+          id: "user-child",
+          parent: "assistant-parent",
+          children: ["assistant-child"],
+          message: {
+            id: "child-prompt-message",
+            author: { role: "user" },
+            content: { content_type: "text", parts: ["Child question"] },
+            metadata: {},
+          },
+        },
+        "assistant-child": {
+          id: "assistant-child",
+          parent: "user-child",
+          children: [],
+          message: {
+            id: "child-assistant-message",
+            author: { role: "assistant" },
+            content: { content_type: "text", parts: ["Child answer"] },
+            metadata: {},
+          },
+        },
+      },
+    };
+    const affinity = {
+      promptMessageId: "prompt-message",
+      assistantMessageId: "assistant-message",
+    };
+
+    const payload = backendToPayload(backend, "https://chatgpt.com/c/conv-1", "sha", 123, affinity);
+
+    expect(payload.branch_affinity).toEqual({
+      prompt_message_id: "prompt-message",
+      assistant_message_id: "assistant-message",
+      verified: true,
+    });
+    expect(payload.stats).toMatchObject({ turn_count: 2, current_path_node_count: 3 });
+    expect((payload.turns as Array<{ text: string }>).map((turn) => turn.text)).toEqual([
+      "Parent question",
+      "Parent answer",
+    ]);
+    expect(() =>
+      backendToPayload(backend, "https://chatgpt.com/c/conv-1", "sha", 123, {
+        ...affinity,
+        promptMessageId: "child-prompt-message",
+      }),
+    ).toThrow(/not the unique ancestor/i);
   });
 });

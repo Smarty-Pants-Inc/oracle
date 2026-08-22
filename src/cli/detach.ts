@@ -27,6 +27,13 @@ export function shouldDetachSession({
   if ((isProModel(model) || reasoningMode === "pro") && engine === "api") return true;
   return false;
 }
+export function buildDetachedSessionExecArgs(
+  execArgv: string[],
+  cliEntrypoint: string,
+  sessionId: string,
+): string[] {
+  return [...execArgv, "--", cliEntrypoint, "--exec-session", sessionId];
+}
 
 export function stopDetachedWorker(
   workerPid: number,

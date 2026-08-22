@@ -4,6 +4,7 @@ import {
   classifyTabState,
   connectToExistingChatGptTab,
   formatBrowserTabState,
+  harvestConnectedChatGptTab,
   resolveExactChatGptTargetForTest,
   resolveChatGptTabFromSummariesForTest,
   sessionMatchesTab,
@@ -12,6 +13,8 @@ import {
   type ChromeTarget,
 } from "../../src/browser/liveTabs.js";
 import type { SessionMetadata } from "../../src/sessionStore.js";
+import { hashConversationTurnText } from "../../src/browser/conversationTurns.js";
+import type { ChromeClient } from "../../src/browser/types.js";
 
 const remoteChromeMocks = vi.hoisted(() => ({
   connectToRemoteChromeTarget: vi.fn(),
@@ -60,6 +63,165 @@ describe("liveTabs helpers", () => {
     expect(expression).toContain("!lastUserTurn.contains?.(node)");
     expect(expression).toContain("!node.contains?.(lastUserTurn)");
     expect(expression).toContain("assistantCandidates.reduce");
+  });
+  test("harvests the assistant paired with the stored user turn, not a later child", async () => {
+    const parentPrompt = `${"shared prefix ".repeat(20)}parent`;
+    const childPrompt = `${"shared prefix ".repeat(20)}child`;
+    const Runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("assistantCandidates.reduce")) {
+          return {
+            result: {
+              value: {
+                title: "ChatGPT",
+                url: "https://chatgpt.com/c/abc",
+                currentModelLabel: "Pro",
+                stopExists: false,
+                sendExists: true,
+                promptReady: true,
+                loginButtonExists: false,
+                authenticated: true,
+                assistantCount: 2,
+                lastAssistantText: "child answer",
+                assistantFollowsLatestUser: true,
+                lastAssistantTurnIndex: 3,
+                lastUserTurnIndex: 2,
+                lastUserText: childPrompt,
+                visibilityState: "visible",
+                focused: false,
+              },
+            },
+          };
+        }
+        if (expression.includes("return turns.flatMap")) {
+          return {
+            result: {
+              value: [
+                { index: 0, text: parentPrompt, turnId: "user-0", messageId: "user-message-0" },
+                { index: 2, text: childPrompt, turnId: "user-2", messageId: "user-message-2" },
+              ],
+            },
+          };
+        }
+        if (expression.includes("const candidates = []")) {
+          return {
+            result: {
+              value: [
+                {
+                  user: {
+                    index: 0,
+                    text: parentPrompt,
+                    turnId: "user-0",
+                    messageId: "user-message-0",
+                  },
+                  assistants: [
+                    {
+                      index: 1,
+                      text: "parent answer",
+                      turnId: "assistant-1",
+                      messageId: "assistant-message-1",
+                    },
+                  ],
+                  hasLaterUserTurn: true,
+                },
+              ],
+            },
+          };
+        }
+        if (expression.includes("const BUTTON_SELECTOR")) {
+          expect(expression).toContain('"assistant-message-1"');
+          return { result: { value: { success: true, markdown: "parent **answer**" } } };
+        }
+        return { result: { value: null } };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      harvestConnectedChatGptTab({
+        client: { Runtime } as unknown as ChromeClient,
+        targetId: "target-1",
+        turnBinding: {
+          promptDigest: hashConversationTurnText(parentPrompt),
+          promptTurnIndex: 0,
+          promptTurnId: "user-0",
+          promptMessageId: "user-message-0",
+        },
+      }),
+    ).resolves.toMatchObject({
+      state: "completed",
+      lastUserText: parentPrompt,
+      lastAssistantText: "parent answer",
+      lastAssistantMarkdown: "parent **answer**",
+    });
+  });
+
+  test("keeps a bound unanswered prompt running despite older completed assistants", async () => {
+    const prompt = "exact unanswered prompt";
+    const Runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("assistantCandidates.reduce")) {
+          return {
+            result: {
+              value: {
+                title: "ChatGPT",
+                url: "https://chatgpt.com/c/abc",
+                currentModelLabel: "Pro",
+                stopExists: false,
+                sendExists: true,
+                promptReady: true,
+                loginButtonExists: false,
+                authenticated: true,
+                assistantCount: 3,
+                lastAssistantText: "older completed answer",
+                assistantFollowsLatestUser: true,
+                lastAssistantTurnIndex: 3,
+                lastUserTurnIndex: 4,
+                lastUserText: prompt,
+                visibilityState: "visible",
+                focused: false,
+              },
+            },
+          };
+        }
+        if (expression.includes("const candidates = []")) {
+          return {
+            result: {
+              value: [
+                {
+                  user: {
+                    index: 4,
+                    text: prompt,
+                    turnId: "user-4",
+                    messageId: "user-message-4",
+                  },
+                  assistants: [],
+                  hasLaterUserTurn: false,
+                },
+              ],
+            },
+          };
+        }
+        return { result: { value: null } };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      harvestConnectedChatGptTab({
+        client: { Runtime } as unknown as ChromeClient,
+        targetId: "target-1",
+        turnBinding: {
+          promptDigest: hashConversationTurnText(prompt),
+          promptTurnIndex: 4,
+          promptTurnId: "user-4",
+          promptMessageId: "user-message-4",
+        },
+      }),
+    ).resolves.toMatchObject({
+      state: "running",
+      lastUserText: prompt,
+      lastAssistantText: "",
+      lastAssistantMarkdown: null,
+    });
   });
 
   test("classifies running/completed/detached states", () => {

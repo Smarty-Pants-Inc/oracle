@@ -151,6 +151,99 @@ describe("buildAgentBlockerFromSession", () => {
       },
     });
   });
+  test("names the exact routed login and workspace in action-required guidance", () => {
+    const blocker = buildAgentBlockerFromSession(
+      session({
+        error: {
+          category: "browser-automation",
+          message: "The routed workspace is unavailable.",
+          details: {
+            stage: "main-chrome-account-router",
+            code: "workspace-required",
+            expectedEmail: "dev1@smartypants.ai",
+            expectedWorkspace: "Smarty Dev",
+          },
+        },
+      }),
+    );
+
+    expect(blocker).toMatchObject({
+      kind: "login_required",
+      severity: "action_required",
+      message: "dev1@smartypants.ai / Smarty Dev is not available in main Chrome.",
+      remediation:
+        "In main Chrome, sign in to dev1@smartypants.ai and select the “Smarty Dev” workspace, then retry the consult.",
+    });
+  });
+
+  test("treats an unavailable identity probe as retryable browser unavailability", () => {
+    const blocker = buildAgentBlockerFromSession(
+      session({
+        error: {
+          category: "browser-automation",
+          message: "ChatGPT identity verification is temporarily unavailable.",
+          details: {
+            stage: "main-chrome-account-router",
+            code: "identity-unavailable",
+          },
+        },
+      }),
+    );
+
+    expect(blocker).toMatchObject({
+      kind: "browser_unavailable",
+      severity: "retryable",
+      resumable: false,
+      remediation: expect.stringMatching(
+        /do not reauthenticate unless Oracle reports login_required/i,
+      ),
+    });
+  });
+
+  test("classifies a missing main-Chrome bridge as browser unavailability", () => {
+    const blocker = buildAgentBlockerFromSession(
+      session({
+        error: {
+          category: "browser-automation",
+          message: "Open Browser Use is not connected.",
+          details: { stage: "open-browser-use", code: "browser-unavailable" },
+        },
+      }),
+    );
+
+    expect(blocker).toMatchObject({
+      kind: "browser_unavailable",
+      severity: "retryable",
+      resumable: false,
+      remediation: expect.stringMatching(/open-browser-use ping/i),
+    });
+  });
+
+  test("resumes the existing thread when login expires after prompt submission", () => {
+    const blocker = buildAgentBlockerFromSession(
+      session({
+        error: {
+          category: "browser-automation",
+          message: "ChatGPT login expired after submission.",
+          details: {
+            stage: "assistant-recheck",
+            code: "login-required",
+            sessionStatus: "needs_login",
+            expectedEmail: "dev1@smartypants.ai",
+            expectedWorkspace: "Smarty Dev",
+          },
+        },
+      }),
+    );
+
+    expect(blocker).toMatchObject({
+      kind: "login_required",
+      severity: "action_required",
+      resumable: true,
+      resumeCommand: "oracle session sess-1 --render",
+      remediation: expect.stringMatching(/without buying another turn/i),
+    });
+  });
 
   test.each([
     {

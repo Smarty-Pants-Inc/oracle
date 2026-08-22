@@ -123,14 +123,22 @@ oracle chatgpt-export \
 
 The exact approved conversation is exported as raw JSON, normalized JSON,
 Markdown, a manifest, and checksums. `--session-id` binds the export to that
-Oracle session's stored browser UUID, refreshed WebSocket, and SHA-256 ChatGPT
-account digest; the raw account id and session payload never leave the page
-context. Omit it only when the conversation has one globally unique stored
-affinity. `--remote-chrome` remains an explicit raw endpoint without
-stored-session affinity checks. Use `--browser-tab` or OBU session/tab ids to
-select an already approved tab, `--json` for a machine-readable result,
-`--no-recover-archived` to disable exact archived-chat recovery, and
-`--archive-after-export` to archive the conversation after success.
+Oracle session's stored browser affinity. Open Browser Use sessions bind the
+stored account, workspace, identity digests, tab lineage, conversation,
+committed prompt message, and paired assistant message. The exporter verifies
+that exact user-to-assistant backend path and ignores later child branches, then
+captures through a fresh task-owned OBU tab so the originating handoff tab is
+not closed or mutated. Remote CDP sessions bind the browser UUID, refreshed
+WebSocket, and account digest. Raw IDs and session payloads never leave page
+context. Omit `--session-id` only when the conversation has one globally unique
+stored affinity. An explicit `--remote-chrome` remains a raw CDP override
+without stored-session affinity checks. Caller-supplied OBU session/tab IDs are
+not CLI options because they are not account/workspace bound.
+
+`--archive-after-export` archives that exact conversation only after the export
+bundle succeeds, including on the main-Chrome Open Browser Use path.
+`--no-recover-archived` remains a legacy CDP-only control; main-Chrome exports
+reject it instead of silently ignoring it.
 
 ## Image / media (browser)
 

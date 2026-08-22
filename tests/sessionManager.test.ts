@@ -140,6 +140,47 @@ describe("session lifecycle", () => {
     expect(stored.options?.browserConfig).toEqual(browserConfig);
   });
 
+  test("never persists cookie material for main-Chrome sessions", async () => {
+    const browserConfig = {
+      browserTransport: "obu" as const,
+      chatGptAccountEmail: "paul@smartypants.ai",
+      chatGptWorkspaceName: "Paul Bettner",
+      chromeCookiePath: "/tmp/cookies.db",
+      cookieNames: ["session-token"],
+      cookieSyncWaitMs: 5_000,
+      inlineCookies: [{ name: "session-token", value: "secret", domain: "chatgpt.com" }],
+      inlineCookiesSource: "inline-arg",
+      allowCookieErrors: true,
+      manualLoginCookieSync: true,
+    };
+    const metadata = await sessionModule.initializeSession(
+      {
+        prompt: "Persist safe main-Chrome route",
+        model: "gpt-5.6-sol-pro",
+        mode: "browser",
+        browserConfig,
+      },
+      "/tmp/cwd",
+    );
+    const storedText = await readFile(
+      path.join(sessionModule.getSessionsDir(), metadata.id, "meta.json"),
+      "utf8",
+    );
+    const stored = JSON.parse(storedText);
+
+    expect(storedText).not.toContain("secret");
+    for (const config of [stored.browser?.config, stored.options?.browserConfig]) {
+      expect(config).toMatchObject({ browserTransport: "obu", cookieSync: false });
+      expect(config).not.toHaveProperty("chromeCookiePath");
+      expect(config).not.toHaveProperty("cookieNames");
+      expect(config).not.toHaveProperty("cookieSyncWaitMs");
+      expect(config).not.toHaveProperty("inlineCookies");
+      expect(config).not.toHaveProperty("inlineCookiesSource");
+      expect(config).not.toHaveProperty("allowCookieErrors");
+      expect(config).not.toHaveProperty("manualLoginCookieSync");
+    }
+  });
+
   test("persists wrapper request origin as immutable session evidence", async () => {
     vi.stubEnv("ORACLE_WRAPPER_REMOTE_ONLY", "1");
     vi.stubEnv("ORACLE_WRAPPER_INVOCATION_ORIGIN", "user");

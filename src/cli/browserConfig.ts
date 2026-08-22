@@ -54,6 +54,13 @@ const BROWSER_MODEL_LABELS: [ModelName, string][] = [
 ];
 
 export interface BrowserFlagOptions {
+  browserTransport?: "cdp" | "obu";
+  browserObuSessionId?: string;
+  browserObuTabId?: number;
+  browserAccountEmail?: string;
+  browserWorkspaceName?: string;
+  browserAccountDigest?: string;
+  browserWorkspaceDigest?: string;
   browserChromeProfile?: string;
   browserChromePath?: string;
   browserCookiePath?: string;
@@ -164,6 +171,51 @@ export async function buildBrowserConfig(
       "--copy-profile cannot be combined with --remote-host: the local profile source is not available to the remote browser service.",
     );
   }
+  const browserTransport = options.browserTransport ?? "cdp";
+  const obuSessionId = options.browserObuSessionId?.trim();
+  const obuTabId = options.browserObuTabId;
+  const chatGptAccountEmail = options.browserAccountEmail?.trim().toLowerCase();
+  const chatGptWorkspaceName = options.browserWorkspaceName?.trim();
+  const chatGptAccountDigest = options.browserAccountDigest?.trim();
+  const chatGptWorkspaceDigest = options.browserWorkspaceDigest?.trim();
+  const obuOptionUsed = Boolean(
+    obuSessionId ||
+    obuTabId ||
+    chatGptAccountEmail ||
+    chatGptWorkspaceName ||
+    chatGptAccountDigest ||
+    chatGptWorkspaceDigest,
+  );
+  if (browserTransport === "obu") {
+    if (
+      options.remoteHost ||
+      options.remoteChrome ||
+      options.copyProfile ||
+      options.browserAttachRunning
+    ) {
+      throw new Error(
+        "--browser-transport obu cannot be combined with remote-host, remote Chrome, copied-profile, or attach-running options.",
+      );
+    }
+    if (!chatGptAccountEmail || !chatGptWorkspaceName) {
+      throw new Error(
+        "--browser-transport obu requires --browser-account-email and --browser-workspace-name.",
+      );
+    }
+  } else if (obuOptionUsed) {
+    throw new Error("Open Browser Use routing flags require --browser-transport obu.");
+  }
+  if (obuTabId != null && (!Number.isInteger(obuTabId) || obuTabId <= 0)) {
+    throw new Error("--browser-obu-tab-id must be a positive integer.");
+  }
+  for (const [label, digest] of [
+    ["--browser-account-digest", chatGptAccountDigest],
+    ["--browser-workspace-digest", chatGptWorkspaceDigest],
+  ] as const) {
+    if (digest && !/^[a-f0-9]{64}$/.test(digest)) {
+      throw new Error(`${label} must be a lowercase SHA-256 digest.`);
+    }
+  }
   const desiredModelOverride = options.browserModelLabel?.trim();
   const normalizedOverride = desiredModelOverride?.toLowerCase() ?? "";
   const baseModel = options.model.toLowerCase();
@@ -173,16 +225,20 @@ export async function buildBrowserConfig(
   const modelStrategy =
     normalizeBrowserModelStrategy(options.browserModelStrategy) ?? DEFAULT_MODEL_STRATEGY;
   assertBrowserModelAvailable(options.model, modelStrategy);
-  const cookieNames = parseCookieNames(
-    options.browserCookieNames ?? process.env.ORACLE_BROWSER_COOKIE_NAMES,
-  );
-  let inline = await resolveInlineCookies({
-    inlineArg: options.browserInlineCookies,
-    inlineFileArg: options.browserInlineCookiesFile,
-    envPayload: process.env.ORACLE_BROWSER_COOKIES_JSON,
-    envFile: process.env.ORACLE_BROWSER_COOKIES_FILE,
-    cwd: process.cwd(),
-  });
+  const cookieNames =
+    browserTransport === "obu"
+      ? undefined
+      : parseCookieNames(options.browserCookieNames ?? process.env.ORACLE_BROWSER_COOKIE_NAMES);
+  let inline =
+    browserTransport === "obu"
+      ? undefined
+      : await resolveInlineCookies({
+          inlineArg: options.browserInlineCookies,
+          inlineFileArg: options.browserInlineCookiesFile,
+          envPayload: process.env.ORACLE_BROWSER_COOKIES_JSON,
+          envFile: process.env.ORACLE_BROWSER_COOKIES_FILE,
+          cwd: process.cwd(),
+        });
   if (inline?.source?.startsWith("home:") && options.browserNoCookieSync !== true) {
     inline = undefined;
   }
@@ -234,9 +290,16 @@ export async function buildBrowserConfig(
       ? (options.browserChromeProfile ?? null)
       : (options.browserChromeProfile ?? DEFAULT_CHROME_PROFILE),
     chromePath: options.browserChromePath ?? null,
-    chromeCookiePath: options.browserCookiePath ?? null,
+    chromeCookiePath: browserTransport === "obu" ? null : (options.browserCookiePath ?? null),
     attachRunning,
     url,
+    browserTransport,
+    obuSessionId,
+    obuTabId,
+    chatGptAccountEmail,
+    chatGptWorkspaceName,
+    chatGptAccountDigest,
+    chatGptWorkspaceDigest,
     debugPort: selectBrowserPort(options),
     timeoutMs: options.browserTimeout
       ? parseBrowserDuration(
@@ -293,10 +356,14 @@ export async function buildBrowserConfig(
           DEFAULT_BROWSER_AUTO_REATTACH_TIMEOUT_MS,
         )
       : undefined,
-    cookieSyncWaitMs: options.browserCookieWait
-      ? parseBrowserDuration(options.browserCookieWait, "--browser-cookie-wait", 0)
-      : undefined,
-    cookieSync: options.browserNoCookieSync ? false : undefined,
+    cookieSyncWaitMs:
+      browserTransport === "obu"
+        ? undefined
+        : options.browserCookieWait
+          ? parseBrowserDuration(options.browserCookieWait, "--browser-cookie-wait", 0)
+          : undefined,
+    cookieSync:
+      browserTransport === "obu" ? false : options.browserNoCookieSync ? false : undefined,
     cookieNames,
     inlineCookies: inline?.cookies,
     inlineCookiesSource: inline?.source ?? null,
@@ -305,12 +372,13 @@ export async function buildBrowserConfig(
     manualLogin: options.browserManualLogin === undefined ? undefined : options.browserManualLogin,
     manualLoginProfileDir: options.browserManualLoginProfileDir ?? undefined,
     copyProfileSource: options.copyProfile ?? undefined,
-    hideWindow: remoteChrome ? undefined : true,
+    hideWindow: remoteChrome || browserTransport === "obu" ? undefined : true,
     desiredModel,
     modelStrategy,
     debug: options.verbose ? true : undefined,
     // Allow cookie failures by default so runs can continue without Chrome/Keychain secrets.
-    allowCookieErrors: options.browserAllowCookieErrors ?? true,
+    allowCookieErrors:
+      browserTransport === "obu" ? undefined : (options.browserAllowCookieErrors ?? true),
     remoteChrome,
     remoteChromeBrowserId: expectedBrowserId,
     remoteChromeBrowserWSEndpoint: browserWSEndpoint,

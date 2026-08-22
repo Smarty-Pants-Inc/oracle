@@ -287,13 +287,13 @@ export async function acquireProfileRunLock(
       }
       let existing = parseProfileRunLock(await readFile(lockPath, "utf8").catch(() => null));
       if (!existing) {
-        // Likely partial write / corruption; re-read once, then delete (user preference: delete unreadable lockfiles).
+        // Re-read once in case another process has only just completed the exclusive write.
         await delay(200);
         existing = parseProfileRunLock(await readFile(lockPath, "utf8").catch(() => null));
         if (!existing) {
-          options.logger?.("Oracle profile lock unreadable; deleting lockfile.");
-          await rm(lockPath, { force: true }).catch(() => undefined);
-          continue;
+          throw new Error(
+            `Oracle profile lock at ${lockPath} is unreadable; refusing to delete unknown lock state.`,
+          );
         }
       }
       if (!existing || !isProcessAlive(existing.pid)) {

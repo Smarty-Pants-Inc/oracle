@@ -1,6 +1,7 @@
 import CDP from "chrome-remote-interface";
 import { createHash } from "node:crypto";
 import type { SessionMetadata, BrowserHarvestState } from "../sessionStore.js";
+import { BrowserAutomationError } from "../oracle/errors.js";
 import {
   ANSWER_SELECTORS,
   ASSISTANT_ROLE_SELECTOR,
@@ -10,12 +11,18 @@ import {
   STOP_BUTTON_SELECTOR,
 } from "./constants.js";
 import { captureAssistantMarkdown, readAssistantSnapshot } from "./actions/assistantResponse.js";
-import { buildConversationTurnListExpression } from "./conversationTurns.js";
+import {
+  buildConversationTurnListExpression,
+  readBoundConversationTurn,
+  type ConversationTurnBinding,
+} from "./conversationTurns.js";
 import { extractStableConversationIdFromUrl } from "./conversationUrl.js";
 import { delay } from "./utils.js";
 import { connectToRemoteChromeTarget, listRemoteChromeTargets } from "./chromeLifecycle.js";
 import { resolveRemoteChromeBrowserIdentity } from "./profileState.js";
 import { readChatGptAccountDigest } from "./pageActions.js";
+import { assertChatGptIdentity } from "./chatgptAccountRouter.js";
+import type { ChromeClient } from "./types.js";
 
 export const DEFAULT_REMOTE_CHROME_HOST = "127.0.0.1";
 export const DEFAULT_REMOTE_CHROME_PORT = 9222;
@@ -81,6 +88,7 @@ interface InspectChatGptTabOptions extends HostPort {
 interface HarvestChatGptTabOptions extends ResolveChatGptTabOptions {
   target?: ChromeTarget;
   stallWindowMs?: number;
+  turnBinding?: ConversationTurnBinding;
 }
 
 const noopLogger = Object.assign((_message: string) => {}, {}) as ((message: string) => void) & {
@@ -370,102 +378,275 @@ export async function inspectChatGptTab(
 
   const client = await connectToTarget(host, port, targetId, options.browserWSEndpoint);
   try {
-    const { Runtime } = client;
+    return await inspectConnectedChatGptTab({
+      client,
+      targetId,
+      title: target.title,
+      url: target.url,
+      host,
+      port,
+      accountDigest: options.accountDigest,
+    });
+  } finally {
+    await client.close().catch(() => undefined);
+  }
+}
+
+export async function inspectConnectedChatGptTab(options: {
+  client: ChromeClient;
+  targetId: string;
+  title?: string;
+  url?: string;
+  host?: string;
+  port?: number;
+  accountDigest?: string;
+  identity?: {
+    email: string;
+    workspaceName: string;
+    accountDigest: string;
+    workspaceDigest: string;
+  };
+}): Promise<ChatGptTabSummary> {
+  const { Runtime } = options.client;
+  await Runtime.enable?.();
+  if (options.identity) {
+    await assertChatGptIdentity(Runtime, options.identity);
+  } else {
     const expectedAccountDigest = options.accountDigest?.trim();
     if (expectedAccountDigest) {
       const observedAccountDigest = await readChatGptAccountDigest(Runtime);
       if (observedAccountDigest !== expectedAccountDigest) {
-        throw new Error("Remote Chrome account identity changed before live tab inspection.");
+        throw new Error("ChatGPT account identity changed before live tab inspection.");
       }
     }
-    const evaluation = await Runtime.evaluate({
-      expression: buildTabInspectionExpression(),
-      returnByValue: true,
-      awaitPromise: true,
-    });
-    const info = (evaluation.result?.value ?? {}) as {
-      title?: string;
-      url?: string;
-      currentModelLabel?: string;
-      stopExists?: boolean;
-      sendExists?: boolean;
-      promptReady?: boolean;
-      loginButtonExists?: boolean;
-      authenticated?: boolean;
-      assistantCount?: number;
-      lastAssistantText?: string;
-      assistantFollowsLatestUser?: boolean;
-      lastAssistantTurnIndex?: number;
-      lastUserTurnIndex?: number;
-      lastUserText?: string;
-      visibilityState?: string;
-      focused?: boolean;
-    };
-    const snapshot = await readAssistantSnapshot(Runtime).catch(() => null);
-    const inspectedAssistantTurnIndex =
-      typeof info.lastAssistantTurnIndex === "number" && info.lastAssistantTurnIndex >= 0
-        ? info.lastAssistantTurnIndex
-        : undefined;
-    const normalizedSnapshotText = normalizeTitle(snapshot?.text ?? "").toLowerCase();
-    const normalizedInspectedText = normalizeTitle(info.lastAssistantText ?? "").toLowerCase();
-    const snapshotMatchesInspectedTurn =
-      (typeof snapshot?.turnIndex === "number" &&
-        snapshot.turnIndex === inspectedAssistantTurnIndex) ||
-      (snapshot?.turnIndex == null &&
-        inspectedAssistantTurnIndex === undefined &&
-        normalizedSnapshotText.length > 0 &&
-        normalizedSnapshotText === normalizedInspectedText);
-    const lastAssistantText =
-      snapshotMatchesInspectedTurn &&
-      typeof snapshot?.text === "string" &&
-      snapshot.text.trim().length > 0
-        ? snapshot.text.trim()
-        : String(info.lastAssistantText ?? "").trim();
-    const lastUserText = String(info.lastUserText ?? "").trim();
-    const summary: ChatGptTabSummary = {
-      host,
-      port,
-      targetId,
-      title: normalizeTitle(info.title ?? target.title ?? ""),
-      url: normalizeUrl(info.url ?? target.url ?? ""),
-      currentModelLabel: normalizeTitle(info.currentModelLabel ?? ""),
-      stopExists: Boolean(info.stopExists),
-      sendExists: Boolean(info.sendExists),
-      promptReady: Boolean(info.promptReady),
-      loginButtonExists: Boolean(info.loginButtonExists),
-      authenticated: Boolean(info.authenticated),
-      assistantCount: Number.isFinite(info.assistantCount) ? Number(info.assistantCount) : 0,
-      lastAssistantText,
-      assistantFollowsLatestUser: Boolean(info.assistantFollowsLatestUser),
-      lastAssistantTurnIndex: inspectedAssistantTurnIndex,
-      lastUserTurnIndex:
-        typeof info.lastUserTurnIndex === "number" && info.lastUserTurnIndex >= 0
-          ? info.lastUserTurnIndex
-          : undefined,
-      lastAssistantSnippet: trimToSnippet(lastAssistantText),
-      lastUserText,
-      lastUserSnippet: trimToSnippet(lastUserText),
-      focused: Boolean(info.focused),
-      visibilityState: typeof info.visibilityState === "string" ? info.visibilityState : "",
-      conversationId: extractConversationIdFromUrl(info.url ?? target.url ?? ""),
-      fingerprint: "",
-      state: "detached",
-      lastAssistantMarkdown: null,
-      lastAssistantMessageId:
-        snapshotMatchesInspectedTurn && typeof snapshot?.messageId === "string"
-          ? snapshot.messageId
-          : undefined,
-      lastAssistantTurnId:
-        snapshotMatchesInspectedTurn && typeof snapshot?.turnId === "string"
-          ? snapshot.turnId
-          : undefined,
-    };
-    summary.state = classifyTabState(summary);
-    summary.fingerprint = buildTargetFingerprint(summary);
-    return summary;
-  } finally {
-    await client.close().catch(() => undefined);
   }
+  const evaluation = await Runtime.evaluate({
+    expression: buildTabInspectionExpression(),
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  const info = (evaluation.result?.value ?? {}) as {
+    title?: string;
+    url?: string;
+    currentModelLabel?: string;
+    stopExists?: boolean;
+    sendExists?: boolean;
+    promptReady?: boolean;
+    loginButtonExists?: boolean;
+    authenticated?: boolean;
+    assistantCount?: number;
+    lastAssistantText?: string;
+    assistantFollowsLatestUser?: boolean;
+    lastAssistantTurnIndex?: number;
+    lastUserTurnIndex?: number;
+    lastUserText?: string;
+    visibilityState?: string;
+    focused?: boolean;
+  };
+  const snapshot = await readAssistantSnapshot(Runtime).catch(() => null);
+  const inspectedAssistantTurnIndex =
+    typeof info.lastAssistantTurnIndex === "number" && info.lastAssistantTurnIndex >= 0
+      ? info.lastAssistantTurnIndex
+      : undefined;
+  const normalizedSnapshotText = normalizeTitle(snapshot?.text ?? "").toLowerCase();
+  const normalizedInspectedText = normalizeTitle(info.lastAssistantText ?? "").toLowerCase();
+  const snapshotMatchesInspectedTurn =
+    (typeof snapshot?.turnIndex === "number" &&
+      snapshot.turnIndex === inspectedAssistantTurnIndex) ||
+    (snapshot?.turnIndex == null &&
+      inspectedAssistantTurnIndex === undefined &&
+      normalizedSnapshotText.length > 0 &&
+      normalizedSnapshotText === normalizedInspectedText);
+  const lastAssistantText =
+    snapshotMatchesInspectedTurn &&
+    typeof snapshot?.text === "string" &&
+    snapshot.text.trim().length > 0
+      ? snapshot.text.trim()
+      : String(info.lastAssistantText ?? "").trim();
+  const lastUserText = String(info.lastUserText ?? "").trim();
+  const summary: ChatGptTabSummary = {
+    host: options.host,
+    port: options.port,
+    targetId: options.targetId,
+    title: normalizeTitle(info.title ?? options.title ?? ""),
+    url: normalizeUrl(info.url ?? options.url ?? ""),
+    currentModelLabel: normalizeTitle(info.currentModelLabel ?? ""),
+    stopExists: Boolean(info.stopExists),
+    sendExists: Boolean(info.sendExists),
+    promptReady: Boolean(info.promptReady),
+    loginButtonExists: Boolean(info.loginButtonExists),
+    authenticated: Boolean(info.authenticated),
+    assistantCount: Number.isFinite(info.assistantCount) ? Number(info.assistantCount) : 0,
+    lastAssistantText,
+    assistantFollowsLatestUser: Boolean(info.assistantFollowsLatestUser),
+    lastAssistantTurnIndex: inspectedAssistantTurnIndex,
+    lastUserTurnIndex:
+      typeof info.lastUserTurnIndex === "number" && info.lastUserTurnIndex >= 0
+        ? info.lastUserTurnIndex
+        : undefined,
+    lastAssistantSnippet: trimToSnippet(lastAssistantText),
+    lastUserText,
+    lastUserSnippet: trimToSnippet(lastUserText),
+    focused: Boolean(info.focused),
+    visibilityState: typeof info.visibilityState === "string" ? info.visibilityState : "",
+    conversationId: extractConversationIdFromUrl(info.url ?? options.url ?? ""),
+    fingerprint: "",
+    state: "detached",
+    lastAssistantMarkdown: null,
+    lastAssistantMessageId:
+      snapshotMatchesInspectedTurn && typeof snapshot?.messageId === "string"
+        ? snapshot.messageId
+        : undefined,
+    lastAssistantTurnId:
+      snapshotMatchesInspectedTurn && typeof snapshot?.turnId === "string"
+        ? snapshot.turnId
+        : undefined,
+  };
+  summary.state = classifyTabState(summary);
+  summary.fingerprint = buildTargetFingerprint(summary);
+  return summary;
+}
+export async function harvestConnectedChatGptTab(options: {
+  client: ChromeClient;
+  targetId: string;
+  title?: string;
+  url?: string;
+  host?: string;
+  port?: number;
+  accountDigest?: string;
+  identity?: {
+    email: string;
+    workspaceName: string;
+    accountDigest: string;
+    workspaceDigest: string;
+  };
+  stallWindowMs?: number;
+  turnBinding?: ConversationTurnBinding;
+}): Promise<ChatGptTabSummary> {
+  const { Runtime } = options.client;
+  if (options.turnBinding) {
+    const inspected = await inspectConnectedChatGptTab(options);
+    const resolved = await readBoundConversationTurn(Runtime, options.turnBinding);
+    if (resolved.status !== "matched") {
+      throw new BrowserAutomationError(
+        "The stored ChatGPT user turn is unavailable or ambiguous; refusing to harvest another turn.",
+        { stage: "chatgpt-turn-affinity", code: `turn-affinity-${resolved.status}` },
+      );
+    }
+    const { user, assistant, hasLaterUserTurn } = resolved.turn;
+    if (hasLaterUserTurn && !assistant?.text) {
+      throw new BrowserAutomationError(
+        "A later ChatGPT user turn exists before the stored turn received an assistant response.",
+        { stage: "chatgpt-turn-affinity", code: "turn-affinity-interrupted" },
+      );
+    }
+    const lastAssistantText = assistant?.text ?? "";
+    const lastAssistantMarkdown =
+      assistant && (assistant.messageId || assistant.turnId)
+        ? await captureAssistantMarkdown(
+            Runtime,
+            { messageId: assistant.messageId, turnId: assistant.turnId },
+            noopLogger,
+          ).catch(() => null)
+        : null;
+    const harvested: ChatGptTabSummary = {
+      ...inspected,
+      stopExists:
+        Boolean(assistant) && !hasLaterUserTurn && assistant?.completionVisible !== true
+          ? inspected.stopExists
+          : false,
+      assistantCount: assistant ? Math.max(inspected.assistantCount, 1) : inspected.assistantCount,
+      lastUserText: user.text,
+      lastUserSnippet: trimToSnippet(user.text),
+      lastUserTurnIndex: user.index,
+      lastAssistantText,
+      lastAssistantSnippet: trimToSnippet(lastAssistantText),
+      lastAssistantTurnIndex: assistant?.index,
+      lastAssistantMessageId: assistant?.messageId,
+      lastAssistantTurnId: assistant?.turnId,
+      lastAssistantMarkdown,
+      assistantFollowsLatestUser: Boolean(assistant),
+    };
+    harvested.state =
+      assistant && (hasLaterUserTurn || assistant.completionVisible === true)
+        ? "completed"
+        : "running";
+    harvested.fingerprint = buildTargetFingerprint(harvested);
+    if (harvested.stopExists && options.stallWindowMs && options.stallWindowMs > 0) {
+      await delay(options.stallWindowMs);
+      return harvestConnectedChatGptTab({ ...options, stallWindowMs: undefined });
+    }
+    return harvested;
+  }
+  const snapshot = await readAssistantSnapshot(Runtime).catch(() => null);
+  const nowSummary = await inspectConnectedChatGptTab(options);
+  const normalizedSnapshotText = normalizeTitle(snapshot?.text ?? "").toLowerCase();
+  const normalizedInspectedText = normalizeTitle(nowSummary.lastAssistantText).toLowerCase();
+  const snapshotMatchesLatestTurn =
+    (typeof snapshot?.turnIndex === "number" &&
+      snapshot.turnIndex === nowSummary.lastAssistantTurnIndex) ||
+    (snapshot?.turnIndex == null &&
+      nowSummary.lastAssistantTurnIndex === undefined &&
+      normalizedSnapshotText.length > 0 &&
+      normalizedSnapshotText === normalizedInspectedText);
+  let assistantMarkdown: string | null = null;
+  if (snapshotMatchesLatestTurn && (snapshot?.messageId || snapshot?.turnId)) {
+    assistantMarkdown = await captureAssistantMarkdown(
+      Runtime,
+      {
+        messageId: snapshot.messageId,
+        turnId: snapshot.turnId,
+      },
+      noopLogger,
+    ).catch(() => null);
+  }
+  const lastAssistantText =
+    snapshotMatchesLatestTurn &&
+    typeof snapshot?.text === "string" &&
+    snapshot.text.trim().length > 0
+      ? snapshot.text.trim()
+      : nowSummary.lastAssistantText;
+  const harvested: ChatGptTabSummary = {
+    ...nowSummary,
+    lastAssistantText,
+    lastAssistantSnippet: trimToSnippet(lastAssistantText),
+    lastAssistantMarkdown: assistantMarkdown ?? (lastAssistantText || null),
+    lastAssistantMessageId:
+      snapshotMatchesLatestTurn && typeof snapshot?.messageId === "string"
+        ? snapshot.messageId
+        : nowSummary.lastAssistantMessageId,
+    lastAssistantTurnId:
+      snapshotMatchesLatestTurn && typeof snapshot?.turnId === "string"
+        ? snapshot.turnId
+        : nowSummary.lastAssistantTurnId,
+  };
+  if (harvested.stopExists && options.stallWindowMs && options.stallWindowMs > 0) {
+    const firstFingerprint = harvested.fingerprint;
+    await delay(options.stallWindowMs);
+    const followup = await inspectConnectedChatGptTab(options);
+    harvested.stopExists = followup.stopExists;
+    harvested.sendExists = followup.sendExists;
+    harvested.promptReady = followup.promptReady;
+    harvested.currentModelLabel = followup.currentModelLabel;
+    harvested.focused = followup.focused;
+    harvested.visibilityState = followup.visibilityState;
+    harvested.assistantCount = followup.assistantCount;
+    harvested.authenticated = followup.authenticated;
+    harvested.loginButtonExists = followup.loginButtonExists;
+    harvested.lastUserText = followup.lastUserText;
+    harvested.lastUserSnippet = followup.lastUserSnippet;
+    harvested.assistantFollowsLatestUser = followup.assistantFollowsLatestUser;
+    harvested.lastAssistantTurnIndex = followup.lastAssistantTurnIndex;
+    harvested.lastUserTurnIndex = followup.lastUserTurnIndex;
+    harvested.fingerprint = followup.fingerprint;
+    harvested.state =
+      harvested.stopExists && firstFingerprint === followup.fingerprint
+        ? "stalled"
+        : classifyTabState(harvested);
+  } else {
+    harvested.state = classifyTabState(harvested);
+  }
+  return harvested;
 }
 
 export function classifyTabState(
@@ -765,98 +946,17 @@ export async function harvestChatGptTab(
     : await resolveChatGptTab({ ...options, browserWSEndpoint, ref: options.ref });
   const client = await connectToTarget(host, port, resolved.targetId, browserWSEndpoint);
   try {
-    const { Runtime } = client;
-    const snapshot = await readAssistantSnapshot(Runtime).catch(() => null);
-    const nowSummary = await inspectChatGptTab({
-      ...options,
+    return await harvestConnectedChatGptTab({
+      client,
+      targetId: resolved.targetId,
+      title: resolved.title,
+      url: resolved.url,
       host,
-      browserWSEndpoint,
       port,
-      target: {
-        targetId: resolved.targetId,
-        title: resolved.title,
-        url: resolved.url,
-        type: "page",
-      },
+      accountDigest: options.accountDigest,
+      stallWindowMs: options.stallWindowMs,
+      turnBinding: options.turnBinding,
     });
-    const normalizedSnapshotText = normalizeTitle(snapshot?.text ?? "").toLowerCase();
-    const normalizedInspectedText = normalizeTitle(nowSummary.lastAssistantText).toLowerCase();
-    const snapshotMatchesLatestTurn =
-      (typeof snapshot?.turnIndex === "number" &&
-        snapshot.turnIndex === nowSummary.lastAssistantTurnIndex) ||
-      (snapshot?.turnIndex == null &&
-        nowSummary.lastAssistantTurnIndex === undefined &&
-        normalizedSnapshotText.length > 0 &&
-        normalizedSnapshotText === normalizedInspectedText);
-    let assistantMarkdown: string | null = null;
-    if (snapshotMatchesLatestTurn && (snapshot?.messageId || snapshot?.turnId)) {
-      assistantMarkdown = await captureAssistantMarkdown(
-        Runtime,
-        {
-          messageId: snapshot.messageId,
-          turnId: snapshot.turnId,
-        },
-        noopLogger,
-      ).catch(() => null);
-    }
-    const lastAssistantText =
-      snapshotMatchesLatestTurn &&
-      typeof snapshot?.text === "string" &&
-      snapshot.text.trim().length > 0
-        ? snapshot.text.trim()
-        : nowSummary.lastAssistantText;
-    const harvested: ChatGptTabSummary = {
-      ...nowSummary,
-      lastAssistantText,
-      lastAssistantSnippet: trimToSnippet(lastAssistantText),
-      lastAssistantMarkdown: assistantMarkdown ?? (lastAssistantText || null),
-      lastAssistantMessageId:
-        snapshotMatchesLatestTurn && typeof snapshot?.messageId === "string"
-          ? snapshot.messageId
-          : nowSummary.lastAssistantMessageId,
-      lastAssistantTurnId:
-        snapshotMatchesLatestTurn && typeof snapshot?.turnId === "string"
-          ? snapshot.turnId
-          : nowSummary.lastAssistantTurnId,
-    };
-    if (harvested.stopExists && options.stallWindowMs && options.stallWindowMs > 0) {
-      const firstFingerprint = harvested.fingerprint;
-      await delay(options.stallWindowMs);
-      const followup = await inspectChatGptTab({
-        ...options,
-        host,
-        browserWSEndpoint,
-        port,
-        target: {
-          targetId: harvested.targetId,
-          title: harvested.title,
-          url: harvested.url,
-          type: "page",
-        },
-      });
-      harvested.stopExists = followup.stopExists;
-      harvested.sendExists = followup.sendExists;
-      harvested.promptReady = followup.promptReady;
-      harvested.currentModelLabel = followup.currentModelLabel;
-      harvested.focused = followup.focused;
-      harvested.visibilityState = followup.visibilityState;
-      harvested.assistantCount = followup.assistantCount;
-      harvested.authenticated = followup.authenticated;
-      harvested.loginButtonExists = followup.loginButtonExists;
-      harvested.lastUserText = followup.lastUserText;
-      harvested.lastUserSnippet = followup.lastUserSnippet;
-      harvested.assistantFollowsLatestUser = followup.assistantFollowsLatestUser;
-      harvested.lastAssistantTurnIndex = followup.lastAssistantTurnIndex;
-      harvested.lastUserTurnIndex = followup.lastUserTurnIndex;
-      harvested.fingerprint = followup.fingerprint;
-      harvested.state =
-        harvested.stopExists && firstFingerprint === followup.fingerprint
-          ? "stalled"
-          : classifyTabState(harvested);
-    } else {
-      harvested.state = classifyTabState(harvested);
-    }
-    return harvested;
   } finally {
     await client.close().catch(() => undefined);
   }

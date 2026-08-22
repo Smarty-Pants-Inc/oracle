@@ -3,6 +3,8 @@ import type { SessionMetadata } from "../../src/sessionStore.js";
 import {
   handleChatGptExportCommand,
   parseRemoteChromeTarget,
+  resolveChatGptExportBrowserTarget,
+  resolveChatGptExportBrowserTargetForSession,
   resolveChatGptExportRemoteChrome,
   resolveChatGptExportRemoteChromeForSession,
 } from "../../src/cli/chatgptExport.js";
@@ -37,6 +39,86 @@ describe("ChatGPT export endpoint affinity", () => {
     browserId,
     browserWSEndpoint: ws(browserId, host, port),
     accountDigest,
+  });
+  const obuSession = (id: string, tabId = 7): SessionMetadata =>
+    session(id, {
+      runtime: {
+        browserTransport: "obu",
+        obuSessionId: "oracle-main",
+        obuTabId: tabId,
+        chatGptAccountEmail: "paul@smartypants.ai",
+        chatGptWorkspaceName: "Paul Bettner",
+        chatGptAccountDigest: "a".repeat(64),
+        chatGptWorkspaceDigest: "b".repeat(64),
+        conversationId: "obu-thread",
+        promptMessageId: "prompt-message",
+        assistantMessageId: "assistant-message",
+      },
+    });
+
+  test("resolves complete OBU export affinity from the originating session", () => {
+    expect(
+      resolveChatGptExportBrowserTargetForSession(
+        "https://chatgpt.com/c/obu-thread",
+        "obu",
+        obuSession("obu"),
+      ),
+    ).toMatchObject({
+      transport: "obu",
+      affinity: {
+        sessionId: "oracle-main",
+        tabId: 7,
+        email: "paul@smartypants.ai",
+        workspaceName: "Paul Bettner",
+        conversationUrl: "https://chatgpt.com/c/obu-thread",
+      },
+      turnAffinity: {
+        promptMessageId: "prompt-message",
+        assistantMessageId: "assistant-message",
+      },
+    });
+  });
+
+  test("rejects an OBU export without exact prompt and assistant branch affinity", () => {
+    const metadata = obuSession("missing-branch");
+    delete metadata.browser?.runtime?.promptMessageId;
+    delete metadata.browser?.runtime?.assistantMessageId;
+
+    expect(() =>
+      resolveChatGptExportBrowserTargetForSession(
+        "https://chatgpt.com/c/obu-thread",
+        metadata.id,
+        metadata,
+      ),
+    ).toThrow(/no exact prompt\/assistant branch affinity/i);
+  });
+
+  test("rejects conflicting OBU conversation evidence in the originating session", () => {
+    const metadata = obuSession("conflicting-conversation");
+    metadata.browser = {
+      ...metadata.browser,
+      harvest: {
+        conversationId: "other-thread",
+        url: "https://chatgpt.com/c/other-thread",
+      },
+    };
+
+    expect(() =>
+      resolveChatGptExportBrowserTargetForSession(
+        "https://chatgpt.com/c/obu-thread",
+        metadata.id,
+        metadata,
+      ),
+    ).toThrow(/conversation affinity is conflicting/i);
+  });
+
+  test("rejects conflicting OBU export tab affinity", () => {
+    expect(() =>
+      resolveChatGptExportBrowserTarget("https://chatgpt.com/c/obu-thread", [
+        obuSession("one", 7),
+        obuSession("two", 8),
+      ]),
+    ).toThrow(/conflicting stored browser affinities/i);
   });
 
   test("matches a root target URL to project conversation evidence", () => {

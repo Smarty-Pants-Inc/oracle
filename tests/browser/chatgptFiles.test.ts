@@ -188,6 +188,49 @@ describe("saveChatGptDownloadableFiles", () => {
     await expect(fs.readFile(result.savedFiles[0]!.path)).resolves.toEqual(Buffer.from([9, 8, 7]));
   });
 
+  test("keeps main-Chrome file cookies inside the browser context", async () => {
+    const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-files-obu-"));
+    setOracleHomeDirOverrideForTest(tmpHome);
+    const network = {
+      getCookies: vi.fn().mockRejectedValue(new Error("must not read cookies")),
+    } as unknown as ChromeClient["Network"];
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: {
+          value: {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            url: "https://chatgpt.com/backend-api/files/file_package/download",
+            contentDisposition: 'attachment; filename="package.zip"',
+            contentType: "application/zip",
+            base64: Buffer.from([7, 8, 9]).toString("base64"),
+          },
+        },
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    globalThis.fetch = vi.fn();
+
+    const result = await saveChatGptDownloadableFiles({
+      Network: network,
+      Runtime: runtime,
+      browserTransport: "obu",
+      sessionId: "file-session",
+      files: [
+        {
+          url: "https://chatgpt.com/backend-api/files/file_package/download",
+          downloadUrl: "https://chatgpt.com/backend-api/files/file_package/download",
+          filename: "package.zip",
+        },
+      ],
+    });
+
+    expect(result.saved).toBe(true);
+    expect(network.getCookies).not.toHaveBeenCalled();
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(runtime.evaluate).toHaveBeenCalledOnce();
+  });
+
   test("saves sandbox-only references through the ChatGPT sandbox download endpoint", async () => {
     const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-sandbox-file-"));
     setOracleHomeDirOverrideForTest(tmpHome);

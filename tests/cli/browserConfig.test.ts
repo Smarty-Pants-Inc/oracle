@@ -48,6 +48,59 @@ describe("buildBrowserConfig", () => {
       vi.unstubAllGlobals();
     }
   });
+  test("builds exact main-Chrome account routes without CDP ownership", async () => {
+    await expect(
+      buildBrowserConfig({
+        model: "gpt-5.6-sol-pro",
+        browserTransport: "obu",
+        browserAccountEmail: " PAUL@smartypants.ai ",
+        browserWorkspaceName: " Paul Bettner ",
+        browserCookiePath: "/tmp/cookies.db",
+        browserCookieNames: "session-token",
+        browserCookieWait: "5s",
+        browserInlineCookies: JSON.stringify([
+          { name: "session-token", value: "secret", domain: "chatgpt.com" },
+        ]),
+        browserAllowCookieErrors: true,
+      }),
+    ).resolves.toMatchObject({
+      browserTransport: "obu",
+      chatGptAccountEmail: "paul@smartypants.ai",
+      chatGptWorkspaceName: "Paul Bettner",
+      chromeCookiePath: null,
+      cookieSync: false,
+      cookieNames: undefined,
+      cookieSyncWaitMs: undefined,
+      inlineCookies: undefined,
+      inlineCookiesSource: null,
+      allowCookieErrors: undefined,
+      hideWindow: undefined,
+    });
+  });
+
+  test("rejects incomplete or mixed main-Chrome routes", async () => {
+    await expect(
+      buildBrowserConfig({ model: "gpt-5.6-sol-pro", browserTransport: "obu" }),
+    ).rejects.toThrow(/requires --browser-account-email and --browser-workspace-name/i);
+    await expect(
+      buildBrowserConfig({
+        model: "gpt-5.6-sol-pro",
+        browserTransport: "obu",
+        browserAccountEmail: "paul@smartypants.ai",
+        browserWorkspaceName: "Paul Bettner",
+        remoteChrome: "127.0.0.1:9222",
+      }),
+    ).rejects.toThrow(/cannot be combined with .*remote Chrome/i);
+    await expect(
+      buildBrowserConfig({
+        model: "gpt-5.6-sol-pro",
+        browserTransport: "obu",
+        browserAccountEmail: "paul@smartypants.ai",
+        browserWorkspaceName: "Paul Bettner",
+        remoteHost: "remote.example:9473",
+      }),
+    ).rejects.toThrow(/cannot be combined with remote-host/i);
+  });
 
   test("rejects a wrapper browser identity that changes before session creation", async () => {
     vi.stubGlobal(

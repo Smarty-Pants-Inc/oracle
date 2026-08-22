@@ -1548,6 +1548,119 @@ describe("performSessionRun", () => {
     expect(logLines).toContain("Auto-reattach succeeded; session marked completed.");
   });
 
+  test("persists recovered OBU affinity in runtime and both browser config copies", async () => {
+    const originalRuntime = {
+      browserTransport: "obu" as const,
+      obuSessionId: "stored-session",
+      obuTabId: 7,
+      chatGptAccountEmail: "paul@smartypants.ai",
+      chatGptWorkspaceName: "Paul Bettner",
+      chatGptAccountDigest: "a".repeat(64),
+      chatGptWorkspaceDigest: "b".repeat(64),
+      tabUrl: "https://chatgpt.com/c/obu-thread",
+      conversationId: "obu-thread",
+      promptSubmitted: true,
+    };
+    const recoveredRuntime = {
+      ...originalRuntime,
+      obuSessionId: "recovered-session",
+      obuTabId: 8,
+    };
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(
+      new BrowserAutomationError("Open Browser Use disconnected before oracle finished.", {
+        stage: "connection-lost",
+        recoverableDisconnect: true,
+        runtime: originalRuntime,
+      }),
+    );
+    vi.mocked(resumeBrowserSession).mockResolvedValueOnce({
+      answerText: "recovered answer",
+      answerMarkdown: "recovered answer",
+      runtime: recoveredRuntime,
+    });
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: {
+        browserTransport: "obu",
+        obuSessionId: "stored-session",
+        obuTabId: 7,
+        chatGptAccountEmail: "paul@smartypants.ai",
+        chatGptWorkspaceName: "Paul Bettner",
+        chatGptAccountDigest: "a".repeat(64),
+        chatGptWorkspaceDigest: "b".repeat(64),
+        timeoutMs: 2_000,
+      },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      status: "completed",
+      browser: {
+        config: { obuSessionId: "recovered-session", obuTabId: 8 },
+        runtime: { obuSessionId: "recovered-session", obuTabId: 8 },
+      },
+      options: {
+        browserConfig: { obuSessionId: "recovered-session", obuTabId: 8 },
+      },
+    });
+  });
+
+  test("fails closed when an OBU prompt was submitted before a stable thread existed", async () => {
+    const runtime = {
+      browserTransport: "obu" as const,
+      obuSessionId: "stored-session",
+      obuTabId: 7,
+      chatGptAccountEmail: "paul@smartypants.ai",
+      chatGptWorkspaceName: "Paul Bettner",
+      chatGptAccountDigest: "a".repeat(64),
+      chatGptWorkspaceDigest: "b".repeat(64),
+      tabUrl: "https://chatgpt.com/",
+      promptSubmitted: true,
+    };
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(
+      new BrowserAutomationError("Open Browser Use disconnected before the thread stabilized.", {
+        stage: "connection-lost",
+        recoverableDisconnect: true,
+        runtime,
+      }),
+    );
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: {
+          browserTransport: "obu",
+          obuSessionId: "stored-session",
+          obuTabId: 7,
+          chatGptAccountEmail: "paul@smartypants.ai",
+          chatGptWorkspaceName: "Paul Bettner",
+          chatGptAccountDigest: "a".repeat(64),
+          chatGptWorkspaceDigest: "b".repeat(64),
+        },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow(/before the thread stabilized/i);
+
+    expect(vi.mocked(resumeBrowserSession)).not.toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
+      status: "error",
+      response: { status: "error", incompleteReason: "chrome-disconnected" },
+      browser: { runtime: { promptSubmitted: true, tabUrl: "https://chatgpt.com/" } },
+    });
+  });
+
   test("marks copied-profile connection loss as non-reattachable", async () => {
     const automationError = new BrowserAutomationError(
       "Chrome window closed before oracle finished.",
@@ -1631,7 +1744,7 @@ describe("performSessionRun", () => {
     );
     const logLines = log.mock.calls.map((c) => String(c[0])).join("\n");
     expect(logLines).toContain(
-      "Chrome disconnected before a ChatGPT conversation was created; marking session error.",
+      "Chrome disconnected before exact ChatGPT conversation affinity was persisted; marking session error.",
     );
     expect(logLines).not.toContain("oracle session sess-1 --render");
   });

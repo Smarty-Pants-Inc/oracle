@@ -64,6 +64,45 @@ describe("promptComposer", () => {
     }
   });
 
+  test("does not accept an unrelated new turn because an older turn matches the prompt", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: {
+            value: {
+              baseline: 10,
+              turnsCount: 11,
+              userMatched: true,
+              prefixMatched: true,
+              lastMatched: false,
+              hasNewTurn: true,
+              stopVisible: true,
+              assistantVisible: true,
+              composerCleared: true,
+              inConversation: true,
+            },
+          },
+        }),
+      } as unknown as {
+        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+      };
+
+      const promise = promptComposer.verifyPromptCommitted(
+        runtime as never,
+        "historical prompt",
+        150,
+        undefined,
+        10,
+      );
+      const assertion = expect(promise).rejects.toThrow(/prompt did not appear/i);
+      await vi.advanceTimersByTimeAsync(250);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("does not count nested broad-selector matches as new turns in a reused conversation", async () => {
     vi.useFakeTimers();
     try {
@@ -238,12 +277,18 @@ describe("promptComposer", () => {
   test("checks an enabled attachment send button even when secondary evidence is stale", async () => {
     vi.useFakeTimers();
     try {
+      const points = [
+        { status: "point", x: 10, y: 20 },
+        { status: "point", x: 30, y: 40 },
+      ];
       const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
         if (expression.includes("const expected =")) {
           return { result: { value: false } };
         }
-        return { result: { value: { status: "point", x: 10, y: 20 } } };
+        expect(expression).not.toContain("dispatchClickSequence(button)");
+        return { result: { value: points.shift() } };
       });
+      const beforeSubmit = vi.fn();
       const input = { dispatchMouseEvent: vi.fn().mockResolvedValue(undefined) };
       const pending = promptComposer.attemptSendButton(
         { evaluate } as never,
@@ -251,12 +296,22 @@ describe("promptComposer", () => {
         undefined,
         ["first.md", "second.md"],
         300,
+        beforeSubmit,
       );
       const assertion = expect(pending).resolves.toBe(true);
 
       await vi.advanceTimersByTimeAsync(1_500);
       await assertion;
+      expect(beforeSubmit).toHaveBeenCalledOnce();
       expect(input.dispatchMouseEvent).toHaveBeenCalledTimes(3);
+      expect(beforeSubmit.mock.invocationCallOrder[0]).toBeLessThan(
+        input.dispatchMouseEvent.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
+      );
+      expect(input.dispatchMouseEvent).toHaveBeenNthCalledWith(1, {
+        type: "mouseMoved",
+        x: 30,
+        y: 40,
+      });
     } finally {
       vi.useRealTimers();
     }
@@ -271,6 +326,7 @@ describe("promptComposer", () => {
 
   test("marks prompt submitted before commit verification finishes", async () => {
     const onPromptSubmitted = vi.fn();
+    const beforePromptSubmit = vi.fn();
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
         if (expression.includes("document.readyState")) {
@@ -285,7 +341,7 @@ describe("promptComposer", () => {
           };
         }
         if (expression.includes("button.scrollIntoView")) {
-          return { result: { value: { status: "clicked" } } };
+          return { result: { value: { status: "point", x: 10, y: 20 } } };
         }
         return {
           result: {
@@ -305,7 +361,11 @@ describe("promptComposer", () => {
         };
       }),
     };
-    const input = { insertText: vi.fn(), dispatchKeyEvent: vi.fn() };
+    const input = {
+      insertText: vi.fn(),
+      dispatchKeyEvent: vi.fn(),
+      dispatchMouseEvent: vi.fn(),
+    };
     const logger = Object.assign(vi.fn(), { verbose: false });
 
     await submitPrompt(
@@ -313,6 +373,7 @@ describe("promptComposer", () => {
         runtime: runtime as never,
         input: input as never,
         baselineTurns: 0,
+        beforePromptSubmit,
         onPromptSubmitted,
       },
       "hello",
@@ -320,6 +381,13 @@ describe("promptComposer", () => {
     );
 
     expect(onPromptSubmitted).toHaveBeenCalledTimes(1);
+    expect(beforePromptSubmit).toHaveBeenCalledTimes(1);
+    expect(beforePromptSubmit.mock.invocationCallOrder[0]).toBeLessThan(
+      onPromptSubmitted.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
+    );
+    expect(beforePromptSubmit.mock.invocationCallOrder[0]).toBeLessThan(
+      input.dispatchMouseEvent.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
+    );
   });
 
   test("waits for a delayed trusted click without issuing a second send", async () => {

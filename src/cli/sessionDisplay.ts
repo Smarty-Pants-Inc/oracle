@@ -2,11 +2,13 @@ import chalk from "chalk";
 import kleur from "kleur";
 import fs from "node:fs/promises";
 import type {
+  BrowserRuntimeMetadata,
+  BrowserSessionConfig,
   SessionMetadata,
   SessionTransportMetadata,
   SessionUserErrorMetadata,
 } from "../sessionStore.js";
-import type { OracleResponseMetadata } from "../oracle.js";
+import { asOracleUserError, type OracleResponseMetadata } from "../oracle.js";
 import { renderMarkdownAnsi } from "./markdownRenderer.js";
 import { formatFinishLine } from "../oracle/finishLine.js";
 import { sessionStore, wait } from "../sessionStore.js";
@@ -242,6 +244,24 @@ type LiveRenderState = {
   noticedFallback: boolean;
 };
 
+function browserConfigWithRuntime(
+  metadata: SessionMetadata,
+  runtime: BrowserRuntimeMetadata | undefined,
+): BrowserSessionConfig | undefined {
+  const config = metadata.browser?.config ?? metadata.options.browserConfig;
+  if (!config || runtime?.browserTransport !== "obu") return config;
+  return {
+    ...config,
+    browserTransport: "obu",
+    obuSessionId: runtime.obuSessionId ?? config.obuSessionId,
+    obuTabId: runtime.obuTabId ?? config.obuTabId,
+    chatGptAccountEmail: runtime.chatGptAccountEmail ?? config.chatGptAccountEmail,
+    chatGptWorkspaceName: runtime.chatGptWorkspaceName ?? config.chatGptWorkspaceName,
+    chatGptAccountDigest: runtime.chatGptAccountDigest ?? config.chatGptAccountDigest,
+    chatGptWorkspaceDigest: runtime.chatGptWorkspaceDigest ?? config.chatGptWorkspaceDigest,
+  };
+}
+
 export async function attachSession(
   sessionId: string,
   options?: AttachSessionOptions,
@@ -309,7 +329,7 @@ export async function attachSession(
     hasFallbackSessionInfo &&
     !workerAlive &&
     (hasRecoverableConversation ||
-      runtime?.promptSubmitted ||
+      (runtime?.browserTransport !== "obu" && runtime?.promptSubmitted) ||
       hasLiveChromeFallback ||
       completedDeepResearchPlaceholder) &&
     (hasChromeDisconnect ||
@@ -339,6 +359,7 @@ export async function attachSession(
         ),
         { promptPreview: metadata.promptPreview },
       );
+      const completedConfig = browserConfigWithRuntime(metadata, result.runtime);
       const outputTokens = estimateTokenCount(result.answerMarkdown);
       const artifacts = await saveReattachBrowserArtifacts(sessionId, metadata, result);
       await writeReattachAnswer(
@@ -370,11 +391,16 @@ export async function attachSession(
         },
         errorMessage: undefined,
         browser: {
-          config: metadata.browser?.config,
-          runtime,
+          config: completedConfig,
+          runtime: result.runtime ?? runtime,
           modelSelection: metadata.browser?.modelSelection,
-          warnings: metadata.browser?.warnings,
+          warnings: result.warnings?.length
+            ? [...(metadata.browser?.warnings ?? []), ...result.warnings]
+            : metadata.browser?.warnings,
         },
+        ...(completedConfig
+          ? { options: { ...metadata.options, browserConfig: completedConfig } }
+          : {}),
         artifacts,
         response: { status: "completed" },
         error: undefined,
@@ -383,30 +409,50 @@ export async function attachSession(
       console.log(chalk.green("Reattach succeeded; session marked completed."));
       metadata = (await sessionStore.readSession(sessionId)) ?? metadata;
     } catch (error) {
+      const userError = asOracleUserError(error);
+      const recoveredRuntime = (
+        userError?.details as { runtime?: NonNullable<typeof runtime> } | undefined
+      )?.runtime;
+      const recoveredConfig = browserConfigWithRuntime(metadata, recoveredRuntime);
       const message = error instanceof Error ? error.message : String(error);
+      const errorMetadata = userError
+        ? {
+            category: userError.category,
+            message: userError.message,
+            details: userError.details,
+          }
+        : { category: "browser-automation", message };
+      await sessionStore.updateSession(sessionId, {
+        errorMessage: message,
+        error: errorMetadata,
+        ...(recoveredRuntime && recoveredConfig
+          ? {
+              browser: {
+                ...(metadata.browser ?? {}),
+                config: recoveredConfig,
+                runtime: recoveredRuntime,
+              },
+              options: { ...metadata.options, browserConfig: recoveredConfig },
+            }
+          : {}),
+      });
       console.log(chalk.red(`Reattach failed: ${message}`));
       if (completedDeepResearchPlaceholder) {
         if (metadata.model) {
           await sessionStore.updateModelRun(metadata.id, metadata.model, {
             status: "error",
             response: { status: "incomplete", incompleteReason: "incomplete-capture" },
-            error: {
-              category: "browser-automation",
-              message: `Deep Research capture incomplete: ${message}`,
-            },
+            error: errorMetadata,
           });
         }
         await sessionStore.updateSession(sessionId, {
           status: "error",
           errorMessage: `Deep Research capture incomplete: ${message}`,
           response: { status: "incomplete", incompleteReason: "incomplete-capture" },
-          error: {
-            category: "browser-automation",
-            message: `Deep Research capture incomplete: ${message}`,
-          },
+          error: errorMetadata,
         });
-        metadata = (await sessionStore.readSession(sessionId)) ?? metadata;
       }
+      metadata = (await sessionStore.readSession(sessionId)) ?? metadata;
     }
   }
   if (!options?.suppressMetadata) {

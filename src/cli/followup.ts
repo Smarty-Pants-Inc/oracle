@@ -4,8 +4,13 @@ import { buildConversationUrl } from "../browser/reattachHelpers.js";
 import { resolveRecoveryUrl } from "../browser/recoverConversation.js";
 import { isRecoverableChatGptConversationUrl } from "../browser/reattachability.js";
 import { browserIdFromWebSocketEndpoint } from "../browser/profileState.js";
+import {
+  hasStoredOpenBrowserUseAffinity,
+  resolveStoredOpenBrowserUseAffinity,
+} from "../browser/openBrowserUse.js";
 import { DEFAULT_MODEL } from "../oracle/config.js";
 import type { ModelName } from "../oracle/types.js";
+import type { BrowserTurnBinding } from "../browser/types.js";
 
 export interface BrowserFollowupResolution {
   sessionId: string;
@@ -17,6 +22,31 @@ export interface BrowserFollowupResolution {
 
 export interface FollowupSessionReader {
   readSession(sessionId: string): Promise<SessionMetadata | null>;
+}
+function resolveStoredResumeTurnBinding(metadata: SessionMetadata): BrowserTurnBinding | null {
+  const runtime = metadata.browser?.runtime;
+  if (!runtime) return null;
+  const binding: BrowserTurnBinding = {
+    promptDigest: runtime.promptDigest,
+    promptTurnIndex: runtime.promptTurnIndex,
+    promptTurnId: runtime.promptTurnId,
+    promptMessageId: runtime.promptMessageId,
+    assistantTurnIndex: runtime.assistantTurnIndex,
+    assistantTurnId: runtime.assistantTurnId,
+    assistantMessageId: runtime.assistantMessageId,
+  };
+  const hasPrompt = Boolean(
+    binding.promptDigest ||
+    binding.promptTurnId ||
+    binding.promptMessageId ||
+    Number.isInteger(binding.promptTurnIndex),
+  );
+  const hasAssistant = Boolean(
+    binding.assistantTurnId ||
+    binding.assistantMessageId ||
+    Number.isInteger(binding.assistantTurnIndex),
+  );
+  return hasPrompt && hasAssistant ? binding : null;
 }
 
 /**
@@ -100,8 +130,70 @@ export async function resolveBrowserFollowupReference(
   }
   const optionsBrowserConfig = metadata.options?.browserConfig;
   const storedBrowserConfig = metadata.browser?.config;
-  if (!optionsBrowserConfig && !storedBrowserConfig) {
+  if (!optionsBrowserConfig && !storedBrowserConfig && !metadata.browser?.runtime) {
     throw new Error(`Session ${trimmed} is missing its stored browser configuration.`);
+  }
+  const runtime = metadata.browser?.runtime;
+  const configs = [optionsBrowserConfig, storedBrowserConfig];
+  if (hasStoredOpenBrowserUseAffinity({ runtime, configs })) {
+    const affinity = resolveStoredOpenBrowserUseAffinity({
+      runtime,
+      configs,
+      conversationUrl: resumeConversationUrl,
+      conversationUrls: [
+        metadata.browser?.harvest?.url,
+        metadata.browser?.archive?.conversationUrl,
+        metadata.options?.browserResumeConversationUrl,
+      ],
+      conversationIds: [metadata.browser?.harvest?.conversationId],
+    });
+    const resumeTurnBinding = resolveStoredResumeTurnBinding(metadata);
+    if (!resumeTurnBinding) {
+      throw new Error(
+        `Session ${trimmed} has no exact stored prompt/assistant branch; harvest or resume it before sending a follow-up.`,
+      );
+    }
+    if (process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" && !requestOrigin) {
+      throw new Error(
+        `Session ${trimmed} has no verified request origin; start a fresh browser conversation through the agent wrapper.`,
+      );
+    }
+    const storedModel = metadata.options?.model ?? metadata.model;
+    const model =
+      typeof storedModel === "string" && storedModel.startsWith("gpt-")
+        ? (storedModel as ModelName)
+        : DEFAULT_MODEL;
+    return {
+      sessionId: metadata.id,
+      resumeConversationUrl: affinity.conversationUrl,
+      model,
+      ...(requestOrigin ? { requestOrigin } : {}),
+      browserConfig: {
+        ...storedBrowserConfig,
+        ...optionsBrowserConfig,
+        browserTransport: "obu",
+        obuSessionId: affinity.sessionId,
+        obuTabId: affinity.tabId,
+        chatGptAccountEmail: affinity.email,
+        chatGptWorkspaceName: affinity.workspaceName,
+        chatGptAccountDigest: affinity.accountDigest,
+        chatGptWorkspaceDigest: affinity.workspaceDigest,
+        remoteChrome: null,
+        remoteChromeBrowserId: null,
+        remoteChromeBrowserWSEndpoint: null,
+        browserTabRef: null,
+        resumeConversationUrl: affinity.conversationUrl,
+        researchMode: "off",
+        archiveConversations: "never",
+        resumeTurnBinding,
+      },
+    };
+  }
+  const optionsTransport = optionsBrowserConfig?.browserTransport;
+  const storedTransport = storedBrowserConfig?.browserTransport;
+  const runtimeTransport = runtime?.browserTransport;
+  if ([optionsTransport, storedTransport, runtimeTransport].some((value) => value === "obu")) {
+    throw new Error(`Session ${trimmed} has incomplete main-Chrome account/workspace affinity.`);
   }
   const optionsRemoteChrome = optionsBrowserConfig?.remoteChrome;
   const storedRemoteChrome = storedBrowserConfig?.remoteChrome;

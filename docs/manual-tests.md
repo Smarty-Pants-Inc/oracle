@@ -7,25 +7,68 @@ and run the live API suite before shipping major transport changes.
 
 ## Prerequisites
 
-- macOS with Chrome running, Open Browser Use enabled, and the default profile signed in to ChatGPT Pro.
 - Node 24+ and `pnpm install` already completed.
-- Open Browser Use MCP available through `obu mcp` for live smoke validation.
-- When debugging, add `--browser-keep-browser` so Chrome stays open after Oracle exits, then connect with `pnpm exec tsx scripts/browser-tools.ts ...` (screenshot, eval, DOM picker, etc.).
-- Ensure no Chrome instances are force-terminated mid-run; let Oracle clean up once you’re done capturing state.
-- Clipboard checks (`browser-tools.ts eval "navigator.clipboard.readText()"`) trigger a permission dialog in Chrome—approve it for debugging, but remember that we can’t rely on readText in unattended runs.
+- Main-Chrome router trials require Chrome running with the Open Browser Use
+  extension/native host connected, both routed accounts already signed in, and
+  `open-browser-use` CLI 0.1.41 matching `open-browser-use-sdk` 0.1.41.
+- Live ChatGPT prompt submission is opt-in. `oracle accounts` and read-only
+  identity checks do not send a prompt; obtain explicit operator approval
+  before each live prompt trial or conversation cleanup.
+- Legacy isolated-Chrome debugging can use `--browser-keep-browser` and
+  `pnpm exec tsx scripts/browser-tools.ts ...` after Oracle exits.
+- Ensure no Chrome instances are force-terminated mid-run; let Oracle clean up
+  task-owned browser state after evidence is captured.
+- Clipboard checks (`browser-tools.ts eval "navigator.clipboard.readText()"`)
+  trigger a permission dialog in Chrome. Approve it only for manual debugging;
+  unattended runs cannot depend on `readText`.
 
 ## Test Cases
 
-### Quick browser port smoke
+### Browser smoke boundaries
 
-- `pnpm test:browser` — verifies the Open Browser Use CLI/MCP path, then runs
-  the live ChatGPT open/read/finalize smoke through `obu mcp` when the backend
-  is connected. It must not use Oracle's legacy browser engine. Use
-  `pnpm test:browser:live` to require the live ChatGPT smoke and fail when the
-  backend or MCP path is not available.
-- `scripts/browser-smoke-upload-only.sh` — verifies the Open Browser Use file
-  chooser upload path against a local test page. This requires Chrome extension
-  file URL access for Open Browser Use.
+- `pnpm test:browser` builds Oracle, checks a newly launched Chrome DevTools
+  endpoint, then runs the legacy isolated-Chrome/CDP live-prompt smoke. It does
+  not prove main-Chrome account routing and must not run without approval for
+  its prompt submissions.
+- `scripts/browser-smoke-upload-only.sh` runs the legacy live ChatGPT upload
+  smoke. It also submits a prompt and requires explicit approval.
+- Main-Chrome proof uses the wrapper-owned account route plus the stored Oracle
+  session route and conversation lineage. Do not pass caller-selected Open
+  Browser Use session or tab IDs.
+
+### Supervised main-Chrome account-router proof
+
+Use the installed wrapper, not a checkout-local CLI. Record the exact candidate
+commit/tree, CLI/SDK versions, account, workspace, session ID, task tab, thread
+URL, and result for every trial. Independent agents must receive the same fixed
+trial contract and may not broaden prompt scope or cleanup.
+
+1. Run `oracle accounts --json`. This is bridge-only evidence and must not be
+   reported as login proof.
+2. After explicit approval for the exact prompt, run one unique-marker consult
+   through `oracle user ...` and one through `oracle agent ...`. Confirm each
+   stored runtime names only its expected email/workspace route, identity
+   digests, OBU session/tab, conversation URL/ID, committed prompt IDs, and
+   paired assistant IDs.
+3. Use unprefixed `oracle --followup <session> -p "<approved follow-up>"` for
+   each route. Confirm it returns to the original account/workspace/thread and
+   replaces the pending binding with the newly committed prompt before send.
+4. Run `oracle session <id> --harvest` for each parent session after another
+   child turn exists. Confirm harvest still returns the assistant paired with
+   that session's bound prompt, including Markdown, not the latest child answer.
+5. Export each exact thread with `oracle chatgpt-export --target-url <url>
+--session-id <id> --json`. Confirm the manifest names the stored prompt and
+   assistant message IDs, the normalized payload ends at that assistant, and
+   the originating handoff tab remains present.
+6. Interrupt one approved long-running trial once. Confirm the signal path keeps
+   the exact task tab, releases the global routing lock, and the stored session
+   reattaches without buying a replacement model turn.
+7. Login-expiry behavior may be tested live only if Paul separately approves the
+   exact account change. Otherwise use deterministic tests to prove
+   `login-required`/`workspace-required`, no cross-account failover, and the
+   operator instruction naming the exact route to restore.
+8. Do not archive, delete, or otherwise clean ChatGPT conversations unless Paul
+   approved those exact thread IDs and cleanup actions.
 
 ### Gemini browser mode (Gemini web / cookies)
 

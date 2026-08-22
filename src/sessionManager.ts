@@ -10,6 +10,7 @@ import type {
   BrowserModelStrategy,
   BrowserResearchMode,
   CookieParam,
+  BrowserTurnBinding,
 } from "./browser/types.js";
 import type {
   TransportFailureReason,
@@ -30,8 +31,18 @@ import { getOracleHomeDir } from "./oracleHome.js";
 
 export type SessionMode = "api" | "browser";
 export type RequestOrigin = "user" | "agent";
+export type BrowserTransport = "cdp" | "obu";
 
 export interface BrowserSessionConfig {
+  browserTransport?: BrowserTransport;
+  obuSessionId?: string | null;
+  obuTabId?: number | null;
+  chatGptAccountEmail?: string | null;
+  chatGptWorkspaceName?: string | null;
+  /** SHA-256 digest of the authenticated ChatGPT user id; never the user id itself. */
+  chatGptAccountDigest?: string | null;
+  /** SHA-256 digest of the active ChatGPT workspace/account id; never the id itself. */
+  chatGptWorkspaceDigest?: string | null;
   chromeProfile?: string | null;
   chromePath?: string | null;
   chromeCookiePath?: string | null;
@@ -91,15 +102,31 @@ export interface BrowserSessionConfig {
   archiveConversations?: BrowserArchiveMode;
   /** Browser-only: existing ChatGPT conversation URL to resume before submitting. */
   resumeConversationUrl?: string | null;
+  /** Exact prior prompt/assistant branch that must be current before a stored follow-up send. */
+  resumeTurnBinding?: BrowserTurnBinding | null;
 }
 
 export interface BrowserRuntimeMetadata {
-  browserTransport?: "cdp";
+  browserTransport?: BrowserTransport;
+  obuSessionId?: string;
+  obuTabId?: number;
   chromePid?: number;
   chromePort?: number;
   chromeHost?: string;
   chromeBrowserWSEndpoint?: string;
+  chatGptAccountEmail?: string;
+  chatGptWorkspaceName?: string;
   chatGptAccountDigest?: string;
+  chatGptWorkspaceDigest?: string;
+  promptDigest?: string;
+  /** Exact committed ChatGPT user-turn location for affinity-safe recovery. */
+  promptTurnIndex?: number;
+  promptTurnId?: string;
+  promptMessageId?: string;
+  /** Exact assistant branch paired with the committed user turn. */
+  assistantTurnIndex?: number;
+  assistantTurnId?: string;
+  assistantMessageId?: string;
   chromeProfileRoot?: string;
   userDataDir?: string;
   chromeTargetId?: string;
@@ -154,6 +181,7 @@ export interface BrowserRunWarning {
   message: string;
   details?: Record<string, unknown>;
 }
+export type BrowserOperationName = "harvest" | "live-tail" | "chatgpt-export";
 
 export interface BrowserMetadata {
   config?: BrowserSessionConfig;
@@ -162,6 +190,7 @@ export interface BrowserMetadata {
   archive?: BrowserArchiveResult;
   modelSelection?: BrowserModelSelectionEvidence;
   warnings?: BrowserRunWarning[];
+  operationErrors?: Partial<Record<BrowserOperationName, SessionUserErrorMetadata>>;
 }
 
 export type SessionArtifactValidationType = "generic" | "zip";
@@ -418,14 +447,43 @@ function metaPath(id: string): string {
   return path.join(sessionDir(id), METADATA_FILENAME);
 }
 
+function sanitizeBrowserConfigForPersistence(
+  config: BrowserSessionConfig | undefined,
+): BrowserSessionConfig | undefined {
+  if (!config || config.browserTransport !== "obu") return config;
+  const safe = { ...config };
+  delete safe.chromeCookiePath;
+  delete safe.cookieNames;
+  delete safe.cookieSyncWaitMs;
+  delete safe.inlineCookies;
+  delete safe.inlineCookiesSource;
+  delete safe.allowCookieErrors;
+  delete safe.manualLoginCookieSync;
+  safe.cookieSync = false;
+  return safe;
+}
+
+export function sanitizeSessionMetadataForPersistenceForTest(
+  metadata: SessionMetadata,
+): SessionMetadata {
+  const optionsBrowserConfig = sanitizeBrowserConfigForPersistence(metadata.options.browserConfig);
+  const browserConfig = sanitizeBrowserConfigForPersistence(metadata.browser?.config);
+  return {
+    ...metadata,
+    options: { ...metadata.options, browserConfig: optionsBrowserConfig },
+    ...(metadata.browser ? { browser: { ...metadata.browser, config: browserConfig } } : {}),
+  };
+}
+
 async function writeSessionMetadataFile(
   sessionId: string,
   metadata: SessionMetadata,
 ): Promise<void> {
   const targetPath = metaPath(sessionId);
   const temporaryPath = `${targetPath}.${process.pid}.${randomUUID()}.tmp`;
+  const persisted = sanitizeSessionMetadataForPersistenceForTest(metadata);
   try {
-    await fs.writeFile(temporaryPath, JSON.stringify(metadata, null, 2), {
+    await fs.writeFile(temporaryPath, JSON.stringify(persisted, null, 2), {
       encoding: "utf8",
       mode: 0o600,
     });

@@ -6,6 +6,7 @@ import {
 } from "../../src/cli/browserTabs.js";
 import type { ChatGptTabSummary } from "../../src/browser/liveTabs.js";
 import type { SessionMetadata } from "../../src/sessionStore.js";
+import { hashConversationTurnText } from "../../src/browser/conversationTurns.js";
 
 describe("browser tab CLI helpers", () => {
   test("prefers stable conversation URLs over stale Chrome target ids", () => {
@@ -179,6 +180,9 @@ describe("browser tab CLI helpers", () => {
     fingerprint: "fingerprint",
     state: "completed",
     lastAssistantMarkdown: '{"outcome":"clean_for_closeout","clean":true,"summary":"ready "}',
+    lastAssistantTurnIndex: 5,
+    lastAssistantTurnId: "assistant-turn-5",
+    lastAssistantMessageId: "assistant-message-5",
     ...overrides,
   });
 
@@ -233,6 +237,31 @@ describe("browser tab CLI helpers", () => {
       runtimeRepaired: true,
     });
   });
+  test("repairs an OBU runtime without inventing a CDP target id", () => {
+    const meta = staleSession();
+    meta.browser!.runtime = {
+      browserTransport: "obu",
+      obuSessionId: "oracle-main",
+      obuTabId: 7,
+      tabUrl: "https://chatgpt.com/g/g-p-1234abcd-oracle/c/conversation-123",
+      conversationId: "conversation-123",
+    };
+    const browser = recoverBrowserMetadataFromHarvestForTest(
+      meta,
+      harvested({ targetId: "8" }),
+      '{"outcome":"clean_for_closeout","clean":true,"summary":"ready "}',
+    );
+    expect(browser.runtime).toMatchObject({
+      browserTransport: "obu",
+      obuSessionId: "oracle-main",
+      obuTabId: 8,
+      conversationId: "conversation-123",
+      assistantTurnIndex: 5,
+      assistantTurnId: "assistant-turn-5",
+      assistantMessageId: "assistant-message-5",
+    });
+    expect(browser.runtime?.chromeTargetId).toBeUndefined();
+  });
 
   test("does not repair identity when harvested output differs", () => {
     const browser = recoverBrowserMetadataFromHarvestForTest(
@@ -244,6 +273,11 @@ describe("browser tab CLI helpers", () => {
     expect(browser.runtime?.tabUrl).toBe("https://chatgpt.com/g/g-p-1234abcd/project");
     expect(browser.harvest?.runtimeRepaired).toBe(false);
     expect(browser.harvest?.outputMatched).toBe(false);
+    expect(browser.runtime).toMatchObject({
+      assistantTurnIndex: 5,
+      assistantTurnId: "assistant-turn-5",
+      assistantMessageId: "assistant-message-5",
+    });
   });
 
   test("does not overwrite a different recorded conversation", () => {
@@ -261,5 +295,51 @@ describe("browser tab CLI helpers", () => {
 
     expect(browser.runtime?.conversationId).toBe("different-conversation");
     expect(browser.harvest?.runtimeRepaired).toBe(false);
+  });
+  test("uses the full stored prompt digest instead of the shared preview prefix", () => {
+    const prefix = "Review this exact candidate ".repeat(10);
+    const parentPrompt = `${prefix}parent`;
+    const childPrompt = `${prefix}child`;
+    const meta = staleSession();
+    meta.promptPreview = prefix.slice(0, 160);
+    meta.browser!.runtime = {
+      ...meta.browser!.runtime,
+      promptDigest: hashConversationTurnText(parentPrompt),
+      promptTurnIndex: 4,
+    };
+
+    const wrong = recoverBrowserMetadataFromHarvestForTest(
+      meta,
+      harvested({ lastUserText: childPrompt, lastUserSnippet: childPrompt }),
+      '{"outcome":"clean_for_closeout","clean":true,"summary":"ready "}',
+    );
+    expect(wrong.harvest?.promptMatched).toBe(false);
+    expect(wrong.harvest?.runtimeRepaired).toBe(false);
+
+    const exact = recoverBrowserMetadataFromHarvestForTest(
+      meta,
+      harvested({ lastUserText: parentPrompt, lastUserSnippet: parentPrompt }),
+      '{"outcome":"clean_for_closeout","clean":true,"summary":"ready "}',
+    );
+    expect(exact.harvest?.promptMatched).toBe(true);
+  });
+
+  test("hashes the unmodified harvested prompt for a stored turn binding", () => {
+    const rawPrompt =
+      "attachments-bundle(31).txtDocument# Review this exact candidate and return JSON only.";
+    const meta = staleSession();
+    meta.browser!.runtime = {
+      ...meta.browser!.runtime,
+      promptDigest: hashConversationTurnText(rawPrompt),
+      promptTurnIndex: 4,
+    };
+
+    const browser = recoverBrowserMetadataFromHarvestForTest(
+      meta,
+      harvested({ lastUserText: rawPrompt, lastUserSnippet: rawPrompt }),
+      '{"outcome":"clean_for_closeout","clean":true,"summary":"ready "}',
+    );
+
+    expect(browser.harvest).toMatchObject({ promptMatched: true, runtimeRepaired: true });
   });
 });

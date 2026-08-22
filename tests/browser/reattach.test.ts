@@ -1,6 +1,9 @@
 import { describe, expect, test, vi } from "vitest";
+import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import { resumeBrowserSession, __test__ } from "../../src/browser/reattach.js";
+import type { OpenBrowserUseConnection } from "../../src/browser/openBrowserUse.js";
 import type { BrowserLogger, ChromeClient } from "../../src/browser/types.js";
+import { hashConversationTurnText } from "../../src/browser/conversationTurns.js";
 
 type FakeTarget = { id?: string; targetId?: string; type?: string; url?: string };
 type FakeClient = {
@@ -18,6 +21,84 @@ type FakeClient = {
   Page?: { enable: () => void };
   close: () => Promise<void> | void;
 };
+
+const obuConversationUrl = "https://chatgpt.com/c/obu-thread";
+const obuAccountDigest = "a".repeat(64);
+const obuWorkspaceDigest = "b".repeat(64);
+const obuRuntime = {
+  browserTransport: "obu" as const,
+  obuSessionId: "stored-session",
+  obuTabId: 7,
+  chatGptAccountEmail: "paul@smartypants.ai",
+  chatGptWorkspaceName: "Paul Bettner",
+  chatGptAccountDigest: obuAccountDigest,
+  chatGptWorkspaceDigest: obuWorkspaceDigest,
+  tabUrl: obuConversationUrl,
+  conversationId: "obu-thread",
+  promptSubmitted: true,
+  promptTurnIndex: 0,
+  promptTurnId: "user-turn-0",
+  promptMessageId: "user-message-0",
+  assistantTurnIndex: 1,
+  assistantTurnId: "assistant-turn-1",
+  assistantMessageId: "assistant-message-1",
+};
+
+function createObuConnection(sessionId: string, tabId: number) {
+  const Runtime = {
+    enable: vi.fn(),
+    evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+      result: {
+        value: expression.includes("/api/auth/session")
+          ? {
+              status: "authenticated",
+              email: "paul@smartypants.ai",
+              accountDigest: obuAccountDigest,
+              workspaceDigest: obuWorkspaceDigest,
+            }
+          : expression.includes("location.href")
+            ? obuConversationUrl
+            : expression.includes("const candidates = []")
+              ? [
+                  {
+                    user: {
+                      index: 0,
+                      text: "exact prompt",
+                      turnId: "user-turn-0",
+                      messageId: "user-message-0",
+                    },
+                    assistants: [
+                      {
+                        index: 1,
+                        text: "exact answer",
+                        turnId: "assistant-turn-1",
+                        messageId: "assistant-message-1",
+                        completionVisible: true,
+                      },
+                    ],
+                    hasLaterUserTurn: true,
+                  },
+                ]
+              : null,
+      },
+    })),
+  } as unknown as ChromeClient["Runtime"];
+  const finalize = vi.fn(async (_keepTab: boolean) => {});
+  const connection: OpenBrowserUseConnection = {
+    client: {
+      Runtime,
+      DOM: { enable: vi.fn() },
+      Page: { enable: vi.fn() },
+    } as unknown as ChromeClient,
+    obuClient: {} as OpenBrowserUseConnection["obuClient"],
+    sessionId,
+    tabId,
+    tabUrl: obuConversationUrl,
+    created: sessionId !== "stored-session",
+    finalize,
+  };
+  return { connection, Runtime, finalize };
+}
 
 describe("resumeBrowserSession", () => {
   test("selects target and captures markdown via stubs", async () => {
@@ -157,7 +238,7 @@ describe("resumeBrowserSession", () => {
         ] satisfies FakeTarget[],
     ) as unknown as () => Promise<FakeTarget[]>;
     const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
-      if (expression === "location.href") {
+      if (expression === "location.href" || expression.includes("location.href ? location.href")) {
         return { result: { value: runtime.tabUrl } };
       }
       if (expression === "1+1") {
@@ -617,6 +698,557 @@ describe("resumeBrowserSession", () => {
     expect(close).toHaveBeenCalledOnce();
     expect(waitForAssistantResponse).not.toHaveBeenCalled();
     expect(recoverSession).toHaveBeenCalled();
+  });
+
+  test("reattaches an OBU tab to the exact stored prompt and persists its assistant", async () => {
+    const { connection, Runtime, finalize } = createObuConnection("recovered-session", 8);
+    const release = vi.fn(async () => {});
+    const promptOnlyRuntime = {
+      ...obuRuntime,
+      assistantTurnIndex: undefined,
+      assistantTurnId: undefined,
+      assistantMessageId: undefined,
+    };
+    const waitForAssistantResponse = vi.fn(
+      async (
+        _Runtime: ChromeClient["Runtime"],
+        _timeoutMs: number,
+        _logger: BrowserLogger,
+        _minTurnIndex?: number,
+        _expectedConversationId?: string,
+      ) => ({
+        text: "exact answer",
+        html: "",
+        meta: { messageId: "m1", turnId: "turn-1" },
+      }),
+    );
+    const result = await resumeBrowserSession(
+      promptOnlyRuntime,
+      {
+        browserTransport: "obu",
+        obuSessionId: "stored-session",
+        obuTabId: 7,
+        chatGptAccountEmail: "paul@smartypants.ai",
+        chatGptWorkspaceName: "Paul Bettner",
+        chatGptAccountDigest: obuAccountDigest,
+        chatGptWorkspaceDigest: obuWorkspaceDigest,
+        url: obuConversationUrl,
+        timeoutMs: 2_000,
+      },
+      vi.fn() as BrowserLogger,
+      {
+        acquireOpenBrowserUseRunLock: vi.fn(async () => ({
+          path: "/tmp/oracle.lock",
+          lockId: "lock-1",
+          release,
+        })),
+        connectOpenBrowserUseTab: vi.fn(async () => connection),
+        prepareOpenBrowserUseChatGptRoute: vi.fn(async () => ({
+          email: "paul@smartypants.ai",
+          workspaceName: "Paul Bettner",
+          accountDigest: obuAccountDigest,
+          workspaceDigest: obuWorkspaceDigest,
+        })),
+        waitForConversationHydration: vi.fn(async () => 2),
+        waitForAssistantResponse,
+        captureAssistantMarkdown: vi.fn(async () => "exact **answer**"),
+      },
+    );
+
+    expect(waitForAssistantResponse).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      answerMarkdown: "exact **answer**",
+      runtime: {
+        browserTransport: "obu",
+        obuSessionId: "recovered-session",
+        obuTabId: 8,
+        conversationId: "obu-thread",
+        assistantTurnIndex: 1,
+        assistantTurnId: "assistant-turn-1",
+        assistantMessageId: "assistant-message-1",
+      },
+    });
+    expect(Runtime.evaluate).toHaveBeenCalled();
+    expect(finalize).toHaveBeenCalledWith(false);
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  test("recovers a delayed OBU conversation URL from the exact stored tab", async () => {
+    const runtime = { ...obuRuntime, tabUrl: undefined, conversationId: undefined };
+    const { connection, finalize } = createObuConnection("stored-session", 7);
+    connection.tabUrl = undefined;
+    const connectOpenBrowserUseTab = vi.fn(async () => connection);
+    const waitForOpenBrowserUseConversationUrl = vi.fn(async () => obuConversationUrl);
+    const prepareOpenBrowserUseConversationRoute = vi.fn(async () => ({
+      email: "paul@smartypants.ai",
+      workspaceName: "Paul Bettner",
+      accountDigest: obuAccountDigest,
+      workspaceDigest: obuWorkspaceDigest,
+    }));
+
+    await expect(
+      resumeBrowserSession(
+        runtime,
+        {
+          browserTransport: "obu",
+          obuSessionId: "stored-session",
+          obuTabId: 7,
+          chatGptAccountEmail: "paul@smartypants.ai",
+          chatGptWorkspaceName: "Paul Bettner",
+          chatGptAccountDigest: obuAccountDigest,
+          chatGptWorkspaceDigest: obuWorkspaceDigest,
+          url: "https://chatgpt.com/",
+          timeoutMs: 2_000,
+        },
+        vi.fn() as BrowserLogger,
+        {
+          acquireOpenBrowserUseRunLock: vi.fn(async () => ({
+            path: "/tmp/oracle.lock",
+            lockId: "lock-1",
+            release: vi.fn(async () => {}),
+          })),
+          connectOpenBrowserUseTab,
+          prepareOpenBrowserUseConversationRoute,
+          waitForOpenBrowserUseConversationUrl,
+          waitForConversationHydration: vi.fn(async () => 2),
+          waitForAssistantResponse: vi.fn(async () => ({
+            text: "delayed answer",
+            html: "",
+            meta: { messageId: "m1", turnId: "turn-1" },
+          })),
+          captureAssistantMarkdown: vi.fn(async () => "delayed **answer**"),
+        },
+      ),
+    ).resolves.toMatchObject({
+      answerMarkdown: "delayed **answer**",
+      runtime: {
+        obuSessionId: "stored-session",
+        obuTabId: 7,
+        tabUrl: obuConversationUrl,
+        conversationId: "obu-thread",
+      },
+    });
+    expect(connectOpenBrowserUseTab).toHaveBeenCalledWith(
+      expect.objectContaining({
+        obuSessionId: "stored-session",
+        obuTabId: 7,
+        exactTabOnly: true,
+        conversationUrl: null,
+      }),
+    );
+    expect(waitForOpenBrowserUseConversationUrl).toHaveBeenCalledWith(
+      expect.objectContaining({ connection }),
+    );
+    expect(prepareOpenBrowserUseConversationRoute).toHaveBeenCalledWith(
+      expect.objectContaining({ targetUrl: obuConversationUrl }),
+    );
+    expect(finalize).toHaveBeenCalledWith(false);
+  });
+
+  test("fails closed when an OBU reattach lacks exact prompt affinity", async () => {
+    const { connection, finalize } = createObuConnection("stored-session", 7);
+    const runtime = {
+      ...obuRuntime,
+      promptTurnIndex: undefined,
+      promptTurnId: undefined,
+      promptMessageId: undefined,
+      assistantTurnIndex: undefined,
+      assistantTurnId: undefined,
+      assistantMessageId: undefined,
+    };
+
+    await expect(
+      resumeBrowserSession(
+        runtime,
+        {
+          browserTransport: "obu",
+          obuSessionId: "stored-session",
+          obuTabId: 7,
+          chatGptAccountEmail: "paul@smartypants.ai",
+          chatGptWorkspaceName: "Paul Bettner",
+          chatGptAccountDigest: obuAccountDigest,
+          chatGptWorkspaceDigest: obuWorkspaceDigest,
+          url: obuConversationUrl,
+          timeoutMs: 2_000,
+        },
+        vi.fn() as BrowserLogger,
+        {
+          acquireOpenBrowserUseRunLock: vi.fn(async () => ({
+            path: "/tmp/oracle.lock",
+            lockId: "lock-1",
+            release: vi.fn(async () => {}),
+          })),
+          connectOpenBrowserUseTab: vi.fn(async () => connection),
+          prepareOpenBrowserUseChatGptRoute: vi.fn(async () => ({
+            email: "paul@smartypants.ai",
+            workspaceName: "Paul Bettner",
+            accountDigest: obuAccountDigest,
+            workspaceDigest: obuWorkspaceDigest,
+          })),
+          waitForConversationHydration: vi.fn(async () => 2),
+        },
+      ),
+    ).rejects.toMatchObject({
+      details: { stage: "chatgpt-turn-affinity", code: "turn-affinity-missing" },
+    });
+    expect(finalize).toHaveBeenCalledWith(true);
+  });
+
+  test("uses completion evidence from the exact assistant instead of a global stop button", async () => {
+    vi.useFakeTimers();
+    try {
+      const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("stop-response")) return { result: { value: true } };
+        return {
+          result: {
+            value: [
+              {
+                user: {
+                  index: 0,
+                  text: "exact prompt",
+                  turnId: "user-turn-0",
+                  messageId: "user-message-0",
+                },
+                assistants: [
+                  {
+                    index: 1,
+                    text: "exact completed answer",
+                    turnId: "assistant-turn-1",
+                    messageId: "assistant-message-1",
+                    completionVisible: true,
+                  },
+                ],
+                hasLaterUserTurn: false,
+              },
+            ],
+          },
+        };
+      });
+      const pending = __test__.waitForBoundAssistantTurn(
+        { evaluate } as never,
+        {
+          promptTurnId: "user-turn-0",
+          promptMessageId: "user-message-0",
+          assistantTurnId: "assistant-turn-1",
+          assistantMessageId: "assistant-message-1",
+        },
+        5_000,
+        vi.fn() as BrowserLogger,
+      );
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(pending).resolves.toMatchObject({ text: "exact completed answer" });
+      expect(evaluate.mock.calls.some(([call]) => call.expression.includes("stop-response"))).toBe(
+        false,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("returns the assistant paired with the stored user turn after later child turns", async () => {
+    const parentPrompt = `${"shared prefix ".repeat(20)}parent`;
+    const runtime = {
+      ...obuRuntime,
+      promptDigest: hashConversationTurnText(parentPrompt),
+      promptTurnIndex: 0,
+      promptTurnId: "user-turn-0",
+      promptMessageId: "user-message-0",
+    };
+    const { connection, Runtime, finalize } = createObuConnection("stored-session", 7);
+    const evaluate = Runtime.evaluate as ReturnType<typeof vi.fn>;
+    evaluate.mockImplementation(async ({ expression }: { expression: string }) => {
+      if (expression.includes("/api/auth/session")) {
+        return {
+          result: {
+            value: {
+              status: "authenticated",
+              email: "paul@smartypants.ai",
+              accountDigest: obuAccountDigest,
+              workspaceDigest: obuWorkspaceDigest,
+            },
+          },
+        };
+      }
+      if (expression.includes("location.href")) {
+        return { result: { value: obuConversationUrl } };
+      }
+      if (expression.includes("const candidates = []")) {
+        return {
+          result: {
+            value: [
+              {
+                user: {
+                  index: 0,
+                  text: parentPrompt,
+                  turnId: "user-turn-0",
+                  messageId: "user-message-0",
+                },
+                assistants: [
+                  {
+                    index: 1,
+                    text: "parent answer",
+                    turnId: "assistant-turn-1",
+                    messageId: "assistant-message-1",
+                  },
+                ],
+                hasLaterUserTurn: true,
+              },
+            ],
+          },
+        };
+      }
+      return { result: { value: null } };
+    });
+    const waitForAssistantResponse = vi.fn();
+    const captureAssistantMarkdown = vi.fn(async () => "parent **answer**");
+
+    await expect(
+      resumeBrowserSession(
+        runtime,
+        {
+          browserTransport: "obu",
+          obuSessionId: "stored-session",
+          obuTabId: 7,
+          chatGptAccountEmail: "paul@smartypants.ai",
+          chatGptWorkspaceName: "Paul Bettner",
+          chatGptAccountDigest: obuAccountDigest,
+          chatGptWorkspaceDigest: obuWorkspaceDigest,
+          url: obuConversationUrl,
+          timeoutMs: 2_000,
+        },
+        vi.fn() as BrowserLogger,
+        {
+          acquireOpenBrowserUseRunLock: vi.fn(async () => ({
+            path: "/tmp/oracle.lock",
+            lockId: "lock-1",
+            release: vi.fn(async () => {}),
+          })),
+          connectOpenBrowserUseTab: vi.fn(async () => connection),
+          prepareOpenBrowserUseChatGptRoute: vi.fn(async () => ({
+            email: "paul@smartypants.ai",
+            workspaceName: "Paul Bettner",
+            accountDigest: obuAccountDigest,
+            workspaceDigest: obuWorkspaceDigest,
+          })),
+          waitForConversationHydration: vi.fn(async () => 3),
+          waitForAssistantResponse,
+          captureAssistantMarkdown,
+        },
+      ),
+    ).resolves.toMatchObject({
+      answerText: "parent answer",
+      answerMarkdown: "parent **answer**",
+      runtime: {
+        assistantTurnIndex: 1,
+        assistantTurnId: "assistant-turn-1",
+        assistantMessageId: "assistant-message-1",
+      },
+    });
+    expect(waitForAssistantResponse).not.toHaveBeenCalled();
+    expect(captureAssistantMarkdown).toHaveBeenCalledWith(
+      Runtime,
+      { messageId: "assistant-message-1", turnId: "assistant-turn-1" },
+      expect.any(Function),
+    );
+    expect(finalize).toHaveBeenCalledWith(false);
+  });
+
+  test("returns the full Deep Research result while persisting exact OBU assistant affinity", async () => {
+    const { connection } = createObuConnection("stored-session", 7);
+    const captureAssistantMarkdown = vi.fn(async () => "short DOM stub");
+    const waitForDeepResearchCompletion = vi.fn(async () => ({
+      text: "Full Deep Research report body",
+      html: "<article>Full Deep Research report body</article>",
+      meta: { turnId: "assistant-turn-1", messageId: "assistant-message-1" },
+    }));
+
+    await expect(
+      resumeBrowserSession(
+        obuRuntime,
+        {
+          browserTransport: "obu",
+          obuSessionId: "stored-session",
+          obuTabId: 7,
+          chatGptAccountEmail: "paul@smartypants.ai",
+          chatGptWorkspaceName: "Paul Bettner",
+          chatGptAccountDigest: obuAccountDigest,
+          chatGptWorkspaceDigest: obuWorkspaceDigest,
+          url: obuConversationUrl,
+          researchMode: "deep",
+          timeoutMs: 2_000,
+        },
+        vi.fn() as BrowserLogger,
+        {
+          acquireOpenBrowserUseRunLock: vi.fn(async () => ({
+            path: "/tmp/oracle.lock",
+            lockId: "lock-1",
+            release: vi.fn(async () => {}),
+          })),
+          connectOpenBrowserUseTab: vi.fn(async () => connection),
+          prepareOpenBrowserUseChatGptRoute: vi.fn(async () => ({
+            email: "paul@smartypants.ai",
+            workspaceName: "Paul Bettner",
+            accountDigest: obuAccountDigest,
+            workspaceDigest: obuWorkspaceDigest,
+          })),
+          waitForConversationHydration: vi.fn(async () => 2),
+          waitForDeepResearchCompletion,
+          captureAssistantMarkdown,
+        },
+      ),
+    ).resolves.toMatchObject({
+      answerText: "Full Deep Research report body",
+      answerMarkdown: "Full Deep Research report body",
+      runtime: {
+        assistantTurnIndex: 1,
+        assistantTurnId: "assistant-turn-1",
+        assistantMessageId: "assistant-message-1",
+      },
+    });
+    expect(captureAssistantMarkdown).not.toHaveBeenCalled();
+  });
+
+  test("returns the recovered affinity and a warning when reattach tab cleanup fails", async () => {
+    const { connection } = createObuConnection("recovered-session", 8);
+    const finalize = vi.fn().mockRejectedValueOnce(
+      new BrowserAutomationError("Failed to finalize the task-owned main-Chrome Oracle tab.", {
+        stage: "open-browser-use",
+        code: "tab-finalize-failed",
+        recoveryHandle: {
+          transport: "obu",
+          sessionId: "recovered-session",
+          tabId: 8,
+          conversationUrl: obuConversationUrl,
+        },
+      }),
+    );
+    connection.finalize = finalize;
+
+    await expect(
+      resumeBrowserSession(
+        obuRuntime,
+        {
+          browserTransport: "obu",
+          obuSessionId: "stored-session",
+          obuTabId: 7,
+          chatGptAccountEmail: "paul@smartypants.ai",
+          chatGptWorkspaceName: "Paul Bettner",
+          chatGptAccountDigest: obuAccountDigest,
+          chatGptWorkspaceDigest: obuWorkspaceDigest,
+          url: obuConversationUrl,
+          timeoutMs: 2_000,
+        },
+        vi.fn() as BrowserLogger,
+        {
+          acquireOpenBrowserUseRunLock: vi.fn(async () => ({
+            path: "/tmp/oracle.lock",
+            lockId: "lock-1",
+            release: vi.fn(async () => {}),
+          })),
+          connectOpenBrowserUseTab: vi.fn(async () => connection),
+          prepareOpenBrowserUseChatGptRoute: vi.fn(async () => ({
+            email: "paul@smartypants.ai",
+            workspaceName: "Paul Bettner",
+            accountDigest: obuAccountDigest,
+            workspaceDigest: obuWorkspaceDigest,
+          })),
+          waitForConversationHydration: vi.fn(async () => 2),
+          waitForAssistantResponse: vi.fn(async () => ({
+            text: "exact answer",
+            html: "",
+            meta: { messageId: "m1", turnId: "turn-1" },
+          })),
+          captureAssistantMarkdown: vi.fn(async () => "exact answer"),
+        },
+      ),
+    ).resolves.toMatchObject({
+      runtime: { obuSessionId: "recovered-session", obuTabId: 8 },
+      warnings: [
+        {
+          code: "obu-tab-finalize-failed",
+          details: {
+            recoveryHandle: { sessionId: "recovered-session", tabId: 8 },
+          },
+        },
+      ],
+    });
+    expect(finalize).toHaveBeenCalledWith(false);
+  });
+
+  test("closes a recovered OBU tab when route verification fails and retains retry affinity", async () => {
+    const recovered = createObuConnection("recovered-session", 8);
+    const original = createObuConnection("stored-session", 7);
+    const connectOpenBrowserUseTab = vi
+      .fn()
+      .mockResolvedValueOnce(recovered.connection)
+      .mockResolvedValueOnce(original.connection);
+    const prepareOpenBrowserUseChatGptRoute = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new BrowserAutomationError("ChatGPT left the stored thread.", {
+          stage: "chatgpt-scope",
+          code: "scope-mismatch",
+        }),
+      )
+      .mockResolvedValueOnce({
+        email: "paul@smartypants.ai",
+        workspaceName: "Paul Bettner",
+        accountDigest: obuAccountDigest,
+        workspaceDigest: obuWorkspaceDigest,
+      });
+    const deps = {
+      acquireOpenBrowserUseRunLock: vi.fn(async () => ({
+        path: "/tmp/oracle.lock",
+        lockId: "lock-1",
+        release: vi.fn(async () => {}),
+      })),
+      connectOpenBrowserUseTab,
+      prepareOpenBrowserUseChatGptRoute,
+      waitForConversationHydration: vi.fn(async () => 2),
+      waitForAssistantResponse: vi.fn(async () => ({
+        text: "retry answer",
+        html: "",
+        meta: { messageId: "m2", turnId: "turn-2" },
+      })),
+      captureAssistantMarkdown: vi.fn(async () => "retry answer"),
+    };
+    const config = {
+      browserTransport: "obu" as const,
+      obuSessionId: "stored-session",
+      obuTabId: 7,
+      chatGptAccountEmail: "paul@smartypants.ai",
+      chatGptWorkspaceName: "Paul Bettner",
+      chatGptAccountDigest: obuAccountDigest,
+      chatGptWorkspaceDigest: obuWorkspaceDigest,
+      url: obuConversationUrl,
+      timeoutMs: 2_000,
+    };
+
+    const firstError = await resumeBrowserSession(
+      obuRuntime,
+      config,
+      vi.fn() as BrowserLogger,
+      deps,
+    ).catch((error) => error);
+    expect(firstError).toMatchObject({
+      details: {
+        stage: "chatgpt-scope",
+        runtime: {
+          obuSessionId: "stored-session",
+          obuTabId: 7,
+          conversationId: "obu-thread",
+        },
+      },
+    });
+    expect(recovered.finalize).toHaveBeenCalledWith(false);
+
+    await expect(
+      resumeBrowserSession(obuRuntime, config, vi.fn() as BrowserLogger, deps),
+    ).resolves.toMatchObject({
+      runtime: { obuSessionId: "stored-session", obuTabId: 7, conversationId: "obu-thread" },
+    });
+    expect(original.finalize).toHaveBeenCalledWith(false);
   });
 });
 

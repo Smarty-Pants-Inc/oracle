@@ -1,40 +1,202 @@
 import { describe, expect, test, vi } from "vitest";
 import {
-  buildConversationTurnCountExpression,
-  buildConversationTurnListExpression,
+  captureConversationUserTurnBinding,
+  captureLatestConversationUserTurnBinding,
+  hashConversationTurnText,
+  readBoundConversationTurn,
+  resolveConversationUserTurnBinding,
 } from "../../src/browser/conversationTurns.js";
-import {
-  CONVERSATION_TURN_CONTAINER_SELECTOR,
-  CONVERSATION_TURN_SELECTOR,
-} from "../../src/browser/constants.js";
+import type { ChromeClient } from "../../src/browser/types.js";
 
-function evaluate(expression: string, responses: Map<string, unknown[]>): unknown {
-  const document = {
-    querySelectorAll: vi.fn((selector: string) => responses.get(selector) ?? []),
-  };
-  return Function("document", `return ${expression};`)(document);
-}
+describe("conversation turn affinity", () => {
+  test("distinguishes prompts that share the same preview prefix", () => {
+    const prefix = "Review this exact candidate ".repeat(12);
+    const first = `${prefix}alpha`;
+    const second = `${prefix}beta`;
+    const turns = [
+      { index: 2, text: first, turnId: "turn-2", messageId: "message-2" },
+      { index: 4, text: second, turnId: "turn-4", messageId: "message-4" },
+    ];
 
-describe("conversation turn expressions", () => {
-  test("prefers top-level turn containers over nested broad-selector matches", () => {
-    const containers = [{ id: "user" }, { id: "assistant" }];
-    const nestedMatches = [...containers, { id: "nested-assistant" }];
-    const responses = new Map([
-      [CONVERSATION_TURN_CONTAINER_SELECTOR, containers],
-      [CONVERSATION_TURN_SELECTOR, nestedMatches],
-    ]);
-
-    expect(evaluate(buildConversationTurnListExpression(), responses)).toEqual(containers);
-    expect(evaluate(buildConversationTurnCountExpression(), responses)).toBe(2);
+    expect(
+      resolveConversationUserTurnBinding(
+        { promptDigest: hashConversationTurnText(second), promptTurnIndex: 4 },
+        turns,
+      ),
+    ).toEqual({ status: "matched", user: turns[1] });
+    expect(
+      resolveConversationUserTurnBinding(
+        { promptDigest: hashConversationTurnText(first), promptTurnIndex: 4 },
+        turns,
+      ),
+    ).toEqual({ status: "missing" });
   });
 
-  test("falls back to the broad selector for older conversation markup", () => {
-    const legacyTurns = [{ id: "user" }, { id: "assistant" }];
-    const responses = new Map([
-      [CONVERSATION_TURN_CONTAINER_SELECTOR, []],
-      [CONVERSATION_TURN_SELECTOR, legacyTurns],
-    ]);
+  test("fails closed when a digest alone matches repeated user turns", () => {
+    const text = "repeat this exact prompt";
+    expect(
+      resolveConversationUserTurnBinding({ promptDigest: hashConversationTurnText(text) }, [
+        { index: 0, text },
+        { index: 2, text },
+      ]),
+    ).toEqual({ status: "ambiguous" });
+  });
 
-    expect(evaluate(buildConversationTurnListExpression(), responses)).toEqual(legacyTurns);
+  test("captures the last committed user turn with full-text digest and DOM ids", async () => {
+    const Runtime = {
+      evaluate: vi.fn(async () => ({
+        result: {
+          value: [
+            { index: 0, text: "first" },
+            { index: 3, text: "second full prompt", turnId: "turn-3", messageId: "message-3" },
+          ],
+        },
+      })),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(captureLatestConversationUserTurnBinding(Runtime, 1)).resolves.toEqual({
+      promptDigest: hashConversationTurnText("second full prompt"),
+      promptTurnIndex: 3,
+      promptTurnId: "turn-3",
+      promptMessageId: "message-3",
+    });
+  });
+
+  test("captures the only new user turn that contains the exact submitted prompt", async () => {
+    const prompt = "Review this `exact` candidate";
+    const Runtime = {
+      evaluate: vi.fn(async () => ({
+        result: {
+          value: [
+            { index: 0, text: prompt, messageId: "old-message" },
+            {
+              index: 4,
+              text: `attachments-bundle.txt Document\nReview this exact candidate`,
+              turnId: "turn-4",
+              messageId: "message-4",
+            },
+          ],
+        },
+      })),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(captureConversationUserTurnBinding(Runtime, prompt, 2)).resolves.toEqual({
+      promptDigest: hashConversationTurnText(
+        "attachments-bundle.txt Document\nReview this exact candidate",
+      ),
+      promptTurnIndex: 4,
+      promptTurnId: "turn-4",
+      promptMessageId: "message-4",
+    });
+  });
+
+  test("fails closed when more than one new user turn matches the submitted prompt", async () => {
+    const Runtime = {
+      evaluate: vi.fn(async () => ({
+        result: {
+          value: [
+            { index: 2, text: "same prompt" },
+            { index: 4, text: "same prompt" },
+          ],
+        },
+      })),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(captureConversationUserTurnBinding(Runtime, "same prompt", 2)).resolves.toBeNull();
+  });
+
+  test("resolves the stored user and assistant branch from one DOM snapshot", async () => {
+    const Runtime = {
+      evaluate: vi.fn(async () => ({
+        result: {
+          value: [
+            {
+              user: {
+                index: 0,
+                text: "parent prompt",
+                turnId: "user-turn",
+                messageId: "user-message",
+              },
+              assistants: [
+                {
+                  index: 1,
+                  text: "selected answer",
+                  turnId: "assistant-turn",
+                  messageId: "assistant-message",
+                  completionVisible: true,
+                },
+                {
+                  index: 1,
+                  text: "regenerated answer",
+                  turnId: "assistant-turn-regenerated",
+                  messageId: "assistant-message-regenerated",
+                },
+              ],
+              hasLaterUserTurn: true,
+            },
+          ],
+        },
+      })),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      readBoundConversationTurn(Runtime, {
+        promptDigest: hashConversationTurnText("parent prompt"),
+        promptTurnIndex: 0,
+        promptTurnId: "user-turn",
+        promptMessageId: "user-message",
+        assistantTurnIndex: 1,
+        assistantTurnId: "assistant-turn",
+        assistantMessageId: "assistant-message",
+      }),
+    ).resolves.toEqual({
+      status: "matched",
+      turn: {
+        user: {
+          index: 0,
+          text: "parent prompt",
+          turnId: "user-turn",
+          messageId: "user-message",
+        },
+        assistant: {
+          index: 1,
+          text: "selected answer",
+          turnId: "assistant-turn",
+          messageId: "assistant-message",
+          completionVisible: true,
+        },
+        hasLaterUserTurn: true,
+      },
+    });
+    expect(Runtime.evaluate).toHaveBeenCalledOnce();
+  });
+
+  test("fails closed when the rendered assistant is not the stored branch", async () => {
+    const Runtime = {
+      evaluate: vi.fn(async () => ({
+        result: {
+          value: [
+            {
+              user: { index: 0, text: "prompt", messageId: "prompt-message" },
+              assistants: [
+                {
+                  index: 1,
+                  text: "different branch",
+                  messageId: "different-assistant-message",
+                },
+              ],
+              hasLaterUserTurn: false,
+            },
+          ],
+        },
+      })),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      readBoundConversationTurn(Runtime, {
+        promptMessageId: "prompt-message",
+        assistantMessageId: "stored-assistant-message",
+      }),
+    ).resolves.toEqual({ status: "missing" });
   });
 });

@@ -246,13 +246,16 @@ export async function runBrowserSessionExecution(
       `[browser] Model selection evidence: ${formatBrowserModelSelectionEvidence(modelSelection, runOptions.model)}`,
     );
   }
-  const warnings = buildBrowserRunWarnings({
-    runOptions,
-    browserConfig,
-    inputTokens: promptArtifacts.estimatedInputTokens,
-    elapsedMs: browserResult.tookMs,
-    modelSelection,
-  });
+  const warnings = [
+    ...(browserResult.warnings ?? []),
+    ...buildBrowserRunWarnings({
+      runOptions,
+      browserConfig,
+      inputTokens: promptArtifacts.estimatedInputTokens,
+      elapsedMs: browserResult.tookMs,
+      modelSelection,
+    }),
+  ];
   for (const warning of warnings) {
     log(chalk.yellow(`[browser] ${warning.message}`));
   }
@@ -307,11 +310,23 @@ export async function runBrowserSessionExecution(
     elapsedMs: browserResult.tookMs,
     runtime: {
       browserTransport: browserResult.browserTransport,
+      obuSessionId: browserResult.obuSessionId,
+      obuTabId: browserResult.obuTabId,
       chromePid: browserResult.chromePid,
       chromePort: browserResult.chromePort,
       chromeHost: browserResult.chromeHost,
       chromeBrowserWSEndpoint: browserResult.chromeBrowserWSEndpoint,
+      chatGptAccountEmail: browserResult.chatGptAccountEmail,
+      chatGptWorkspaceName: browserResult.chatGptWorkspaceName,
       chatGptAccountDigest: browserResult.chatGptAccountDigest,
+      chatGptWorkspaceDigest: browserResult.chatGptWorkspaceDigest,
+      promptDigest: browserResult.promptDigest,
+      promptTurnIndex: browserResult.promptTurnIndex,
+      promptTurnId: browserResult.promptTurnId,
+      promptMessageId: browserResult.promptMessageId,
+      assistantTurnIndex: browserResult.assistantTurnIndex,
+      assistantTurnId: browserResult.assistantTurnId,
+      assistantMessageId: browserResult.assistantMessageId,
       chromeProfileRoot: browserResult.chromeProfileRoot,
       userDataDir: browserResult.userDataDir,
       chromeTargetId: browserResult.chromeTargetId,

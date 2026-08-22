@@ -40,6 +40,7 @@ export async function submitPrompt(
     inputTimeoutMs?: number | null;
     attachmentTimeoutMs?: number | null;
     onPromptSubmitted?: () => Promise<void> | void;
+    beforePromptSubmit?: () => Promise<void> | void;
   },
   prompt: string,
   logger: BrowserLogger,
@@ -219,8 +220,10 @@ export async function submitPrompt(
     logger,
     deps?.attachmentNames,
     deps?.attachmentTimeoutMs,
+    deps.beforePromptSubmit,
   );
   if (!clicked) {
+    await deps.beforePromptSubmit?.();
     await input.dispatchKeyEvent({
       type: "keyDown",
       ...ENTER_KEY_EVENT,
@@ -651,9 +654,9 @@ async function attemptSendButton(
   _logger?: BrowserLogger,
   attachmentNames?: AttachmentReadyInput[],
   attachmentTimeoutMs?: number | null,
+  beforeSubmit?: () => Promise<void> | void,
 ): Promise<boolean> {
   const script = `(() => {
-    ${buildClickDispatcher()}
     const selectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
     const isVisible = (node) => {
       if (!(node instanceof HTMLElement)) return false;
@@ -685,9 +688,7 @@ async function attemptSendButton(
     if (rect.width > 0 && rect.height > 0) {
       return { status: 'point', x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
     }
-    // Last-resort fallback for unusual DOMs where the button is visible but has no useful rect.
-    dispatchClickSequence(button);
-    return { status: 'clicked' };
+    return { status: 'missing' };
   })()`;
 
   // Give attachment-bearing submissions more headroom. ChatGPT's chip render can
@@ -698,22 +699,36 @@ async function attemptSendButton(
   // Attachment upload completion is verified before this step. Treat ChatGPT's enabled
   // send control as authoritative instead of blocking on a second, drift-prone DOM matcher.
   while (Date.now() < deadline) {
-    const { result } = await Runtime.evaluate({ expression: script, returnByValue: true });
-    const value = result.value as
-      | { status?: "clicked" | "missing" | "point"; x?: number; y?: number }
-      | string
-      | undefined;
-    const status = typeof value === "string" ? value : value?.status;
+    const locate = async () => {
+      const { result } = await Runtime.evaluate({ expression: script, returnByValue: true });
+      return result.value as
+        | { status?: "missing" | "point"; x?: number; y?: number }
+        | string
+        | undefined;
+    };
+    let value = await locate();
+    let status = typeof value === "string" ? value : value?.status;
     if (
       status === "point" &&
       typeof value === "object" &&
       typeof value.x === "number" &&
       typeof value.y === "number"
     ) {
+      if (beforeSubmit) {
+        await beforeSubmit();
+        value = await locate();
+        status = typeof value === "string" ? value : value?.status;
+        if (
+          status !== "point" ||
+          typeof value !== "object" ||
+          typeof value.x !== "number" ||
+          typeof value.y !== "number"
+        ) {
+          await delay(100);
+          continue;
+        }
+      }
       await clickTrustedPoint(Runtime, Input, value.x, value.y);
-      return true;
-    }
-    if (status === "clicked") {
       return true;
     }
     if (status === "missing") {
@@ -829,6 +844,15 @@ async function verifyPromptCommitted(
 	    const normalizedPromptPrefix = normalizedPrompt.slice(0, 120);
 	    const articles = ${buildConversationTurnListExpression()};
 	    const normalizedTurns = articles.map((node) => normalize(node?.innerText));
+	    const roleOf = (node) => String(
+	      node?.getAttribute?.('data-message-author-role') ||
+	      node?.getAttribute?.('data-turn') ||
+	      node?.dataset?.turn ||
+	      '',
+	    ).toLowerCase();
+	    const isUser = (node) =>
+	      roleOf(node) === 'user' ||
+	      Boolean(node?.querySelector?.('[data-message-author-role="user"], [data-turn="user"]'));
 	    const readValue = (node) => {
 	      if (!node) return '';
 	      if (node instanceof HTMLTextAreaElement) return node.value ?? '';
@@ -844,24 +868,30 @@ async function verifyPromptCommitted(
 	      .filter((node) => Boolean(node));
 	    const visibleInputs = inputs.filter((node) => isVisible(node));
 	    const activeInputs = visibleInputs.length > 0 ? visibleInputs : inputs;
+	    const baseline = ${baselineLiteral};
+	    const eligibleUserTurns = articles.flatMap((node, index) =>
+	      isUser(node) && (baseline < 0 || index >= baseline)
+	        ? [{ index, text: normalizedTurns[index] ?? '' }]
+	        : [],
+	    );
 	    const userMatched =
-	      normalizedPrompt.length > 0 && normalizedTurns.some((text) => text.includes(normalizedPrompt));
+	      normalizedPrompt.length > 0 &&
+	      eligibleUserTurns.some(({ text }) => text.includes(normalizedPrompt));
 	    const prefixMatched =
 	      normalizedPromptPrefix.length > 30 &&
-	      normalizedTurns.some((text) => text.includes(normalizedPromptPrefix));
-		    const lastTurn = normalizedTurns[normalizedTurns.length - 1] ?? '';
-		    const lastMatched =
-		      normalizedPrompt.length > 0 &&
-		      (lastTurn.includes(normalizedPrompt) ||
-		        (normalizedPromptPrefix.length > 30 && lastTurn.includes(normalizedPromptPrefix)));
-		    const baseline = ${baselineLiteral};
-		    const hasNewTurn = baseline < 0 ? false : normalizedTurns.length > baseline;
+	      eligibleUserTurns.some(({ text }) => text.includes(normalizedPromptPrefix));
+	    const lastTurn = eligibleUserTurns[eligibleUserTurns.length - 1]?.text ?? '';
+	    const lastMatched =
+	      normalizedPrompt.length > 0 &&
+	      (lastTurn.includes(normalizedPrompt) ||
+	        (normalizedPromptPrefix.length > 30 && lastTurn.includes(normalizedPromptPrefix)));
+	    const hasNewTurn = baseline < 0 ? false : normalizedTurns.length > baseline;
 		    const stopVisible = Boolean(document.querySelector(${stopSelectorLiteral}));
 		    const assistantVisible = Boolean(
 		      document.querySelector(${assistantSelectorLiteral}) ||
 		      document.querySelector('[data-testid*="assistant"]'),
 		    );
-	    // Learned: composer clearing + stop button or assistant presence is a reliable fallback signal.
+	    // Keep composer and response controls only as diagnostics; they do not prove this prompt committed.
       const editorValue = editor?.innerText ?? '';
       const fallbackValue = fallback?.value ?? '';
       const activeEmpty =
@@ -895,17 +925,10 @@ async function verifyPromptCommitted(
       lastProbe = info;
     }
     const turnsCount = (result.value as { turnsCount?: number } | undefined)?.turnsCount;
-    const matchesPrompt = Boolean(info?.lastMatched || info?.userMatched || info?.prefixMatched);
+    const matchesPrompt = Boolean(info?.lastMatched);
     const baselineUnknown =
       typeof info?.baseline === "number" ? info.baseline < 0 : baselineLiteral < 0;
     if (matchesPrompt && (baselineUnknown || info?.hasNewTurn)) {
-      return typeof turnsCount === "number" && Number.isFinite(turnsCount) ? turnsCount : null;
-    }
-    const fallbackCommit =
-      info?.composerCleared &&
-      Boolean(info?.hasNewTurn) &&
-      ((info?.stopVisible ?? false) || info?.assistantVisible || info?.inConversation);
-    if (fallbackCommit) {
       return typeof turnsCount === "number" && Number.isFinite(turnsCount) ? turnsCount : null;
     }
     await delay(100);

@@ -120,6 +120,80 @@ describe("remote browser identity", () => {
   });
 });
 
+describe("main-Chrome follow-up guards", () => {
+  const binding = {
+    promptTurnIndex: 0,
+    promptTurnId: "user-turn-0",
+    promptMessageId: "user-message-0",
+    assistantTurnIndex: 1,
+    assistantTurnId: "assistant-turn-1",
+    assistantMessageId: "assistant-message-1",
+  };
+  const runtime = (hasLaterUserTurn: boolean) =>
+    ({
+      evaluate: vi.fn().mockResolvedValue({
+        result: {
+          value: [
+            {
+              user: {
+                index: 0,
+                text: "Prior prompt",
+                turnId: "user-turn-0",
+                messageId: "user-message-0",
+              },
+              assistants: [
+                {
+                  index: 1,
+                  text: "Prior answer",
+                  turnId: "assistant-turn-1",
+                  messageId: "assistant-message-1",
+                },
+              ],
+              hasLaterUserTurn,
+            },
+          ],
+        },
+      }),
+    }) as never;
+
+  test("accepts only the exact current prompt/assistant branch", async () => {
+    await expect(
+      __test__.assertResumeTurnAffinity(runtime(false), binding, "prompt send"),
+    ).resolves.toBeUndefined();
+    await expect(
+      __test__.assertResumeTurnAffinity(runtime(true), binding, "prompt send"),
+    ).rejects.toMatchObject({
+      details: { stage: "chatgpt-turn-affinity", code: "turn-affinity-advanced" },
+    });
+    await expect(
+      __test__.assertResumeTurnAffinity(
+        { evaluate: vi.fn() } as never,
+        { promptTurnIndex: 0 },
+        "prompt send",
+      ),
+    ).rejects.toMatchObject({
+      details: {
+        stage: "chatgpt-turn-affinity",
+        code: "resume-turn-affinity-incomplete",
+      },
+    });
+  });
+
+  test("fails closed when exact main-Chrome affinity cannot be persisted", async () => {
+    const logger = vi.fn();
+    const failure = vi.fn().mockRejectedValue(new Error("disk full"));
+
+    await expect(
+      __test__.persistRuntimeHintForTransport(true, logger as never, failure),
+    ).rejects.toMatchObject({
+      details: { stage: "session-persistence", code: "runtime-hint-persist-failed" },
+    });
+    await expect(
+      __test__.persistRuntimeHintForTransport(false, logger as never, failure),
+    ).resolves.toBeUndefined();
+  });
+});
+
 describe("shouldPreserveBrowserOnErrorForTest", () => {
   test("preserves the browser for headful cloudflare challenge errors", () => {
     const error = new BrowserAutomationError("Cloudflare challenge detected.", {
@@ -752,7 +826,7 @@ describe("browser conversation archiving", () => {
         result: {
           value: {
             status: "archived",
-            conversationUrl: "https://chatgpt.com/g/g-p-demo/project/c/abc",
+            conversationUrl: "https://chatgpt.com/g/g-p-demo/c/abc",
           },
         },
       }),
@@ -768,14 +842,14 @@ describe("browser conversation archiving", () => {
           chatgptUrl: "https://chatgpt.com/g/g-p-demo/project",
         }),
         accountDigest: "a".repeat(64),
-        conversationUrl: "https://chatgpt.com/g/g-p-demo/project/c/abc",
+        conversationUrl: "https://chatgpt.com/g/g-p-demo/c/abc",
         followUpCount: 0,
       }),
     ).resolves.toMatchObject({
       mode: "auto",
       attempted: true,
       archived: true,
-      conversationUrl: "https://chatgpt.com/g/g-p-demo/project/c/abc",
+      conversationUrl: "https://chatgpt.com/g/g-p-demo/c/abc",
     });
     expect(runtime.evaluate).toHaveBeenCalledTimes(1);
   });
@@ -952,6 +1026,29 @@ describe("browser conversation archiving", () => {
       conversationUrl,
     });
     expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+  });
+
+  test("returns an archive failure instead of discarding a completed answer on probe error", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockRejectedValueOnce(new Error("account route changed")),
+    };
+
+    await expect(
+      maybeArchiveCompletedConversationForTest({
+        Runtime: runtime as never,
+        logger: vi.fn() as never,
+        config: resolveBrowserConfig({ archiveConversations: "always" }),
+        accountDigest: "a".repeat(64),
+        conversationUrl: "https://chatgpt.com/c/abc",
+        followUpCount: 0,
+        requiredArtifactsSaved: true,
+      }),
+    ).resolves.toMatchObject({
+      attempted: true,
+      archived: false,
+      reason: "archive-failed",
+      error: "account route changed",
+    });
   });
 
   test("does not attempt interrupted archive before a conversation exists", async () => {

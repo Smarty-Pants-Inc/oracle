@@ -1,6 +1,28 @@
 import { describe, expect, test, vi } from "vitest";
-import { shouldDetachSession, stopDetachedWorker } from "../../src/cli/detach.js";
+import {
+  buildDetachedSessionExecArgs,
+  shouldDetachSession,
+  stopDetachedWorker,
+} from "../../src/cli/detach.js";
 
+describe("buildDetachedSessionExecArgs", () => {
+  test("preserves Node loader flags for source-tree workers", () => {
+    expect(
+      buildDetachedSessionExecArgs(
+        ["--import", "tsx"],
+        "/repo/bin/oracle-cli.ts",
+        "browser-session",
+      ),
+    ).toEqual([
+      "--import",
+      "tsx",
+      "--",
+      "/repo/bin/oracle-cli.ts",
+      "--exec-session",
+      "browser-session",
+    ]);
+  });
+});
 describe("shouldDetachSession", () => {
   test("disables detach when env disables it", () => {
     const result = shouldDetachSession({

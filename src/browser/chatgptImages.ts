@@ -342,6 +342,7 @@ async function fetchGeneratedImageInBrowserContext(
 export async function saveChatGptGeneratedImages(params: {
   Network: ChromeClient["Network"];
   Runtime?: ChromeClient["Runtime"];
+  browserTransport?: "cdp" | "obu";
   images: BrowserGeneratedImage[];
   outputPath: string;
   logger?: BrowserLogger;
@@ -354,8 +355,17 @@ export async function saveChatGptGeneratedImages(params: {
   const { Network, Runtime, images, outputPath, logger } = params;
   if (!images.length) return { saved: false, imageCount: 0, savedImages: [], errors: [] };
 
-  const cookieHeader = await buildCookieHeader(Network);
-  if (!cookieHeader) {
+  const browserContextOnly = params.browserTransport === "obu";
+  if (browserContextOnly && !Runtime) {
+    return {
+      saved: false,
+      imageCount: images.length,
+      savedImages: [],
+      errors: ["Main-Chrome image download requires an attached browser context."],
+    };
+  }
+  const cookieHeader = browserContextOnly ? "" : await buildCookieHeader(Network);
+  if (!browserContextOnly && !cookieHeader) {
     return {
       saved: false,
       imageCount: images.length,
@@ -379,33 +389,43 @@ export async function saveChatGptGeneratedImages(params: {
       let finalUrl = imageUrl;
       let buffer: Buffer;
 
-      try {
-        const response = await fetch(imageUrl, {
-          headers: {
-            cookie: cookieHeader,
-            "user-agent": "Mozilla/5.0",
-          },
-          redirect: "follow",
-        });
-        if (!response.ok) {
-          throw new Error(`download failed: ${response.status} ${response.statusText}`);
-        }
-        contentType = response.headers.get("content-type");
-        finalUrl = response.url;
-        buffer = Buffer.from(await response.arrayBuffer());
-      } catch (downloadError) {
-        if (!Runtime) {
-          throw downloadError;
-        }
-        const message =
-          downloadError instanceof Error ? downloadError.message : String(downloadError);
-        logger?.(
-          `[browser] ChatGPT generated image download failed via Node fetch; retrying in browser context (${image.fileId ?? imageUrl}: ${message}).`,
+      if (browserContextOnly) {
+        const browserFetch = await fetchGeneratedImageInBrowserContext(
+          Runtime as ChromeClient["Runtime"],
+          imageUrl,
         );
-        const browserFetch = await fetchGeneratedImageInBrowserContext(Runtime, imageUrl);
         contentType = browserFetch.contentType;
         finalUrl = browserFetch.finalUrl;
         buffer = browserFetch.buffer;
+      } else {
+        try {
+          const response = await fetch(imageUrl, {
+            headers: {
+              cookie: cookieHeader,
+              "user-agent": "Mozilla/5.0",
+            },
+            redirect: "follow",
+          });
+          if (!response.ok) {
+            throw new Error(`download failed: ${response.status} ${response.statusText}`);
+          }
+          contentType = response.headers.get("content-type");
+          finalUrl = response.url;
+          buffer = Buffer.from(await response.arrayBuffer());
+        } catch (downloadError) {
+          if (!Runtime) {
+            throw downloadError;
+          }
+          const message =
+            downloadError instanceof Error ? downloadError.message : String(downloadError);
+          logger?.(
+            `[browser] ChatGPT generated image download failed via Node fetch; retrying in browser context (${image.fileId ?? imageUrl}: ${message}).`,
+          );
+          const browserFetch = await fetchGeneratedImageInBrowserContext(Runtime, imageUrl);
+          contentType = browserFetch.contentType;
+          finalUrl = browserFetch.finalUrl;
+          buffer = browserFetch.buffer;
+        }
       }
 
       const extension = contentTypeToExtension(contentType);
@@ -528,6 +548,7 @@ export async function collectGeneratedImageArtifacts(params: {
   Page?: ChromeClient["Page"];
   Runtime: ChromeClient["Runtime"];
   Network: ChromeClient["Network"];
+  browserTransport?: "cdp" | "obu";
   logger?: BrowserLogger;
   minTurnIndex?: number | null;
   sessionId?: string;
@@ -626,6 +647,7 @@ export async function collectGeneratedImageArtifacts(params: {
   }
 
   const saved = await saveChatGptGeneratedImages({
+    browserTransport: params.browserTransport,
     Network: params.Network,
     Runtime: params.Runtime,
     images: generatedImages,

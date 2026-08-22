@@ -53,7 +53,12 @@ function readErrorCode(meta: SessionMetadata): string | undefined {
 }
 
 function readErrorStringDetail(meta: SessionMetadata, key: string): string | undefined {
-  const value = meta.error?.details?.[key];
+  const details = meta.error?.details;
+  const direct = details?.[key];
+  if (typeof direct === "string") return direct;
+  const nested = details?.details;
+  if (!nested || typeof nested !== "object" || Array.isArray(nested)) return undefined;
+  const value = (nested as Record<string, unknown>)[key];
   return typeof value === "string" ? value : undefined;
 }
 
@@ -185,6 +190,28 @@ export function buildAgentBlockerFromSession(
     });
   }
 
+  if (code === "browser-unavailable") {
+    return blocker(meta, {
+      kind: "browser_unavailable",
+      severity: "retryable",
+      message: "Oracle could not reach the Open Browser Use bridge for main Chrome.",
+      remediation:
+        "Restore the main-Chrome bridge, verify it with open-browser-use ping and open-browser-use info, then retry or reattach to the saved session.",
+      resumable: false,
+    });
+  }
+
+  if (code === "identity-unavailable") {
+    return blocker(meta, {
+      kind: "browser_unavailable",
+      severity: "retryable",
+      message: "Oracle could not verify the routed ChatGPT identity in main Chrome.",
+      remediation:
+        "Keep chatgpt.com open and retry after the page and Open Browser Use bridge are responsive; do not reauthenticate unless Oracle reports login_required.",
+      resumable: false,
+    });
+  }
+
   if (code === "scope-mismatch" || stage === "chatgpt-scope") {
     return blocker(meta, {
       kind: "scope_mismatch",
@@ -237,7 +264,31 @@ export function buildAgentBlockerFromSession(
   }
 
   if (
+    code === "login-required" &&
+    (stage === "assistant-recheck" ||
+      readErrorStringDetail(meta, "sessionStatus") === "needs_login")
+  ) {
+    const expectedEmail = readErrorStringDetail(meta, "expectedEmail")?.trim() ?? "";
+    const expectedWorkspace = readErrorStringDetail(meta, "expectedWorkspace")?.trim() ?? "";
+    const routedIdentity = expectedEmail
+      ? `${expectedEmail}${expectedWorkspace ? ` / ${expectedWorkspace}` : ""}`
+      : "the routed ChatGPT account";
+    const resumeCommand = meta.id ? `oracle session ${meta.id} --render` : undefined;
+    return blocker(meta, {
+      kind: "login_required",
+      severity: "action_required",
+      message: `${routedIdentity} expired after Oracle submitted the prompt.`,
+      remediation: resumeCommand
+        ? `In main Chrome, sign back in to ${routedIdentity}, then run ${resumeCommand} to resume the existing conversation without buying another turn.`
+        : `In main Chrome, sign back in to ${routedIdentity}, then resume the existing conversation without buying another turn.`,
+      resumable: true,
+      resumeCommand,
+    });
+  }
+
+  if (
     code === "login-required" ||
+    code === "workspace-required" ||
     sourceMatches(text, [
       /sign in/,
       /log in/,
@@ -247,11 +298,18 @@ export function buildAgentBlockerFromSession(
       /authentication required/,
     ])
   ) {
+    const expectedEmail = readErrorStringDetail(meta, "expectedEmail")?.trim() ?? "";
+    const expectedWorkspace = readErrorStringDetail(meta, "expectedWorkspace")?.trim() ?? "";
+    const routedIdentity = expectedEmail
+      ? `${expectedEmail}${expectedWorkspace ? ` / ${expectedWorkspace}` : ""}`
+      : "Oracle's browser profile";
     return blocker(meta, {
       kind: "login_required",
       severity: "action_required",
-      message: "Oracle's browser profile is not signed in.",
-      remediation: "Sign in through Oracle's browser profile, then retry the consult.",
+      message: `${routedIdentity} is not available in main Chrome.`,
+      remediation: expectedEmail
+        ? `In main Chrome, sign in to ${expectedEmail}${expectedWorkspace ? ` and select the “${expectedWorkspace}” workspace` : ""}, then retry the consult.`
+        : "Sign in through Oracle's browser profile, then retry the consult.",
       resumable: false,
     });
   }

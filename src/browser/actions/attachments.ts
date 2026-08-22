@@ -11,6 +11,7 @@ export async function uploadAttachmentFile(
     runtime: ChromeClient["Runtime"];
     dom?: ChromeClient["DOM"];
     input?: ChromeClient["Input"];
+    beforeFileInputMutation?: () => Promise<void> | void;
   },
   attachment: BrowserAttachment,
   logger: BrowserLogger,
@@ -1030,11 +1031,17 @@ export async function uploadAttachmentFile(
         let hasExpectedFile = snapshotMatchesExpected(immediateInputSnapshot);
         if (!hasExpectedFile) {
           if (mode === "set") {
+            await deps.beforeFileInputMutation?.();
             await dom.setFileInputFiles({ nodeId: resultNode.nodeId, files: [attachment.path] });
           } else {
             const selector = `input[type="file"][data-oracle-upload-idx="${idx}"]`;
             try {
-              await transferAttachmentViaDataTransfer(runtime, attachment, selector);
+              await transferAttachmentViaDataTransfer(
+                runtime,
+                attachment,
+                selector,
+                deps.beforeFileInputMutation,
+              );
             } catch (error) {
               logger(
                 `Attachment data transfer failed: ${(error as Error)?.message ?? String(error)}`,
@@ -1062,6 +1069,7 @@ export async function uploadAttachmentFile(
       };
 
       const dispatchInputEvents = async () => {
+        await deps.beforeFileInputMutation?.();
         await runtime
           .evaluate({
             expression: `(() => {
@@ -1104,6 +1112,7 @@ export async function uploadAttachmentFile(
           break;
         }
         logger("Attachment input set; retrying with data transfer to trigger ChatGPT upload.");
+        await deps.beforeFileInputMutation?.();
         await dom
           .setFileInputFiles({ nodeId: resultNode.nodeId, files: [] })
           .catch(() => undefined);
@@ -1149,6 +1158,7 @@ export async function uploadAttachmentFile(
         break;
       }
       if (orderIndex < candidateOrder.length - 1) {
+        await deps.beforeFileInputMutation?.();
         await dom
           .setFileInputFiles({ nodeId: resultNode.nodeId, files: [] })
           .catch(() => undefined);

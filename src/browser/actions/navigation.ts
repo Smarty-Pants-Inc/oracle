@@ -77,49 +77,82 @@ export interface PromptReadyNavigationDeps {
   ensurePromptReady?: typeof ensurePromptReady;
 }
 
+function hasUnsafeChatGptPathEncoding(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return /(^|\.)chatgpt\.com$/i.test(parsed.hostname) && parsed.pathname.includes("%");
+  } catch {
+    return false;
+  }
+}
+
 function shouldFailClosedWithoutFallback(url: string): boolean {
   try {
     const parsed = new URL(url);
     if (!/(^|\.)chatgpt\.com$/i.test(parsed.hostname)) {
       return false;
     }
-    return /\/c\//.test(parsed.pathname) || /\/g\/[^/]+\/project(?:\/|$)/.test(parsed.pathname);
+    return (
+      parsed.pathname.includes("%") ||
+      /\/c\//.test(parsed.pathname) ||
+      /\/g\/[^/]+\/project(?:\/|$)/.test(parsed.pathname)
+    );
   } catch {
     return false;
   }
 }
 
-function normalizePinnedChatGptScope(url: string): string | null {
+interface PinnedChatGptScope {
+  conversationId?: string;
+  projectId?: string;
+}
+
+function normalizePinnedChatGptScope(url: string): PinnedChatGptScope | null {
   try {
     const parsed = new URL(url);
     if (!/(^|\.)chatgpt\.com$/i.test(parsed.hostname)) {
       return null;
     }
-    const conversationMatch = parsed.pathname.match(/\/c\/([^/?#]+)/);
-    if (conversationMatch?.[1]) {
-      return `conversation:${conversationMatch[1]}`;
+    if (parsed.pathname.includes("%")) {
+      return null;
     }
-    const projectMatch = parsed.pathname.match(/^(\/g\/[^/]+\/project)(?:\/|$)/);
-    if (projectMatch?.[1]) {
-      return `project:${projectMatch[1]}`;
-    }
+    const conversationId = parsed.pathname.match(/\/c\/([^/?#]+)/)?.[1];
+    const projectId = parsed.pathname.match(/^\/g\/([^/?#]+)\/(?:project|c\/[^/?#]+)\/?$/)?.[1];
+    if (!conversationId && !projectId) return null;
+    return {
+      ...(conversationId ? { conversationId } : {}),
+      ...(projectId ? { projectId } : {}),
+    };
   } catch {
     return null;
   }
-  return null;
 }
 
 export async function ensureChatGptScopeRetained(
   Runtime: ChromeClient["Runtime"],
   expectedUrl: string,
 ) {
+  if (hasUnsafeChatGptPathEncoding(expectedUrl)) {
+    throw new BrowserAutomationError(
+      "ChatGPT scope URL contains an encoded path; refusing ambiguous route affinity.",
+      {
+        stage: "chatgpt-scope",
+        code: "scope-mismatch",
+        expectedUrl,
+        actualUrl: "",
+      },
+    );
+  }
   const expectedScope = normalizePinnedChatGptScope(expectedUrl);
   if (!expectedScope) {
     return;
   }
   const actualUrl = (await currentUrl(Runtime)) ?? "";
   const actualScope = normalizePinnedChatGptScope(actualUrl);
-  if (actualScope === expectedScope) {
+  const retained = expectedScope.conversationId
+    ? actualScope?.conversationId === expectedScope.conversationId
+    : actualScope?.projectId === expectedScope.projectId;
+  if (retained) {
     return;
   }
   throw new BrowserAutomationError(

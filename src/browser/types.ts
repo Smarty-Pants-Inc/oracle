@@ -4,6 +4,7 @@ import type {
   BrowserModelSelectionEvidence,
   BrowserRunWarning,
   BrowserRuntimeMetadata,
+  BrowserTransport,
 } from "../sessionStore.js";
 import type { SessionArtifact } from "../sessionStore.js";
 import type { ThinkingTimeLevel } from "../oracle/types.js";
@@ -61,7 +62,26 @@ export interface SavedBrowserFile extends SessionArtifact {
   filename?: string;
 }
 
+export interface BrowserTurnBinding {
+  promptDigest?: string;
+  promptTurnIndex?: number;
+  promptTurnId?: string;
+  promptMessageId?: string;
+  assistantTurnIndex?: number;
+  assistantTurnId?: string;
+  assistantMessageId?: string;
+}
+
 export interface BrowserAutomationConfig {
+  browserTransport?: BrowserTransport;
+  obuSessionId?: string | null;
+  obuTabId?: number | null;
+  chatGptAccountEmail?: string | null;
+  chatGptWorkspaceName?: string | null;
+  /** SHA-256 digest of the authenticated ChatGPT user id; never the user id itself. */
+  chatGptAccountDigest?: string | null;
+  /** SHA-256 digest of the active ChatGPT workspace/account id; never the id itself. */
+  chatGptWorkspaceDigest?: string | null;
   chromeProfile?: string | null;
   chromePath?: string | null;
   chromeCookiePath?: string | null;
@@ -121,6 +141,8 @@ export interface BrowserAutomationConfig {
   archiveConversations?: BrowserArchiveMode;
   /** Existing ChatGPT conversation URL to open before submitting the prompt. */
   resumeConversationUrl?: string | null;
+  /** Exact prior prompt/assistant branch that must be current before a stored follow-up send. */
+  resumeTurnBinding?: BrowserTurnBinding | null;
 }
 
 export interface BrowserRunOptions {
@@ -180,12 +202,24 @@ export interface BrowserRunResult {
   tookMs: number;
   answerTokens: number;
   answerChars: number;
-  browserTransport?: "cdp";
+  browserTransport?: BrowserTransport;
+  obuSessionId?: string;
+  obuTabId?: number;
   chromePid?: number;
   chromePort?: number;
   chromeHost?: string;
   chromeBrowserWSEndpoint?: string;
+  chatGptAccountEmail?: string;
+  chatGptWorkspaceName?: string;
   chatGptAccountDigest?: string;
+  chatGptWorkspaceDigest?: string;
+  promptDigest?: string;
+  promptTurnIndex?: number;
+  promptTurnId?: string;
+  promptMessageId?: string;
+  assistantTurnIndex?: number;
+  assistantTurnId?: string;
+  assistantMessageId?: string;
   chromeProfileRoot?: string;
   userDataDir?: string;
   chromeTargetId?: string;
@@ -201,6 +235,13 @@ export type ResolvedBrowserConfig = Required<
     | "chromeProfile"
     | "chromePath"
     | "chromeCookiePath"
+    | "browserTransport"
+    | "obuSessionId"
+    | "obuTabId"
+    | "chatGptAccountEmail"
+    | "chatGptWorkspaceName"
+    | "chatGptAccountDigest"
+    | "chatGptWorkspaceDigest"
     | "desiredModel"
     | "remoteChrome"
     | "remoteChromeBrowserId"
@@ -212,6 +253,7 @@ export type ResolvedBrowserConfig = Required<
     | "maxConcurrentTabs"
     | "researchMode"
     | "copyProfileSource"
+    | "resumeTurnBinding"
   >
 > & {
   chromeProfile?: string | null;
@@ -220,6 +262,13 @@ export type ResolvedBrowserConfig = Required<
   attachRunning?: boolean;
   browserTabRef?: string | null;
   desiredModel?: string | null;
+  browserTransport: BrowserTransport;
+  obuSessionId?: string | null;
+  obuTabId?: number | null;
+  chatGptAccountEmail?: string | null;
+  chatGptWorkspaceName?: string | null;
+  chatGptAccountDigest?: string | null;
+  chatGptWorkspaceDigest?: string | null;
   modelStrategy?: BrowserModelStrategy;
   thinkingTime?: ThinkingTimeLevel;
   debugPort?: number | null;
@@ -236,4 +285,5 @@ export type ResolvedBrowserConfig = Required<
   maxConcurrentTabs: number;
   researchMode: BrowserResearchMode;
   archiveConversations: BrowserArchiveMode;
+  resumeTurnBinding?: BrowserTurnBinding | null;
 };

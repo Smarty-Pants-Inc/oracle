@@ -2,7 +2,12 @@ import CDP from "chrome-remote-interface";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
-import type { BrowserRuntimeMetadata, BrowserSessionConfig } from "../sessionStore.js";
+import { BrowserAutomationError } from "../oracle/errors.js";
+import type {
+  BrowserRunWarning,
+  BrowserRuntimeMetadata,
+  BrowserSessionConfig,
+} from "../sessionStore.js";
 import {
   waitForAssistantResponse,
   captureAssistantMarkdown,
@@ -12,6 +17,7 @@ import {
   readChatGptAccountDigest,
   ensurePromptReady,
   waitForResumedConversationHydration,
+  ensureChatGptScopeRetained,
 } from "./pageActions.js";
 import type { BrowserLogger, ChromeClient } from "./types.js";
 import {
@@ -24,7 +30,13 @@ import {
 import { resolveBrowserConfig } from "./config.js";
 import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
 import { CHATGPT_URL } from "./constants.js";
-import { buildConversationTurnListExpression } from "./conversationTurns.js";
+import { delay } from "./utils.js";
+import {
+  buildConversationTurnListExpression,
+  readBoundConversationTurn,
+  type BoundConversationTurn,
+  type ConversationTurnBinding,
+} from "./conversationTurns.js";
 import {
   browserIdFromWebSocketEndpoint,
   cleanupStaleProfileState,
@@ -46,6 +58,19 @@ import {
   type TargetInfoLite,
 } from "./reattachHelpers.js";
 import { waitForDeepResearchCompletion } from "./actions/deepResearch.js";
+import { classifyTurnTerminal, createTerminalGateState } from "./actions/assistantResponse.js";
+import { assertChatGptIdentity } from "./chatgptAccountRouter.js";
+import {
+  acquireOpenBrowserUseRunLock,
+  connectOpenBrowserUseTab,
+  prepareOpenBrowserUseChatGptRoute,
+  prepareOpenBrowserUseConversationRoute,
+  registerOpenBrowserUseTerminationHooks,
+  resolveStoredOpenBrowserUseAffinity,
+  resolveStoredOpenBrowserUseTabAffinity,
+  waitForOpenBrowserUseConversationUrl,
+  type OpenBrowserUseConnection,
+} from "./openBrowserUse.js";
 
 export interface ReattachDeps {
   listTargets?: () => Promise<TargetInfoLite[]>;
@@ -54,16 +79,119 @@ export interface ReattachDeps {
   captureAssistantMarkdown?: typeof captureAssistantMarkdown;
   waitForDeepResearchCompletion?: typeof waitForDeepResearchCompletion;
   waitForConversationHydration?: typeof waitForResumedConversationHydration;
+  acquireOpenBrowserUseRunLock?: typeof acquireOpenBrowserUseRunLock;
+  connectOpenBrowserUseTab?: typeof connectOpenBrowserUseTab;
+  prepareOpenBrowserUseChatGptRoute?: typeof prepareOpenBrowserUseChatGptRoute;
+  prepareOpenBrowserUseConversationRoute?: typeof prepareOpenBrowserUseConversationRoute;
+  waitForOpenBrowserUseConversationUrl?: typeof waitForOpenBrowserUseConversationUrl;
   recoverSession?: (
     runtime: BrowserRuntimeMetadata,
     config: BrowserSessionConfig | undefined,
   ) => Promise<ReattachResult>;
   promptPreview?: string;
+  promptBinding?: ConversationTurnBinding;
 }
 
 export interface ReattachResult {
   answerText: string;
   answerMarkdown: string;
+  runtime?: BrowserRuntimeMetadata;
+  warnings?: BrowserRunWarning[];
+}
+function storedConversationTurnBinding(
+  runtime: BrowserRuntimeMetadata,
+  explicit?: ConversationTurnBinding,
+): ConversationTurnBinding | null {
+  const binding: ConversationTurnBinding = {
+    promptDigest: explicit?.promptDigest ?? runtime.promptDigest,
+    promptTurnIndex: explicit?.promptTurnIndex ?? runtime.promptTurnIndex,
+    promptTurnId: explicit?.promptTurnId ?? runtime.promptTurnId,
+    promptMessageId: explicit?.promptMessageId ?? runtime.promptMessageId,
+    assistantTurnIndex: explicit?.assistantTurnIndex ?? runtime.assistantTurnIndex,
+    assistantTurnId: explicit?.assistantTurnId ?? runtime.assistantTurnId,
+    assistantMessageId: explicit?.assistantMessageId ?? runtime.assistantMessageId,
+  };
+  return Object.values(binding).some((value) => value !== undefined) ? binding : null;
+}
+
+const BOUND_TURN_TERMINAL_CONFIG = { barConfirmCycles: 3, minStableMs: 1_200 };
+
+async function waitForBoundAssistantTurn(
+  Runtime: ChromeClient["Runtime"],
+  binding: ConversationTurnBinding,
+  timeoutMs: number,
+  logger: BrowserLogger,
+): Promise<NonNullable<BoundConversationTurn["assistant"]>> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  let gate = createTerminalGateState(Date.now());
+  let loggedWaiting = false;
+  for (;;) {
+    const resolved = await readBoundConversationTurn(Runtime, binding);
+    if (resolved.status !== "matched") {
+      throw new BrowserAutomationError(
+        `The stored ChatGPT user turn is ${resolved.status}; refusing to capture another turn.`,
+        { stage: "chatgpt-turn-affinity", code: `turn-affinity-${resolved.status}` },
+      );
+    }
+    const { assistant, hasLaterUserTurn } = resolved.turn;
+    if (hasLaterUserTurn && !assistant?.text) {
+      throw new BrowserAutomationError(
+        "A later ChatGPT user turn exists before the stored turn received an assistant response.",
+        { stage: "chatgpt-turn-affinity", code: "turn-affinity-interrupted" },
+      );
+    }
+    if (assistant?.text) {
+      if (hasLaterUserTurn) return assistant;
+      const decision = classifyTurnTerminal(
+        gate,
+        {
+          now: Date.now(),
+          len: assistant.text.length,
+          contentKey: `${assistant.messageId ?? assistant.turnId ?? assistant.index}::${assistant.text}`,
+          stopVisible: false,
+          barVisible: assistant.completionVisible === true,
+          strongThinkingActive: false,
+        },
+        BOUND_TURN_TERMINAL_CONFIG,
+      );
+      gate = decision.state;
+      if (decision.terminal) return assistant;
+    } else {
+      gate = createTerminalGateState(Date.now());
+    }
+    if (Date.now() >= deadline) {
+      throw new BrowserAutomationError(
+        "The stored ChatGPT turn has no completed assistant response yet.",
+        { stage: "assistant-timeout", code: "bound-turn-incomplete" },
+      );
+    }
+    if (!loggedWaiting) {
+      logger("Waiting for the exact stored ChatGPT turn to complete...");
+      loggedWaiting = true;
+    }
+    await delay(400);
+  }
+}
+
+async function captureBoundAssistantResult(
+  Runtime: ChromeClient["Runtime"],
+  assistant: NonNullable<BoundConversationTurn["assistant"]>,
+  captureMarkdown: typeof captureAssistantMarkdown,
+  logger: BrowserLogger,
+): Promise<Pick<ReattachResult, "answerText" | "answerMarkdown">> {
+  const markdown =
+    assistant.messageId || assistant.turnId
+      ? await withTimeout(
+          captureMarkdown(
+            Runtime,
+            { messageId: assistant.messageId, turnId: assistant.turnId },
+            logger,
+          ),
+          15_000,
+          "Reattach markdown capture timed out",
+        ).catch(() => null)
+      : null;
+  return { answerText: assistant.text, answerMarkdown: markdown ?? assistant.text };
 }
 
 export async function resumeBrowserSession(
@@ -72,6 +200,9 @@ export async function resumeBrowserSession(
   logger: BrowserLogger,
   deps: ReattachDeps = {},
 ): Promise<ReattachResult> {
+  if (config?.browserTransport === "obu" || runtime.browserTransport === "obu") {
+    return resumeBrowserSessionViaObu(runtime, config, logger, deps);
+  }
   const recoverSession =
     deps.recoverSession ??
     (async (runtimeMeta, configMeta) =>
@@ -257,6 +388,25 @@ export async function resumeBrowserSession(
       requirePromptReady: false,
       expectedConversationUrl: expectedConversationUrl ?? undefined,
     });
+    const turnBinding = storedConversationTurnBinding(runtime, deps.promptBinding);
+    const assertCaptureAffinity = async (): Promise<void> => {
+      if (expectedConversationUrl) {
+        await ensureChatGptScopeRetained(Runtime, expectedConversationUrl);
+      }
+      if (identityBoundRemoteSession) {
+        const observedAccountDigest = await readChatGptAccountDigest(Runtime);
+        if (observedAccountDigest !== expectedAccountDigest) {
+          throw new Error("Remote Chrome account identity changed before response capture.");
+        }
+      }
+    };
+    if (turnBinding && config?.researchMode !== "deep") {
+      const assistant = await waitForBoundAssistantTurn(Runtime, turnBinding, timeoutMs, logger);
+      await assertCaptureAffinity();
+      const result = await captureBoundAssistantResult(Runtime, assistant, captureMarkdown, logger);
+      await closeAttached();
+      return result;
+    }
     const minTurnIndex =
       (await readPromptPreviewTurnIndex(Runtime, deps.promptPreview)) ??
       (deps.promptPreview ? null : await readConversationTurnIndex(Runtime, logger));
@@ -270,6 +420,10 @@ export async function resumeBrowserSession(
         timeoutMs + 5_000,
         "Reattach Deep Research response timed out",
       );
+      if (turnBinding) {
+        await waitForBoundAssistantTurn(Runtime, turnBinding, timeoutMs, logger);
+      }
+      await assertCaptureAffinity();
       await closeAttached();
       return {
         answerText: researchResult.text,
@@ -310,6 +464,271 @@ export async function resumeBrowserSession(
       `Existing Chrome reattach failed (${message}); reopening browser to locate the session.`,
     );
     return recoverSession(runtime, config);
+  }
+}
+async function resumeBrowserSessionViaObu(
+  runtime: BrowserRuntimeMetadata,
+  config: BrowserSessionConfig | undefined,
+  logger: BrowserLogger,
+  deps: ReattachDeps,
+): Promise<ReattachResult> {
+  let conversationUrl = buildConversationUrl(runtime, resolveBrowserConfig(config ?? {}).url);
+  const affinity = conversationUrl
+    ? resolveStoredOpenBrowserUseAffinity({
+        runtime,
+        configs: [config],
+        conversationUrl,
+        conversationUrls: [config?.resumeConversationUrl, config?.chatgptUrl, config?.url],
+      })
+    : resolveStoredOpenBrowserUseTabAffinity({ runtime, configs: [config] });
+  let expectedConversationId = conversationUrl
+    ? extractConversationIdFromUrl(conversationUrl)
+    : undefined;
+  const acquireLock = deps.acquireOpenBrowserUseRunLock ?? acquireOpenBrowserUseRunLock;
+  const connectTab = deps.connectOpenBrowserUseTab ?? connectOpenBrowserUseTab;
+  const prepareRoute =
+    deps.prepareOpenBrowserUseConversationRoute ??
+    deps.prepareOpenBrowserUseChatGptRoute ??
+    prepareOpenBrowserUseConversationRoute;
+  const waitForConversationUrl =
+    deps.waitForOpenBrowserUseConversationUrl ?? waitForOpenBrowserUseConversationUrl;
+
+  const lock = await acquireLock({
+    timeoutMs: config?.profileLockTimeoutMs ?? 300_000,
+    logger,
+  });
+  let connection: OpenBrowserUseConnection | null = null;
+  let connectionReady: Promise<OpenBrowserUseConnection> | null = null;
+  const removeTerminationHooks = registerOpenBrowserUseTerminationHooks({
+    connection: () => connection ?? connectionReady,
+    releaseLock: () => lock.release(),
+    logger,
+  });
+  let completed = false;
+  let routeRetained = false;
+  let thrownError: BrowserAutomationError | null = null;
+  let assistantBinding: Pick<
+    BrowserRuntimeMetadata,
+    "assistantTurnIndex" | "assistantTurnId" | "assistantMessageId"
+  > = {};
+  const expectation = {
+    email: affinity.email,
+    workspaceName: affinity.workspaceName,
+    accountDigest: affinity.accountDigest,
+    workspaceDigest: affinity.workspaceDigest,
+  };
+  const runtimeForConnection = (useConnection = routeRetained): BrowserRuntimeMetadata => ({
+    ...runtime,
+    browserTransport: "obu",
+    obuSessionId: useConnection
+      ? (connection?.sessionId ?? affinity.sessionId)
+      : affinity.sessionId,
+    obuTabId: useConnection ? (connection?.tabId ?? affinity.tabId) : affinity.tabId,
+    chatGptAccountEmail: affinity.email,
+    chatGptWorkspaceName: affinity.workspaceName,
+    chatGptAccountDigest: affinity.accountDigest,
+    chatGptWorkspaceDigest: affinity.workspaceDigest,
+    ...assistantBinding,
+    tabUrl: conversationUrl ?? runtime.tabUrl,
+    conversationId: expectedConversationId ?? runtime.conversationId,
+  });
+  const finalizeCompletedConnection = async (): Promise<BrowserRunWarning[] | undefined> => {
+    if (!connection) return undefined;
+    try {
+      await connection.finalize(false);
+      return undefined;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const details = error instanceof BrowserAutomationError ? error.details : undefined;
+      logger(`[browser] Reattached answer captured, but task-tab finalization failed: ${message}`);
+      return [
+        {
+          code: "obu-tab-finalize-failed",
+          severity: "warning",
+          message,
+          ...(details ? { details: { ...details } } : {}),
+        },
+      ];
+    }
+  };
+  try {
+    connectionReady = connectTab({
+      oracleSessionId: `reattach-${runtime.conversationId ?? "session"}`,
+      obuSessionId: affinity.sessionId,
+      obuTabId: affinity.tabId,
+      exactTabOnly: !conversationUrl,
+      conversationUrl,
+      timeoutMs: config?.inputTimeoutMs,
+      logger,
+    });
+    connection = await connectionReady;
+    const { Runtime, DOM, Page } = connection.client;
+    await Promise.all([Runtime.enable?.(), DOM?.enable?.(), Page?.enable?.()].filter(Boolean));
+    if (!conversationUrl) {
+      conversationUrl = await waitForConversationUrl({
+        connection,
+        timeoutMs: config?.inputTimeoutMs ?? 30_000,
+      });
+      expectedConversationId = extractConversationIdFromUrl(conversationUrl);
+    }
+    await prepareRoute({ connection, expectation, targetUrl: conversationUrl, logger });
+    routeRetained = true;
+    const timeoutMs = config?.timeoutMs ?? 120_000;
+    const waitForHydration =
+      deps.waitForConversationHydration ?? waitForResumedConversationHydration;
+    await waitForHydration(Runtime, timeoutMs, logger, {
+      requirePriorTurns: true,
+      requirePromptReady: false,
+      expectedConversationUrl: conversationUrl,
+    });
+    const captureMarkdown = deps.captureAssistantMarkdown ?? captureAssistantMarkdown;
+    const turnBinding = storedConversationTurnBinding(runtime, deps.promptBinding);
+    const hasPromptBinding = Boolean(
+      turnBinding?.promptDigest ||
+      turnBinding?.promptTurnId ||
+      turnBinding?.promptMessageId ||
+      Number.isInteger(turnBinding?.promptTurnIndex),
+    );
+    if (!turnBinding || !hasPromptBinding) {
+      throw new BrowserAutomationError(
+        "Stored main-Chrome reattach has no exact prompt turn affinity.",
+        { stage: "chatgpt-turn-affinity", code: "turn-affinity-missing" },
+      );
+    }
+    if (config?.researchMode !== "deep") {
+      const assistant = await waitForBoundAssistantTurn(Runtime, turnBinding, timeoutMs, logger);
+      await ensureChatGptScopeRetained(Runtime, conversationUrl);
+      await assertChatGptIdentity(Runtime, expectation);
+      assistantBinding = {
+        assistantTurnIndex: assistant.index,
+        ...(assistant.turnId ? { assistantTurnId: assistant.turnId } : {}),
+        ...(assistant.messageId ? { assistantMessageId: assistant.messageId } : {}),
+      };
+      const result = await captureBoundAssistantResult(Runtime, assistant, captureMarkdown, logger);
+      const warnings = await finalizeCompletedConnection();
+      completed = true;
+      return { ...result, runtime: runtimeForConnection(), warnings };
+    }
+    const minTurnIndex =
+      (await readPromptPreviewTurnIndex(Runtime, deps.promptPreview)) ??
+      (deps.promptPreview ? null : await readConversationTurnIndex(Runtime, logger));
+    if (config?.researchMode === "deep") {
+      const waitForDeepResearch =
+        deps.waitForDeepResearchCompletion ?? waitForDeepResearchCompletion;
+      const researchResult = await withTimeout(
+        waitForDeepResearch(
+          Runtime,
+          logger,
+          timeoutMs,
+          minTurnIndex ?? undefined,
+          Page,
+          connection.client,
+          { requireScopedTargetOwner: true },
+        ),
+        timeoutMs + 5_000,
+        "Reattach Deep Research response timed out",
+      );
+      const exactAssistant = await waitForBoundAssistantTurn(
+        Runtime,
+        turnBinding,
+        timeoutMs,
+        logger,
+      );
+      await ensureChatGptScopeRetained(Runtime, conversationUrl);
+      await assertChatGptIdentity(Runtime, expectation);
+      assistantBinding = {
+        assistantTurnIndex: exactAssistant.index,
+        ...(exactAssistant.turnId ? { assistantTurnId: exactAssistant.turnId } : {}),
+        ...(exactAssistant.messageId ? { assistantMessageId: exactAssistant.messageId } : {}),
+      };
+      const result = { answerText: researchResult.text, answerMarkdown: researchResult.text };
+      const warnings = await finalizeCompletedConnection();
+      completed = true;
+      return { ...result, runtime: runtimeForConnection(), warnings };
+    }
+    const waitForResponse = deps.waitForAssistantResponse ?? waitForAssistantResponse;
+    const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
+    const answer = await withTimeout(
+      waitForResponse(
+        Runtime,
+        timeoutMs,
+        logger,
+        minTurnIndex ?? undefined,
+        expectedConversationId,
+      ),
+      timeoutMs + 5_000,
+      "Reattach response timed out",
+    );
+    await ensureChatGptScopeRetained(Runtime, conversationUrl);
+    await assertChatGptIdentity(Runtime, expectation);
+    const recovered = await recoverPromptEcho(
+      Runtime,
+      answer,
+      promptEcho,
+      logger,
+      minTurnIndex,
+      timeoutMs,
+    );
+    const markdown =
+      (await withTimeout(
+        captureMarkdown(Runtime, recovered.meta, logger),
+        15_000,
+        "Reattach markdown capture timed out",
+      )) ?? recovered.text;
+    await ensureChatGptScopeRetained(Runtime, conversationUrl);
+    const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
+    const warnings = await finalizeCompletedConnection();
+    completed = true;
+    return {
+      answerText: aligned.answerText,
+      answerMarkdown: aligned.answerMarkdown,
+      runtime: runtimeForConnection(),
+      warnings,
+    };
+  } catch (error) {
+    let failure = error;
+    if (connection) {
+      try {
+        if (conversationUrl) {
+          await ensureChatGptScopeRetained(connection.client.Runtime, conversationUrl);
+        }
+        await assertChatGptIdentity(connection.client.Runtime, expectation);
+      } catch (routeError) {
+        if (routeError instanceof BrowserAutomationError) failure = routeError;
+        routeRetained = false;
+      }
+    }
+    const details = failure instanceof BrowserAutomationError ? failure.details : undefined;
+    if (
+      details?.stage === "main-chrome-account-router" ||
+      details?.stage === "chatgpt-scope" ||
+      details?.stage === "open-browser-use"
+    ) {
+      routeRetained = false;
+    }
+    thrownError = new BrowserAutomationError(
+      failure instanceof Error ? failure.message : String(failure),
+      { ...details, stage: details?.stage ?? "reattach", runtime: runtimeForConnection() },
+      failure,
+    );
+    throw thrownError;
+  } finally {
+    removeTerminationHooks();
+    try {
+      await connection?.finalize(!completed && routeRetained);
+    } catch (error) {
+      if (thrownError?.details) {
+        (thrownError.details as Record<string, unknown>).cleanupFailure =
+          error instanceof BrowserAutomationError
+            ? { message: error.message, details: error.details }
+            : { message: error instanceof Error ? error.message : String(error) };
+      } else {
+        logger(
+          `[browser] Failed to finalize main-Chrome reattach tab: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    await lock.release().catch(() => undefined);
   }
 }
 
@@ -441,6 +860,7 @@ async function resumeBrowserSessionViaNewChrome(
   });
   const waitForResponse = deps.waitForAssistantResponse ?? waitForAssistantResponse;
   const captureMarkdown = deps.captureAssistantMarkdown ?? captureAssistantMarkdown;
+  const turnBinding = storedConversationTurnBinding(runtime, deps.promptBinding);
   const timeoutMs = resolved.timeoutMs ?? 120_000;
   const cleanup = async () => {
     if (client && typeof client.close === "function") {
@@ -465,6 +885,13 @@ async function resumeBrowserSessionViaNewChrome(
       }
     }
   };
+  if (turnBinding && resolved.researchMode !== "deep") {
+    const assistant = await waitForBoundAssistantTurn(Runtime, turnBinding, timeoutMs, logger);
+    if (conversationUrl) await ensureChatGptScopeRetained(Runtime, conversationUrl);
+    const result = await captureBoundAssistantResult(Runtime, assistant, captureMarkdown, logger);
+    await cleanup();
+    return result;
+  }
   const minTurnIndex =
     (await readPromptPreviewTurnIndex(Runtime, deps.promptPreview)) ??
     (deps.promptPreview ? null : await readConversationTurnIndex(Runtime, logger));
@@ -481,11 +908,13 @@ async function resumeBrowserSessionViaNewChrome(
         requireScopedTargetOwner: true,
       },
     );
+    if (turnBinding) {
+      await waitForBoundAssistantTurn(Runtime, turnBinding, timeoutMs, logger);
+    }
+    if (conversationUrl) await ensureChatGptScopeRetained(Runtime, conversationUrl);
+    const result = { answerText: researchResult.text, answerMarkdown: researchResult.text };
     await cleanup();
-    return {
-      answerText: researchResult.text,
-      answerMarkdown: researchResult.text,
-    };
+    return result;
   }
   const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
   const answer = await waitForResponse(Runtime, timeoutMs, logger, minTurnIndex ?? undefined);
@@ -543,4 +972,5 @@ export const __test__ = {
   buildConversationUrl,
   openConversationFromSidebar,
   readPromptPreviewTurnIndex,
+  waitForBoundAssistantTurn,
 };

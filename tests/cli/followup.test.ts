@@ -152,6 +152,184 @@ describe("browser follow-up resolution", () => {
       });
     },
   );
+  test.each([
+    ["user", "paul@smartypants.ai", "Paul Bettner"],
+    ["agent", "dev1@smartypants.ai", "Smarty Dev"],
+  ] as const)(
+    "preserves the exact %s main-Chrome account, workspace, tab, and thread",
+    async (requestOrigin, email, workspaceName) => {
+      vi.stubEnv("ORACLE_WRAPPER_REMOTE_ONLY", "1");
+      const metadata: SessionMetadata = {
+        ...baseMetadata,
+        mode: "browser",
+        requestOrigin,
+        options: {
+          requestOrigin,
+          browserConfig: {
+            browserTransport: "obu",
+            obuSessionId: `oracle-${requestOrigin}`,
+            obuTabId: requestOrigin === "user" ? 7 : 8,
+            chatGptAccountEmail: email,
+            chatGptWorkspaceName: workspaceName,
+            chatGptAccountDigest: "a".repeat(64),
+            chatGptWorkspaceDigest: "b".repeat(64),
+          },
+        },
+        browser: {
+          runtime: {
+            browserTransport: "obu",
+            obuSessionId: `oracle-${requestOrigin}`,
+            obuTabId: requestOrigin === "user" ? 7 : 8,
+            chatGptAccountEmail: email,
+            chatGptWorkspaceName: workspaceName,
+            chatGptAccountDigest: "a".repeat(64),
+            chatGptWorkspaceDigest: "b".repeat(64),
+            conversationId: `${requestOrigin}-thread`,
+            promptTurnIndex: 0,
+            promptTurnId: `user-${requestOrigin}`,
+            promptMessageId: `user-message-${requestOrigin}`,
+            assistantTurnIndex: 1,
+            assistantTurnId: `assistant-${requestOrigin}`,
+            assistantMessageId: `assistant-message-${requestOrigin}`,
+          },
+        },
+      };
+
+      await expect(
+        resolveBrowserFollowupReference("session-1", {
+          readSession: vi.fn(async () => metadata),
+        }),
+      ).resolves.toMatchObject({
+        requestOrigin,
+        resumeConversationUrl: `https://chatgpt.com/c/${requestOrigin}-thread`,
+        browserConfig: {
+          browserTransport: "obu",
+          obuSessionId: `oracle-${requestOrigin}`,
+          chatGptAccountEmail: email,
+          chatGptWorkspaceName: workspaceName,
+          browserTabRef: null,
+          resumeTurnBinding: {
+            promptTurnIndex: 0,
+            promptTurnId: `user-${requestOrigin}`,
+            promptMessageId: `user-message-${requestOrigin}`,
+            assistantTurnIndex: 1,
+            assistantTurnId: `assistant-${requestOrigin}`,
+            assistantMessageId: `assistant-message-${requestOrigin}`,
+          },
+        },
+      });
+    },
+  );
+
+  test("rejects a main-Chrome follow-up without exact prompt and assistant affinity", async () => {
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      options: {
+        browserConfig: {
+          browserTransport: "obu",
+          obuSessionId: "oracle-session",
+          obuTabId: 7,
+          chatGptAccountEmail: "paul@smartypants.ai",
+          chatGptWorkspaceName: "Paul Bettner",
+          chatGptAccountDigest: "a".repeat(64),
+          chatGptWorkspaceDigest: "b".repeat(64),
+        },
+      },
+      browser: {
+        runtime: {
+          browserTransport: "obu",
+          obuSessionId: "oracle-session",
+          obuTabId: 7,
+          chatGptAccountEmail: "paul@smartypants.ai",
+          chatGptWorkspaceName: "Paul Bettner",
+          chatGptAccountDigest: "a".repeat(64),
+          chatGptWorkspaceDigest: "b".repeat(64),
+          conversationId: "thread-without-assistant-binding",
+          promptTurnIndex: 0,
+          promptMessageId: "prompt-message",
+        },
+      },
+    };
+
+    await expect(
+      resolveBrowserFollowupReference("session-1", {
+        readSession: vi.fn(async () => metadata),
+      }),
+    ).rejects.toThrow(/no exact stored prompt\/assistant branch/i);
+  });
+
+  test("rejects conflicting duplicated main-Chrome affinity", async () => {
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      options: {
+        browserConfig: {
+          browserTransport: "obu",
+          obuSessionId: "oracle-session",
+          obuTabId: 7,
+          chatGptAccountEmail: "paul@smartypants.ai",
+          chatGptWorkspaceName: "Paul Bettner",
+          chatGptAccountDigest: "a".repeat(64),
+          chatGptWorkspaceDigest: "b".repeat(64),
+        },
+      },
+      browser: {
+        runtime: {
+          browserTransport: "obu",
+          obuSessionId: "oracle-session",
+          obuTabId: 8,
+          chatGptAccountEmail: "paul@smartypants.ai",
+          chatGptWorkspaceName: "Paul Bettner",
+          chatGptAccountDigest: "a".repeat(64),
+          chatGptWorkspaceDigest: "b".repeat(64),
+          conversationId: "thread-conflict",
+        },
+      },
+    };
+    await expect(
+      resolveBrowserFollowupReference("session-1", { readSession: vi.fn(async () => metadata) }),
+    ).rejects.toThrow(/tab identity is conflicting/i);
+  });
+
+  test("rejects conflicting duplicated main-Chrome conversation affinity", async () => {
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      options: {
+        browserConfig: {
+          browserTransport: "obu",
+          obuSessionId: "oracle-session",
+          obuTabId: 7,
+          chatGptAccountEmail: "paul@smartypants.ai",
+          chatGptWorkspaceName: "Paul Bettner",
+          chatGptAccountDigest: "a".repeat(64),
+          chatGptWorkspaceDigest: "b".repeat(64),
+        },
+      },
+      browser: {
+        harvest: {
+          conversationId: "thread-two",
+          url: "https://chatgpt.com/c/thread-two",
+        },
+        runtime: {
+          browserTransport: "obu",
+          obuSessionId: "oracle-session",
+          obuTabId: 7,
+          chatGptAccountEmail: "paul@smartypants.ai",
+          chatGptWorkspaceName: "Paul Bettner",
+          chatGptAccountDigest: "a".repeat(64),
+          chatGptWorkspaceDigest: "b".repeat(64),
+          tabUrl: "https://chatgpt.com/c/thread-one",
+          conversationId: "thread-one",
+        },
+      },
+    };
+
+    await expect(
+      resolveBrowserFollowupReference("session-1", { readSession: vi.fn(async () => metadata) }),
+    ).rejects.toThrow(/conversation affinity is conflicting/i);
+  });
 
   test("fails closed for legacy wrapper sessions without request origin", async () => {
     vi.stubEnv("ORACLE_WRAPPER_REMOTE_ONLY", "1");

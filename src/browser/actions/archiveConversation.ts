@@ -13,7 +13,15 @@ export interface BrowserArchiveDecision {
 }
 
 export function isProjectChatgptUrl(url?: string | null): boolean {
-  return /\/project(?:[/?#]|$)/i.test(url ?? "");
+  try {
+    const parsed = new URL(url ?? "");
+    return Boolean(
+      parsed.origin === "https://chatgpt.com" &&
+      /^\/g\/[^/]+\/(?:project|c\/[^/]+)\/?$/i.test(parsed.pathname),
+    );
+  } catch {
+    return false;
+  }
 }
 
 export function isTemporaryChatgptUrl(url?: string | null): boolean {
@@ -65,7 +73,7 @@ function resolveArchiveConversationAffinity(
   try {
     const parsed = new URL(rawUrl ?? "");
     if (parsed.origin !== "https://chatgpt.com") return null;
-    const match = /^\/(?:c|g\/[^/]+(?:\/project)?\/c)\/([a-zA-Z0-9-]+)\/?$/.exec(parsed.pathname);
+    const match = /^\/(?:c|g\/[^/]+\/c)\/([a-zA-Z0-9-]+)\/?$/.exec(parsed.pathname);
     return match?.[1] ? { origin: parsed.origin, conversationId: match[1] } : null;
   } catch {
     return null;
@@ -187,7 +195,7 @@ function buildArchiveConversationExpression({
       try {
         const currentUrl = new URL(conversationUrl);
         const match = currentUrl.pathname
-          .match(/^\\/(?:c|g\\/[^/]+(?:\\/project)?\\/c)\\/([a-zA-Z0-9-]+)\\/?$/);
+          .match(/^\\/(?:c|g\\/[^/]+\\/c)\\/([a-zA-Z0-9-]+)\\/?$/);
         return currentUrl.origin === expectedOrigin && match?.[1] === expectedConversationId;
       } catch {
         return false;

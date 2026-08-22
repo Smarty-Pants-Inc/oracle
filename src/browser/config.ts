@@ -29,6 +29,13 @@ export const DEFAULT_CHATGPT_COOKIE_NAMES = [
 const PRO_BROWSER_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
 export const DEFAULT_BROWSER_CONFIG: ResolvedBrowserConfig = {
+  browserTransport: "cdp",
+  obuSessionId: null,
+  obuTabId: null,
+  chatGptAccountEmail: null,
+  chatGptWorkspaceName: null,
+  chatGptAccountDigest: null,
+  chatGptWorkspaceDigest: null,
   chromeProfile: null,
   chromePath: null,
   chromeCookiePath: null,
@@ -143,7 +150,7 @@ export function resolveBrowserConfig(
     inlineCookiesSource: config?.inlineCookiesSource ?? DEFAULT_BROWSER_CONFIG.inlineCookiesSource,
     headless: config?.headless ?? DEFAULT_BROWSER_CONFIG.headless,
     keepBrowser: config?.keepBrowser ?? DEFAULT_BROWSER_CONFIG.keepBrowser,
-    hideWindow: !(config?.remoteChrome || config?.headless),
+    hideWindow: !(config?.browserTransport === "obu" || config?.remoteChrome || config?.headless),
     desiredModel,
     modelStrategy,
     chromeProfile: config?.chromeProfile ?? DEFAULT_BROWSER_CONFIG.chromeProfile,
@@ -154,6 +161,16 @@ export function resolveBrowserConfig(
     debug: config?.debug ?? DEFAULT_BROWSER_CONFIG.debug,
     allowCookieErrors:
       config?.allowCookieErrors ?? envAllowCookieErrors ?? DEFAULT_BROWSER_CONFIG.allowCookieErrors,
+    browserTransport: config?.browserTransport ?? DEFAULT_BROWSER_CONFIG.browserTransport,
+    obuSessionId: config?.obuSessionId ?? DEFAULT_BROWSER_CONFIG.obuSessionId,
+    obuTabId: config?.obuTabId ?? DEFAULT_BROWSER_CONFIG.obuTabId,
+    chatGptAccountEmail: config?.chatGptAccountEmail ?? DEFAULT_BROWSER_CONFIG.chatGptAccountEmail,
+    chatGptWorkspaceName:
+      config?.chatGptWorkspaceName ?? DEFAULT_BROWSER_CONFIG.chatGptWorkspaceName,
+    chatGptAccountDigest:
+      config?.chatGptAccountDigest ?? DEFAULT_BROWSER_CONFIG.chatGptAccountDigest,
+    chatGptWorkspaceDigest:
+      config?.chatGptWorkspaceDigest ?? DEFAULT_BROWSER_CONFIG.chatGptWorkspaceDigest,
     remoteChromeBrowserId:
       config?.remoteChromeBrowserId ?? DEFAULT_BROWSER_CONFIG.remoteChromeBrowserId,
     remoteChromeBrowserWSEndpoint:

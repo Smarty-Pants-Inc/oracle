@@ -10,6 +10,7 @@ import {
   extractConversationIdFromUrl,
   formatBrowserTabState,
   harvestChatGptTab,
+  harvestConnectedChatGptTab,
   sessionMatchesTab,
   type ChatGptTabSummary,
 } from "../browser/liveTabs.js";
@@ -19,6 +20,23 @@ import {
 } from "../browser/recoverConversation.js";
 import { resolveOutputPath } from "./writeOutputPath.js";
 import { browserIdFromWebSocketEndpoint } from "../browser/profileState.js";
+import {
+  acquireOpenBrowserUseRunLock,
+  connectOpenBrowserUseTab,
+  hasStoredOpenBrowserUseAffinity,
+  prepareOpenBrowserUseConversationRoute,
+  registerOpenBrowserUseTerminationHooks,
+  resolveStoredOpenBrowserUseAffinity,
+  resolveStoredOpenBrowserUseTabAffinity,
+  waitForOpenBrowserUseConversationUrl,
+  type StoredOpenBrowserUseTabAffinity,
+} from "../browser/openBrowserUse.js";
+import { delay } from "../browser/utils.js";
+import {
+  hashConversationTurnText,
+  type ConversationTurnBinding,
+} from "../browser/conversationTurns.js";
+import { asOracleUserError, BrowserAutomationError } from "../oracle/errors.js";
 
 const LIVE_POLL_MS = 2000;
 const DEFAULT_STALL_THRESHOLD_MS = 60_000;
@@ -254,6 +272,50 @@ function normalizeHarvestComparison(text: string): string {
     .trim();
 }
 
+function storedConversationTurnBinding(meta: SessionMetadata): ConversationTurnBinding | undefined {
+  const runtime = meta.browser?.runtime;
+  if (!runtime) return undefined;
+  const binding = {
+    promptDigest: runtime.promptDigest,
+    promptTurnIndex: runtime.promptTurnIndex,
+    promptTurnId: runtime.promptTurnId,
+    promptMessageId: runtime.promptMessageId,
+    assistantTurnIndex: runtime.assistantTurnIndex,
+    assistantTurnId: runtime.assistantTurnId,
+    assistantMessageId: runtime.assistantMessageId,
+  };
+  return Object.values(binding).some((value) => value !== undefined) ? binding : undefined;
+}
+
+function harvestMatchesSessionPrompt(meta: SessionMetadata, harvested: ChatGptTabSummary): boolean {
+  const rawHarvestedPrompt = harvested.lastUserText || harvested.lastUserSnippet;
+  const binding = storedConversationTurnBinding(meta);
+  if (binding?.promptDigest) {
+    return Boolean(
+      rawHarvestedPrompt && hashConversationTurnText(rawHarvestedPrompt) === binding.promptDigest,
+    );
+  }
+  const harvestedPrompt = normalizeHarvestComparison(rawHarvestedPrompt);
+  const promptPreview = normalizeHarvestComparison(meta.promptPreview ?? "");
+  if (!promptPreview) return true;
+  return Boolean(harvestedPrompt && harvestedPrompt.startsWith(promptPreview));
+}
+
+function assertHarvestMatchesSessionPrompt(
+  meta: SessionMetadata,
+  harvested: ChatGptTabSummary,
+): void {
+  if (harvestMatchesSessionPrompt(meta, harvested)) return;
+  throw new BrowserAutomationError(
+    "The stored ChatGPT thread now ends with a different Oracle prompt; refusing to return another session's answer.",
+    {
+      stage: "chatgpt-turn-affinity",
+      code: "turn-affinity-mismatch",
+      conversationUrl: harvested.url,
+    },
+  );
+}
+
 function stableProjectKey(value: string | undefined): string | null {
   if (!value) return null;
   try {
@@ -272,12 +334,10 @@ export function recoverBrowserMetadataFromHarvestForTest(
 ): NonNullable<SessionMetadata["browser"]> {
   const browser = meta.browser ?? {};
   const conversationId = harvested.conversationId ?? extractConversationIdFromUrl(harvested.url);
-  const promptPreview = normalizeHarvestComparison(meta.promptPreview ?? "");
-  const harvestedPrompt = normalizeHarvestComparison(
-    harvested.lastUserText || harvested.lastUserSnippet,
-  );
+  const hasTurnBinding = Boolean(storedConversationTurnBinding(meta));
   const promptMatched = Boolean(
-    promptPreview && harvestedPrompt && harvestedPrompt.startsWith(promptPreview),
+    (hasTurnBinding || normalizeHarvestComparison(meta.promptPreview ?? "")) &&
+    harvestMatchesSessionPrompt(meta, harvested),
   );
   const outputMatched = Boolean(
     persistedOutput &&
@@ -324,14 +384,40 @@ export function recoverBrowserMetadataFromHarvestForTest(
     promptMatched,
     runtimeRepaired,
   };
+  const hasAssistantAffinity = Boolean(
+    typeof harvested.lastAssistantTurnIndex === "number" ||
+    harvested.lastAssistantTurnId ||
+    harvested.lastAssistantMessageId,
+  );
+  const runtimeWithAssistant =
+    promptMatched && hasAssistantAffinity
+      ? {
+          ...(browser.runtime ?? {}),
+          ...(typeof harvested.lastAssistantTurnIndex === "number"
+            ? { assistantTurnIndex: harvested.lastAssistantTurnIndex }
+            : {}),
+          ...(harvested.lastAssistantTurnId
+            ? { assistantTurnId: harvested.lastAssistantTurnId }
+            : {}),
+          ...(harvested.lastAssistantMessageId
+            ? { assistantMessageId: harvested.lastAssistantMessageId }
+            : {}),
+        }
+      : browser.runtime;
   if (!runtimeRepaired || !conversationId) {
-    return { ...browser, harvest };
+    return {
+      ...browser,
+      ...(runtimeWithAssistant ? { runtime: runtimeWithAssistant } : {}),
+      harvest,
+    };
   }
   return {
     ...browser,
     runtime: {
-      ...(browser.runtime ?? {}),
-      chromeTargetId: harvested.targetId,
+      ...(runtimeWithAssistant ?? {}),
+      ...(browser.runtime?.browserTransport === "obu"
+        ? { obuTabId: Number(harvested.targetId) }
+        : { chromeTargetId: harvested.targetId }),
       tabUrl: harvested.url,
       conversationId,
     },
@@ -363,6 +449,7 @@ async function persistHarvest(
   }
   const browser = recoverBrowserMetadataFromHarvestForTest(meta, harvested, persistedOutput);
   await sessionStore.updateSession(sessionId, { browser });
+  meta.browser = browser;
 }
 
 function printHarvestSummary(sessionId: string, harvested: ChatGptTabSummary): void {
@@ -399,8 +486,333 @@ async function maybeWriteHarvestOutput(
   console.log(chalk.dim(`Wrote harvested assistant output to ${resolved}`));
 }
 
+async function withPersistedOpenBrowserUseOperationError<T>(
+  meta: SessionMetadata,
+  operationName: "harvest" | "live-tail",
+  operation: () => Promise<T>,
+): Promise<T> {
+  try {
+    const result = await operation();
+    const currentMeta = (await sessionStore.readSession(meta.id)) ?? meta;
+    if (currentMeta.browser?.operationErrors?.[operationName]) {
+      const operationErrors = { ...currentMeta.browser.operationErrors };
+      delete operationErrors[operationName];
+      const browser = {
+        ...currentMeta.browser,
+        operationErrors: Object.keys(operationErrors).length > 0 ? operationErrors : undefined,
+      };
+      await sessionStore.updateSession(meta.id, { browser });
+      meta.browser = browser;
+    }
+    return result;
+  } catch (error) {
+    const userError = asOracleUserError(error);
+    const message = error instanceof Error ? error.message : String(error);
+    const operationError = userError
+      ? {
+          category: userError.category,
+          message: userError.message,
+          details: { ...userError.details, oracleOperation: operationName },
+        }
+      : {
+          category: "browser-automation",
+          message,
+          details: { oracleOperation: operationName },
+        };
+    const currentMeta = (await sessionStore.readSession(meta.id)) ?? meta;
+    const browser = {
+      ...(currentMeta.browser ?? {}),
+      operationErrors: {
+        ...(currentMeta.browser?.operationErrors ?? {}),
+        [operationName]: operationError,
+      },
+    };
+    await sessionStore.updateSession(meta.id, { browser }).catch(() => undefined);
+    meta.browser = browser;
+    throw error;
+  }
+}
+async function appendBrowserWarning(
+  meta: SessionMetadata,
+  code: string,
+  error: unknown,
+): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error);
+  const details = error instanceof BrowserAutomationError ? error.details : undefined;
+  const warning = {
+    code,
+    severity: "warning" as const,
+    message,
+    ...(details ? { details: { ...details } } : {}),
+  };
+  const browser = {
+    ...(meta.browser ?? {}),
+    warnings: [...(meta.browser?.warnings ?? []), warning],
+  };
+  await sessionStore.updateSession(meta.id, { browser }).catch(() => undefined);
+  meta.browser = browser;
+}
+
+function storedOpenBrowserUseAffinity(
+  meta: SessionMetadata,
+): StoredOpenBrowserUseTabAffinity & { conversationUrl: string | null } {
+  const runtime = meta.browser?.runtime;
+  const configs = [meta.options.browserConfig, meta.browser?.config];
+  const conversationUrls = [
+    meta.browser?.harvest?.url,
+    runtime?.tabUrl,
+    meta.browser?.archive?.conversationUrl,
+    meta.options.browserResumeConversationUrl,
+    ...configs.flatMap((config) => [
+      config?.resumeConversationUrl,
+      config?.chatgptUrl,
+      config?.url,
+    ]),
+  ];
+  const selectedUrl = conversationUrls.find((value) => extractConversationIdFromUrl(value ?? ""));
+  const selectedId = runtime?.conversationId ?? meta.browser?.harvest?.conversationId;
+  const conversationUrl =
+    selectedUrl ?? (selectedId ? `https://chatgpt.com/c/${selectedId}` : null);
+  if (!conversationUrl) {
+    return {
+      ...resolveStoredOpenBrowserUseTabAffinity({ runtime, configs }),
+      conversationUrl: null,
+    };
+  }
+  return resolveStoredOpenBrowserUseAffinity({
+    runtime,
+    configs,
+    conversationUrl,
+    conversationUrls,
+    conversationIds: [meta.browser?.harvest?.conversationId],
+  });
+}
+
+interface OpenBrowserUseHarvestContext {
+  meta: SessionMetadata;
+  affinity: StoredOpenBrowserUseTabAffinity & { conversationUrl: string };
+  connection: Awaited<ReturnType<typeof connectOpenBrowserUseTab>>;
+  recoveryTimeoutMs: number;
+  close(keepTab: boolean): Promise<void>;
+}
+
+async function persistRecoveredOpenBrowserUseAffinity(
+  meta: SessionMetadata,
+  affinity: StoredOpenBrowserUseTabAffinity & { conversationUrl: string },
+  connection: Awaited<ReturnType<typeof connectOpenBrowserUseTab>>,
+): Promise<void> {
+  const route = {
+    browserTransport: "obu" as const,
+    obuSessionId: connection.sessionId,
+    obuTabId: connection.tabId,
+    chatGptAccountEmail: affinity.email,
+    chatGptWorkspaceName: affinity.workspaceName,
+    chatGptAccountDigest: affinity.accountDigest,
+    chatGptWorkspaceDigest: affinity.workspaceDigest,
+  };
+  const baseConfig = meta.browser?.config ?? meta.options.browserConfig ?? {};
+  const recoveredConfig = { ...baseConfig, ...route };
+  const browser = {
+    ...(meta.browser ?? {}),
+    config: recoveredConfig,
+    runtime: {
+      ...(meta.browser?.runtime ?? {}),
+      ...route,
+      tabUrl: affinity.conversationUrl,
+      conversationId: extractConversationIdFromUrl(affinity.conversationUrl),
+    },
+  };
+  const options = {
+    ...meta.options,
+    browserConfig: recoveredConfig,
+  };
+  await sessionStore.updateSession(meta.id, { browser, options });
+  meta.browser = browser;
+  meta.options = options;
+}
+
+async function openOpenBrowserUseHarvestContext(
+  meta: SessionMetadata,
+): Promise<OpenBrowserUseHarvestContext> {
+  const logger = (message: string) => console.log(message);
+  const lock = await acquireOpenBrowserUseRunLock({
+    timeoutMs: meta.browser?.config?.profileLockTimeoutMs ?? 300_000,
+    logger,
+  });
+  let connection: Awaited<ReturnType<typeof connectOpenBrowserUseTab>> | null = null;
+  let connectionReady: ReturnType<typeof connectOpenBrowserUseTab> | null = null;
+  const removeTerminationHooks = registerOpenBrowserUseTerminationHooks({
+    connection: () => connection ?? connectionReady,
+    releaseLock: () => lock.release(),
+    logger,
+  });
+  try {
+    const freshMeta = await sessionStore.readSession(meta.id);
+    if (!freshMeta) {
+      throw new Error(`No session found with ID ${meta.id}.`);
+    }
+    const affinity = storedOpenBrowserUseAffinity(freshMeta);
+    connectionReady = connectOpenBrowserUseTab({
+      oracleSessionId: freshMeta.id,
+      obuSessionId: affinity.sessionId,
+      obuTabId: affinity.tabId,
+      exactTabOnly: !affinity.conversationUrl,
+      conversationUrl: affinity.conversationUrl,
+      timeoutMs: freshMeta.browser?.config?.inputTimeoutMs,
+      logger,
+    });
+    connection = await connectionReady;
+    const identity = {
+      email: affinity.email,
+      workspaceName: affinity.workspaceName,
+      accountDigest: affinity.accountDigest,
+      workspaceDigest: affinity.workspaceDigest,
+    };
+    if (!affinity.conversationUrl) {
+      affinity.conversationUrl = await waitForOpenBrowserUseConversationUrl({
+        connection,
+        timeoutMs:
+          freshMeta.browser?.config?.inputTimeoutMs ??
+          freshMeta.options.browserConfig?.inputTimeoutMs ??
+          30_000,
+      });
+    }
+    await prepareOpenBrowserUseConversationRoute({
+      connection,
+      expectation: identity,
+      targetUrl: affinity.conversationUrl,
+      logger,
+    });
+    await persistRecoveredOpenBrowserUseAffinity(
+      freshMeta,
+      affinity as StoredOpenBrowserUseTabAffinity & { conversationUrl: string },
+      connection,
+    );
+    return {
+      meta: freshMeta,
+      affinity: affinity as StoredOpenBrowserUseTabAffinity & { conversationUrl: string },
+      connection,
+      recoveryTimeoutMs:
+        freshMeta.browser?.config?.inputTimeoutMs ??
+        freshMeta.options.browserConfig?.inputTimeoutMs ??
+        30_000,
+      close: async (keepTab: boolean) => {
+        removeTerminationHooks();
+        let finalizeFailure: unknown;
+        try {
+          await connection?.finalize(keepTab);
+        } catch (error) {
+          finalizeFailure = error;
+        }
+        await lock.release().catch(() => undefined);
+        if (finalizeFailure) throw finalizeFailure;
+      },
+    };
+  } catch (error) {
+    removeTerminationHooks();
+    try {
+      await connection?.finalize(false);
+    } catch (cleanupError) {
+      if (error instanceof BrowserAutomationError && error.details) {
+        (error.details as Record<string, unknown>).cleanupFailure =
+          cleanupError instanceof BrowserAutomationError
+            ? { message: cleanupError.message, details: cleanupError.details }
+            : {
+                message:
+                  cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+              };
+      }
+    }
+    await lock.release().catch(() => undefined);
+    throw error;
+  }
+}
+
+async function harvestOpenBrowserUseContext(
+  context: OpenBrowserUseHarvestContext,
+  stallWindowMs?: number,
+): Promise<ChatGptTabSummary> {
+  const identity = {
+    email: context.affinity.email,
+    workspaceName: context.affinity.workspaceName,
+    accountDigest: context.affinity.accountDigest,
+    workspaceDigest: context.affinity.workspaceDigest,
+  };
+  const expectedConversationId = extractConversationIdFromUrl(context.affinity.conversationUrl);
+  const recoveryDeadline = Date.now() + context.recoveryTimeoutMs;
+  for (;;) {
+    const harvested = await harvestConnectedChatGptTab({
+      client: context.connection.client,
+      targetId: String(context.connection.tabId),
+      title: "Oracle main-Chrome tab",
+      url: context.affinity.conversationUrl,
+      identity,
+      stallWindowMs,
+      turnBinding: storedConversationTurnBinding(context.meta),
+    });
+    if (!expectedConversationId || harvested.conversationId !== expectedConversationId) {
+      throw new BrowserAutomationError(
+        "Main-Chrome tab left the stored ChatGPT conversation during harvest.",
+        {
+          stage: "chatgpt-scope",
+          code: "scope-mismatch",
+          expectedUrl: context.affinity.conversationUrl,
+          actualUrl: harvested.url,
+        },
+      );
+    }
+    if (isRecoveredConversationHarvestReady(harvested)) return harvested;
+    if (Date.now() >= recoveryDeadline) {
+      throw new BrowserAutomationError("Main-Chrome conversation did not hydrate before harvest.", {
+        stage: "assistant-timeout",
+        code: "recovered-content-unavailable",
+        recoveryHandle: {
+          transport: "obu",
+          sessionId: context.connection.sessionId,
+          tabId: context.connection.tabId,
+          conversationUrl: context.affinity.conversationUrl,
+        },
+      });
+    }
+    await delay(LIVE_POLL_MS);
+  }
+}
+
+async function harvestOpenBrowserUseSession(
+  meta: SessionMetadata,
+  options: { stallWindowMs?: number; keepIncomplete: boolean },
+): Promise<{ harvested: ChatGptTabSummary; meta: SessionMetadata }> {
+  const context = await openOpenBrowserUseHarvestContext(meta);
+  let keepTab = true;
+  let harvested: ChatGptTabSummary | null = null;
+  let operationError: unknown;
+  try {
+    harvested = await harvestOpenBrowserUseContext(context, options.stallWindowMs);
+    assertHarvestMatchesSessionPrompt(context.meta, harvested);
+    keepTab = options.keepIncomplete && harvested.state !== "completed";
+  } catch (error) {
+    operationError = error;
+  }
+  try {
+    await context.close(keepTab);
+  } catch (error) {
+    await appendBrowserWarning(context.meta, "obu-tab-finalize-failed", error);
+  }
+  if (operationError) throw operationError;
+  if (!harvested) throw new Error("Main-Chrome harvest returned no result.");
+  return { harvested, meta: context.meta };
+}
+
+function isOpenBrowserUseSession(meta: SessionMetadata): boolean {
+  return hasStoredOpenBrowserUseAffinity({
+    runtime: meta.browser?.runtime,
+    configs: [meta.options.browserConfig, meta.browser?.config],
+  });
+}
+
 export async function showBrowserTabsStatus(): Promise<void> {
   const metas = await sessionStore.listSessions();
+  const openBrowserUseSessions = metas.filter(isOpenBrowserUseSession);
   const endpoints = collectUniqueEndpoints(metas);
   let printedAny = false;
   for (const endpoint of endpoints) {
@@ -433,6 +845,12 @@ export async function showBrowserTabsStatus(): Promise<void> {
       }
     }
   }
+  if (openBrowserUseSessions.length > 0) {
+    printedAny = true;
+    console.log(
+      `Main-Chrome tab inventory is session-affinity scoped; inspect a stored session with “oracle session <id> --browser-harvest” (${openBrowserUseSessions.length} known).`,
+    );
+  }
   if (!printedAny) {
     console.log("No live ChatGPT tabs found on known Chrome DevTools endpoints.");
   }
@@ -445,6 +863,33 @@ export async function harvestSessionBrowserOutput(
   const meta = await sessionStore.readSession(sessionId);
   if (!meta) {
     throw new Error(`No session found with ID ${sessionId}.`);
+  }
+  if (isOpenBrowserUseSession(meta)) {
+    return withPersistedOpenBrowserUseOperationError(meta, "harvest", async () => {
+      if (options.browserTabRef) {
+        throw new Error(
+          "Main-Chrome sessions use their stored conversation affinity; remove --browser-tab.",
+        );
+      }
+      const { harvested, meta: activeMeta } = await harvestOpenBrowserUseSession(meta, {
+        stallWindowMs: options.stallWindowMs,
+        keepIncomplete: true,
+      });
+      await persistHarvest(sessionId, activeMeta, harvested);
+      printHarvestSummary(sessionId, harvested);
+      const output = harvested.lastAssistantMarkdown ?? harvested.lastAssistantText ?? "";
+      if (options.writeOutputPath) {
+        await maybeWriteHarvestOutput(
+          options.writeOutputPath,
+          activeMeta.cwd ?? process.cwd(),
+          output,
+        );
+      }
+      if (!options.quietOutput && output) {
+        process.stdout.write(`${output}${output.endsWith("\n") ? "" : "\n"}`);
+      }
+      return harvested;
+    });
   }
   const recordedEndpoint = sessionBrowserEndpoint(meta);
   const initialEndpoint = recordedEndpoint ?? {
@@ -477,6 +922,7 @@ export async function harvestSessionBrowserOutput(
         browserId: recovered.browserId,
         accountDigest: recovered.accountDigest,
         ref: recovered.ref,
+        turnBinding: storedConversationTurnBinding(meta),
         stallWindowMs: options.stallWindowMs,
       });
     };
@@ -489,17 +935,16 @@ export async function harvestSessionBrowserOutput(
         harvested = await harvestChatGptTab({
           ...initialEndpoint,
           ref,
+          turnBinding: storedConversationTurnBinding(meta),
           stallWindowMs: options.stallWindowMs,
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (!isRecoverableMissingTabError(message) || !recoverIfMissing) {
-          throw error;
-        }
+        if (!isRecoverableMissingTabError(message) || !recoverIfMissing) throw error;
         harvested = await recoverAndHarvest();
       }
     }
-
+    assertHarvestMatchesSessionPrompt(meta, harvested);
     await persistHarvest(sessionId, meta, harvested);
     printHarvestSummary(sessionId, harvested);
     const output = harvested.lastAssistantMarkdown ?? harvested.lastAssistantText ?? "";
@@ -520,8 +965,75 @@ export async function liveTailSessionBrowserOutput(
   options: BrowserLiveTailOptions = {},
 ): Promise<ChatGptTabSummary> {
   const meta = await sessionStore.readSession(sessionId);
-  if (!meta) {
-    throw new Error(`No session found with ID ${sessionId}.`);
+  if (!meta) throw new Error(`No session found with ID ${sessionId}.`);
+  if (isOpenBrowserUseSession(meta)) {
+    return withPersistedOpenBrowserUseOperationError(meta, "live-tail", async () => {
+      if (options.browserTabRef) {
+        throw new Error(
+          "Main-Chrome sessions use their stored conversation affinity; remove --browser-tab.",
+        );
+      }
+      const context = await openOpenBrowserUseHarvestContext(meta);
+      const activeMeta = context.meta;
+      const stallThresholdMs = options.stallThresholdMs ?? DEFAULT_STALL_THRESHOLD_MS;
+      let lastHash: string | null = null;
+      let unchangedSince = Date.now();
+      let keepTab = true;
+      let finalHarvest: ChatGptTabSummary | null = null;
+      let operationError: unknown;
+      try {
+        while (true) {
+          const harvested = await harvestOpenBrowserUseContext(context);
+          assertHarvestMatchesSessionPrompt(activeMeta, harvested);
+          const fullText = harvested.lastAssistantMarkdown ?? harvested.lastAssistantText ?? "";
+          const hash = createHash("sha1").update(fullText).digest("hex");
+          if (hash !== lastHash) {
+            lastHash = hash;
+            unchangedSince = Date.now();
+            console.log(
+              `[${new Date().toISOString()}] state=${harvested.state} stop=${harvested.stopExists ? "yes" : "no"} ` +
+                `send=${harvested.sendExists ? "yes" : "no"} model=${harvested.currentModelLabel || "(unknown)"} ` +
+                `snippet=${snippet(harvested.lastAssistantSnippet || fullText, 160)}`,
+            );
+            await persistHarvest(sessionId, activeMeta, harvested);
+          }
+          const derivedState =
+            harvested.state === "running"
+              ? Date.now() - unchangedSince >= stallThresholdMs
+                ? "stalled"
+                : "running"
+              : harvested.state;
+          if (derivedState !== "running") {
+            finalHarvest = { ...harvested, state: derivedState };
+            keepTab = derivedState !== "completed";
+            await persistHarvest(sessionId, activeMeta, finalHarvest);
+            printHarvestSummary(sessionId, finalHarvest);
+            const output =
+              finalHarvest.lastAssistantMarkdown ?? finalHarvest.lastAssistantText ?? "";
+            if (options.writeOutputPath) {
+              await maybeWriteHarvestOutput(
+                options.writeOutputPath,
+                activeMeta.cwd ?? process.cwd(),
+                output,
+              );
+            }
+            if (output) process.stdout.write(`${output}${output.endsWith("\n") ? "" : "\n"}`);
+            break;
+          }
+          await delay(LIVE_POLL_MS);
+        }
+      } catch (error) {
+        operationError = error;
+      }
+      try {
+        await context.close(keepTab);
+      } catch (error) {
+        await appendBrowserWarning(activeMeta, "obu-tab-finalize-failed", error);
+      }
+      if (operationError) throw operationError;
+      if (!finalHarvest) throw new Error("Main-Chrome live tail returned no result.");
+      return finalHarvest;
+    });
   }
   const recordedEndpoint = sessionBrowserEndpoint(meta);
   let endpoint = recordedEndpoint ?? {
@@ -540,7 +1052,11 @@ export async function liveTailSessionBrowserOutput(
   try {
     // Probe once to see if the live tab is still alive; recover if not.
     try {
-      await harvestChatGptTab({ ...endpoint, ref: browserTabRef });
+      await harvestChatGptTab({
+        ...endpoint,
+        ref: browserTabRef,
+        turnBinding: storedConversationTurnBinding(meta),
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (!isRecoverableMissingTabError(message) || !recoverIfMissing) {
@@ -568,11 +1084,15 @@ export async function liveTailSessionBrowserOutput(
     }
 
     while (true) {
-      const harvested = await harvestChatGptTab({ ...endpoint, ref: browserTabRef });
+      const harvested = await harvestChatGptTab({
+        ...endpoint,
+        ref: browserTabRef,
+        turnBinding: storedConversationTurnBinding(meta),
+      });
       const fullText = harvested.lastAssistantMarkdown ?? harvested.lastAssistantText ?? "";
       if (requireRecoveredContent && !isRecoveredConversationHarvestReady(harvested)) {
         if (Date.now() < recoveredContentDeadlineMs) {
-          await new Promise((resolve) => setTimeout(resolve, LIVE_POLL_MS));
+          await delay(LIVE_POLL_MS);
           continue;
         }
         throw new Error("Recovered ChatGPT conversation did not become ready in time.");
@@ -619,7 +1139,7 @@ export async function liveTailSessionBrowserOutput(
         return finalHarvest;
       }
 
-      await new Promise((resolve) => setTimeout(resolve, LIVE_POLL_MS));
+      await delay(LIVE_POLL_MS);
     }
   } finally {
     finishRecoveredChrome(recoveredChrome, options.closeAfterRecover);
