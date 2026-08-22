@@ -1068,6 +1068,35 @@ const evaluateNoModelButtonExpression = (
 };
 
 describe("browser model selection matchers", () => {
+  it("checks page affinity immediately before evaluating a pinned model selection", async () => {
+    const events: string[] = [];
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        events.push("evaluate");
+        expect(expression).toContain('const EXPECTED_CONVERSATION_ID = "conv-123"');
+        return { result: { value: { status: "already-selected", label: "Pro" } } };
+      }),
+    };
+
+    await ensureModelSelection(runtime as never, "gpt-5.5-pro", vi.fn() as never, "select", {
+      expectedConversationId: "conv-123",
+      assertPageAffinity: async () => {
+        events.push("affinity");
+      },
+    });
+
+    expect(events).toEqual(["affinity", "evaluate"]);
+  });
+
+  it("rechecks the pinned conversation immediately before the model option click", () => {
+    const expression = buildModelSelectionExpressionForTest("gpt-5.5-pro", "select", "conv-123");
+    const clickIndex = expression.indexOf("dispatchClickSequence(match.node);");
+    const guardIndex = expression.lastIndexOf("if (!matchesExpectedConversation())", clickIndex);
+
+    expect(clickIndex).toBeGreaterThan(-1);
+    expect(guardIndex).toBeGreaterThan(-1);
+    expect(guardIndex).toBeLessThan(clickIndex);
+  });
   it("includes explicit GPT-5.6 Sol tokens", () => {
     const { labelTokens, testIdTokens } = buildModelMatchersLiteralForTest("GPT-5.6 Sol");
     expect(labelTokens).toContain("gpt-5.6 sol");

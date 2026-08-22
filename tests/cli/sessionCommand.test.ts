@@ -40,6 +40,7 @@ function createDeps() {
     usesDefaultStatusFilters: vi.fn(),
     deleteSessionsOlderThan: vi.fn(),
     getSessionPaths: vi.fn(),
+    writeSessionIdReceipt: vi.fn(),
   };
 }
 
@@ -60,6 +61,7 @@ describe("handleSessionCommand", () => {
       limit: 5,
       showExamples: true,
     });
+    expect(deps.writeSessionIdReceipt).not.toHaveBeenCalled();
   });
 
   test("attaches when id provided", async () => {
@@ -70,6 +72,22 @@ describe("handleSessionCommand", () => {
       "abc",
       expect.objectContaining({ renderMarkdown: false }),
     );
+    expect(deps.writeSessionIdReceipt).toHaveBeenCalledWith("abc");
+    expect(deps.attachSession.mock.invocationCallOrder[0]).toBeLessThan(
+      deps.writeSessionIdReceipt.mock.invocationCallOrder[0],
+    );
+  });
+
+  test("does not write a receipt when attach reports failure", async () => {
+    const command = createCommandWithOptions({ hours: 24, limit: 10, all: false });
+    const deps = createDeps();
+    deps.attachSession.mockImplementation(async () => {
+      process.exitCode = 1;
+    });
+
+    await handleSessionCommand("missing", command, deps);
+
+    expect(deps.writeSessionIdReceipt).not.toHaveBeenCalled();
   });
 
   test("ignores unrelated root-only flags and logs a note when attaching by id", async () => {
@@ -114,6 +132,7 @@ describe("handleSessionCommand", () => {
     expect(logSpy).toHaveBeenCalledWith("Request: /tmp/.oracle/sessions/abc/request.json");
     expect(logSpy).toHaveBeenCalledWith("Log: /tmp/.oracle/sessions/abc/output.log");
     expect(process.exitCode).toBeUndefined();
+    expect(deps.writeSessionIdReceipt).not.toHaveBeenCalled();
   });
 
   test("errors when --path is provided without an id", async () => {
@@ -214,6 +233,7 @@ describe("handleSessionCommand", () => {
       browserTabRef: "current",
       recoverIfMissing: true,
     });
+    expect(deps.writeSessionIdReceipt).toHaveBeenCalledWith("abc");
     expect(deps.liveTailSessionBrowserOutput).not.toHaveBeenCalled();
   });
 
@@ -234,6 +254,7 @@ describe("handleSessionCommand", () => {
       browserTabRef: "tab-123",
       recoverIfMissing: true,
     });
+    expect(deps.writeSessionIdReceipt).toHaveBeenCalledWith("abc");
     expect(deps.harvestSessionBrowserOutput).not.toHaveBeenCalled();
   });
 

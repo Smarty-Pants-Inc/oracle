@@ -13,16 +13,27 @@ import { captureAssistantMarkdown, readAssistantSnapshot } from "./actions/assis
 import { buildConversationTurnListExpression } from "./conversationTurns.js";
 import { extractStableConversationIdFromUrl } from "./conversationUrl.js";
 import { delay } from "./utils.js";
-import { connectToRemoteChromeTarget, listRemoteChromeTargets } from "./chromeLifecycle.js";
+import {
+  closeTab,
+  connectToRemoteChromeTarget,
+  listRemoteChromeTargets,
+} from "./chromeLifecycle.js";
 import { resolveRemoteChromeBrowserIdentity } from "./profileState.js";
 import { readChatGptAccountDigest } from "./pageActions.js";
+import type { ChromeClient } from "./types.js";
 
 export const DEFAULT_REMOTE_CHROME_HOST = "127.0.0.1";
 export const DEFAULT_REMOTE_CHROME_PORT = 9222;
 
 const LOGIN_CTA_PATTERN =
   /\b(log in|login|sign up|sign in|continue with google|continue with microsoft)\b/i;
+const CHATGPT_HOSTS: Record<string, true> = {
+  "chatgpt.com": true,
+  "chat.openai.com": true,
+};
+const ABSOLUTE_URL_AUTHORITY_PATTERN = /^[a-z][a-z\d+.-]*:\/\/([^/?#\\]*)/iu;
 
+class ChatGptOriginError extends Error {}
 export interface ChromeTarget {
   id?: string;
   targetId?: string;
@@ -72,14 +83,17 @@ export interface ChatGptTabSummary {
 
 interface ResolveChatGptTabOptions extends HostPort {
   ref?: string;
+  closeTargetOnDispose?: boolean;
 }
 
 interface InspectChatGptTabOptions extends HostPort {
   target: ChromeTarget;
+  expectedConversationId?: string;
 }
 
 interface HarvestChatGptTabOptions extends ResolveChatGptTabOptions {
   target?: ChromeTarget;
+  expectedConversationId?: string;
   stallWindowMs?: number;
 }
 
@@ -110,8 +124,7 @@ async function refreshBoundBrowserEndpoint(options: HostPort): Promise<string | 
   if (!expectedBrowserId && !expectedAccountDigest) return options.browserWSEndpoint;
   if (
     !expectedBrowserId ||
-    !expectedAccountDigest ||
-    !/^[a-f0-9]{64}$/.test(expectedAccountDigest)
+    (expectedAccountDigest && !/^[a-f0-9]{64}$/.test(expectedAccountDigest))
   ) {
     throw new Error("Stored remote Chrome browser and account identity is incomplete.");
   }
@@ -141,39 +154,104 @@ function buildTargetFingerprint(
     .digest("hex");
 }
 
-function isChatGptUrl(url: string): boolean {
-  const normalized = normalizeUrl(url).toLowerCase();
-  return (
-    normalized.startsWith("https://chatgpt.com") || normalized.startsWith("https://chat.openai.com")
-  );
+function parseChatGptUrl(value: unknown): URL | null {
+  const raw = normalizeUrl(value);
+  const authority = ABSOLUTE_URL_AUTHORITY_PATTERN.exec(raw)?.[1];
+  if (!authority) return null;
+  try {
+    const parsed = new URL(raw);
+    const hostname = parsed.hostname.toLowerCase();
+    if (
+      parsed.protocol !== "https:" ||
+      parsed.username ||
+      parsed.password ||
+      parsed.port ||
+      !Object.hasOwn(CHATGPT_HOSTS, hostname) ||
+      authority.toLowerCase() !== hostname
+    ) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export function isChatGptUrl(url: string): boolean {
+  return parseChatGptUrl(url) !== null;
+}
+
+function requireChatGptUrl(url: string, action: string): URL {
+  const parsed = parseChatGptUrl(url);
+  if (!parsed) {
+    throw new ChatGptOriginError(`ChatGPT tab left an allowed HTTPS origin before ${action}.`);
+  }
+  return parsed;
+}
+
+export async function assertChatGptTabOrigin(
+  Runtime: ChromeClient["Runtime"],
+  action: string,
+): Promise<string> {
+  const evaluation = await Runtime.evaluate({
+    expression:
+      'typeof location === "object" && typeof location.href === "string" ? location.href : ""',
+    returnByValue: true,
+  });
+  const url = normalizeUrl(evaluation.result?.value);
+  requireChatGptUrl(url, action);
+  return url;
 }
 
 function isChatGptConversationUrl(url: string): boolean {
-  return /\/c\//.test(normalizeUrl(url));
+  const parsed = parseChatGptUrl(url);
+  return parsed ? /\/c\//.test(parsed.pathname) : false;
 }
 
 function isChatGptTarget(target: ChromeTarget): boolean {
-  if (!target || target.type !== "page") {
-    return false;
-  }
-  return isChatGptUrl(target.url ?? "") || /chatgpt/i.test(target.title ?? "");
+  return Boolean(target && target.type === "page" && isChatGptUrl(target.url ?? ""));
 }
 
 function extractTargetId(target: ChromeTarget | undefined | null): string | null {
   return target?.targetId ?? target?.id ?? null;
 }
 
+export function expectedConversationIdForRef(
+  ref: string | undefined,
+  selected?: { id?: string; targetId?: string; url?: string; conversationId?: string },
+): string | undefined {
+  const refConversationId = extractConversationIdFromUrl(String(ref ?? "").trim());
+  if (refConversationId) return refConversationId;
+  return extractConversationIdFromUrl(selected?.url ?? "") ?? selected?.conversationId;
+}
+
+export function assertExpectedConversationId(
+  expectedConversationId: string | undefined,
+  observedUrl: string,
+  action: string,
+): void {
+  if (!expectedConversationId) return;
+  const observedConversationId = extractConversationIdFromUrl(observedUrl);
+  if (observedConversationId !== expectedConversationId) {
+    throw new Error(`ChatGPT conversation changed before ${action}.`);
+  }
+}
+
 function escapeLiteral(value: string): string {
   return JSON.stringify(value);
 }
 
-function buildTabInspectionExpression(): string {
+function buildTabInspectionExpression(expectedConversationId?: string): string {
   const inputSelectorsLiteral = JSON.stringify(INPUT_SELECTORS);
   const sendSelectorsLiteral = JSON.stringify(SEND_BUTTON_SELECTORS);
   const answerSelectorsLiteral = JSON.stringify(ANSWER_SELECTORS);
   const assistantRoleLiteral = escapeLiteral(ASSISTANT_ROLE_SELECTOR);
   const modelButtonSelectorLiteral = escapeLiteral(MODEL_BUTTON_SELECTOR);
   const stopSelectorLiteral = escapeLiteral(STOP_BUTTON_SELECTOR);
+  const expectedConversationLiteral =
+    typeof expectedConversationId === "string" && expectedConversationId.trim().length > 0
+      ? JSON.stringify(expectedConversationId.trim())
+      : "null";
   return `(() => {
       const INPUT_SELECTORS = ${inputSelectorsLiteral};
       const SEND_SELECTORS = ${sendSelectorsLiteral};
@@ -183,6 +261,12 @@ function buildTabInspectionExpression(): string {
       const STOP_BUTTON_SELECTOR = ${stopSelectorLiteral};
       const LOGIN_CTA = ${LOGIN_CTA_PATTERN.toString()};
       const normalize = (value) => String(value ?? '').replace(/\\s+/g, ' ').trim();
+      const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
+      const currentHref = typeof location === 'object' && location.href ? location.href : '';
+      const currentConversationId = currentHref.match(/\\/c\\/([a-zA-Z0-9_-]+)/)?.[1] ?? null;
+      if (EXPECTED_CONVERSATION_ID && currentConversationId !== EXPECTED_CONVERSATION_ID) {
+        return { url: currentHref, scopeMismatch: true };
+      }
       const isVisible = (node) => {
         if (!(node instanceof Element)) return false;
         const style = window.getComputedStyle(node);
@@ -296,8 +380,8 @@ function buildTabInspectionExpression(): string {
     })()`;
 }
 
-export function buildTabInspectionExpressionForTest(): string {
-  return buildTabInspectionExpression();
+export function buildTabInspectionExpressionForTest(expectedConversationId?: string): string {
+  return buildTabInspectionExpression(expectedConversationId);
 }
 
 export async function listChatGptTargets(options: HostPort = {}): Promise<ChromeTarget[]> {
@@ -311,6 +395,7 @@ export async function openChatGptTarget(
 ): Promise<string> {
   const { host, port } = normalizeHostPort(options);
   const url = options.url ?? "https://chatgpt.com/";
+  requireChatGptUrl(url, "opening a ChatGPT tab");
   if (options.browserWSEndpoint) {
     const connection = await connectToRemoteChromeTarget(host, port, noopLogger, {
       browserWSEndpoint: options.browserWSEndpoint,
@@ -363,6 +448,7 @@ export async function inspectChatGptTab(
 ): Promise<ChatGptTabSummary> {
   const { host, port } = normalizeHostPort(options);
   const target = options.target;
+  requireChatGptUrl(target.url ?? "", "live tab selection");
   const targetId = extractTargetId(target);
   if (!targetId) {
     throw new Error("inspectChatGptTab requires a target with targetId.");
@@ -371,6 +457,8 @@ export async function inspectChatGptTab(
   const client = await connectToTarget(host, port, targetId, options.browserWSEndpoint);
   try {
     const { Runtime } = client;
+    const initialUrl = await assertChatGptTabOrigin(Runtime, "live tab inspection");
+    assertExpectedConversationId(options.expectedConversationId, initialUrl, "live tab inspection");
     const expectedAccountDigest = options.accountDigest?.trim();
     if (expectedAccountDigest) {
       const observedAccountDigest = await readChatGptAccountDigest(Runtime);
@@ -379,7 +467,7 @@ export async function inspectChatGptTab(
       }
     }
     const evaluation = await Runtime.evaluate({
-      expression: buildTabInspectionExpression(),
+      expression: buildTabInspectionExpression(options.expectedConversationId),
       returnByValue: true,
       awaitPromise: true,
     });
@@ -400,8 +488,32 @@ export async function inspectChatGptTab(
       lastUserText?: string;
       visibilityState?: string;
       focused?: boolean;
+      scopeMismatch?: boolean;
     };
-    const snapshot = await readAssistantSnapshot(Runtime).catch(() => null);
+    const inspectedUrl = normalizeUrl(info.url ?? target.url ?? "");
+    requireChatGptUrl(inspectedUrl, "live tab inspection");
+    assertExpectedConversationId(
+      options.expectedConversationId,
+      inspectedUrl,
+      "live tab inspection evaluation",
+    );
+    const snapshotUrl = await assertChatGptTabOrigin(Runtime, "live tab inspection snapshot");
+    assertExpectedConversationId(
+      options.expectedConversationId,
+      snapshotUrl,
+      "live tab inspection snapshot",
+    );
+    const snapshot = await readAssistantSnapshot(
+      Runtime,
+      undefined,
+      options.expectedConversationId,
+    ).catch(() => null);
+    const finalUrl = await assertChatGptTabOrigin(Runtime, "live tab inspection completion");
+    assertExpectedConversationId(
+      options.expectedConversationId,
+      finalUrl,
+      "live tab inspection completion",
+    );
     const inspectedAssistantTurnIndex =
       typeof info.lastAssistantTurnIndex === "number" && info.lastAssistantTurnIndex >= 0
         ? info.lastAssistantTurnIndex
@@ -427,7 +539,7 @@ export async function inspectChatGptTab(
       port,
       targetId,
       title: normalizeTitle(info.title ?? target.title ?? ""),
-      url: normalizeUrl(info.url ?? target.url ?? ""),
+      url: finalUrl,
       currentModelLabel: normalizeTitle(info.currentModelLabel ?? ""),
       stopExists: Boolean(info.stopExists),
       sendExists: Boolean(info.sendExists),
@@ -447,7 +559,7 @@ export async function inspectChatGptTab(
       lastUserSnippet: trimToSnippet(lastUserText),
       focused: Boolean(info.focused),
       visibilityState: typeof info.visibilityState === "string" ? info.visibilityState : "",
-      conversationId: extractConversationIdFromUrl(info.url ?? target.url ?? ""),
+      conversationId: extractConversationIdFromUrl(finalUrl),
       fingerprint: "",
       state: "detached",
       lastAssistantMarkdown: null,
@@ -507,39 +619,43 @@ function resolveChatGptTabFromSummaries(
   summaries: ChatGptTabSummary[],
   ref?: string,
 ): ChatGptTabSummary {
-  if (!Array.isArray(summaries) || summaries.length === 0) {
+  const chatGptSummaries = Array.isArray(summaries)
+    ? summaries.filter((summary) => isChatGptUrl(summary.url))
+    : [];
+  if (chatGptSummaries.length === 0) {
     throw new Error("No live ChatGPT tabs found on the configured Chrome DevTools endpoint.");
   }
   const trimmedRef = String(ref ?? "").trim();
   if (!trimmedRef || trimmedRef.toLowerCase() === "current") {
-    return summaries[0] as ChatGptTabSummary;
+    return chatGptSummaries[0] as ChatGptTabSummary;
   }
-  const exactId = summaries.find((tab) => tab.targetId === trimmedRef);
+  const exactId = chatGptSummaries.find((tab) => tab.targetId === trimmedRef);
   if (exactId) {
     return exactId;
   }
-  const exactUrl = summaries.find((tab) => tab.url === trimmedRef);
+  const exactUrl = chatGptSummaries.find((tab) => tab.url === trimmedRef);
   if (exactUrl) {
     return exactUrl;
   }
   const refConversationId = extractConversationIdFromUrl(trimmedRef) ?? trimmedRef;
-  const exactConversation = summaries.find((tab) => tab.conversationId === refConversationId);
+  const exactConversation = chatGptSummaries.find(
+    (tab) => tab.conversationId === refConversationId,
+  );
   if (exactConversation) {
     return exactConversation;
   }
   const lower = trimmedRef.toLowerCase();
-  const titleMatches = summaries.filter((tab) => tab.title.toLowerCase().includes(lower));
+  const titleMatches = chatGptSummaries.filter((tab) => tab.title.toLowerCase().includes(lower));
   if (titleMatches.length === 1) {
     return titleMatches[0] as ChatGptTabSummary;
   }
   if (titleMatches.length > 1) {
-    const details = titleMatches
-      .map((tab) => `${tab.targetId}: ${tab.title || "(untitled)"} — ${tab.url}`)
-      .join("\n");
-    throw new Error(`Multiple ChatGPT tabs match "${trimmedRef}":\n${details}`);
+    throw new Error(
+      'Multiple ChatGPT tabs match the requested reference. Use "oracle-tabs" or "oracle status --browser-tabs" to choose a unique target.',
+    );
   }
   throw new Error(
-    `No ChatGPT tab matched "${trimmedRef}". Use "oracle-tabs" or "oracle status --browser-tabs" to inspect live targets.`,
+    'No ChatGPT tab matched the requested reference. Use "oracle-tabs" or "oracle status --browser-tabs" to inspect live targets.',
   );
 }
 
@@ -551,19 +667,18 @@ export function resolveChatGptTabFromSummariesForTest(
 }
 
 function resolveExactChatGptTarget(targets: ChromeTarget[], ref?: string): ChromeTarget | null {
+  const chatGptTargets = targets.filter(isChatGptTarget);
   const trimmedRef = String(ref ?? "").trim();
   if (!trimmedRef || trimmedRef.toLowerCase() === "current") {
     return null;
   }
-  const refConversationId = extractConversationIdFromUrl(trimmedRef);
+  const refConversationId = extractConversationIdFromUrl(trimmedRef) ?? trimmedRef;
   return (
-    targets.find((target) => extractTargetId(target) === trimmedRef) ??
-    targets.find((target) => normalizeUrl(target.url ?? "") === trimmedRef) ??
-    (refConversationId
-      ? targets.find(
-          (target) => extractConversationIdFromUrl(target.url ?? "") === refConversationId,
-        )
-      : undefined) ??
+    chatGptTargets.find((target) => extractTargetId(target) === trimmedRef) ??
+    chatGptTargets.find((target) => normalizeUrl(target.url ?? "") === trimmedRef) ??
+    chatGptTargets.find(
+      (target) => extractConversationIdFromUrl(target.url ?? "") === refConversationId,
+    ) ??
     null
   );
 }
@@ -578,6 +693,7 @@ export function resolveExactChatGptTargetForTest(
 function summaryFromTarget(host: string, port: number, target: ChromeTarget): ChatGptTabSummary {
   const targetId = extractTargetId(target) ?? "";
   const url = normalizeUrl(target.url ?? "");
+  requireChatGptUrl(url, "live tab summary creation");
   return {
     host,
     port,
@@ -620,7 +736,7 @@ async function collectChatGptTabsFromTargets(
   accountDigest?: string,
 ): Promise<ChatGptTabSummary[]> {
   const summaries: ChatGptTabSummary[] = [];
-  for (const target of targets) {
+  for (const target of targets.filter(isChatGptTarget)) {
     try {
       const summary = await inspectChatGptTab({
         host,
@@ -631,6 +747,7 @@ async function collectChatGptTabsFromTargets(
       });
       summaries.push(summary);
     } catch (error) {
+      if (error instanceof ChatGptOriginError) continue;
       if (accountDigest) throw error;
 
       summaries.push({
@@ -678,14 +795,25 @@ export async function resolveChatGptTab(
       )
     : await listChatGptTargets({ host, port });
   const exactTarget = resolveExactChatGptTarget(targets, options.ref);
+  const expectedConversationId = expectedConversationIdForRef(
+    options.ref,
+    exactTarget ?? undefined,
+  );
   if (exactTarget) {
-    return inspectChatGptTab({
+    const tab = await inspectChatGptTab({
       host,
       port,
       browserWSEndpoint,
       accountDigest: options.accountDigest,
+      expectedConversationId,
       target: exactTarget,
     });
+    assertExpectedConversationId(
+      expectedConversationId ?? expectedConversationIdForRef(options.ref, tab),
+      tab.url,
+      "live tab resolution",
+    );
+    return tab;
   }
   const summaries = await collectChatGptTabsFromTargets(
     host,
@@ -694,12 +822,44 @@ export async function resolveChatGptTab(
     browserWSEndpoint,
     options.accountDigest,
   );
-  return resolveChatGptTabFromSummaries(summaries, options.ref);
+  const tab = resolveChatGptTabFromSummaries(summaries, options.ref);
+  assertExpectedConversationId(
+    expectedConversationIdForRef(options.ref, tab),
+    tab.url,
+    "live tab resolution",
+  );
+  return tab;
+}
+
+export interface ChatGptTabConnection {
+  client: ChromeClient;
+  targetId: string;
+  tab: ChatGptTabSummary;
+}
+async function revalidateConnectedChatGptTab(
+  client: ChromeClient,
+  tab: ChatGptTabSummary,
+  expectedConversationId: string | undefined,
+  accountDigest: string | undefined,
+  action: string,
+): Promise<void> {
+  const url = await assertChatGptTabOrigin(client.Runtime, action);
+  assertExpectedConversationId(expectedConversationId, url, action);
+  const expectedAccountDigest = accountDigest?.trim();
+  if (expectedAccountDigest) {
+    const observedAccountDigest = await readChatGptAccountDigest(client.Runtime);
+    if (observedAccountDigest !== expectedAccountDigest) {
+      throw new Error(`Remote Chrome account identity changed before ${action}.`);
+    }
+  }
+  tab.url = url;
+  tab.conversationId = extractConversationIdFromUrl(url);
+  tab.fingerprint = buildTargetFingerprint(tab);
 }
 
 export async function connectToExistingChatGptTab(
   options: ResolveChatGptTabOptions = {},
-): Promise<{ client: Awaited<ReturnType<typeof CDP>>; targetId: string; tab: ChatGptTabSummary }> {
+): Promise<ChatGptTabConnection> {
   const { host, port } = normalizeHostPort(options);
   const browserWSEndpoint = await refreshBoundBrowserEndpoint(options);
   if (browserWSEndpoint) {
@@ -711,6 +871,10 @@ export async function connectToExistingChatGptTab(
       })) as ChromeTarget[]
     ).filter(isChatGptTarget);
     const exactTarget = resolveExactChatGptTarget(targets, options.ref);
+    let expectedConversationId = expectedConversationIdForRef(
+      options.ref,
+      exactTarget ?? undefined,
+    );
     const tab = exactTarget
       ? await inspectChatGptTab({
           host,
@@ -718,6 +882,7 @@ export async function connectToExistingChatGptTab(
           target: exactTarget,
           browserWSEndpoint,
           accountDigest: options.accountDigest,
+          expectedConversationId,
         })
       : resolveChatGptTabFromSummaries(
           await collectChatGptTabsFromTargets(
@@ -729,11 +894,25 @@ export async function connectToExistingChatGptTab(
           ),
           options.ref,
         );
+    expectedConversationId ??= expectedConversationIdForRef(options.ref, tab);
+    assertExpectedConversationId(expectedConversationId, tab.url, "live tab resolution");
     const connection = await connectToRemoteChromeTarget(host, port, noopLogger, {
       browserWSEndpoint,
       targetId: tab.targetId,
-      closeTargetOnDispose: false,
+      closeTargetOnDispose: options.closeTargetOnDispose ?? false,
     });
+    try {
+      await revalidateConnectedChatGptTab(
+        connection.client,
+        tab,
+        expectedConversationId,
+        options.accountDigest,
+        "existing-tab connection",
+      );
+    } catch (error) {
+      await connection.close().catch(() => undefined);
+      throw error;
+    }
     Object.defineProperty(connection.client, "close", {
       configurable: true,
       value: connection.close,
@@ -742,17 +921,49 @@ export async function connectToExistingChatGptTab(
   }
   const targets = await listChatGptTargets({ host, port });
   const exactTarget = resolveExactChatGptTarget(targets, options.ref);
-  if (exactTarget) {
-    const targetId = extractTargetId(exactTarget);
-    if (!targetId) {
-      throw new Error("Resolved ChatGPT tab is missing a target id.");
-    }
-    const client = await connectToTarget(host, port, targetId);
-    return { client, targetId, tab: summaryFromTarget(host, port, exactTarget) };
+  const tab = exactTarget
+    ? summaryFromTarget(host, port, exactTarget)
+    : await resolveChatGptTab({ host, port, ref: options.ref });
+  const expectedConversationId = expectedConversationIdForRef(options.ref, exactTarget ?? tab);
+  assertExpectedConversationId(expectedConversationId, tab.url, "live tab resolution");
+  const targetId = exactTarget ? extractTargetId(exactTarget) : tab.targetId;
+  if (!targetId) {
+    throw new Error("Resolved ChatGPT tab is missing a target id.");
   }
-  const tab = await resolveChatGptTab({ host, port, ref: options.ref });
-  const client = await connectToTarget(host, port, tab.targetId);
-  return { client, targetId: tab.targetId, tab };
+  const client = await connectToTarget(host, port, targetId);
+  try {
+    await revalidateConnectedChatGptTab(
+      client,
+      tab,
+      expectedConversationId,
+      options.accountDigest,
+      "existing-tab connection",
+    );
+  } catch (error) {
+    await client.close().catch(() => undefined);
+    throw error;
+  }
+  if (options.closeTargetOnDispose) {
+    const detach = client.close.bind(client);
+    Object.defineProperty(client, "close", {
+      configurable: true,
+      value: async () => {
+        const failures: unknown[] = [];
+        try {
+          await detach();
+        } catch (error) {
+          failures.push(error);
+        }
+        if (!(await closeTab(port, targetId, noopLogger, host))) {
+          failures.push(new Error("ChatGPT target cleanup was not confirmed."));
+        }
+        if (failures.length) {
+          throw new AggregateError(failures, "ChatGPT target cleanup failed.");
+        }
+      },
+    });
+  }
+  return { client, targetId, tab };
 }
 
 export async function harvestChatGptTab(
@@ -760,17 +971,39 @@ export async function harvestChatGptTab(
 ): Promise<ChatGptTabSummary> {
   const browserWSEndpoint = await refreshBoundBrowserEndpoint(options);
   const { host, port } = normalizeHostPort(options);
+  const initialExpectedConversationId =
+    options.expectedConversationId ?? expectedConversationIdForRef(options.ref, options.target);
   const resolved = options.target
-    ? await inspectChatGptTab({ ...options, browserWSEndpoint, target: options.target })
+    ? await inspectChatGptTab({
+        ...options,
+        browserWSEndpoint,
+        expectedConversationId: initialExpectedConversationId,
+        target: options.target,
+      })
     : await resolveChatGptTab({ ...options, browserWSEndpoint, ref: options.ref });
+  const expectedConversationId =
+    initialExpectedConversationId ?? expectedConversationIdForRef(options.ref, resolved);
+  assertExpectedConversationId(expectedConversationId, resolved.url, "live tab resolution");
   const client = await connectToTarget(host, port, resolved.targetId, browserWSEndpoint);
   try {
     const { Runtime } = client;
-    const snapshot = await readAssistantSnapshot(Runtime).catch(() => null);
+    await revalidateConnectedChatGptTab(
+      client,
+      resolved,
+      expectedConversationId,
+      options.accountDigest,
+      "live tab harvest",
+    );
+    const snapshotUrl = await assertChatGptTabOrigin(Runtime, "live tab harvest snapshot");
+    assertExpectedConversationId(expectedConversationId, snapshotUrl, "live tab harvest snapshot");
+    const snapshot = await readAssistantSnapshot(Runtime, undefined, expectedConversationId).catch(
+      () => null,
+    );
     const nowSummary = await inspectChatGptTab({
       ...options,
       host,
       browserWSEndpoint,
+      expectedConversationId,
       port,
       target: {
         targetId: resolved.targetId,
@@ -779,6 +1012,11 @@ export async function harvestChatGptTab(
         type: "page",
       },
     });
+    assertExpectedConversationId(
+      expectedConversationId,
+      nowSummary.url,
+      "live tab harvest completion",
+    );
     const normalizedSnapshotText = normalizeTitle(snapshot?.text ?? "").toLowerCase();
     const normalizedInspectedText = normalizeTitle(nowSummary.lastAssistantText).toLowerCase();
     const snapshotMatchesLatestTurn =
@@ -790,6 +1028,8 @@ export async function harvestChatGptTab(
         normalizedSnapshotText === normalizedInspectedText);
     let assistantMarkdown: string | null = null;
     if (snapshotMatchesLatestTurn && (snapshot?.messageId || snapshot?.turnId)) {
+      const captureUrl = await assertChatGptTabOrigin(Runtime, "live tab harvest capture");
+      assertExpectedConversationId(expectedConversationId, captureUrl, "live tab harvest capture");
       assistantMarkdown = await captureAssistantMarkdown(
         Runtime,
         {
@@ -797,6 +1037,7 @@ export async function harvestChatGptTab(
           turnId: snapshot.turnId,
         },
         noopLogger,
+        expectedConversationId,
       ).catch(() => null);
     }
     const lastAssistantText =
@@ -827,6 +1068,7 @@ export async function harvestChatGptTab(
         host,
         browserWSEndpoint,
         port,
+        expectedConversationId,
         target: {
           targetId: harvested.targetId,
           title: harvested.title,
@@ -834,6 +1076,11 @@ export async function harvestChatGptTab(
           type: "page",
         },
       });
+      assertExpectedConversationId(
+        expectedConversationId,
+        followup.url,
+        "live tab harvest completion",
+      );
       harvested.stopExists = followup.stopExists;
       harvested.sendExists = followup.sendExists;
       harvested.promptReady = followup.promptReady;
@@ -856,6 +1103,11 @@ export async function harvestChatGptTab(
     } else {
       harvested.state = classifyTabState(harvested);
     }
+    assertExpectedConversationId(
+      expectedConversationId,
+      harvested.url,
+      "live tab harvest completion",
+    );
     return harvested;
   } finally {
     await client.close().catch(() => undefined);
@@ -863,7 +1115,8 @@ export async function harvestChatGptTab(
 }
 
 export function extractConversationIdFromUrl(url: string): string | undefined {
-  return extractStableConversationIdFromUrl(normalizeUrl(url));
+  const parsed = parseChatGptUrl(url);
+  return parsed ? extractStableConversationIdFromUrl(parsed.pathname) : undefined;
 }
 
 export function formatBrowserTabState(

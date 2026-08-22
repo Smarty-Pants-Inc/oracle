@@ -293,6 +293,12 @@ describe("remote browser service", () => {
               ],
               warnings: [
                 {
+                  code: "browser-cleanup-incomplete",
+                  severity: "warning",
+                  message: "host path leaked here: /Users/private/browser-profile",
+                  details: { failureCount: 3, privatePath: "/Users/private/browser-profile" },
+                },
+                {
                   code: "chatgpt-ui-warning",
                   severity: "warning",
                   message: "host-only warning /Users/private/profile",
@@ -317,6 +323,11 @@ describe("remote browser service", () => {
       expect(result.answerText).toBe("done");
       expect(result.warnings).toEqual([
         {
+          code: "browser-cleanup-incomplete",
+          severity: "warning",
+          message: "Browser cleanup could not be fully confirmed.",
+        },
+        {
           code: "remote-artifact-registration-failed",
           severity: "warning",
           message: expect.stringContaining("could not prepare host-private.zip for transfer"),
@@ -324,6 +335,8 @@ describe("remote browser service", () => {
       ]);
       expect(JSON.stringify(result)).not.toContain(hostPrivatePath);
       expect(JSON.stringify(result)).not.toContain("host-only warning /Users/private/profile");
+      expect(JSON.stringify(result)).not.toContain("host path leaked here");
+      expect(JSON.stringify(result)).not.toContain("privatePath");
       expect(result.artifacts).toHaveLength(2);
       const artifact = result.artifacts?.[0];
       expect(artifact?.path).toBe(

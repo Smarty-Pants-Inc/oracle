@@ -246,13 +246,16 @@ export async function runBrowserSessionExecution(
       `[browser] Model selection evidence: ${formatBrowserModelSelectionEvidence(modelSelection, runOptions.model)}`,
     );
   }
-  const warnings = buildBrowserRunWarnings({
-    runOptions,
-    browserConfig,
-    inputTokens: promptArtifacts.estimatedInputTokens,
-    elapsedMs: browserResult.tookMs,
-    modelSelection,
-  });
+  const warnings = [
+    ...(browserResult.warnings ?? []),
+    ...buildBrowserRunWarnings({
+      runOptions,
+      browserConfig,
+      inputTokens: promptArtifacts.estimatedInputTokens,
+      elapsedMs: browserResult.tookMs,
+      modelSelection,
+    }),
+  ];
   for (const warning of warnings) {
     log(chalk.yellow(`[browser] ${warning.message}`));
   }

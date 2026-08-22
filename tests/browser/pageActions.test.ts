@@ -2182,10 +2182,16 @@ describe("uploadAttachmentFile", () => {
   test("avoids retrying other inputs once upload shows progress", async () => {
     logger.mockClear();
     let readSignalCalls = 0;
+    const mutationOrder: string[] = [];
+    const assertPageAffinity = vi.fn(async (action: string) => {
+      mutationOrder.push(`guard:${action}`);
+    });
     const dom = {
       getDocument: vi.fn().mockResolvedValue({ root: { nodeId: 1 } }),
       querySelector: vi.fn().mockResolvedValue({ nodeId: 2 }),
-      setFileInputFiles: vi.fn().mockResolvedValue(undefined),
+      setFileInputFiles: vi.fn(async () => {
+        mutationOrder.push("set-file-input");
+      }),
     } as unknown as ChromeClient["DOM"];
     const runtime = {
       evaluate: vi.fn().mockImplementation(async (params: { expression?: string }) => {
@@ -2248,7 +2254,7 @@ describe("uploadAttachmentFile", () => {
 
     await expect(
       uploadAttachmentFile(
-        { runtime, dom },
+        { runtime, dom, assertPageAffinity },
         { path: "/tmp/oracle-browser-smoke.txt", displayPath: "oracle-browser-smoke.txt" },
         logger,
       ),
@@ -2256,6 +2262,11 @@ describe("uploadAttachmentFile", () => {
 
     expect(dom.querySelector).toHaveBeenCalledTimes(1);
     expect(dom.setFileInputFiles).toHaveBeenCalledTimes(1);
+    expect(mutationOrder).toEqual([
+      "guard:attachment controls",
+      "guard:attachment transfer",
+      "set-file-input",
+    ]);
   });
 
   test("checks for late attachment signals before trying alternate inputs", async () => {

@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
-import { mkdtemp, rm, readFile, readdir, stat } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { setOracleHomeDirOverrideForTest } from "../src/oracleHome.js";
@@ -20,6 +20,10 @@ beforeAll(async () => {
 beforeEach(async () => {
   await rm(sessionModule.getSessionsDir(), { recursive: true, force: true });
   await sessionModule.ensureSessionStorage();
+  delete process.env.ORACLE_ARCHIVE_REPOSITORY;
+  delete process.env.ORACLE_ARCHIVE_TOPIC;
+  delete process.env.ORACLE_ARCHIVE_ACCOUNT_ALIAS;
+  delete process.env.ORACLE_SESSION_ID_RECEIPT;
 });
 
 afterAll(async () => {
@@ -134,6 +138,143 @@ describe("session lifecycle", () => {
 
     expect(stored.browser?.config).toEqual(browserConfig);
     expect(stored.options?.browserConfig).toEqual(browserConfig);
+  });
+  test("persists a validated archive route before execution", async () => {
+    process.env.ORACLE_ARCHIVE_REPOSITORY = "example-repository";
+    process.env.ORACLE_ARCHIVE_TOPIC = "oracle/review/";
+    process.env.ORACLE_ARCHIVE_ACCOUNT_ALIAS = "paul";
+    const metadata = await sessionModule.initializeSession(
+      { prompt: "Persist archive route", model: "gpt-5.6-sol-pro", mode: "browser" },
+      "/tmp/cwd",
+    );
+    const stored = JSON.parse(
+      await readFile(path.join(sessionModule.getSessionsDir(), metadata.id, "meta.json"), "utf8"),
+    );
+
+    expect(metadata.archiveRoute).toEqual({
+      repository: "example-repository",
+      topic: "oracle/review",
+    });
+    expect(stored.archiveRoute).toEqual(metadata.archiveRoute);
+    expect(metadata.archiveAccountAlias).toBe("paul");
+    expect(stored.archiveAccountAlias).toBe("paul");
+    expect(stored.options.archiveAccountAlias).toBeUndefined();
+    expect(stored.options.archiveRoute).toBeUndefined();
+  });
+
+  test("rejects incomplete or unsafe archive metadata before reserving a session", async () => {
+    process.env.ORACLE_ARCHIVE_REPOSITORY = "example-repository";
+    await expect(
+      sessionModule.initializeSession(
+        { prompt: "Reject incomplete route", model: "gpt-5.6-sol-pro", mode: "browser" },
+        "/tmp/cwd",
+      ),
+    ).rejects.toThrow(/archive route is invalid/i);
+    process.env.ORACLE_ARCHIVE_TOPIC = "../unsafe";
+    await expect(
+      sessionModule.initializeSession(
+        { prompt: "Reject unsafe route", model: "gpt-5.6-sol-pro", mode: "browser" },
+        "/tmp/cwd",
+      ),
+    ).rejects.toThrow(/archive route is invalid/i);
+    process.env.ORACLE_ARCHIVE_TOPIC = "oracle/review";
+    process.env.ORACLE_ARCHIVE_ACCOUNT_ALIAS = "../unsafe";
+    await expect(
+      sessionModule.initializeSession(
+        { prompt: "Reject unsafe alias", model: "gpt-5.6-sol-pro", mode: "browser" },
+        "/tmp/cwd",
+      ),
+    ).rejects.toThrow(/archive account alias is invalid/i);
+    expect(await readdir(sessionModule.getSessionsDir())).toEqual([]);
+  });
+
+  test("writes the exact collision-resolved session ID to a private receipt", async () => {
+    const receiptPath = path.join(oracleHomeDir, "session-id-receipt");
+    await writeFile(receiptPath, "", { mode: 0o600 });
+    await sessionModule.initializeSession(
+      { prompt: "ignored", slug: "Collision session proof", model: "gpt-5.6-sol-pro" },
+      "/tmp/cwd",
+    );
+    const second = await sessionModule.initializeSession(
+      { prompt: "ignored", slug: "Collision session proof", model: "gpt-5.6-sol-pro" },
+      "/tmp/cwd",
+    );
+
+    if (process.platform === "win32") {
+      await expect(sessionModule.writeSessionIdReceipt(second.id, receiptPath)).rejects.toThrow(
+        /disabled on Windows.*ACL/i,
+      );
+      expect(await readFile(receiptPath, "utf8")).toBe("");
+      return;
+    }
+    await sessionModule.writeSessionIdReceipt(second.id, receiptPath);
+
+    expect(second.id).toBe("collision-session-proof-2");
+    expect(await readFile(receiptPath, "utf8")).toBe(`${second.id}\n`);
+    expect((await stat(receiptPath)).mode & 0o777).toBe(0o600);
+  });
+
+  test("preflights a private receipt without changing its contents", async () => {
+    const receiptPath = path.join(oracleHomeDir, "preflight-session-id-receipt");
+    await writeFile(receiptPath, "unchanged\n", { mode: 0o600 });
+
+    if (process.platform === "win32") {
+      await expect(sessionModule.preflightSessionIdReceipt(receiptPath)).rejects.toThrow(
+        /disabled on Windows.*ACL/i,
+      );
+    } else {
+      await expect(sessionModule.preflightSessionIdReceipt(receiptPath)).resolves.toBeUndefined();
+    }
+    expect(await readFile(receiptPath, "utf8")).toBe("unchanged\n");
+  });
+
+  test("removes a newly reserved session when launch setup must roll back", async () => {
+    const metadata = await sessionModule.initializeSession(
+      { prompt: "Receipt rollback proof", model: "gpt-5.6-sol-pro" },
+      "/tmp/cwd",
+    );
+
+    await sessionModule.removeSessionReservation(metadata.id);
+
+    expect(await readdir(sessionModule.getSessionsDir())).toEqual([]);
+  });
+
+  test("leaves the receipt unchanged when Windows ACL privacy cannot be verified", async () => {
+    const receiptPath = path.join(oracleHomeDir, "windows-session-id-receipt");
+    await writeFile(receiptPath, "unchanged\n", { mode: 0o600 });
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    try {
+      await expect(
+        sessionModule.writeSessionIdReceipt("session-proof", receiptPath),
+      ).rejects.toThrow(/disabled on Windows.*ACL/i);
+      expect(await readFile(receiptPath, "utf8")).toBe("unchanged\n");
+    } finally {
+      if (platform) Object.defineProperty(process, "platform", platform);
+    }
+  });
+
+  test("rejects non-private and symlinked session ID receipts", async () => {
+    if (process.platform === "win32") return;
+    const publicReceipt = path.join(oracleHomeDir, "public-session-id-receipt");
+    await writeFile(publicReceipt, "unchanged\n", { mode: 0o600 });
+    await chmod(publicReceipt, 0o644);
+    await expect(sessionModule.preflightSessionIdReceipt(publicReceipt)).rejects.toThrow(
+      /private regular file/i,
+    );
+    await expect(
+      sessionModule.writeSessionIdReceipt("session-proof", publicReceipt),
+    ).rejects.toThrow(/private regular file/i);
+    expect(await readFile(publicReceipt, "utf8")).toBe("unchanged\n");
+
+    const target = path.join(oracleHomeDir, "session-id-target");
+    const link = path.join(oracleHomeDir, "session-id-link");
+    await writeFile(target, "unchanged\n", { mode: 0o600 });
+    await symlink(target, link);
+    await expect(sessionModule.writeSessionIdReceipt("session-proof", link)).rejects.toThrow(
+      /private regular file/i,
+    );
+    expect(await readFile(target, "utf8")).toBe("unchanged\n");
   });
 
   test("readSessionMetadata returns null for missing sessions and updateSessionMetadata persists changes", async () => {

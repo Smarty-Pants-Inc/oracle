@@ -117,20 +117,32 @@ See [Browser Mode](browser-mode.md) for usage.
 ```bash
 oracle chatgpt-export \
   --target-url "https://chatgpt.com/c/<conversation-id>" \
-  --session-id "<originating-oracle-session-id>" \
-  --out ~/Documents/chatgpt-conversation-exports/review
+  --session-id "<originating-oracle-session-id>"
 ```
 
 The exact approved conversation is exported as raw JSON, normalized JSON,
-Markdown, a manifest, and checksums. `--session-id` binds the export to that
-Oracle session's stored browser UUID, refreshed WebSocket, and SHA-256 ChatGPT
-account digest; the raw account id and session payload never leave the page
-context. Omit it only when the conversation has one globally unique stored
-affinity. `--remote-chrome` remains an explicit raw endpoint without
-stored-session affinity checks. Use `--browser-tab` or OBU session/tab ids to
-select an already approved tab, `--json` for a machine-readable result,
-`--no-recover-archived` to disable exact archived-chat recovery, and
-`--archive-after-export` to archive the conversation after success.
+Markdown, a manifest, and checksums. The default destination has an opaque
+random leaf under `~/Documents/chatgpt-conversation-exports`. An explicit
+`--out` path must be absent. Oracle rejects symlink parent components. On POSIX
+systems it creates the final directory as `0700` and every file exclusively as
+`0600`. On Windows the command fails closed until an owner-exclusive DACL can be
+established and verified.
+
+`--session-id` binds the export to that Oracle session's stored browser UUID,
+refreshed WebSocket, and SHA-256 ChatGPT account digest; the raw account id and
+session payload never leave the page context. Omit it only when the conversation
+has one globally unique stored affinity. Direct raw `--remote-chrome` and OBU
+CLI routes are rejected because they lack authoritative approved account
+affinity; the account-bound wrapper supplies its own verified affinity. Its
+local child argv includes affinity identifiers that same-user process inspection
+may observe, but never cookies, bearer tokens, or the raw ChatGPT user id.
+Stored-session, auto-resolved, and wrapper read-only exports use one exact
+authenticated GET and preserve archive state. `--archive-after-export` is
+available only through the account-bound wrapper for an inventory-confirmed
+active conversation and runs after the bundle succeeds. Expected email is
+optional for read-only stored affinity because cookie and bearer identities plus
+the expected digest are bound inside the expression; mutations still require
+complete email-bound affinity. Use `--json` for a machine-readable result.
 
 ## Image / media (browser)
 

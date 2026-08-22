@@ -1,6 +1,6 @@
 import path from "node:path";
 import fs from "node:fs/promises";
-import { createWriteStream, mkdirSync } from "node:fs";
+import { constants, createWriteStream, mkdirSync } from "node:fs";
 import type { WriteStream } from "node:fs";
 import { randomUUID } from "node:crypto";
 import net from "node:net";
@@ -273,6 +273,11 @@ export interface StoredRunOptions {
   geminiShowThoughts?: boolean;
 }
 
+export interface SessionArchiveRoute {
+  repository: string;
+  topic: string;
+}
+
 export interface SessionMetadata {
   id: string;
   createdAt: string;
@@ -301,6 +306,8 @@ export interface SessionMetadata {
   transport?: SessionTransportMetadata;
   error?: SessionUserErrorMetadata;
   lifecycle?: SessionLifecycleMetadata;
+  archiveRoute?: SessionArchiveRoute;
+  archiveAccountAlias?: string;
 }
 
 export type SessionStatus = "pending" | "running" | "completed" | "partial" | "error" | "cancelled";
@@ -406,9 +413,117 @@ export function createSessionId(prompt: string, customSlug?: string): string {
   }
   return slugify(prompt);
 }
+export function readSessionArchiveRoute(
+  env: NodeJS.ProcessEnv = process.env,
+): SessionArchiveRoute | undefined {
+  const repository = env.ORACLE_ARCHIVE_REPOSITORY;
+  const topic = env.ORACLE_ARCHIVE_TOPIC;
+  if (repository === undefined && topic === undefined) {
+    return undefined;
+  }
+  if (
+    !repository ||
+    !topic ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(repository) ||
+    !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(topic) ||
+    topic.split("/").includes("..")
+  ) {
+    throw new Error("Oracle archive route is invalid.");
+  }
+  return { repository, topic: topic.replace(/\/+$/, "") };
+}
+
+export function readSessionArchiveAccountAlias(
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const alias = env.ORACLE_ARCHIVE_ACCOUNT_ALIAS;
+  if (alias === undefined) {
+    return undefined;
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(alias)) {
+    throw new Error("Oracle archive account alias is invalid.");
+  }
+  return alias;
+}
+
+function validateSessionIdReceiptPath(receiptPath: string): void {
+  if (process.platform === "win32") {
+    throw new Error(
+      "Oracle session ID receipts are disabled on Windows until owner-exclusive ACLs can be verified.",
+    );
+  }
+  if (!path.isAbsolute(receiptPath) || !constants.O_NOFOLLOW) {
+    throw new Error("Oracle session ID receipt is invalid.");
+  }
+}
+
+async function openPrivateSessionIdReceipt(receiptPath: string) {
+  validateSessionIdReceiptPath(receiptPath);
+  const initial = await fs.lstat(receiptPath).catch(() => null);
+  const getuid = process.getuid?.();
+  if (
+    !initial?.isFile() ||
+    initial.isSymbolicLink() ||
+    (initial.mode & 0o777) !== 0o600 ||
+    (getuid !== undefined && initial.uid !== getuid)
+  ) {
+    throw new Error("Oracle session ID receipt is not a private regular file.");
+  }
+  const handle = await fs.open(receiptPath, constants.O_WRONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = await handle.stat();
+    if (
+      !opened.isFile() ||
+      (opened.mode & 0o777) !== 0o600 ||
+      opened.dev !== initial.dev ||
+      opened.ino !== initial.ino ||
+      (getuid !== undefined && opened.uid !== getuid)
+    ) {
+      throw new Error("Oracle session ID receipt changed before write.");
+    }
+    return handle;
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+export async function preflightSessionIdReceipt(
+  receiptPath = process.env.ORACLE_SESSION_ID_RECEIPT,
+): Promise<void> {
+  if (!receiptPath) {
+    return;
+  }
+  const handle = await openPrivateSessionIdReceipt(receiptPath);
+  await handle.close();
+}
+
+export async function writeSessionIdReceipt(
+  sessionId: string,
+  receiptPath = process.env.ORACLE_SESSION_ID_RECEIPT,
+): Promise<void> {
+  if (!receiptPath) {
+    return;
+  }
+  const handle = await openPrivateSessionIdReceipt(receiptPath);
+  try {
+    await handle.truncate(0);
+    await handle.writeFile(`${sessionId}\n`, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
 
 function sessionDir(id: string): string {
   return path.join(getSessionsDir(), id);
+}
+
+export async function removeSessionReservation(sessionId: string): Promise<void> {
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(sessionId)) {
+    throw new Error("Oracle session reservation ID is invalid.");
+  }
+  await fs.rm(sessionDir(sessionId), { recursive: true, force: true });
 }
 
 function metaPath(id: string): string {
@@ -562,6 +677,8 @@ export async function initializeSession(
   baseSlugOverride?: string,
 ): Promise<SessionMetadata> {
   await ensureSessionStorage();
+  const archiveRoute = readSessionArchiveRoute();
+  const archiveAccountAlias = readSessionArchiveAccountAlias();
   const baseSlug =
     baseSlugOverride || createSessionId(options.prompt || DEFAULT_SLUG, options.slug);
   const sessionId = await reserveUniqueSessionDir(baseSlug);
@@ -588,6 +705,8 @@ export async function initializeSession(
     mode,
     browser: browserConfig ? { config: browserConfig } : undefined,
     notifications,
+    archiveRoute,
+    archiveAccountAlias,
     options: {
       prompt: options.prompt,
       file: options.file ?? [],

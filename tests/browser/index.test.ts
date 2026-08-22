@@ -77,8 +77,6 @@ describe("remote browser identity", () => {
       ).rejects.toMatchObject({
         details: {
           stage: "remote-browser-identity",
-          expectedBrowserId: "browser-a",
-          observedBrowserId: "browser-b",
         },
       });
     } finally {
@@ -335,6 +333,27 @@ describe("browser run target cleanup", () => {
         chromePort: 9222,
       }),
     ).toBe(false);
+  });
+
+  test("marks a completed result when browser cleanup is not confirmed", () => {
+    const result = {
+      answerText: "kept answer",
+      answerMarkdown: "kept answer",
+      tookMs: 1,
+      answerTokens: 2,
+      answerChars: 11,
+      warnings: undefined,
+    };
+
+    __test__.appendBrowserCleanupWarning(result, 2);
+
+    expect(result.answerText).toBe("kept answer");
+    expect(result.warnings).toEqual([
+      expect.objectContaining({
+        code: "browser-cleanup-incomplete",
+        details: { failureCount: 2 },
+      }),
+    ]);
   });
 });
 

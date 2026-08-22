@@ -2,7 +2,13 @@
 
 ## 0.17.1 — Unreleased
 
+### Added
+
+- CLI/Browser: add account-bound, read-only ChatGPT conversation inventory and exact-thread export for curated archive reconciliation through a shared remote Chrome session.
+
 ### Fixed
+
+- Browser: bind remote setup, reattach, harvest, and prompt mutation to the expected browser, account, and conversation, and surface disposable-target cleanup failures instead of leaving authenticated tabs behind.
 
 - Browser: wait for copied-profile Chrome processes to exit before deleting the throwaway profile, preventing Chrome from recreating profile residue during shutdown.
 - Browser: close owned run and Project Sources tabs after non-recoverable failures while preserving explicit keep-browser and reattach recovery cases.

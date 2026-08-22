@@ -11,6 +11,7 @@ export async function uploadAttachmentFile(
     runtime: ChromeClient["Runtime"];
     dom?: ChromeClient["DOM"];
     input?: ChromeClient["Input"];
+    assertPageAffinity?: (action: string) => Promise<void>;
   },
   attachment: BrowserAttachment,
   logger: BrowserLogger,
@@ -331,6 +332,7 @@ export async function uploadAttachmentFile(
     if (!locate?.ok || typeof locate.x !== "number" || typeof locate.y !== "number") return false;
     const x = locate.x;
     const y = locate.y;
+    await deps.assertPageAffinity?.("attachment controls");
     await input.dispatchMouseEvent({ type: "mouseMoved", x, y });
     await input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", clickCount: 1 });
     await input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", clickCount: 1 });
@@ -339,6 +341,7 @@ export async function uploadAttachmentFile(
 
   const clickedTrusted = await clickPlusTrusted().catch(() => false);
   if (!clickedTrusted) {
+    await deps.assertPageAffinity?.("attachment controls");
     await Promise.resolve(
       runtime.evaluate({
         expression: `(() => {
@@ -1030,11 +1033,17 @@ export async function uploadAttachmentFile(
         let hasExpectedFile = snapshotMatchesExpected(immediateInputSnapshot);
         if (!hasExpectedFile) {
           if (mode === "set") {
+            await deps.assertPageAffinity?.("attachment transfer");
             await dom.setFileInputFiles({ nodeId: resultNode.nodeId, files: [attachment.path] });
           } else {
             const selector = `input[type="file"][data-oracle-upload-idx="${idx}"]`;
             try {
-              await transferAttachmentViaDataTransfer(runtime, attachment, selector);
+              await transferAttachmentViaDataTransfer(
+                runtime,
+                attachment,
+                selector,
+                deps.assertPageAffinity,
+              );
             } catch (error) {
               logger(
                 `Attachment data transfer failed: ${(error as Error)?.message ?? String(error)}`,
@@ -1104,6 +1113,7 @@ export async function uploadAttachmentFile(
           break;
         }
         logger("Attachment input set; retrying with data transfer to trigger ChatGPT upload.");
+        await deps.assertPageAffinity?.("attachment transfer cleanup");
         await dom
           .setFileInputFiles({ nodeId: resultNode.nodeId, files: [] })
           .catch(() => undefined);
@@ -1149,6 +1159,7 @@ export async function uploadAttachmentFile(
         break;
       }
       if (orderIndex < candidateOrder.length - 1) {
+        await deps.assertPageAffinity?.("attachment transfer cleanup");
         await dom
           .setFileInputFiles({ nodeId: resultNode.nodeId, files: [] })
           .catch(() => undefined);
@@ -1199,6 +1210,7 @@ export async function clearComposerAttachments(
   Runtime: ChromeClient["Runtime"],
   timeoutMs: number,
   logger?: BrowserLogger,
+  assertPageAffinity?: (action: string) => Promise<void>,
 ): Promise<void> {
   const deadline = Date.now() + Math.max(0, timeoutMs);
   const expression = `(() => {
@@ -1298,6 +1310,7 @@ export async function clearComposerAttachments(
   let sawAttachments = false;
   let lastState: { chipCount?: number; inputCount?: number } | null = null;
   while (Date.now() < deadline) {
+    await assertPageAffinity?.("attachment clearing");
     const response = await Runtime.evaluate({ expression, returnByValue: true });
     const value = response.result?.value as
       | { removeClicks?: number; chipCount?: number; inputCount?: number; hadAttachments?: boolean }
@@ -1824,7 +1837,6 @@ function buildUserTurnAttachmentExpression(options: {
     const currentConversationId = currentHref.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] ?? null;
     if (
       EXPECTED_CONVERSATION_ID &&
-      currentConversationId &&
       currentConversationId !== EXPECTED_CONVERSATION_ID
     ) {
       return { ok: false, conversationMismatch: true };

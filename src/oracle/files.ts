@@ -165,16 +165,15 @@ async function partitionFileInputs(
       continue;
     }
 
-    if (fg.isDynamicPattern(raw)) {
-      result.globPatterns.push(normalizeGlob(raw, cwd));
-      continue;
-    }
-
     const absolutePath = path.isAbsolute(raw) ? raw : path.resolve(cwd, raw);
     let stats: FsStats;
     try {
       stats = await fsModule.stat(absolutePath);
     } catch (error) {
+      if (fg.isDynamicPattern(raw)) {
+        result.globPatterns.push(normalizeGlob(raw, cwd));
+        continue;
+      }
       throw new FileValidationError(
         `Missing file or directory: ${raw}`,
         { path: absolutePath },

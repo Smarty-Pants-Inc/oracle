@@ -393,9 +393,12 @@ export async function captureAssistantMarkdown(
   Runtime: ChromeClient["Runtime"],
   meta: { messageId?: string | null; turnId?: string | null },
   logger: BrowserLogger,
+  expectedConversationId?: string,
+  assertPageAffinity?: (action: string) => Promise<void>,
 ): Promise<string | null> {
+  await assertPageAffinity?.("assistant markdown copy");
   const { result } = await Runtime.evaluate({
-    expression: buildCopyExpression(meta),
+    expression: buildCopyExpression(meta, expectedConversationId),
     returnByValue: true,
     awaitPromise: true,
   });
@@ -403,6 +406,7 @@ export async function captureAssistantMarkdown(
     return result.value.markdown;
   }
   const status = result?.value?.status;
+  if (status === "conversation-mismatch") return null;
   if (status && status !== "missing-button") {
     logger(`Copy button fallback status: ${status}`);
     await logDomFailure(Runtime, logger, "copy-markdown");
@@ -434,8 +438,9 @@ export function buildMarkdownFallbackExtractorForTest(minTurnLiteral = "0"): str
 
 export function buildCopyExpressionForTest(
   meta: { messageId?: string | null; turnId?: string | null } = {},
+  expectedConversationId?: string,
 ): string {
-  return buildCopyExpression(meta);
+  return buildCopyExpression(meta, expectedConversationId);
 }
 
 async function recoverAssistantResponse(
@@ -872,7 +877,6 @@ function buildAssistantSnapshotExpression(
     const currentConversationId = currentHref.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] ?? null;
     if (
       EXPECTED_CONVERSATION_ID &&
-      currentConversationId &&
       currentConversationId !== EXPECTED_CONVERSATION_ID
     ) {
       return null;
@@ -938,8 +942,7 @@ function buildResponseObserverExpression(
     };
     const matchesExpectedConversation = () => {
       if (!EXPECTED_CONVERSATION_ID) return true;
-      const currentId = currentConversationId();
-      return !currentId || currentId === EXPECTED_CONVERSATION_ID;
+      return currentConversationId() === EXPECTED_CONVERSATION_ID;
     };
     const isAnswerNowPlaceholder = (snapshot) => {
       const normalized = String(snapshot?.text ?? '').toLowerCase().trim();
@@ -1391,11 +1394,28 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
   })`;
 }
 
-function buildCopyExpression(meta: { messageId?: string | null; turnId?: string | null }): string {
+function buildCopyExpression(
+  meta: { messageId?: string | null; turnId?: string | null },
+  expectedConversationId?: string,
+): string {
+  const expectedConversationLiteral =
+    typeof expectedConversationId === "string" && expectedConversationId.trim().length > 0
+      ? JSON.stringify(expectedConversationId.trim())
+      : "null";
   return `(() => {
     ${buildClickDispatcher()}
     const BUTTON_SELECTOR = '${COPY_BUTTON_SELECTOR}';
     const TIMEOUT_MS = 10000;
+    const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
+    const currentConversationId = () => {
+      const currentHref = typeof location === 'object' && location.href ? location.href : '';
+      return currentHref.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] ?? null;
+    };
+    const matchesExpectedConversation = () =>
+      !EXPECTED_CONVERSATION_ID || currentConversationId() === EXPECTED_CONVERSATION_ID;
+    if (!matchesExpectedConversation()) {
+      return { success: false, status: 'conversation-mismatch' };
+    }
 
     const locateButton = () => {
       const hint = ${JSON.stringify(meta ?? {})};
@@ -1492,8 +1512,16 @@ function buildCopyExpression(meta: { messageId?: string | null; turnId?: string 
     return new Promise((resolve) => {
       const deadline = Date.now() + TIMEOUT_MS;
       const waitForButton = () => {
+        if (!matchesExpectedConversation()) {
+          resolve({ success: false, status: 'conversation-mismatch' });
+          return;
+        }
         const button = locateButton();
         if (button) {
+          if (!matchesExpectedConversation()) {
+            resolve({ success: false, status: 'conversation-mismatch' });
+            return;
+          }
           const interception = interceptClipboard();
           let settled = false;
           let pollId = null;
@@ -1525,6 +1553,10 @@ function buildCopyExpression(meta: { messageId?: string | null; turnId?: string 
           const requiredStableTicks = 3;
           const requiredStableMs = 250;
           const maybeFinish = () => {
+            if (!matchesExpectedConversation()) {
+              finish({ success: false, status: 'conversation-mismatch' });
+              return;
+            }
             const payload = readIntercepted();
             if (!payload.success) return;
             if (payload.markdown !== lastText) {
@@ -1545,11 +1577,19 @@ function buildCopyExpression(meta: { messageId?: string | null; turnId?: string 
 
           button.addEventListener('copy', handleCopy, true);
           button.scrollIntoView({ block: 'center', behavior: 'instant' });
+          if (!matchesExpectedConversation()) {
+            finish({ success: false, status: 'conversation-mismatch' });
+            return;
+          }
           dispatchClickSequence(button);
           pollId = setInterval(maybeFinish, 120);
           timeoutId = setTimeout(() => {
             button.removeEventListener('copy', handleCopy, true);
-            finish({ success: false, status: 'timeout' });
+            finish(
+              matchesExpectedConversation()
+                ? { success: false, status: 'timeout' }
+                : { success: false, status: 'conversation-mismatch' },
+            );
           }, TIMEOUT_MS);
           return;
         }

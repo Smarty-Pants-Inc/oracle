@@ -74,21 +74,39 @@ sending a prompt:
 ```bash
 oracle chatgpt-export \
   --target-url "https://chatgpt.com/c/<conversation-id>" \
-  --session-id "<originating-oracle-session-id>" \
-  --out ~/Documents/chatgpt-conversation-exports/review
+  --session-id "<originating-oracle-session-id>"
 ```
 
 The command scopes capture to that exact backend conversation URL and writes
-raw JSON, normalized JSON, Markdown, a manifest, and checksums. `--session-id`
-uses only that Oracle session's stored browser UUID, refreshed WebSocket, and
-SHA-256 digest of the originating ChatGPT user id; the raw id and session payload
-never leave the page context. Omit it only when the conversation has one globally
-unique stored affinity. `--remote-chrome` is an explicit raw-CLI endpoint and does
-not provide stored-session affinity checks. The command does not read cookies,
-local storage, browser profiles, or unrelated history. Archived targets are
-recovered only for the exact approved id and re-archived after export; use
-`--no-recover-archived` to disable recovery. `--archive-after-export` is an
-explicit mutation that archives an active conversation after a successful export.
+raw JSON, normalized JSON, Markdown, a manifest, and checksums. By default it
+creates a fresh directory with an opaque random leaf under
+`~/Documents/chatgpt-conversation-exports`; an explicit `--out` path must not
+already exist. Symlink parent components are rejected. On POSIX systems, the
+final directory is mode `0700` and every file is created exclusively with mode
+`0600`. On Windows, export fails closed until Oracle can establish and verify an
+owner-exclusive DACL; POSIX mode bits are not treated as an ACL guarantee.
+
+`--session-id` uses only that Oracle session's stored browser UUID, refreshed
+WebSocket, and SHA-256 digest of the originating ChatGPT user id; the raw id and
+session payload never leave the page context. Omit it only when the conversation
+has one globally unique stored affinity. Direct raw `--remote-chrome` and OBU
+CLI exports are rejected because they do not carry authoritative approved
+account affinity; the account-bound wrapper supplies its own verified affinity.
+Stored-session, auto-resolved, and wrapper read-only exports use one exact
+authenticated GET after browser and account affinity validation. The cookie and
+bearer identities plus expected digest are bound inside that expression, so a
+stored read-only export does not require an expected email. The command does not
+read cookie values, local storage, browser profiles, or unrelated history, and
+never automatically unarchives or re-archives an export target.
+`--archive-after-export` is the sole opt-in archive mutation. It is available
+only to the account-bound wrapper for an inventory-confirmed active conversation
+and runs after a successful bundle write; already archived conversations reject
+the flag and remain read-only.
+
+The account-bound wrapper passes browser/account affinity identifiers to its
+child Oracle process in local argv. Same-user process inspection may observe
+those identifiers under this local-tool threat model. Cookies, bearer tokens,
+and the raw ChatGPT user id are not passed in argv.
 
 ## Current Pipeline
 

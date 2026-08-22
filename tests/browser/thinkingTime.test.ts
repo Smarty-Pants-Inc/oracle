@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   buildThinkingTimeExpressionForTest,
   ensureThinkingTime,
@@ -6,6 +6,35 @@ import {
 } from "../../src/browser/actions/thinkingTime.js";
 
 describe("browser thinking-time selection expression", () => {
+  it("checks page affinity immediately before evaluating pinned effort selection", async () => {
+    const events: string[] = [];
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        events.push("evaluate");
+        expect(expression).toContain('const EXPECTED_CONVERSATION_ID = "conv-123"');
+        return { result: { value: { status: "already-selected", label: "Extended" } } };
+      }),
+    };
+
+    await ensureThinkingTime(runtime as never, "extended", vi.fn() as never, null, {
+      expectedConversationId: "conv-123",
+      assertPageAffinity: async () => {
+        events.push("affinity");
+      },
+    });
+
+    expect(events).toEqual(["affinity", "evaluate"]);
+  });
+
+  it("rechecks the pinned conversation immediately before effort option clicks", () => {
+    const expression = buildThinkingTimeExpressionForTest("extended", null, "conv-123");
+    const clickIndex = expression.indexOf("dispatchClickSequence(option);");
+    const guardIndex = expression.lastIndexOf("if (!matchesExpectedConversation())", clickIndex);
+
+    expect(clickIndex).toBeGreaterThan(-1);
+    expect(guardIndex).toBeGreaterThan(-1);
+    expect(guardIndex).toBeLessThan(clickIndex);
+  });
   it("uses centralized menu selectors and normalized matching", () => {
     const expression = buildThinkingTimeExpressionForTest();
     expect(expression).toContain("const MENU_CONTAINER_SELECTOR");

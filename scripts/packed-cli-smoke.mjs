@@ -10,9 +10,12 @@ function run(command, args, options = {}) {
   return execFileSync(command, args, {
     cwd: options.cwd ?? repoRoot,
     encoding: "utf8",
+    env: options.env ?? process.env,
     stdio: options.inherit ? "inherit" : ["ignore", "pipe", "pipe"],
   });
 }
+const npmEnv = { ...process.env };
+delete npmEnv.npm_config_allow_scripts;
 
 try {
   run("pnpm", ["pack", "--pack-destination", tmpRoot]);
@@ -23,9 +26,10 @@ try {
 
   const installDir = join(tmpRoot, "install");
   mkdirSync(installDir);
-  run("npm", ["init", "-y"], { cwd: installDir });
+  run("npm", ["init", "-y"], { cwd: installDir, env: npmEnv });
   run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", join(tmpRoot, tarball)], {
     cwd: installDir,
+    env: npmEnv,
   });
   const cliPath = join(
     installDir,

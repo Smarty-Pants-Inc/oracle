@@ -14,6 +14,7 @@ import {
   type BrowserLiveTailOptions,
 } from "./browserTabs.js";
 import { sessionStore } from "../sessionStore.js";
+import { writeSessionIdReceipt } from "../sessionManager.js";
 
 export interface StatusOptions extends OptionValues {
   hours: number;
@@ -55,6 +56,7 @@ interface SessionCommandDependencies {
   getSessionPaths: (
     sessionId: string,
   ) => Promise<{ dir: string; metadata: string; log: string; request: string }>;
+  writeSessionIdReceipt: (sessionId: string) => Promise<void>;
 }
 
 const defaultDependencies: SessionCommandDependencies = {
@@ -65,6 +67,7 @@ const defaultDependencies: SessionCommandDependencies = {
   usesDefaultStatusFilters,
   deleteSessionsOlderThan: (options) => sessionStore.deleteOlderThan(options),
   getSessionPaths: (sessionId) => sessionStore.getPaths(sessionId),
+  writeSessionIdReceipt,
 };
 
 const SESSION_OPTION_KEYS = new Set([
@@ -182,6 +185,7 @@ export async function handleSessionCommand(
         browserTabRef,
         recoverIfMissing,
       });
+      await deps.writeSessionIdReceipt(sessionId);
       return;
     }
     await deps.liveTailSessionBrowserOutput(sessionId, {
@@ -189,6 +193,7 @@ export async function handleSessionCommand(
       browserTabRef,
       recoverIfMissing,
     });
+    await deps.writeSessionIdReceipt(sessionId);
     return;
   }
   if (!sessionId) {
@@ -215,6 +220,9 @@ export async function handleSessionCommand(
     renderPrompt: !sessionOptions.hidePrompt,
     model: sessionOptions.model,
   });
+  if (!process.exitCode) {
+    await deps.writeSessionIdReceipt(sessionId);
+  }
 }
 
 export function formatSessionCleanupMessage(

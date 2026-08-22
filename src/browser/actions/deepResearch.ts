@@ -21,8 +21,13 @@ type ActivateOutcome =
   | { status: "already-active" }
   | { status: "plus-button-missing" }
   | { status: "dropdown-item-missing"; available?: string[] }
-  | { status: "pill-not-confirmed"; clickPoint?: { x?: number; y?: number } };
+  | { status: "pill-not-confirmed"; clickPoint?: { x?: number; y?: number } }
+  | { status: "conversation-mismatch" };
 
+interface DeepResearchAffinityOptions {
+  expectedConversationId?: string;
+  assertPageAffinity?: (action: string) => Promise<void>;
+}
 /**
  * Activates Deep Research mode through ChatGPT's composer tools menu and
  * verifies the selected tool pill before prompt submission.
@@ -31,8 +36,10 @@ export async function activateDeepResearch(
   Runtime: ChromeClient["Runtime"],
   Input: ChromeClient["Input"],
   logger: BrowserLogger,
+  options: DeepResearchAffinityOptions = {},
 ): Promise<void> {
-  const expression = buildActivateDeepResearchExpression();
+  await options.assertPageAffinity?.("Deep Research activation");
+  const expression = buildActivateDeepResearchExpression(options.expectedConversationId);
   const outcome = await Runtime.evaluate({
     expression,
     awaitPromise: true,
@@ -65,8 +72,8 @@ export async function activateDeepResearch(
     case "pill-not-confirmed": {
       const point = result.clickPoint;
       if (typeof point?.x === "number" && typeof point.y === "number") {
-        await clickTrustedPoint(Runtime, Input, point.x, point.y);
-        if (await waitForDeepResearchPill(Runtime)) {
+        await clickTrustedPoint(Runtime, Input, point.x, point.y, options);
+        if (await waitForDeepResearchPill(Runtime, 5000, options)) {
           logger("Deep Research mode activated");
           return;
         }
@@ -76,6 +83,11 @@ export async function activateDeepResearch(
         { stage: "deep-research-activate", code: "pill-not-confirmed" },
       );
     }
+    case "conversation-mismatch":
+      throw new BrowserAutomationError(
+        "ChatGPT conversation changed before Deep Research activation.",
+        { stage: "deep-research-activate", code: "conversation-mismatch" },
+      );
     default:
       throw new BrowserAutomationError("Unexpected result from Deep Research activation.", {
         stage: "deep-research-activate",
@@ -88,16 +100,25 @@ async function clickTrustedPoint(
   Input: ChromeClient["Input"],
   x: number,
   y: number,
+  options: DeepResearchAffinityOptions,
 ): Promise<void> {
   if (Input && typeof Input.dispatchMouseEvent === "function") {
     await Input.dispatchMouseEvent({ type: "mouseMoved", x, y });
+    await options.assertPageAffinity?.("Deep Research trusted click");
     await Input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", clickCount: 1 });
+    await options.assertPageAffinity?.("Deep Research trusted click release");
     await Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", clickCount: 1 });
     return;
   }
+  await options.assertPageAffinity?.("Deep Research trusted click");
   await Runtime.evaluate({
     expression: `(() => {
       const el = document.elementFromPoint(${JSON.stringify(x)}, ${JSON.stringify(y)});
+      const expectedConversationId = ${JSON.stringify(options.expectedConversationId ?? null)};
+      if (expectedConversationId) {
+        const currentConversationId = location.href.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] ?? null;
+        if (currentConversationId !== expectedConversationId) return false;
+      }
       if (!(el instanceof HTMLElement)) return false;
       el.click();
       return true;
@@ -109,9 +130,11 @@ async function clickTrustedPoint(
 async function waitForDeepResearchPill(
   Runtime: ChromeClient["Runtime"],
   timeoutMs = 5000,
+  options: DeepResearchAffinityOptions = {},
 ): Promise<boolean> {
+  await options.assertPageAffinity?.("Deep Research pill read");
   const { result } = await Runtime.evaluate({
-    expression: buildWaitForDeepResearchPillExpression(timeoutMs),
+    expression: buildWaitForDeepResearchPillExpression(timeoutMs, options.expectedConversationId),
     awaitPromise: true,
     returnByValue: true,
   });
@@ -126,12 +149,14 @@ export async function waitForResearchPlanAutoConfirm(
   Runtime: ChromeClient["Runtime"],
   logger: BrowserLogger,
   autoConfirmWaitMs: number = DEEP_RESEARCH_AUTO_CONFIRM_WAIT_MS,
+  options: DeepResearchAffinityOptions = {},
 ): Promise<void> {
   // Phase A: Detect research plan appearance (up to 60s)
   const planDeadline = Date.now() + 60_000;
   let planDetected = false;
 
   while (Date.now() < planDeadline) {
+    await options.assertPageAffinity?.("Deep Research plan read");
     const { result } = await Runtime.evaluate({
       expression: `(() => {
         const iframes = document.querySelectorAll('iframe');
@@ -170,6 +195,7 @@ export async function waitForResearchPlanAutoConfirm(
   // Phase B: Wait for auto-confirm countdown
   const confirmStart = Date.now();
   while (Date.now() - confirmStart < autoConfirmWaitMs) {
+    await options.assertPageAffinity?.("Deep Research plan confirmation read");
     const { result } = await Runtime.evaluate({
       expression: `(() => {
         const iframes = document.querySelectorAll('iframe');
@@ -213,6 +239,8 @@ export async function waitForDeepResearchCompletion(
     ignoredTargetKeys?: readonly string[];
     requireScopedTargetOwner?: boolean;
     targetBaselineCaptured?: boolean;
+    expectedConversationId?: string;
+    assertPageAffinity?: (action: string) => Promise<void>;
   },
 ): Promise<{
   text: string;
@@ -237,6 +265,7 @@ export async function waitForDeepResearchCompletion(
   logger(`Monitoring Deep Research (timeout: ${Math.round(timeoutMs / 60_000)}min)...`);
 
   while (Date.now() - start < timeoutMs) {
+    await options?.assertPageAffinity?.("Deep Research progress read");
     const { result } = await Runtime.evaluate({
       expression: buildDeepResearchCompletionPollExpression(minTurnLiteral),
       returnByValue: true,
@@ -269,6 +298,7 @@ export async function waitForDeepResearchCompletion(
     // (readDeepResearchTargetResult) attaches to the iframe's own CDP target and
     // walks its nested frames, so it CAN read the report. Prefer the target path
     // and fall back to the in-page frame path for legacy/inline rendering.
+    await options?.assertPageAffinity?.("Deep Research report read");
     const rawTargetResult = client
       ? ((
           await readDeepResearchTargetResult(
@@ -282,18 +312,20 @@ export async function waitForDeepResearchCompletion(
     // A completed target read is authoritative. If the target read is missing or
     // only in-progress, still try the in-page frame path so an incomplete target
     // read does not suppress a completed report there (legacy/inline rendering).
-    const inPageScan =
-      !targetResult?.completed && Page
-        ? await readDeepResearchFrameResult(
-            Runtime,
-            Page,
-            client,
-            scopedToNewTurns ? minTurnLiteral : -1,
-          ).catch(() => null)
-        : null;
+    let inPageScan = null;
+    if (!targetResult?.completed && Page) {
+      await options?.assertPageAffinity?.("Deep Research frame report read");
+      inPageScan = await readDeepResearchFrameResult(
+        Runtime,
+        Page,
+        client,
+        scopedToNewTurns ? minTurnLiteral : -1,
+      ).catch(() => null);
+    }
     const rawInPageResult = inPageScan?.read ?? null;
     const inPageResult = filterIncompleteDeepResearchRead(rawInPageResult);
     const read = pickPreferredDeepResearchRead(targetResult, inPageResult);
+    await options?.assertPageAffinity?.("Deep Research report read completion");
     // Target keys captured before submission are ignored, so a target result is
     // tied to this run. Main-page iframes are not: old reports can remain in the
     // conversation and must never authorize a new normal-response fallback.
@@ -321,7 +353,7 @@ export async function waitForDeepResearchCompletion(
         );
       }
       logger(`Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed)`);
-      return await extractDeepResearchResult(Runtime, logger, minTurnIndex ?? undefined);
+      return await extractDeepResearchResult(Runtime, logger, minTurnIndex ?? undefined, options);
     }
 
     const incompleteFrameResult = Boolean(
@@ -374,19 +406,31 @@ export async function extractDeepResearchResult(
   Runtime: ChromeClient["Runtime"],
   logger: BrowserLogger,
   minTurnIndex?: number,
+  options: DeepResearchAffinityOptions = {},
 ): Promise<{
   text: string;
   html?: string;
   meta: { turnId?: string | null; messageId?: string | null };
 }> {
-  const snapshot = await readAssistantSnapshot(Runtime, minTurnIndex);
+  await options.assertPageAffinity?.("Deep Research assistant response read");
+  const snapshot = await readAssistantSnapshot(
+    Runtime,
+    minTurnIndex,
+    options.expectedConversationId,
+  );
   const meta = {
     turnId: snapshot?.turnId ?? null,
     messageId: snapshot?.messageId ?? null,
   };
 
   // Try the copy-button approach first for clean markdown
-  const markdown = await captureAssistantMarkdown(Runtime, meta, logger);
+  const markdown = await captureAssistantMarkdown(
+    Runtime,
+    meta,
+    logger,
+    options.expectedConversationId,
+    options.assertPageAffinity,
+  );
   if (markdown && !isDeepResearchIncompleteText(markdown)) {
     return { text: markdown, html: snapshot?.html ?? undefined, meta };
   }
@@ -1156,25 +1200,41 @@ function buildFindDeepResearchPillExpression(functionName = "findDeepResearchPil
     };`;
 }
 
-function buildWaitForDeepResearchPillExpression(timeoutMs: number): string {
+function buildWaitForDeepResearchPillExpression(
+  timeoutMs: number,
+  expectedConversationId?: string,
+): string {
   return `(async () => {
     ${buildFindDeepResearchPillExpression()}
+    const EXPECTED_CONVERSATION_ID = ${JSON.stringify(expectedConversationId ?? null)};
+    const matchesExpectedConversation = () => {
+      if (!EXPECTED_CONVERSATION_ID) return true;
+      const href = typeof location === 'object' && location.href ? location.href : '';
+      return href.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] === EXPECTED_CONVERSATION_ID;
+    };
     const deadline = Date.now() + ${JSON.stringify(Math.max(timeoutMs, 0))};
     while (Date.now() < deadline) {
+      if (!matchesExpectedConversation()) return false;
       if (findDeepResearchPill()) return true;
       await new Promise(resolve => setTimeout(resolve, 200));
     }
-    return Boolean(findDeepResearchPill());
+    return matchesExpectedConversation() && Boolean(findDeepResearchPill());
   })()`;
 }
 
-function buildActivateDeepResearchExpression(): string {
+function buildActivateDeepResearchExpression(expectedConversationId?: string): string {
   const plusBtnSelector = JSON.stringify(DEEP_RESEARCH_PLUS_BUTTON);
   const targetText = JSON.stringify(DEEP_RESEARCH_DROPDOWN_ITEM_TEXT);
-
+  const expectedConversationLiteral = JSON.stringify(expectedConversationId ?? null);
   return `(async () => {
     ${buildClickDispatcher()}
     ${buildFindDeepResearchPillExpression()}
+    const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
+    const matchesExpectedConversation = () => {
+      if (!EXPECTED_CONVERSATION_ID) return true;
+      const href = typeof location === 'object' && location.href ? location.href : '';
+      return href.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] === EXPECTED_CONVERSATION_ID;
+    };
 
     const waitForPill = () => new Promise((resolve) => {
       let elapsed = 0;
@@ -1302,6 +1362,7 @@ function buildActivateDeepResearchExpression(): string {
         b => (b.getAttribute('aria-label') || '').toLowerCase().includes('add files')
       );
     if (!plusBtn) return { status: 'plus-button-missing' };
+    if (!matchesExpectedConversation()) return { status: 'conversation-mismatch' };
     dispatchClickSequence(plusBtn);
 
     // Step 2: Wait for dropdown
@@ -1333,12 +1394,14 @@ function buildActivateDeepResearchExpression(): string {
     if (!match) {
       const searchInput = findPopoverSearchInput();
       if (searchInput) {
+        if (!matchesExpectedConversation()) return { status: 'conversation-mismatch' };
         setSearchText(searchInput, ${targetText});
         await new Promise(resolve => setTimeout(resolve, 600));
         match = findDeepResearchItem({ requirePopover: true });
         available = collectAvailableItems({ requirePopover: true });
       }
     }
+    if (!matchesExpectedConversation()) return { status: 'conversation-mismatch' };
     if (!match) return { status: 'dropdown-item-missing', available };
 
     // Step 4: Click it
@@ -1348,14 +1411,18 @@ function buildActivateDeepResearchExpression(): string {
     const clickPoint = rect && rect.width > 0 && rect.height > 0
       ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
       : undefined;
+    if (!matchesExpectedConversation()) return { status: 'conversation-mismatch' };
     dispatchClickSequence(match);
 
     // Step 5: Verify pill appeared
     const pillConfirmed = await waitForPill();
+    if (!matchesExpectedConversation()) return { status: 'conversation-mismatch' };
     return pillConfirmed ? { status: 'activated' } : { status: 'pill-not-confirmed', clickPoint };
   })()`;
 }
 
-export function buildActivateDeepResearchExpressionForTest(): string {
-  return buildActivateDeepResearchExpression();
+export function buildActivateDeepResearchExpressionForTest(
+  expectedConversationId?: string,
+): string {
+  return buildActivateDeepResearchExpression(expectedConversationId);
 }

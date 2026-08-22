@@ -340,18 +340,136 @@ export interface RemoteChromeBrowserIdentity {
   browserWSEndpoint: string;
 }
 
-export function browserIdFromWebSocketEndpoint(browserWSEndpoint: string): string {
+type RemoteChromeHttpProtocol = "http:" | "https:";
+
+function parseBrowserWebSocketEndpoint(browserWSEndpoint: string): {
+  parsed: URL;
+  browserId: string;
+} {
   let parsed: URL;
   try {
     parsed = new URL(browserWSEndpoint);
   } catch {
     throw new Error("Remote Chrome returned an invalid browser WebSocket URL.");
   }
-  const match = /^\/devtools\/browser\/([^/]+)$/u.exec(parsed.pathname);
-  if ((parsed.protocol !== "ws:" && parsed.protocol !== "wss:") || !match?.[1]) {
+  const authorityStart = browserWSEndpoint.indexOf("//") + 2;
+  const pathStart = browserWSEndpoint.indexOf("/", authorityStart);
+  const rawAuthority = browserWSEndpoint.slice(
+    authorityStart,
+    pathStart === -1 ? undefined : pathStart,
+  );
+  const rawPath = pathStart === -1 ? "" : browserWSEndpoint.slice(pathStart);
+  const match = /^\/devtools\/browser\/([A-Za-z0-9._~-]+)$/u.exec(parsed.pathname);
+  if (
+    (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") ||
+    !parsed.hostname ||
+    parsed.username ||
+    parsed.password ||
+    parsed.search ||
+    parsed.hash ||
+    rawAuthority.includes("@") ||
+    rawPath.includes("?") ||
+    rawPath.includes("#") ||
+    !match?.[1] ||
+    match[1] === "." ||
+    match[1] === ".."
+  ) {
     throw new Error("Remote Chrome returned an invalid browser WebSocket URL.");
   }
-  return match[1];
+  return { parsed, browserId: match[1] };
+}
+
+function normalizeAuthorityHostname(hostname: string): string {
+  const normalized = hostname
+    .toLowerCase()
+    .replace(/^\[|\]$/gu, "")
+    .replace(/\.$/u, "");
+  if (
+    normalized === "localhost" ||
+    normalized === "::1" ||
+    /^127(?:\.\d{1,3}){3}$/u.test(normalized)
+  ) {
+    return "loopback";
+  }
+  const mappedLoopback = /^::ffff:([0-9a-f]{1,4}):[0-9a-f]{1,4}$/u.exec(normalized);
+  if (mappedLoopback?.[1] && Number.parseInt(mappedLoopback[1], 16) >> 8 === 127) {
+    return "loopback";
+  }
+  return normalized;
+}
+
+function configuredRemoteChromeUrl(
+  host: string,
+  port: number,
+  protocol: RemoteChromeHttpProtocol,
+): URL {
+  if (!Number.isInteger(port) || port <= 0 || port > 65_535 || !host.trim()) {
+    throw new Error("Remote Chrome configured authority is invalid.");
+  }
+  const trimmedHost = host.trim();
+  if (
+    trimmedHost.includes("@") ||
+    trimmedHost.includes("/") ||
+    trimmedHost.includes("?") ||
+    trimmedHost.includes("#")
+  ) {
+    throw new Error("Remote Chrome configured authority is invalid.");
+  }
+  const formattedHost =
+    trimmedHost.startsWith("[") && trimmedHost.endsWith("]")
+      ? trimmedHost
+      : trimmedHost.includes(":")
+        ? `[${trimmedHost}]`
+        : trimmedHost;
+  let configured: URL;
+  try {
+    configured = new URL(`${protocol}//${formattedHost}:${port}/`);
+  } catch {
+    throw new Error("Remote Chrome configured authority is invalid.");
+  }
+  if (
+    configured.username ||
+    configured.password ||
+    configured.search ||
+    configured.hash ||
+    configured.pathname !== "/"
+  ) {
+    throw new Error("Remote Chrome configured authority is invalid.");
+  }
+  return configured;
+}
+
+export function bindRemoteChromeBrowserWebSocketEndpoint({
+  browserWSEndpoint,
+  host,
+  port,
+  httpProtocol = "http:",
+}: {
+  browserWSEndpoint: string;
+  host: string;
+  port: number;
+  httpProtocol?: RemoteChromeHttpProtocol;
+}): RemoteChromeBrowserIdentity {
+  const { parsed, browserId } = parseBrowserWebSocketEndpoint(browserWSEndpoint);
+  const configured = configuredRemoteChromeUrl(host, port, httpProtocol);
+  const expectedWebSocketProtocol = httpProtocol === "https:" ? "wss:" : "ws:";
+  if (
+    parsed.protocol !== expectedWebSocketProtocol ||
+    (parsed.port ? Number(parsed.port) : parsed.protocol === "wss:" ? 443 : 80) !== port ||
+    normalizeAuthorityHostname(parsed.hostname) !== normalizeAuthorityHostname(configured.hostname)
+  ) {
+    throw new Error(
+      `Remote Chrome browser WebSocket authority does not match configured ${host}:${port}.`,
+    );
+  }
+  const bound = new URL(configured.href);
+  bound.protocol = expectedWebSocketProtocol;
+  bound.pathname = parsed.pathname;
+  return { browserId, browserWSEndpoint: bound.href };
+}
+
+export function browserIdFromWebSocketEndpoint(browserWSEndpoint: string): string {
+  return parseBrowserWebSocketEndpoint(browserWSEndpoint).browserId;
 }
 
 export async function resolveRemoteChromeBrowserIdentity({
@@ -365,8 +483,7 @@ export async function resolveRemoteChromeBrowserIdentity({
   attempts?: number;
   timeoutMs?: number;
 }): Promise<RemoteChromeBrowserIdentity> {
-  const formattedHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-  const versionUrl = `http://${formattedHost}:${port}/json/version`;
+  const versionUrl = new URL("/json/version", configuredRemoteChromeUrl(host, port, "http:")).href;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
       const controller = new AbortController();
@@ -380,10 +497,11 @@ export async function resolveRemoteChromeBrowserIdentity({
         if (typeof payload.webSocketDebuggerUrl !== "string") {
           throw new Error("Remote Chrome response is missing webSocketDebuggerUrl.");
         }
-        return {
-          browserId: browserIdFromWebSocketEndpoint(payload.webSocketDebuggerUrl),
+        return bindRemoteChromeBrowserWebSocketEndpoint({
           browserWSEndpoint: payload.webSocketDebuggerUrl,
-        };
+          host,
+          port,
+        });
       } finally {
         clearTimeout(timeout);
       }

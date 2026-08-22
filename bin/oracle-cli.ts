@@ -2,7 +2,7 @@
 import "dotenv/config";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { Command, Option } from "commander";
+import { Command, InvalidArgumentError, Option } from "commander";
 import type { OptionValues } from "commander";
 // Allow `npx @steipete/oracle oracle-mcp` to resolve the MCP server even though npx runs the default binary.
 if (process.argv[2] === "oracle-mcp") {
@@ -16,6 +16,11 @@ import { resolveDashPrompt } from "../src/cli/stdin.js";
 import chalk from "chalk";
 import type { SessionMetadata, SessionMode, BrowserSessionConfig } from "../src/sessionStore.js";
 import { sessionStore, pruneOldSessions } from "../src/sessionStore.js";
+import {
+  preflightSessionIdReceipt,
+  removeSessionReservation,
+  writeSessionIdReceipt,
+} from "../src/sessionManager.js";
 import {
   DEFAULT_API_MODEL,
   DEFAULT_BROWSER_MODEL,
@@ -61,6 +66,7 @@ import { shouldDetachSession, stopDetachedWorker } from "../src/cli/detach.js";
 import { applyHiddenAliases } from "../src/cli/hiddenAliases.js";
 import type { BrowserSessionRunnerDeps } from "../src/browser/sessionRunner.js";
 import { isMediaFile } from "../src/browser/prompt.js";
+import { handleChatGptInventoryCommand } from "../src/cli/chatgptInventory.js";
 import { formatCompactNumber } from "../src/cli/format.js";
 import { formatIntroLine } from "../src/cli/tagline.js";
 import { warnIfOversizeBundle } from "../src/cli/bundleWarnings.js";
@@ -224,6 +230,12 @@ interface RestartCommandOptions {
   wait?: boolean;
   remoteHost?: string;
   remoteToken?: string;
+}
+
+function parseStrictBoolean(value: string): boolean {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new InvalidArgumentError('Value must be exactly "true" or "false".');
 }
 
 const VERSION = getCliVersion();
@@ -1076,8 +1088,19 @@ addProjectSourcesCommonOptions(
 });
 
 program
+  .command("chatgpt-inventory")
+  .description("List active and archived ChatGPT conversations through an account-bound wrapper.")
+  .addOption(new Option("--expected-email <email>").hideHelp())
+  .option("--json", "Print the safe structured inventory result.", false)
+  .action(async function (this: Command) {
+    await handleChatGptInventoryCommand(this.optsWithGlobals());
+  });
+
+program
   .command("chatgpt-export")
-  .description("Export an approved existing ChatGPT conversation by capturing its backend payload.")
+  .description(
+    "Export an approved existing ChatGPT conversation without changing it unless post-export archiving is explicitly requested.",
+  )
   .requiredOption(
     "--target-url <url>",
     "Exact approved ChatGPT conversation URL, e.g. https://chatgpt.com/c/<conversation-id>.",
@@ -1094,10 +1117,9 @@ program
     "--browser-tab <ref>",
     "Existing ChatGPT tab ref to use (defaults to the exact target URL; accepts current, target id, URL, or title substring).",
   )
-  .option(
-    "--remote-chrome <host:port>",
-    "Explicit raw-CLI Chrome DevTools endpoint override; when omitted, resolve the endpoint from stored session affinity.",
-  )
+  .addOption(new Option("--remote-chrome-account-digest <sha256>").hideHelp())
+  .addOption(new Option("--expected-email <email>").hideHelp())
+  .addOption(new Option("--known-archived <bool>").argParser(parseStrictBoolean).hideHelp())
   .option("--obu-session-id <id>", "Open Browser Use session id for OBU-managed tabs.")
   .option("--obu-tab-id <id>", "Open Browser Use tab id for an approved OBU-managed tab.")
   .option(
@@ -1106,18 +1128,25 @@ program
   )
   .option("--chunk-size <chars>", "Characters to retrieve per CDP chunk (default 250000).")
   .option(
-    "--no-recover-archived",
-    "Disable automatic exact-conversation recovery from ChatGPT Archived Chats.",
-  )
-  .option(
     "--archive-after-export",
-    "Archive the exact conversation only after its export succeeds.",
+    "Archive an active account-bound conversation only after its export succeeds.",
     false,
   )
   .option("--json", "Print structured JSON result.", false)
   .action(async function (this: Command) {
     const { handleChatGptExportCommand } = await import("../src/cli/chatgptExport.js");
-    await handleChatGptExportCommand(this.opts());
+    const local = this.opts();
+    const globals = this.optsWithGlobals();
+    await handleChatGptExportCommand({
+      ...local,
+      remoteChrome: globals.remoteChrome,
+      remoteChromeBrowserId: globals.remoteChromeBrowserId,
+      remoteChromeBrowserWs: globals.remoteChromeBrowserWs,
+      browserTab: globals.browserTab,
+      ...(this.parent?.getOptionValueSource("timeout") === "cli"
+        ? { timeout: globals.timeout }
+        : {}),
+    });
   });
 
 const bridgeCommand = program
@@ -1360,16 +1389,8 @@ program
       return;
     }
     if (sessionId) {
-      const autoRender =
-        !command.getOptionValueSource?.("render") &&
-        !command.getOptionValueSource?.("renderMarkdown")
-          ? process.stdout.isTTY
-          : false;
-      const renderMarkdown = Boolean(
-        statusOptions.render || statusOptions.renderMarkdown || autoRender,
-      );
-      const { attachSession } = await import("../src/cli/sessionDisplay.js");
-      await attachSession(sessionId, { renderMarkdown, renderPrompt: !statusOptions.hidePrompt });
+      const { handleSessionCommand } = await import("../src/cli/sessionCommand.js");
+      await handleSessionCommand(sessionId, command);
       return;
     }
     const showExamples = usesDefaultStatusFilters(command);
@@ -2440,6 +2461,7 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     waitPreference = true;
   }
 
+  await preflightSessionIdReceipt();
   await sessionStore.ensureStorage();
   const baseRunOptions = buildRunOptions(resolvedOptions, {
     preview: false,
@@ -2476,6 +2498,19 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     process.cwd(),
     notifications,
   );
+  try {
+    await writeSessionIdReceipt(sessionMeta.id);
+  } catch (receiptError) {
+    try {
+      await removeSessionReservation(sessionMeta.id);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [receiptError, cleanupError],
+        "Oracle session ID receipt write and reservation cleanup failed.",
+      );
+    }
+    throw receiptError;
+  }
   const liveRunOptions: RunOracleOptions = {
     ...baseRunOptions,
     sessionId: sessionMeta.id,

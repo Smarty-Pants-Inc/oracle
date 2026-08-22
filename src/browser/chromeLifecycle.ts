@@ -6,6 +6,7 @@ import CDP from "chrome-remote-interface";
 import { launch, Launcher, type LaunchedChrome } from "chrome-launcher";
 import type { BrowserLogger, ResolvedBrowserConfig, ChromeClient } from "./types.js";
 import {
+  bindRemoteChromeBrowserWebSocketEndpoint,
   cleanupStaleProfileState,
   findRunningChromeDebugTargetForProfile,
   terminateRecordedChromeForProfile,
@@ -232,13 +233,13 @@ export async function connectToRemoteChrome(
   }
   if (targetUrl) {
     const targetConnection = await connectToNewTarget(host, port, targetUrl, logger, {
-      opened: () => `Opened dedicated remote Chrome tab targeting ${targetUrl}`,
+      opened: () => "Opened a dedicated remote Chrome tab.",
       openFailed: (message) =>
         `Failed to open dedicated remote Chrome tab (${message}); falling back to first target.`,
-      attachFailed: (targetId, message) =>
-        `Failed to attach to dedicated remote Chrome tab ${targetId} (${message}); falling back to first target.`,
-      closeFailed: (targetId, message) =>
-        `Failed to close unused remote Chrome tab ${targetId}: ${message}`,
+      attachFailed: (_targetId, message) =>
+        `Failed to attach to the dedicated remote Chrome tab (${message}); falling back to first target.`,
+      closeFailed: (_targetId, message) =>
+        `Failed to close an unused remote Chrome tab: ${message}`,
     });
     if (targetConnection) {
       return {
@@ -273,11 +274,11 @@ export async function closeRemoteChromeTarget(
   try {
     await CDP.Close({ host, port, id: targetId });
     if (logger.verbose) {
-      logger(`Closed remote Chrome tab ${targetId}`);
+      logger("Closed remote Chrome tab.");
     }
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger(`Failed to close remote Chrome tab ${targetId}: ${message}`);
+    logger("Failed to close remote Chrome tab.");
+    throw new Error("Remote Chrome tab cleanup failed.", { cause: error });
   }
 }
 
@@ -315,7 +316,12 @@ export async function listRemoteChromeTargets(options: {
     const targets = await CDP.List({ host: options.host, port: options.port });
     return targets as unknown as RemoteTargetInfo[];
   }
-  const browser = await CDP({ target: options.browserWSEndpoint, local: true });
+  const { browserWSEndpoint } = bindRemoteChromeBrowserWebSocketEndpoint({
+    browserWSEndpoint: options.browserWSEndpoint,
+    host: options.host,
+    port: options.port,
+  });
+  const browser = await CDP({ target: browserWSEndpoint, local: true });
   try {
     const result = await browser.Target.getTargets();
     return (result.targetInfos ?? []).map((target) => ({
@@ -325,6 +331,27 @@ export async function listRemoteChromeTargets(options: {
     }));
   } finally {
     await browser.close().catch(() => undefined);
+  }
+}
+
+async function closeRemoteTargetAndConfirm(browser: ChromeClient, targetId: string): Promise<void> {
+  try {
+    const result = await browser.Target.closeTarget({ targetId });
+    if (result.success === false) {
+      throw new Error("Remote Chrome target cleanup failed.");
+    }
+  } catch (error) {
+    try {
+      const remaining = await browser.Target.getTargets();
+      if (!(remaining.targetInfos ?? []).some((target) => target.targetId === targetId)) return;
+    } catch {
+      // Preserve the close failure when target state cannot be confirmed.
+    }
+    throw error;
+  }
+  const remaining = await browser.Target.getTargets();
+  if ((remaining.targetInfos ?? []).some((target) => target.targetId === targetId)) {
+    throw new Error("Remote Chrome target cleanup was not confirmed.");
   }
 }
 
@@ -351,40 +378,92 @@ export async function connectToRemoteChromeTarget(
     };
   }
 
+  const { browserWSEndpoint } = bindRemoteChromeBrowserWebSocketEndpoint({
+    browserWSEndpoint: options.browserWSEndpoint,
+    host,
+    port,
+  });
   const browser = await connectToBrowserWebSocket(
     host,
     port,
-    options.browserWSEndpoint,
+    browserWSEndpoint,
     logger,
     options.approvalWaitMs,
   );
   let targetId = options.targetId;
+  let createdTarget = false;
   try {
     if (!targetId) {
       const created = await browser.Target.createTarget({
         url: options.targetUrl ?? "about:blank",
       });
       targetId = created.targetId;
-      logger(`Opened dedicated remote Chrome tab targeting ${options.targetUrl ?? "about:blank"}`);
+      createdTarget = true;
+      logger("Opened a dedicated remote Chrome tab.");
     }
     const attached = await browser.Target.attachToTarget({ targetId, flatten: true });
     const client = createSessionBoundChromeClient(browser, attached.sessionId);
     return {
       client,
       targetId,
-      browserWSEndpoint: options.browserWSEndpoint,
+      browserWSEndpoint,
       close: async () => {
-        await browser.Target.detachFromTarget({ sessionId: attached.sessionId }).catch(
-          () => undefined,
-        );
-        if (options.closeTargetOnDispose && targetId) {
-          await browser.Target.closeTarget({ targetId }).catch(() => undefined);
+        if (!options.closeTargetOnDispose) {
+          await browser.Target.detachFromTarget({ sessionId: attached.sessionId }).catch(
+            () => undefined,
+          );
+          await browser.close().catch(() => undefined);
+          return;
         }
-        await browser.close().catch(() => undefined);
+        let targetCleanupError: unknown;
+        try {
+          await browser.Target.detachFromTarget({ sessionId: attached.sessionId });
+        } catch (error) {
+          targetCleanupError = error;
+        }
+        if (targetId) {
+          try {
+            await closeRemoteTargetAndConfirm(browser, targetId);
+            targetCleanupError = undefined;
+          } catch (error) {
+            targetCleanupError = error;
+          }
+        }
+        let browserCloseError: unknown;
+        try {
+          await browser.close();
+        } catch (error) {
+          browserCloseError = error;
+        }
+        if (targetCleanupError && browserCloseError) {
+          throw new AggregateError(
+            [targetCleanupError, browserCloseError],
+            "Remote Chrome target cleanup failed.",
+          );
+        }
+        if (targetCleanupError) {
+          throw new AggregateError([targetCleanupError], "Remote Chrome target cleanup failed.");
+        }
+        if (browserCloseError) throw browserCloseError;
       },
     };
   } catch (error) {
-    await browser.close().catch(() => undefined);
+    const failures: unknown[] = [error];
+    if (createdTarget && targetId) {
+      try {
+        await closeRemoteTargetAndConfirm(browser, targetId);
+      } catch (closeError) {
+        failures.push(closeError);
+      }
+    }
+    try {
+      await browser.close();
+    } catch (closeError) {
+      failures.push(closeError);
+    }
+    if (failures.length > 1) {
+      throw new AggregateError(failures, "Remote Chrome target setup and cleanup failed.");
+    }
     throw error;
   }
 }
@@ -569,12 +648,11 @@ export async function connectWithNewTab(
   let attempt = 0;
   while (attempt <= retries) {
     const targetConnection = await connectToNewTarget(effectiveHost, port, url, logger, {
-      opened: (targetId) => `Opened isolated browser tab (target=${targetId})`,
+      opened: () => "Opened isolated browser tab.",
       openFailed: (message) => `Failed to open isolated browser tab (${message}); ${fallbackLabel}`,
-      attachFailed: (targetId, message) =>
-        `Failed to attach to isolated browser tab ${targetId} (${message}); ${fallbackLabel}`,
-      closeFailed: (targetId, message) =>
-        `Failed to close unused browser tab ${targetId}: ${message}`,
+      attachFailed: (_targetId, message) =>
+        `Failed to attach to isolated browser tab (${message}); ${fallbackLabel}`,
+      closeFailed: (_targetId, message) => `Failed to close unused browser tab: ${message}`,
     });
     if (targetConnection) {
       return targetConnection;
@@ -614,27 +692,26 @@ export async function closeTab(
         continue;
       }
       if (!targets.some((target) => (target.targetId ?? target.id) === targetId)) {
-        logger(`Closed isolated browser tab (target=${targetId})`);
+        logger("Closed isolated browser tab.");
         return true;
       }
     }
-    logger(`Browser tab close was not confirmed (target=${targetId})`);
+    logger("Browser tab close was not confirmed.");
     return false;
-  } catch (error) {
+  } catch {
     try {
       const targets = (await CDP.List({ host: effectiveHost, port })) as Array<{
         id?: string;
         targetId?: string;
       }>;
       if (!targets.some((target) => (target.targetId ?? target.id) === targetId)) {
-        logger(`Closed isolated browser tab (target=${targetId})`);
+        logger("Closed isolated browser tab.");
         return true;
       }
     } catch {
       // Preserve the original close error below.
     }
-    const message = error instanceof Error ? error.message : String(error);
-    logger(`Failed to close browser tab ${targetId}: ${message}`);
+    logger("Failed to close browser tab.");
     return false;
   }
 }
@@ -656,11 +733,10 @@ export async function createChromePageTarget(
       logger("Failed to create a replacement Chrome tab.");
       return undefined;
     }
-    logger(`Opened replacement Chrome tab (target=${createdTargetId})`);
+    logger("Opened replacement Chrome tab.");
     return createdTargetId;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger(`Failed to create a replacement Chrome tab: ${message}`);
+  } catch {
+    logger("Failed to create a replacement Chrome tab.");
     return undefined;
   }
 }
@@ -685,9 +761,8 @@ export async function ensureChromePageTargetAfterClose(
     if (existingPageTargetId) {
       return existingPageTargetId;
     }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger(`Failed to inspect Chrome tabs before closing ${closingTargetId}: ${message}`);
+  } catch {
+    logger("Failed to inspect Chrome tabs before closing the current tab.");
   }
   return await createChromePageTarget(port, logger, host);
 }
@@ -742,9 +817,8 @@ export async function closeBlankChromeTabs(
     try {
       await CDP.Close({ host: effectiveHost, port, id: targetId });
       closed += 1;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logger(`Failed to close blank Chrome tab ${targetId}: ${message}`);
+    } catch {
+      logger("Failed to close blank Chrome tab.");
     }
   }
   if (closed > 0) {

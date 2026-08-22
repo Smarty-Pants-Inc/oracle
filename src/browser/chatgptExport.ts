@@ -6,19 +6,32 @@ import { promisify } from "node:util";
 import type { BrowserArchiveResult, ChromeClient } from "./types.js";
 import { archiveChatGptConversation } from "./actions/archiveConversation.js";
 import {
+  assertChatGptTabOrigin,
   connectToExistingChatGptTab,
   DEFAULT_REMOTE_CHROME_HOST,
   DEFAULT_REMOTE_CHROME_PORT,
+  isChatGptUrl,
   openChatGptTarget,
+  type ChatGptTabConnection,
 } from "./liveTabs.js";
 import { delay } from "./utils.js";
 import {
-  browserIdFromWebSocketEndpoint,
+  bindRemoteChromeBrowserWebSocketEndpoint,
   resolveRemoteChromeBrowserIdentity,
 } from "./profileState.js";
 import { readChatGptAccountDigest } from "./pageActions.js";
+import { closeTab, connectToRemoteChromeTarget } from "./chromeLifecycle.js";
+import { assertChatGptAccountAffinity } from "./chatgptAccount.js";
 
 const execFileAsync = promisify(execFile);
+const WINDOWS_EXPORT_UNAVAILABLE_MESSAGE =
+  "ChatGPT conversation export is disabled on Windows until owner-exclusive ACLs can be established and verified.";
+
+function assertValidExportChunkSize(chunkSize: number): void {
+  if (!Number.isFinite(chunkSize) || !Number.isInteger(chunkSize) || chunkSize <= 0) {
+    throw new Error("ChatGPT export chunk size must be a finite positive integer.");
+  }
+}
 
 type JsonRecord = Record<string, unknown>;
 
@@ -61,9 +74,10 @@ export interface ChatGptConversationExportOptions {
   browserId?: string;
   browserWSEndpoint?: string;
   accountDigest?: string;
+  expectedEmail?: string;
   timeoutMs?: number;
   chunkSize?: number;
-  recoverArchived?: boolean;
+  knownArchived?: boolean;
   archiveAfterExport?: boolean;
 }
 
@@ -104,9 +118,17 @@ export interface ChatGptConversationExportResult {
 export interface ChatGptArchiveRecoveryResult {
   attempted: boolean;
   recovered: boolean;
-  status: "not-needed" | "recovered";
-  settingsUrl?: string;
-  patchStatus?: number;
+  status: "not-needed" | "read-only";
+  getStatus?: number;
+  archiveStatePreserved?: boolean;
+}
+
+interface ResolvedChatGptExportConnection {
+  client: ChatGptTabConnection["client"];
+  targetId: string;
+  tabUrl: string;
+  tabTitle: string;
+  recovery: ChatGptArchiveRecoveryResult;
 }
 
 interface CaptureHitSummary {
@@ -116,16 +138,11 @@ interface CaptureHitSummary {
   ok?: boolean;
   contentType?: string | null;
   chars?: number;
-  title?: string | null;
   conversation_id?: string | null;
   mappingCount?: number | null;
-  current_node?: string | null;
-  bodyPreview?: string;
 }
 
 interface CapturePollResult {
-  href?: string;
-  title?: string;
   hit?: CaptureHitSummary | null;
   hits?: CaptureHitSummary[];
 }
@@ -160,18 +177,23 @@ export function conversationIdFromChatGptUrl(rawUrl: string): string {
     parsed = new URL(rawUrl);
   } catch {
     throw new Error(
-      "target-url must be https://chatgpt.com/c/<conversation-id> or https://chatgpt.com/g/<project>/c/<conversation-id>",
+      "target-url must be https://chatgpt.com/c/<conversation-id> or https://chatgpt.com/g/<project>/project/c/<conversation-id>",
     );
   }
-  if (parsed.protocol !== "https:" || parsed.hostname !== "chatgpt.com") {
+  if (
+    !isChatGptUrl(rawUrl) ||
+    parsed.hostname.toLowerCase() !== "chatgpt.com" ||
+    parsed.search ||
+    parsed.hash
+  ) {
     throw new Error(
-      "target-url must be https://chatgpt.com/c/<conversation-id> or https://chatgpt.com/g/<project>/c/<conversation-id>",
+      "target-url must be https://chatgpt.com/c/<conversation-id> or https://chatgpt.com/g/<project>/project/c/<conversation-id>",
     );
   }
-  const match = /^(?:\/c|\/g\/[^/?#]+\/c)\/([^/?#]+)\/?$/.exec(parsed.pathname);
+  const match = /^(?:\/c|\/g\/[^/?#]+\/(?:project\/)?c)\/([^/?#]+)\/?$/.exec(parsed.pathname);
   if (!match?.[1]) {
     throw new Error(
-      "target-url must be a specific ChatGPT conversation URL: https://chatgpt.com/c/<conversation-id> or https://chatgpt.com/g/<project>/c/<conversation-id>",
+      "target-url must be a specific ChatGPT conversation URL: https://chatgpt.com/c/<conversation-id> or https://chatgpt.com/g/<project>/project/c/<conversation-id>",
     );
   }
   return match[1];
@@ -179,13 +201,6 @@ export function conversationIdFromChatGptUrl(rawUrl: string): string {
 
 export function buildBackendConversationUrl(conversationId: string): string {
   return `https://chatgpt.com/backend-api/conversation/${conversationId}`;
-}
-
-export function archivedSettingsUrlFromConversationUrl(rawUrl: string): string {
-  const parsed = new URL(rawUrl);
-  const project = /^(\/g\/[^/?#]+)\/c\/[^/?#]+\/?$/.exec(parsed.pathname)?.[1];
-  const base = project ? `${parsed.origin}${project}/project` : `${parsed.origin}/`;
-  return `${base}#settings/DataControls/ArchivedChats`;
 }
 
 export function isSameConversationUrl(actualUrl: string, expectedConversationId: string): boolean {
@@ -196,24 +211,62 @@ export function isSameConversationUrl(actualUrl: string, expectedConversationId:
   }
 }
 
+async function assertChatGptExportAccountAffinity(
+  Runtime: ChromeClient["Runtime"],
+  expectedAccountDigest: string | undefined,
+  action: string,
+  expectedEmail?: string,
+): Promise<string> {
+  await assertChatGptTabOrigin(Runtime, action);
+  if (!expectedAccountDigest) {
+    return await readChatGptAccountDigest(Runtime);
+  }
+  if (expectedEmail) {
+    return await assertChatGptAccountAffinity(
+      Runtime,
+      expectedAccountDigest,
+      expectedEmail,
+      action,
+    );
+  }
+  const observedAccountDigest = await readChatGptAccountDigest(Runtime);
+  if (observedAccountDigest !== expectedAccountDigest) {
+    throw new Error(`Remote Chrome account identity changed before ${action}.`);
+  }
+  return observedAccountDigest;
+}
+
+async function assertChatGptExportCaptureAffinity(
+  Runtime: ChromeClient["Runtime"],
+  expectedAccountDigest: string,
+  conversationId: string,
+  action: string,
+  expectedEmail?: string,
+): Promise<void> {
+  await assertChatGptExportAccountAffinity(Runtime, expectedAccountDigest, action, expectedEmail);
+  const currentUrl = await evaluateByValue<string>(Runtime, "location.href", "conversation URL");
+  if (!isSameConversationUrl(currentUrl, conversationId)) {
+    throw new Error(`ChatGPT conversation changed before ${action}.`);
+  }
+}
+
 async function assertChatGptExportMutationAffinity(
   Runtime: ChromeClient["Runtime"],
   expectedAccountDigest: string | undefined,
   conversationId: string,
   action: string,
+  expectedEmail?: string,
 ): Promise<void> {
-  if (expectedAccountDigest) {
-    const observedAccountDigest = await readChatGptAccountDigest(Runtime);
-    if (observedAccountDigest !== expectedAccountDigest) {
-      throw new Error(`Remote Chrome account identity changed before ${action}.`);
-    }
+  if (!expectedAccountDigest || !expectedEmail) {
+    throw new Error(`Complete ChatGPT account affinity is required before ${action}.`);
   }
-  const currentUrl = await evaluateByValue<string>(Runtime, "location.href", "conversation URL");
-  if (!isSameConversationUrl(currentUrl, conversationId)) {
-    throw new Error(
-      `ChatGPT conversation changed before ${action}; expected ${conversationId}, got ${currentUrl}`,
-    );
-  }
+  await assertChatGptExportCaptureAffinity(
+    Runtime,
+    expectedAccountDigest,
+    conversationId,
+    action,
+    expectedEmail,
+  );
 }
 
 export async function assertChatGptExportMutationAffinityForTest(
@@ -221,8 +274,15 @@ export async function assertChatGptExportMutationAffinityForTest(
   expectedAccountDigest: string | undefined,
   conversationId: string,
   action = "archive mutation",
+  expectedEmail?: string,
 ): Promise<void> {
-  await assertChatGptExportMutationAffinity(Runtime, expectedAccountDigest, conversationId, action);
+  await assertChatGptExportMutationAffinity(
+    Runtime,
+    expectedAccountDigest,
+    conversationId,
+    action,
+    expectedEmail,
+  );
 }
 
 function hashText(value: string): string {
@@ -243,16 +303,22 @@ export function buildScopedBackendCaptureHook(targetApiUrl: string): string {
   return `
 (() => {
   const TARGET = ${jsString(targetApiUrl)};
-  window.__oracleChatGptBackendCapture = { target: TARGET, hits: [] };
+  if (window !== window.top) return;
+  try { window.__oracleChatGptBackendCapture?.cleanup?.(); } catch {}
+  const originalFetch = window.fetch;
+  const OriginalXHR = window.XMLHttpRequest;
+  let active = true;
+  const capture = { target: TARGET, hits: [], cleanup: null };
   const record = async (kind, input, response) => {
     try {
       const url = new URL(typeof input === "string" ? input : (input && input.url) || "", location.href).href;
       if (url !== TARGET) return;
       const text = await response.clone().text();
+      if (!active) return;
       try {
         sessionStorage.setItem("__oracleChatGptBackendCapture:" + TARGET, text);
       } catch {}
-      window.__oracleChatGptBackendCapture.hits.push({
+      capture.hits.push({
         kind,
         url,
         status: response.status,
@@ -263,19 +329,16 @@ export function buildScopedBackendCaptureHook(targetApiUrl: string): string {
         capturedAt: new Date().toISOString()
       });
     } catch (error) {
-      try {
-        window.__oracleChatGptBackendCapture.hits.push({ kind, error: String(error), capturedAt: new Date().toISOString() });
-      } catch {}
+      if (active) capture.hits.push({ kind, error: String(error), capturedAt: new Date().toISOString() });
     }
   };
-  const originalFetch = window.fetch;
-  window.fetch = async function(input, init) {
+  const wrappedFetch = async function(input, init) {
     const response = await originalFetch.apply(this, arguments);
-    record("fetch", input, response);
+    void record("fetch", input, response);
     return response;
   };
-  const OriginalXHR = window.XMLHttpRequest;
-  window.XMLHttpRequest = function() {
+  wrappedFetch.__oracleChatGptBackendCaptureTarget = TARGET;
+  const WrappedXHR = function() {
     const xhr = new OriginalXHR();
     let requestUrl = "";
     const open = xhr.open;
@@ -286,12 +349,12 @@ export function buildScopedBackendCaptureHook(targetApiUrl: string): string {
     xhr.addEventListener("loadend", () => {
       try {
         const href = new URL(requestUrl, location.href).href;
-        if (href !== TARGET) return;
+        if (!active || href !== TARGET) return;
         const text = String(xhr.responseText || "");
         try {
           sessionStorage.setItem("__oracleChatGptBackendCapture:" + TARGET, text);
         } catch {}
-        window.__oracleChatGptBackendCapture.hits.push({
+        capture.hits.push({
           kind: "xhr",
           url: href,
           status: xhr.status,
@@ -305,63 +368,193 @@ export function buildScopedBackendCaptureHook(targetApiUrl: string): string {
     });
     return xhr;
   };
+  WrappedXHR.__oracleChatGptBackendCaptureTarget = TARGET;
+  capture.cleanup = () => {
+    active = false;
+    if (window.fetch === wrappedFetch) window.fetch = originalFetch;
+    if (window.XMLHttpRequest === WrappedXHR) window.XMLHttpRequest = OriginalXHR;
+    for (const hit of capture.hits) {
+      if (hit && typeof hit === "object") delete hit.text;
+    }
+    capture.hits.length = 0;
+    try { sessionStorage.removeItem("__oracleChatGptBackendCapture:" + TARGET); } catch {}
+    if (window.__oracleChatGptBackendCapture === capture) {
+      delete window.__oracleChatGptBackendCapture;
+    }
+  };
+  window.__oracleChatGptBackendCapture = capture;
+  window.fetch = wrappedFetch;
+  window.XMLHttpRequest = WrappedXHR;
 })();
 `.trim();
 }
 
-export function buildArchivedConversationRecoveryHookForTest(conversationId: string): string {
-  return buildArchivedConversationRecoveryHook(conversationId);
-}
-
-function buildArchivedConversationRecoveryHook(conversationId: string): string {
-  const targetApiUrl = buildBackendConversationUrl(conversationId);
+function buildCaptureCleanupExpression(targetApiUrl: string): string {
   return `
 (() => {
   const TARGET = ${jsString(targetApiUrl)};
-  const KEY = "__oracleArchivedConversationRecovery";
-  if (window[KEY]?.target === TARGET && window[KEY]?.status === "pending") return;
-  const state = window[KEY] = {
-    target: TARGET,
-    status: "pending",
-    attempted: false,
-    recovered: false
-  };
-  const originalFetch = window.fetch.bind(window);
-  window.fetch = async function(input, init) {
-    const request = input instanceof Request ? input : new Request(input, init);
-    const response = await originalFetch(input, init);
-    try {
-      const url = new URL(request.url, location.href);
-      if (
-        state.status === "pending" &&
-        request.method.toUpperCase() === "GET" &&
-        url.pathname === "/backend-api/conversations" &&
-        url.searchParams.get("is_archived") === "true"
-      ) {
-        state.attempted = true;
-        state.listStatus = response.status;
-        const headers = new Headers(request.headers);
-        headers.set("content-type", "application/json");
-        headers.delete("content-length");
-        headers.delete("x-openai-target-path");
-        headers.delete("x-openai-target-route");
-        const patch = await originalFetch(TARGET, {
-          method: "PATCH",
-          headers,
-          credentials: "include",
-          body: JSON.stringify({ is_archived: false })
-        });
-        state.patchStatus = patch.status;
-        state.recovered = patch.ok;
-        state.status = patch.ok ? "recovered" : "failed";
-      }
-    } catch (error) {
-      state.status = "failed";
-      state.error = error instanceof Error ? error.message : String(error);
+  const CAPTURE_KEY = "__oracleChatGptBackendCapture:" + TARGET;
+  const WRAPPER_MARKER = "__oracleChatGptBackendCaptureTarget";
+  const capture = window.__oracleChatGptBackendCapture;
+  try { capture?.cleanup?.(); } catch {}
+  if (Array.isArray(capture?.hits)) {
+    for (const hit of capture.hits) {
+      if (hit && typeof hit === "object") delete hit.text;
     }
-    return response;
+    capture.hits.length = 0;
+  }
+  let storageCleared = false;
+  try {
+    sessionStorage.removeItem(CAPTURE_KEY);
+    storageCleared = sessionStorage.getItem(CAPTURE_KEY) === null;
+  } catch {}
+  if (window.__oracleChatGptBackendCapture === capture) {
+    delete window.__oracleChatGptBackendCapture;
+  }
+  const globalCleared = typeof window.__oracleChatGptBackendCapture === "undefined";
+  const fetchRestored = window.fetch?.[WRAPPER_MARKER] !== TARGET;
+  const xhrRestored = window.XMLHttpRequest?.[WRAPPER_MARKER] !== TARGET;
+  return globalCleared && storageCleared && fetchRestored && xhrRestored;
+})()
+`.trim();
+}
+
+export function buildChatGptCaptureCleanupExpressionForTest(targetApiUrl: string): string {
+  return buildCaptureCleanupExpression(targetApiUrl);
+}
+
+export function buildReadOnlyConversationGetExpressionForTest(
+  targetApiUrl: string,
+  expectedAccountDigest?: string,
+  expectedEmail?: string,
+): string {
+  const url = new URL(targetApiUrl);
+  const prefix = "/backend-api/conversation/";
+  if (
+    url.origin !== "https://chatgpt.com" ||
+    !url.pathname.startsWith(prefix) ||
+    url.pathname.length === prefix.length ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error("Expected an exact ChatGPT backend conversation URL.");
+  }
+  return buildReadOnlyConversationGetExpression(
+    targetApiUrl,
+    decodeURIComponent(url.pathname.slice(prefix.length)),
+    expectedAccountDigest,
+    expectedEmail,
+  );
+}
+
+function buildReadOnlyConversationGetExpression(
+  targetApiUrl: string,
+  expectedConversationId: string,
+  expectedAccountDigest?: string,
+  expectedEmail?: string,
+): string {
+  return `
+(async () => {
+  const TARGET = ${jsString(targetApiUrl)};
+  const EXPECTED_CONVERSATION_ID = ${jsString(expectedConversationId)};
+  const EXPECTED_ACCOUNT_DIGEST = ${JSON.stringify(expectedAccountDigest ?? null)};
+  const EXPECTED_EMAIL = ${JSON.stringify(expectedEmail?.trim().toLowerCase() || null)};
+  const digestUserId = async (userId) => {
+    if (typeof userId !== "string" || !userId.trim() || !globalThis.crypto?.subtle) return null;
+    const bytes = new Uint8Array(await crypto.subtle.digest(
+      "SHA-256", new TextEncoder().encode(userId.trim()),
+    ));
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
   };
-})();
+  const sessionIdentity = async (session) => {
+    const userId = typeof session?.user?.id === "string" ? session.user.id.trim() : "";
+    const email = typeof session?.user?.email === "string"
+      ? session.user.email.trim().toLowerCase()
+      : "";
+    const accountDigest = await digestUserId(userId);
+    return accountDigest && email ? { accountDigest, email } : null;
+  };
+  const bearerIdentity = async (accessToken) => {
+    try {
+      const match = /^([A-Za-z0-9_-]+)\\.([A-Za-z0-9_-]+)\\.([A-Za-z0-9_-]+)$/.exec(accessToken);
+      if (!match) return null;
+      const encoded = match[2].replace(/-/g, "+").replace(/_/g, "/");
+      const payload = JSON.parse(atob(encoded.padEnd(Math.ceil(encoded.length / 4) * 4, "=")));
+      const auth = payload?.["https://api.openai.com/auth"];
+      const profile = payload?.["https://api.openai.com/profile"];
+      const userIds = [auth?.chatgpt_user_id, auth?.user_id]
+        .filter((value) => typeof value === "string" && value.trim())
+        .map((value) => value.trim());
+      const email = typeof profile?.email === "string" ? profile.email.trim().toLowerCase() : "";
+      if (!email || userIds.length === 0 || userIds.some((value) => value !== userIds[0])) return null;
+      const accountDigest = await digestUserId(userIds[0]);
+      return accountDigest ? { accountDigest, email } : null;
+    } catch {
+      return null;
+    }
+  };
+  const sessionResponse = await fetch("/api/auth/session", {
+    method: "GET",
+    cache: "no-store",
+    credentials: "include",
+    redirect: "error"
+  });
+  if (!sessionResponse.ok) throw new Error("Authenticated ChatGPT session is unavailable.");
+  const session = await sessionResponse.json();
+  const accessToken = typeof session?.accessToken === "string" ? session.accessToken.trim() : "";
+  if (!accessToken) throw new Error("Authenticated ChatGPT access token is unavailable.");
+  const cookieIdentity = await sessionIdentity(session);
+  const tokenIdentity = await bearerIdentity(accessToken);
+  if (
+    !cookieIdentity ||
+    !tokenIdentity ||
+    cookieIdentity.accountDigest !== tokenIdentity.accountDigest ||
+    cookieIdentity.email !== tokenIdentity.email ||
+    (EXPECTED_ACCOUNT_DIGEST && tokenIdentity.accountDigest !== EXPECTED_ACCOUNT_DIGEST) ||
+    (EXPECTED_EMAIL && tokenIdentity.email !== EXPECTED_EMAIL)
+  ) {
+    throw new Error("Authenticated ChatGPT bearer identity does not match the approved account.");
+  }
+  const headers = new Headers({ accept: "application/json" });
+  headers.set("authorization", "Bearer " + accessToken);
+  const response = await fetch(TARGET, {
+    method: "GET",
+    cache: "no-store",
+    credentials: "include",
+    redirect: "error",
+    headers
+  });
+  const responseUrl = new URL(response.url, location.href).href;
+  if (response.redirected || responseUrl !== TARGET) {
+    throw new Error("Authenticated ChatGPT exact GET left the approved backend URL.");
+  }
+  const text = await response.text();
+  let parsed = null;
+  try { parsed = JSON.parse(text); } catch {}
+  const conversationId = typeof parsed?.conversation_id === "string" ? parsed.conversation_id : null;
+  if (!response.ok || response.status !== 200 || conversationId !== EXPECTED_CONVERSATION_ID) {
+    throw new Error("Authenticated ChatGPT exact GET did not return the approved conversation.");
+  }
+  const hit = {
+    kind: "authenticated-exact-get",
+    url: responseUrl,
+    status: response.status,
+    ok: response.ok,
+    contentType: response.headers.get("content-type"),
+    chars: text.length,
+    title: typeof parsed?.title === "string" ? parsed.title : null,
+    conversation_id: conversationId,
+    mappingCount: parsed?.mapping && typeof parsed.mapping === "object"
+      ? Object.keys(parsed.mapping).length
+      : null,
+    current_node: typeof parsed?.current_node === "string" ? parsed.current_node : null
+  };
+  window.__oracleChatGptBackendCapture = {
+    target: TARGET,
+    hits: [{ ...hit, text, capturedAt: new Date().toISOString() }]
+  };
+  return hit;
+})()
 `.trim();
 }
 
@@ -369,7 +562,8 @@ async function waitForDocument(Runtime: ChromeClient["Runtime"], timeoutMs: numb
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const ready = await evaluateByValue<string>(Runtime, "document.readyState", "document ready");
-    if (ready === "interactive" || ready === "complete") return;
+    const href = await evaluateByValue<string>(Runtime, "location.href", "document URL");
+    if (isChatGptUrl(href) && (ready === "interactive" || ready === "complete")) return;
     await delay(100);
   }
   throw new Error("Timed out waiting for ChatGPT document readiness.");
@@ -387,102 +581,26 @@ async function waitForConversationUrl(
     if (isSameConversationUrl(lastUrl, conversationId)) return lastUrl;
     await delay(150);
   }
-  throw new Error(
-    `Recovered conversation did not open at the approved URL; expected ${conversationId}, got ${lastUrl}`,
-  );
+  throw new Error("Conversation did not open at the approved URL.");
 }
 
-async function recoverArchivedConversation({
-  targetUrl,
-  host,
-  port,
-  browserWSEndpoint,
-  accountDigest,
-  timeoutMs,
-}: {
-  targetUrl: string;
-  host: string;
-  port: number;
-  browserWSEndpoint?: string;
-  accountDigest?: string;
-  timeoutMs: number;
-}): Promise<{
-  client: Awaited<ReturnType<typeof connectToExistingChatGptTab>>["client"];
-  targetId: string;
-  tabUrl: string;
-  recovery: ChatGptArchiveRecoveryResult;
-}> {
-  const conversationId = conversationIdFromChatGptUrl(targetUrl);
-  const settingsUrl = archivedSettingsUrlFromConversationUrl(targetUrl);
-  const projectUrl = settingsUrl.split("#", 1)[0] as string;
-  const targetId = await openChatGptTarget({
-    host,
-    port,
-    browserWSEndpoint,
-    url: accountDigest ? "https://chatgpt.com/" : projectUrl,
-  });
-  const { client } = await connectToExistingChatGptTab({
-    host,
-    port,
-    browserWSEndpoint,
-    ref: targetId,
-  });
-  try {
-    const { Page, Runtime } = client;
-    await Page.enable();
-    await waitForDocument(Runtime, timeoutMs);
-    if (accountDigest) {
-      const observedAccountDigest = await readChatGptAccountDigest(Runtime);
-      if (observedAccountDigest !== accountDigest) {
-        throw new Error("Remote Chrome account identity changed before ChatGPT export.");
-      }
-    }
-    await Runtime.evaluate({
-      expression: buildArchivedConversationRecoveryHook(conversationId),
-      awaitPromise: false,
-      returnByValue: true,
-    });
-    await Page.addScriptToEvaluateOnNewDocument({
-      source: buildArchivedConversationRecoveryHook(conversationId),
-    });
-    await Page.navigate({ url: settingsUrl });
-    const deadline = Date.now() + timeoutMs;
-    let state: JsonRecord = {};
-    while (Date.now() < deadline) {
-      state = await evaluateByValue<JsonRecord>(
-        Runtime,
-        "window.__oracleArchivedConversationRecovery || {}",
-        "archive recovery",
-      );
-      if (state.status === "recovered") break;
-      if (state.status === "failed") {
-        throw new Error(`Archived conversation recovery failed: ${JSON.stringify(state)}`);
-      }
-      await delay(200);
-    }
-    if (state.status !== "recovered") {
-      throw new Error(
-        `Timed out recovering archived ChatGPT conversation: ${JSON.stringify(state)}`,
-      );
-    }
-    await Page.navigate({ url: targetUrl });
-    const tabUrl = await waitForConversationUrl(Runtime, conversationId, timeoutMs);
-    await waitForDocument(Runtime, timeoutMs);
-    return {
-      client,
+async function closeOpenedChatGptTarget(
+  host: string,
+  port: number,
+  targetId: string,
+  browserWSEndpoint?: string,
+): Promise<void> {
+  if (browserWSEndpoint) {
+    const connection = await connectToRemoteChromeTarget(host, port, () => {}, {
+      browserWSEndpoint,
       targetId,
-      tabUrl,
-      recovery: {
-        attempted: true,
-        recovered: true,
-        status: "recovered",
-        settingsUrl,
-        patchStatus: Number(state.patchStatus),
-      },
-    };
-  } catch (error) {
-    await client.close().catch(() => undefined);
-    throw error;
+      closeTargetOnDispose: true,
+    });
+    await connection.close();
+    return;
+  }
+  if (!(await closeTab(port, targetId, () => {}, host))) {
+    throw new Error("ChatGPT target cleanup was not confirmed.");
   }
 }
 
@@ -550,13 +668,85 @@ async function evaluateObuByValue<T>(
     sessionId,
     tabId,
     "Runtime.evaluate",
-    { expression, awaitPromise: false, returnByValue: true },
+    { expression, awaitPromise: true, returnByValue: true },
     "60s",
   );
   if (result.exceptionDetails) {
     throw new Error(`${timeoutLabel} failed: ${JSON.stringify(result.exceptionDetails)}`);
   }
   return asRecord(result.result).value as T;
+}
+
+const CHATGPT_ACCOUNT_DIGEST_EXPRESSION = `(() => (async () => {
+  try {
+    const response = await fetch('/api/auth/session', {
+      method: 'GET', cache: 'no-store', credentials: 'include', redirect: 'error',
+    });
+    if (!response.ok) return null;
+    const body = await response.json();
+    const userId = typeof body?.user?.id === 'string' ? body.user.id.trim() : '';
+    if (!userId || !globalThis.crypto?.subtle) return null;
+    const bytes = new Uint8Array(await crypto.subtle.digest(
+      'SHA-256', new TextEncoder().encode(userId),
+    ));
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+  } catch {
+    return null;
+  }
+})())()`;
+
+async function readChatGptAccountDigestWithEvaluator(
+  evaluate: EvaluateExpression,
+): Promise<string> {
+  const digest = await evaluate<string | null>(
+    CHATGPT_ACCOUNT_DIGEST_EXPRESSION,
+    "ChatGPT account identity",
+  );
+  if (typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest)) {
+    throw new Error("Authenticated ChatGPT account identity is unavailable.");
+  }
+  return digest;
+}
+
+async function cleanupCaptureWithEvaluator(
+  evaluate: EvaluateExpression,
+  targetApiUrl: string,
+): Promise<void> {
+  const cleaned = await evaluate<boolean>(
+    buildCaptureCleanupExpression(targetApiUrl),
+    "capture cleanup",
+  );
+  if (cleaned !== true) {
+    throw new Error("ChatGPT raw capture cleanup could not be verified.");
+  }
+}
+
+function captureHitDiagnostics(value: unknown): JsonRecord | null {
+  const hit = asRecord(value);
+  if (Object.keys(hit).length === 0) return null;
+  const diagnostics: JsonRecord = {};
+  for (const key of ["kind", "status", "ok", "contentType", "chars", "mappingCount"]) {
+    const item = hit[key];
+    if (item == null || ["string", "number", "boolean"].includes(typeof item)) {
+      diagnostics[key] = item;
+    }
+  }
+  return diagnostics;
+}
+
+function capturePollTimeoutMessage(value: unknown): string {
+  const poll = asRecord(value);
+  const hits = Array.isArray(poll.hits) ? poll.hits : [];
+  const diagnostics: JsonRecord = {
+    hit: captureHitDiagnostics(poll.hit),
+    hitCount: hits.length,
+    hits: hits.map(captureHitDiagnostics).filter((hit) => hit !== null),
+  };
+  return `Timed out waiting for backend conversation capture: ${JSON.stringify(diagnostics)}`;
+}
+
+export function formatChatGptCaptureTimeoutForTest(value: unknown): string {
+  return capturePollTimeoutMessage(value);
 }
 
 async function pollCaptureWithEvaluator(
@@ -581,15 +771,12 @@ async function pollCaptureWithEvaluator(
       ok: hit.ok,
       contentType: hit.contentType,
       chars: text.length,
-      title: parsed?.title || null,
       conversation_id: parsed?.conversation_id || null,
-      mappingCount: parsed?.mapping ? Object.keys(parsed.mapping).length : null,
-      current_node: parsed?.current_node || null,
-      bodyPreview: text.slice(0, 120)
+      mappingCount: parsed?.mapping ? Object.keys(parsed.mapping).length : null
     };
   });
   const match = summaries.find((hit) => hit.url === target && hit.status === 200 && hit.conversation_id);
-  return { href: location.href, title: document.title, hit: match || null, hits: summaries };
+  return { hit: match || null, hits: summaries };
 })()
 `;
   while (Date.now() < deadline) {
@@ -597,9 +784,9 @@ async function pollCaptureWithEvaluator(
     if (last?.hit) {
       return last;
     }
-    await delay(1_000);
+    await delay(Math.min(1_000, Math.max(0, deadline - Date.now())));
   }
-  throw new Error(`Timed out waiting for backend conversation capture: ${JSON.stringify(last)}`);
+  throw new Error(capturePollTimeoutMessage(last));
 }
 
 async function pollCapture(
@@ -621,17 +808,20 @@ export async function retrieveCapturedTextWithEvaluator(
   chars: number,
   chunkSize: number,
 ): Promise<string> {
+  assertValidExportChunkSize(chunkSize);
   const parts: string[] = [];
   for (let start = 0; start < chars; start += chunkSize) {
     const end = Math.min(start + chunkSize, chars);
     const expression = `
 (() => {
   const target = ${jsString(targetApiUrl)};
-  const hits = window.__oracleChatGptBackendCapture?.hits || [];
+  const capture = window.__oracleChatGptBackendCapture;
+  const hits = capture?.hits || [];
   const hit = hits.find((item) => item.url === target && item.status === 200 && String(item.text || "").startsWith("{"));
   const text = hit?.text || sessionStorage.getItem("__oracleChatGptBackendCapture:" + target);
   if (!text || !String(text).startsWith("{")) return null;
-  return String(text).slice(${start}, ${end});
+  const chunk = String(text).slice(${start}, ${end});
+  return chunk;
 })()
 `;
     let part: string | null = null;
@@ -905,8 +1095,74 @@ function markdownForPayload(payload: JsonRecord): string {
   return lines.join("\n");
 }
 
+async function isExistingRealDirectory(directory: string): Promise<boolean> {
+  try {
+    const info = await fs.lstat(directory);
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new Error(
+        "ChatGPT export destination parent components must be real directories, not symlinks.",
+      );
+    }
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function ensurePrivateOutputDirectory(outDir: string): Promise<void> {
+  if (process.platform === "win32") {
+    throw new Error(WINDOWS_EXPORT_UNAVAILABLE_MESSAGE);
+  }
+  const absoluteOutDir = path.resolve(outDir);
+  const parentDir = path.dirname(absoluteOutDir);
+  const { root } = path.parse(absoluteOutDir);
+  let current = root;
+  for (const component of parentDir.slice(root.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    if (await isExistingRealDirectory(current)) continue;
+    let created = false;
+    try {
+      await fs.mkdir(current, { mode: 0o700 });
+      created = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    if (!(await isExistingRealDirectory(current))) {
+      throw new Error("ChatGPT export destination parent disappeared during creation.");
+    }
+    if (created) await fs.chmod(current, 0o700);
+  }
+
+  try {
+    await fs.mkdir(absoluteOutDir, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new Error(
+        "ChatGPT export destination must be a fresh path that does not already exist.",
+      );
+    }
+    throw error;
+  }
+  const info = await fs.lstat(absoluteOutDir);
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new Error("ChatGPT export destination must be a real directory, not a symlink.");
+  }
+  await fs.chmod(absoluteOutDir, 0o700);
+}
+
+async function writePrivateFile(filePath: string, value: string): Promise<void> {
+  const file = await fs.open(filePath, "wx", 0o600);
+  try {
+    await file.chmod(0o600);
+    await file.writeFile(value, "utf8");
+  } finally {
+    await file.close();
+  }
+}
+
 async function writeJson(filePath: string, value: unknown): Promise<void> {
-  await fs.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  await writePrivateFile(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 export function scanTextForSecretLikeMarkers(
@@ -953,7 +1209,7 @@ async function writeSha256Sums(outDir: string, files: string[]): Promise<string>
     lines.push(`${await sha256File(absolute)}  ${file}`);
   }
   const sumsPath = path.join(outDir, "SHA256SUMS.txt");
-  await fs.writeFile(sumsPath, `${lines.join("\n")}\n`, "utf8");
+  await writePrivateFile(sumsPath, `${lines.join("\n")}\n`);
   return sumsPath;
 }
 
@@ -975,70 +1231,84 @@ async function writeBundle({
   captureInfoPath: string;
   sha256SumsPath: string;
 }> {
-  await fs.mkdir(outDir, { recursive: true });
-  const rawBackendPath = path.join(outDir, "backend-conversation.json");
-  const conversationPath = path.join(outDir, "conversation.json");
-  const payloadPath = path.join(outDir, "payload.json");
-  const markdownPath = path.join(outDir, "conversation.md");
-  const manifestPath = path.join(outDir, "manifest.json");
-  const captureInfoPath = path.join(outDir, "backend-capture-info.json");
-  const redactionReportPath = path.join(outDir, "redaction-report.json");
-  const stats = asRecord(payload.stats);
-  const files = [
-    "backend-conversation.json",
-    "backend-capture-info.json",
-    "conversation.json",
-    "payload.json",
-    "conversation.md",
-    "manifest.json",
-    "redaction-report.json",
-  ];
-  await fs.writeFile(rawBackendPath, rawText, "utf8");
-  await writeJson(conversationPath, payload);
-  await writeJson(payloadPath, payload);
-  await fs.writeFile(markdownPath, markdownForPayload(payload), "utf8");
-  await writeJson(captureInfoPath, captureInfo);
-  await writeJson(manifestPath, {
-    schema_version: "oracle.chatgpt-conversation-export.manifest.v1",
-    created_at: new Date().toISOString(),
-    target_url: payload.target_url,
-    final_url: payload.final_url,
-    conversation_id: payload.conversation_id,
-    expected_conversation_id: payload.expected_conversation_id,
-    scope_ok: payload.scope_ok === true,
-    extraction_method: payload.extraction_method,
-    turn_count: stats.turn_count,
-    user_turns: stats.user_turns,
-    assistant_turns: stats.assistant_turns,
-    tool_turns: stats.tool_turns,
-    system_turns: stats.system_turns,
-    stats,
-    backend_probe: payload.backend_probe,
-    files,
-    non_claims: [
-      "No cookies, localStorage, profile stores, or unrelated history were read.",
-      "The hook captured only the exact target backend conversation URL during page load.",
-    ],
-  });
-  const redactionReport = await buildRedactionReport(outDir, [
-    "backend-conversation.json",
-    "backend-capture-info.json",
-    "conversation.json",
-    "payload.json",
-    "conversation.md",
-    "manifest.json",
-  ]);
-  await writeJson(redactionReportPath, redactionReport);
-  const sha256SumsPath = await writeSha256Sums(outDir, files);
-  return {
-    rawBackendPath,
-    payloadPath,
-    markdownPath,
-    manifestPath,
-    captureInfoPath,
-    sha256SumsPath,
-  };
+  await ensurePrivateOutputDirectory(outDir);
+  try {
+    const rawBackendPath = path.join(outDir, "backend-conversation.json");
+    const conversationPath = path.join(outDir, "conversation.json");
+    const payloadPath = path.join(outDir, "payload.json");
+    const markdownPath = path.join(outDir, "conversation.md");
+    const manifestPath = path.join(outDir, "manifest.json");
+    const captureInfoPath = path.join(outDir, "backend-capture-info.json");
+    const redactionReportPath = path.join(outDir, "redaction-report.json");
+    const stats = asRecord(payload.stats);
+    const files = [
+      "backend-conversation.json",
+      "backend-capture-info.json",
+      "conversation.json",
+      "payload.json",
+      "conversation.md",
+      "manifest.json",
+      "redaction-report.json",
+    ];
+    await writePrivateFile(rawBackendPath, rawText);
+    await writeJson(conversationPath, payload);
+    await writeJson(payloadPath, payload);
+    await writePrivateFile(markdownPath, markdownForPayload(payload));
+    await writeJson(captureInfoPath, captureInfo);
+    await writeJson(manifestPath, {
+      schema_version: "oracle.chatgpt-conversation-export.manifest.v1",
+      created_at: new Date().toISOString(),
+      target_url: payload.target_url,
+      final_url: payload.final_url,
+      conversation_id: payload.conversation_id,
+      expected_conversation_id: payload.expected_conversation_id,
+      scope_ok: payload.scope_ok === true,
+      extraction_method: payload.extraction_method,
+      turn_count: stats.turn_count,
+      user_turns: stats.user_turns,
+      assistant_turns: stats.assistant_turns,
+      tool_turns: stats.tool_turns,
+      system_turns: stats.system_turns,
+      stats,
+      backend_probe: payload.backend_probe,
+      files,
+      non_claims: [
+        "No cookies, localStorage, profile stores, or unrelated history were read.",
+        "The hook captured only the exact target backend conversation URL during page load.",
+      ],
+    });
+    const redactionReport = await buildRedactionReport(outDir, [
+      "backend-conversation.json",
+      "backend-capture-info.json",
+      "conversation.json",
+      "payload.json",
+      "conversation.md",
+      "manifest.json",
+    ]);
+    await writeJson(redactionReportPath, redactionReport);
+    const sha256SumsPath = await writeSha256Sums(outDir, files);
+    return {
+      rawBackendPath,
+      payloadPath,
+      markdownPath,
+      manifestPath,
+      captureInfoPath,
+      sha256SumsPath,
+    };
+  } catch (error) {
+    try {
+      await fs.rm(outDir, { recursive: true, force: true });
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "ChatGPT export bundle creation and partial-output cleanup failed.",
+      );
+    }
+    throw error;
+  }
 }
+
+export const writeChatGptExportBundleForTest = writeBundle;
 
 async function finalizeCapturedExport({
   backend,
@@ -1061,7 +1331,7 @@ async function finalizeCapturedExport({
 }): Promise<Omit<ChatGptConversationExportResult, "archiveRecovery" | "postExportArchive">> {
   const conversationId = conversationIdFromChatGptUrl(targetUrl);
   if (backend.conversation_id !== conversationId) {
-    throw new Error(`Captured wrong conversation id: ${backend.conversation_id ?? "(missing)"}`);
+    throw new Error("Captured backend data did not match the approved conversation.");
   }
   const rawBackendSha256 = hashText(rawText);
   const rawBackendSizeBytes = Buffer.byteLength(rawText, "utf8");
@@ -1101,9 +1371,231 @@ async function finalizeCapturedExport({
   };
 }
 
+async function disposeChatGptExportConnection(client: ChromeClient): Promise<void> {
+  await client.close();
+}
+
+async function evaluateReadOnlyConversationGet(
+  Runtime: ChromeClient["Runtime"],
+  targetApiUrl: string,
+  conversationId: string,
+  expectedAccountDigest: string,
+  expectedEmail?: string,
+): Promise<CaptureHitSummary> {
+  const outcome = await Runtime.evaluate({
+    expression: buildReadOnlyConversationGetExpression(
+      targetApiUrl,
+      conversationId,
+      expectedAccountDigest,
+      expectedEmail,
+    ),
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  if (outcome.exceptionDetails) {
+    throw new Error(
+      `Read-only conversation GET failed: ${JSON.stringify(outcome.exceptionDetails)}`,
+    );
+  }
+  const hit = outcome.result?.value;
+  if (!hit || typeof hit !== "object" || Array.isArray(hit)) {
+    throw new Error("Read-only conversation GET returned no response metadata.");
+  }
+  return hit as CaptureHitSummary;
+}
+
+async function captureChatGptConversationReadOnly({
+  targetUrl,
+  targetApiUrl,
+  outDir,
+  host,
+  port,
+  browserId,
+  browserWSEndpoint,
+  accountDigest,
+  expectedEmail,
+  timeoutMs,
+  chunkSize,
+}: {
+  targetUrl: string;
+  targetApiUrl: string;
+  outDir: string;
+  host: string;
+  port: number;
+  browserId: string;
+  browserWSEndpoint: string;
+  accountDigest: string;
+  expectedEmail?: string;
+  timeoutMs: number;
+  chunkSize: number;
+}): Promise<ChatGptConversationExportResult> {
+  const conversationId = conversationIdFromChatGptUrl(targetUrl);
+  const boundIdentity = bindRemoteChromeBrowserWebSocketEndpoint({
+    browserWSEndpoint,
+    host,
+    port,
+  });
+  if (boundIdentity.browserId !== browserId) {
+    throw new Error("Read-only ChatGPT export browser id does not match its WebSocket.");
+  }
+  const opened = await connectToRemoteChromeTarget(host, port, () => {}, {
+    browserWSEndpoint: boundIdentity.browserWSEndpoint,
+    targetUrl: "https://chatgpt.com/",
+    closeTargetOnDispose: true,
+  });
+  const targetId = opened.targetId;
+
+  let completedResult: ChatGptConversationExportResult | undefined;
+  let operationError: unknown;
+  let captureCleanupRequired = false;
+  try {
+    if (!targetId || opened.browserWSEndpoint !== boundIdentity.browserWSEndpoint) {
+      throw new Error("Read-only ChatGPT export target identity changed during connection.");
+    }
+    const { Page, Runtime } = opened.client;
+    await Page.enable();
+    await waitForDocument(Runtime, timeoutMs);
+    const tabUrl = await evaluateByValue<string>(Runtime, "location.href", "export target URL");
+    const tabTitle = await evaluateByValue<string>(
+      Runtime,
+      "document.title",
+      "export target title",
+    );
+
+    await assertChatGptExportAccountAffinity(
+      Runtime,
+      accountDigest,
+      "ChatGPT export exact GET",
+      expectedEmail,
+    );
+
+    let hit: CaptureHitSummary | undefined;
+    let getError: unknown;
+    captureCleanupRequired = true;
+    try {
+      hit = await evaluateReadOnlyConversationGet(
+        Runtime,
+        targetApiUrl,
+        conversationId,
+        accountDigest,
+        expectedEmail,
+      );
+    } catch (error) {
+      getError = error;
+    }
+    let postGetAffinityError: unknown;
+    try {
+      await assertChatGptExportAccountAffinity(
+        Runtime,
+        accountDigest,
+        "ChatGPT export exact GET completion",
+        expectedEmail,
+      );
+    } catch (error) {
+      postGetAffinityError = error;
+    }
+    if (getError && postGetAffinityError) {
+      throw new AggregateError(
+        [getError, postGetAffinityError],
+        "Read-only conversation GET and post-GET account validation failed.",
+      );
+    }
+    if (getError) throw getError;
+    if (postGetAffinityError) throw postGetAffinityError;
+    if (
+      !hit ||
+      hit.url !== targetApiUrl ||
+      hit.status !== 200 ||
+      hit.ok !== true ||
+      hit.conversation_id !== conversationId ||
+      typeof hit.chars !== "number" ||
+      !Number.isSafeInteger(hit.chars) ||
+      hit.chars <= 0
+    ) {
+      throw new Error(
+        `Read-only conversation GET did not return the approved conversation: ${JSON.stringify(captureHitDiagnostics(hit))}`,
+      );
+    }
+
+    const rawText = await retrieveCapturedText(Runtime, targetApiUrl, hit.chars, chunkSize);
+    const backend = JSON.parse(rawText) as BackendConversation;
+    const result = await finalizeCapturedExport({
+      backend,
+      rawText,
+      targetUrl,
+      targetApiUrl,
+      outDir,
+      targetId,
+      tabUrl,
+      captureInfo: {
+        captured_at: new Date().toISOString(),
+        target_url: targetUrl,
+        target_api_url: targetApiUrl,
+        capture_method: "authenticated-affinity-bound-exact-get",
+        archive_state_preserved: true,
+        tab: {
+          host,
+          port,
+          target_id: targetId,
+          url_before_get: tabUrl,
+          title_before_get: tabTitle,
+        },
+        hit,
+        non_claims: [
+          "No cookie values, localStorage, profile stores, or unrelated ChatGPT history were read.",
+          "The conversation was fetched only from the exact approved backend URL through a verified authenticated page context.",
+          "Cookie and bearer JWT account affinity were validated inside the exact GET expression, the returned conversation id was exact, and no archive-state mutation was issued.",
+        ],
+      },
+    });
+    completedResult = {
+      ...result,
+      archiveRecovery: {
+        attempted: false,
+        recovered: false,
+        status: "read-only",
+        getStatus: hit.status,
+        archiveStatePreserved: true,
+      },
+    };
+  } catch (error) {
+    operationError = error;
+  }
+
+  const cleanupErrors: unknown[] = [];
+  if (captureCleanupRequired) {
+    try {
+      await cleanupCaptureWithEvaluator(
+        <T>(expression: string, timeoutLabel?: string) =>
+          evaluateByValue<T>(opened.client.Runtime, expression, timeoutLabel),
+        targetApiUrl,
+      );
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  try {
+    await opened.close();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  const errors = operationError ? [operationError, ...cleanupErrors] : cleanupErrors;
+  if (errors.length > 1) {
+    throw new AggregateError(errors, "Read-only ChatGPT export and target cleanup failed.");
+  }
+  if (errors.length === 1) throw errors[0];
+  if (!completedResult) throw new Error("Read-only ChatGPT export did not produce a result.");
+  return completedResult;
+}
+
 export async function captureApprovedChatGptConversationBackend(
   options: ChatGptConversationExportOptions,
 ): Promise<ChatGptConversationExportResult> {
+  if (process.platform === "win32") {
+    throw new Error(WINDOWS_EXPORT_UNAVAILABLE_MESSAGE);
+  }
+  const chunkSize = options.chunkSize ?? 250_000;
+  assertValidExportChunkSize(chunkSize);
   const conversationId = conversationIdFromChatGptUrl(options.targetUrl);
   const targetApiUrl = buildBackendConversationUrl(conversationId);
   const host = options.host ?? DEFAULT_REMOTE_CHROME_HOST;
@@ -1112,15 +1604,22 @@ export async function captureApprovedChatGptConversationBackend(
   const expectedBrowserId = options.browserId?.trim();
   let browserWSEndpoint = options.browserWSEndpoint?.trim();
   const expectedAccountDigest = options.accountDigest?.trim();
-  if (expectedBrowserId || browserWSEndpoint || expectedAccountDigest) {
+  const expectedEmail = options.expectedEmail?.trim().toLowerCase();
+  if (expectedBrowserId || browserWSEndpoint || expectedAccountDigest || expectedEmail) {
     if (!expectedBrowserId || !browserWSEndpoint || !expectedAccountDigest) {
       throw new Error(
         "ChatGPT export browser affinity requires browser id, WebSocket, and account identity.",
       );
     }
-    if (browserIdFromWebSocketEndpoint(browserWSEndpoint) !== expectedBrowserId) {
+    const configuredIdentity = bindRemoteChromeBrowserWebSocketEndpoint({
+      browserWSEndpoint,
+      host,
+      port,
+    });
+    if (configuredIdentity.browserId !== expectedBrowserId) {
       throw new Error("ChatGPT export browser id does not match its WebSocket.");
     }
+    browserWSEndpoint = configuredIdentity.browserWSEndpoint;
     if (!/^[a-f0-9]{64}$/.test(expectedAccountDigest)) {
       throw new Error("ChatGPT export account identity is invalid.");
     }
@@ -1130,16 +1629,39 @@ export async function captureApprovedChatGptConversationBackend(
     }
     browserWSEndpoint = liveIdentity.browserWSEndpoint;
   }
-  const chunkSize = options.chunkSize ?? 250_000;
+  const readOnlyAccountAffinity =
+    expectedBrowserId && browserWSEndpoint && expectedAccountDigest
+      ? {
+          browserId: expectedBrowserId,
+          browserWSEndpoint,
+          accountDigest: expectedAccountDigest,
+          expectedEmail,
+        }
+      : undefined;
+  if (options.knownArchived !== undefined && !readOnlyAccountAffinity) {
+    throw new Error("Known ChatGPT archive state requires browser and account affinity.");
+  }
+  if (options.archiveAfterExport === true && (!readOnlyAccountAffinity || !expectedEmail)) {
+    throw new Error("Post-export archiving requires complete ChatGPT account affinity.");
+  }
   const tabRef = options.tabRef ?? options.targetUrl;
   const outDir = path.resolve(options.outDir);
-  let resolved: {
-    client: Awaited<ReturnType<typeof connectToExistingChatGptTab>>["client"];
-    targetId: string;
-    tabUrl: string;
-    tabTitle: string;
-    recovery: ChatGptArchiveRecoveryResult;
-  };
+  if (readOnlyAccountAffinity && options.archiveAfterExport !== true) {
+    return await captureChatGptConversationReadOnly({
+      targetUrl: options.targetUrl,
+      targetApiUrl,
+      outDir,
+      host,
+      port,
+      browserId: readOnlyAccountAffinity.browserId,
+      browserWSEndpoint: readOnlyAccountAffinity.browserWSEndpoint,
+      accountDigest: readOnlyAccountAffinity.accountDigest,
+      expectedEmail: readOnlyAccountAffinity.expectedEmail,
+      timeoutMs,
+      chunkSize,
+    });
+  }
+  let resolved: ResolvedChatGptExportConnection;
   try {
     const connected = await connectToExistingChatGptTab({
       host,
@@ -1151,9 +1673,7 @@ export async function captureApprovedChatGptConversationBackend(
     });
     if (!isSameConversationUrl(connected.tab.url, conversationId)) {
       await connected.client.close().catch(() => undefined);
-      throw new Error(
-        `Resolved ChatGPT tab is not the approved target conversation; expected ${conversationId}, got ${connected.tab.url}`,
-      );
+      throw new Error("Resolved ChatGPT tab is not the approved target conversation.");
     }
     resolved = {
       client: connected.client,
@@ -1163,46 +1683,139 @@ export async function captureApprovedChatGptConversationBackend(
       recovery: { attempted: false, recovered: false, status: "not-needed" },
     };
   } catch (error) {
-    if (options.recoverArchived === false) throw error;
-    const recovered = await recoverArchivedConversation({
-      targetUrl: options.targetUrl,
-      host,
-      port,
-      browserWSEndpoint,
-      timeoutMs,
-      accountDigest: expectedAccountDigest,
-    });
-    resolved = {
-      client: recovered.client,
-      targetId: recovered.targetId,
-      tabUrl: recovered.tabUrl,
-      tabTitle: "",
-      recovery: recovered.recovery,
-    };
+    if (options.knownArchived === false) {
+      const targetId = await openChatGptTarget({
+        host,
+        port,
+        browserWSEndpoint,
+        url: "https://chatgpt.com/",
+      });
+      let opened: ChatGptTabConnection;
+      try {
+        opened = await connectToExistingChatGptTab({
+          host,
+          port,
+          browserWSEndpoint,
+          browserId: expectedBrowserId,
+          accountDigest: expectedAccountDigest,
+          ref: targetId,
+          closeTargetOnDispose: true,
+        });
+      } catch (openError) {
+        try {
+          await closeOpenedChatGptTarget(host, port, targetId, browserWSEndpoint);
+        } catch (closeError) {
+          throw new AggregateError(
+            [openError, closeError],
+            "Active ChatGPT export setup and target cleanup failed.",
+          );
+        }
+        throw openError;
+      }
+      try {
+        const { Page, Runtime } = opened.client;
+        await Page.enable();
+        await waitForDocument(Runtime, timeoutMs);
+        await assertChatGptExportAccountAffinity(
+          Runtime,
+          expectedAccountDigest,
+          "ChatGPT export navigation",
+          expectedEmail,
+        );
+        await Page.navigate({ url: options.targetUrl });
+        const tabUrl = await waitForConversationUrl(Runtime, conversationId, timeoutMs);
+        await waitForDocument(Runtime, timeoutMs);
+        resolved = {
+          client: opened.client,
+          targetId,
+          tabUrl,
+          tabTitle: opened.tab.title,
+          recovery: { attempted: false, recovered: false, status: "not-needed" },
+        };
+      } catch (openError) {
+        try {
+          await opened.client.close();
+        } catch (closeError) {
+          throw new AggregateError(
+            [openError, closeError],
+            "Active ChatGPT export navigation and target cleanup failed.",
+          );
+        }
+        throw openError;
+      }
+    } else if (
+      expectedBrowserId &&
+      browserWSEndpoint &&
+      expectedAccountDigest &&
+      options.archiveAfterExport !== true
+    ) {
+      return await captureChatGptConversationReadOnly({
+        targetUrl: options.targetUrl,
+        targetApiUrl,
+        outDir,
+        host,
+        port,
+        browserId: expectedBrowserId,
+        browserWSEndpoint,
+        accountDigest: expectedAccountDigest,
+        expectedEmail,
+        timeoutMs,
+        chunkSize,
+      });
+    } else {
+      const reason =
+        options.archiveAfterExport === true
+          ? "The approved conversation is not available in an existing tab, so --archive-after-export cannot be completed safely."
+          : "The approved conversation is not available in an existing tab, and read-only fallback requires stored browser and account affinity.";
+      throw new Error(`${reason} No archive-state changes were attempted.`, { cause: error });
+    }
   }
   const { client, targetId, tabUrl, tabTitle, recovery } = resolved;
-  let archiveRestored = false;
+  const { Page, Runtime } = client;
+  let completedResult: ChatGptConversationExportResult | undefined;
+  let operationError: unknown;
+  let pinnedAccountDigest: string | undefined;
+  let captureScriptIdentifier: string | undefined;
+  let rawCapturePending = false;
   try {
-    const { Page, Runtime } = client;
-    if (expectedAccountDigest) {
-      const observedAccountDigest = await readChatGptAccountDigest(Runtime);
-      if (observedAccountDigest !== expectedAccountDigest) {
-        throw new Error("Remote Chrome account identity changed before ChatGPT export.");
-      }
-    }
-    await Page.addScriptToEvaluateOnNewDocument({
+    pinnedAccountDigest = await assertChatGptExportAccountAffinity(
+      Runtime,
+      expectedAccountDigest,
+      "ChatGPT export",
+      expectedEmail,
+    );
+    const registration = await Page.addScriptToEvaluateOnNewDocument({
       source: buildScopedBackendCaptureHook(targetApiUrl),
     });
+    captureScriptIdentifier = registration.identifier;
+    rawCapturePending = true;
     await Page.enable();
     await Page.reload({ ignoreCache: true });
     const capture = await pollCapture(Runtime, targetApiUrl, timeoutMs);
     const hit = capture.hit;
     if (!hit?.chars || hit.conversation_id !== conversationId) {
       throw new Error(
-        `Capture did not return the approved conversation id: ${JSON.stringify(hit)}`,
+        `Capture did not return the approved conversation id: ${JSON.stringify(captureHitDiagnostics(hit))}`,
       );
     }
     const rawText = await retrieveCapturedText(Runtime, targetApiUrl, hit.chars, chunkSize);
+    if (captureScriptIdentifier) {
+      await Page.removeScriptToEvaluateOnNewDocument({ identifier: captureScriptIdentifier });
+      captureScriptIdentifier = undefined;
+    }
+    await cleanupCaptureWithEvaluator(
+      <T>(expression: string, timeoutLabel?: string) =>
+        evaluateByValue<T>(Runtime, expression, timeoutLabel),
+      targetApiUrl,
+    );
+    rawCapturePending = false;
+    await assertChatGptExportCaptureAffinity(
+      Runtime,
+      pinnedAccountDigest,
+      conversationId,
+      "ChatGPT export capture completion",
+      expectedEmail,
+    );
     const backend = JSON.parse(rawText) as BackendConversation;
     const result = await finalizeCapturedExport({
       backend,
@@ -1223,22 +1836,24 @@ export async function captureApprovedChatGptConversationBackend(
           url_before_reload: tabUrl,
           title_before_reload: tabTitle,
         },
-        hit: Object.fromEntries(Object.entries(hit).filter(([key]) => key !== "bodyPreview")),
+        hit,
         non_claims: [
-          "No cookies, localStorage, profile stores, or unrelated history were read.",
+          "No cookie values, localStorage, profile stores, or unrelated history were read.",
           "The hook captured only the exact target backend conversation URL during page load.",
-          "Archive recovery, when needed, reuses ChatGPT's own authenticated archived-list request only to PATCH the exact approved conversation id and does not record credential values or unrelated conversation payloads.",
+          options.archiveAfterExport === true
+            ? "No archive-state mutation was issued during capture; a post-export archive was explicitly requested."
+            : "No archive-state mutation was issued during or after capture.",
         ],
       },
     });
-    const shouldArchive = options.archiveAfterExport === true || recovery.recovered;
     let postExportArchive: BrowserArchiveResult | undefined;
-    if (shouldArchive) {
+    if (options.archiveAfterExport === true) {
       await assertChatGptExportMutationAffinity(
         Runtime,
         expectedAccountDigest,
         conversationId,
         "post-export archive",
+        expectedEmail,
       );
       postExportArchive = await archiveChatGptConversation(Runtime, () => {}, {
         mode: "always",
@@ -1248,105 +1863,187 @@ export async function captureApprovedChatGptConversationBackend(
       if (!postExportArchive.archived) {
         throw new Error(`Post-export archive failed: ${JSON.stringify(postExportArchive)}`);
       }
-      archiveRestored = recovery.recovered;
     }
-    return { ...result, archiveRecovery: recovery, postExportArchive };
+    completedResult = {
+      ...result,
+      archiveRecovery: recovery,
+      postExportArchive,
+    };
   } catch (error) {
-    if (recovery.recovered && !archiveRestored) {
-      const restore = await (async () => {
-        await assertChatGptExportMutationAffinity(
-          client.Runtime,
-          expectedAccountDigest,
-          conversationId,
-          "archive restore",
-        );
-        return archiveChatGptConversation(client.Runtime, () => {}, {
-          mode: "always",
-          conversationUrl: options.targetUrl,
-          expectedAccountDigest,
-        });
-      })().catch(() => null);
-      if (!restore?.archived) {
-        throw new Error(
-          `${error instanceof Error ? error.message : String(error)}; archive restore also failed`,
-        );
-      }
-    }
-    throw error;
-  } finally {
-    await client.close().catch(() => undefined);
+    operationError = error;
   }
+  const cleanupErrors: unknown[] = [];
+  if (captureScriptIdentifier) {
+    try {
+      await Page.removeScriptToEvaluateOnNewDocument({ identifier: captureScriptIdentifier });
+      captureScriptIdentifier = undefined;
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  if (rawCapturePending) {
+    try {
+      await cleanupCaptureWithEvaluator(
+        <T>(expression: string, timeoutLabel?: string) =>
+          evaluateByValue<T>(Runtime, expression, timeoutLabel),
+        targetApiUrl,
+      );
+      rawCapturePending = false;
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  try {
+    await disposeChatGptExportConnection(client);
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  const errors = operationError ? [operationError, ...cleanupErrors] : cleanupErrors;
+  if (errors.length > 1) {
+    throw new AggregateError(errors, "ChatGPT export and target cleanup failed.");
+  }
+  if (errors.length === 1) throw errors[0];
+  if (!completedResult) throw new Error("ChatGPT export did not produce a result.");
+  return completedResult;
 }
 
 export async function captureApprovedChatGptConversationBackendViaObu(
   options: ChatGptConversationExportObuOptions,
 ): Promise<ChatGptConversationExportResult> {
+  if (process.platform === "win32") {
+    throw new Error(WINDOWS_EXPORT_UNAVAILABLE_MESSAGE);
+  }
+  const chunkSize = options.chunkSize ?? 250_000;
+  assertValidExportChunkSize(chunkSize);
   const conversationId = conversationIdFromChatGptUrl(options.targetUrl);
   const targetApiUrl = buildBackendConversationUrl(conversationId);
   const sessionId = options.sessionId ?? "obu-mcp";
   const timeoutMs = options.timeoutMs ?? 45_000;
-  const chunkSize = options.chunkSize ?? 250_000;
   const outDir = path.resolve(options.outDir);
   const evaluate: EvaluateExpression = <T>(expression: string, timeoutLabel?: string) =>
     evaluateObuByValue<T>(sessionId, options.tabId, expression, timeoutLabel);
   const currentUrl = await evaluate<string>("location.href", "current URL check");
   if (!isSameConversationUrl(currentUrl, conversationId)) {
-    throw new Error(
-      `Resolved OBU tab is not the approved target conversation; expected ${conversationId}, got ${currentUrl}`,
+    throw new Error("Resolved OBU tab is not the approved target conversation.");
+  }
+  const accountDigest = await readChatGptAccountDigestWithEvaluator(evaluate);
+
+  let completedResult: ChatGptConversationExportResult | undefined;
+  let operationError: unknown;
+  let captureScriptIdentifier: string | undefined;
+  let rawCapturePending = false;
+  try {
+    const registration = await runObuCdp(
+      sessionId,
+      options.tabId,
+      "Page.addScriptToEvaluateOnNewDocument",
+      { source: buildScopedBackendCaptureHook(targetApiUrl) },
+      "60s",
     );
+    captureScriptIdentifier =
+      typeof registration.identifier === "string" ? registration.identifier : undefined;
+    if (!captureScriptIdentifier) {
+      throw new Error("OBU capture hook registration did not return an identifier.");
+    }
+    rawCapturePending = true;
+    await runObuCdp(sessionId, options.tabId, "Page.enable", {}, "60s");
+    await runObuCdp(sessionId, options.tabId, "Page.reload", { ignoreCache: true }, "60s");
+    const capture = await pollCaptureWithEvaluator(evaluate, targetApiUrl, timeoutMs);
+    const hit = capture.hit;
+    if (!hit?.chars || hit.conversation_id !== conversationId) {
+      throw new Error(
+        `Capture did not return the approved conversation id: ${JSON.stringify(captureHitDiagnostics(hit))}`,
+      );
+    }
+    const rawText = await retrieveCapturedTextWithEvaluator(
+      evaluate,
+      targetApiUrl,
+      hit.chars,
+      chunkSize,
+    );
+    await runObuCdp(
+      sessionId,
+      options.tabId,
+      "Page.removeScriptToEvaluateOnNewDocument",
+      { identifier: captureScriptIdentifier },
+      "60s",
+    );
+    captureScriptIdentifier = undefined;
+    await cleanupCaptureWithEvaluator(evaluate, targetApiUrl);
+    rawCapturePending = false;
+    const completionUrl = await evaluate<string>("location.href", "capture completion URL check");
+    if (!isSameConversationUrl(completionUrl, conversationId)) {
+      throw new Error("OBU conversation changed during capture.");
+    }
+    if ((await readChatGptAccountDigestWithEvaluator(evaluate)) !== accountDigest) {
+      throw new Error("Authenticated ChatGPT account identity changed during OBU capture.");
+    }
+    const backend = JSON.parse(rawText) as BackendConversation;
+    const result = await finalizeCapturedExport({
+      backend,
+      rawText,
+      targetUrl: options.targetUrl,
+      targetApiUrl,
+      outDir,
+      targetId: `obu:${sessionId}:${options.tabId}`,
+      tabUrl: currentUrl,
+      captureInfo: {
+        captured_at: new Date().toISOString(),
+        target_url: options.targetUrl,
+        target_api_url: targetApiUrl,
+        tab: {
+          transport: "obu",
+          session_id: sessionId,
+          tab_id: options.tabId,
+          url_before_reload: currentUrl,
+        },
+        hit,
+        non_claims: [
+          "No cookies, localStorage, profile stores, or unrelated history were read.",
+          "The hook captured only the exact target backend conversation URL during page load.",
+        ],
+      },
+    });
+    completedResult = {
+      ...result,
+      archiveRecovery: {
+        attempted: false,
+        recovered: false,
+        status: "not-needed",
+      },
+    };
+  } catch (error) {
+    operationError = error;
   }
 
-  await runObuCdp(
-    sessionId,
-    options.tabId,
-    "Page.addScriptToEvaluateOnNewDocument",
-    { source: buildScopedBackendCaptureHook(targetApiUrl) },
-    "60s",
-  );
-  await runObuCdp(sessionId, options.tabId, "Page.enable", {}, "60s");
-  await runObuCdp(sessionId, options.tabId, "Page.reload", { ignoreCache: true }, "60s");
-  const capture = await pollCaptureWithEvaluator(evaluate, targetApiUrl, timeoutMs);
-  const hit = capture.hit;
-  if (!hit?.chars || hit.conversation_id !== conversationId) {
-    throw new Error(`Capture did not return the approved conversation id: ${JSON.stringify(hit)}`);
+  const cleanupErrors: unknown[] = [];
+  if (captureScriptIdentifier) {
+    try {
+      await runObuCdp(
+        sessionId,
+        options.tabId,
+        "Page.removeScriptToEvaluateOnNewDocument",
+        { identifier: captureScriptIdentifier },
+        "60s",
+      );
+      captureScriptIdentifier = undefined;
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
   }
-  const rawText = await retrieveCapturedTextWithEvaluator(
-    evaluate,
-    targetApiUrl,
-    hit.chars,
-    chunkSize,
-  );
-  const backend = JSON.parse(rawText) as BackendConversation;
-  return await finalizeCapturedExport({
-    backend,
-    rawText,
-    targetUrl: options.targetUrl,
-    targetApiUrl,
-    outDir,
-    targetId: `obu:${sessionId}:${options.tabId}`,
-    tabUrl: currentUrl,
-    captureInfo: {
-      captured_at: new Date().toISOString(),
-      target_url: options.targetUrl,
-      target_api_url: targetApiUrl,
-      tab: {
-        transport: "obu",
-        session_id: sessionId,
-        tab_id: options.tabId,
-        url_before_reload: currentUrl,
-      },
-      hit: Object.fromEntries(Object.entries(hit).filter(([key]) => key !== "bodyPreview")),
-      non_claims: [
-        "No cookies, localStorage, profile stores, or unrelated history were read.",
-        "The hook captured only the exact target backend conversation URL during page load.",
-      ],
-    },
-  }).then((result) => ({
-    ...result,
-    archiveRecovery: {
-      attempted: false,
-      recovered: false,
-      status: "not-needed" as const,
-    },
-  }));
+  if (rawCapturePending) {
+    try {
+      await cleanupCaptureWithEvaluator(evaluate, targetApiUrl);
+      rawCapturePending = false;
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  const errors = operationError ? [operationError, ...cleanupErrors] : cleanupErrors;
+  if (errors.length > 1) {
+    throw new AggregateError(errors, "OBU ChatGPT export and capture cleanup failed.");
+  }
+  if (errors.length === 1) throw errors[0];
+  if (!completedResult) throw new Error("OBU ChatGPT export did not produce a result.");
+  return completedResult;
 }

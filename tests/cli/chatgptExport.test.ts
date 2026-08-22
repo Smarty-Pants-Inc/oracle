@@ -157,7 +157,7 @@ describe("ChatGPT export endpoint affinity", () => {
   test("rejects missing or mismatched named sessions", () => {
     const targetUrl = "https://chatgpt.com/c/thread-exact";
     expect(() => resolveChatGptExportRemoteChromeForSession(targetUrl, "missing", null)).toThrow(
-      /stored Oracle session missing was not found/i,
+      /requested stored Oracle session was not found/i,
     );
     expect(() =>
       resolveChatGptExportRemoteChromeForSession(
@@ -165,10 +165,10 @@ describe("ChatGPT export endpoint affinity", () => {
         "other",
         session("other", { harvest: { conversationId: "different-thread" } }),
       ),
-    ).toThrow(/does not match ChatGPT conversation thread-exact/i);
+    ).toThrow(/requested stored Oracle session does not match the ChatGPT conversation/i);
   });
-  test("fails closed when no session matches the target conversation", () => {
-    expect(() =>
+  test("fails closed with a supported recovery hint when no session matches", () => {
+    const resolve = () =>
       resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-3", [
         session("other", {
           config: {
@@ -176,8 +176,15 @@ describe("ChatGPT export endpoint affinity", () => {
             ...config("127.0.0.1", 9225, "browser-a"),
           },
         }),
-      ]),
-    ).toThrow(/no stored browser session matches/i);
+      ]);
+
+    expect(resolve).toThrow(/no stored browser session matches/i);
+    expect(resolve).toThrow(/--session-id.*account-bound wrapper/i);
+    try {
+      resolve();
+    } catch (error) {
+      expect((error as Error).message).not.toContain("Pass --remote-chrome explicitly");
+    }
   });
 
   test("fails closed when a matching session has no endpoint", () => {

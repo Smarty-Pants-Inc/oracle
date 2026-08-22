@@ -25,28 +25,28 @@ describe("promptComposer", () => {
     );
   });
 
-  test("does not treat historical assistant content as committed without a new turn", async () => {
+  test("does not accept a cleared-composer fallback without a matching submitted turn", async () => {
     vi.useFakeTimers();
     try {
       const runtime = {
         evaluate: vi
           .fn()
-          // Baseline read (turn count)
           .mockResolvedValueOnce({ result: { value: 10 } })
-          // Polls (repeat)
           .mockResolvedValue({
             result: {
               value: {
                 baseline: 10,
-                turnsCount: 10,
+                turnsCount: 11,
                 userMatched: false,
                 prefixMatched: false,
                 lastMatched: false,
-                hasNewTurn: false,
+                submittedTurnMatched: false,
+                hasNewTurn: true,
                 stopVisible: true,
                 assistantVisible: true,
                 composerCleared: true,
-                inConversation: false,
+                inConversation: true,
+                href: "https://chatgpt.com/c/unrelated",
               },
             },
           }),
@@ -55,7 +55,6 @@ describe("promptComposer", () => {
       };
 
       const promise = promptComposer.verifyPromptCommitted(runtime as never, "hello", 150);
-      // Attach the rejection handler before timers advance to avoid unhandled-rejection warnings.
       const assertion = expect(promise).rejects.toThrow(/prompt did not appear/i);
       await vi.advanceTimersByTimeAsync(250);
       await assertion;
@@ -190,11 +189,13 @@ describe("promptComposer", () => {
               userMatched: true,
               prefixMatched: false,
               lastMatched: true,
+              submittedTurnMatched: true,
               hasNewTurn: false,
               stopVisible: false,
               assistantVisible: false,
               composerCleared: false,
               inConversation: true,
+              href: "https://chatgpt.com/c/created-for-prompt",
             },
           },
         }),
@@ -204,7 +205,10 @@ describe("promptComposer", () => {
 
     await expect(
       promptComposer.verifyPromptCommitted(runtime as never, "hello", 150),
-    ).resolves.toBe(1);
+    ).resolves.toEqual({
+      turnsCount: 1,
+      conversationUrl: "https://chatgpt.com/c/created-for-prompt",
+    });
   });
 
   test("attachment sends time out instead of allowing Enter fallback", async () => {
@@ -285,7 +289,7 @@ describe("promptComposer", () => {
           };
         }
         if (expression.includes("button.scrollIntoView")) {
-          return { result: { value: { status: "clicked" } } };
+          return { result: { value: { status: "point", x: 1, y: 1 } } };
         }
         return {
           result: {
@@ -295,18 +299,25 @@ describe("promptComposer", () => {
               userMatched: true,
               prefixMatched: false,
               lastMatched: true,
+              submittedTurnMatched: true,
               hasNewTurn: true,
               stopVisible: true,
               assistantVisible: false,
               composerCleared: true,
               inConversation: true,
+              href: "https://chatgpt.com/c/created-for-prompt",
             },
           },
         };
       }),
     };
-    const input = { insertText: vi.fn(), dispatchKeyEvent: vi.fn() };
+    const input = {
+      insertText: vi.fn(),
+      dispatchKeyEvent: vi.fn(),
+      dispatchMouseEvent: vi.fn(),
+    };
     const logger = Object.assign(vi.fn(), { verbose: false });
+    const assertPageAffinity = vi.fn().mockResolvedValue(undefined);
 
     await submitPrompt(
       {
@@ -314,12 +325,18 @@ describe("promptComposer", () => {
         input: input as never,
         baselineTurns: 0,
         onPromptSubmitted,
+        assertPageAffinity,
       },
       "hello",
       logger as never,
     );
 
     expect(onPromptSubmitted).toHaveBeenCalledTimes(1);
+    expect(assertPageAffinity.mock.calls.map(([action]) => action)).toEqual([
+      "prompt composer focus",
+      "prompt text insertion",
+      "prompt send",
+    ]);
   });
 
   test("waits for a delayed trusted click without issuing a second send", async () => {

@@ -130,6 +130,21 @@ describe("oracle utility helpers", () => {
     }
   });
 
+  test("readFiles treats existing absolute paths with glob syntax as literals", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-readfiles-literal-"));
+    try {
+      const literalDir = path.join(dir, "[literal]");
+      await mkdir(literalDir);
+      const literalFile = path.join(literalDir, "note.txt");
+      await writeFile(literalFile, "literal", "utf8");
+
+      const files = await readFiles([literalFile], { cwd: dir });
+      expect(files).toEqual([{ path: literalFile, content: "literal" }]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("readFiles rejects immediately when a referenced file is missing", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-readfiles-missing-"));
     try {

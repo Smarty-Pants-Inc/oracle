@@ -8,6 +8,7 @@ export async function transferAttachmentViaDataTransfer(
   runtime: ChromeClient["Runtime"],
   attachment: BrowserAttachment,
   selector: string,
+  assertPageAffinity?: (action: string) => Promise<void>,
 ): Promise<{ fileName: string; size: number }> {
   const fileContent = await readFile(attachment.path);
   if (fileContent.length > MAX_DATA_TRANSFER_BYTES) {
@@ -87,6 +88,7 @@ export async function transferAttachmentViaDataTransfer(
     return { success: true, fileName: file.name, size: file.size };
   })()`;
 
+  await assertPageAffinity?.("attachment transfer");
   const evalResult = await runtime.evaluate({ expression, returnByValue: true });
   if (evalResult.exceptionDetails) {
     const description = evalResult.exceptionDetails.text ?? "JS evaluation failed";

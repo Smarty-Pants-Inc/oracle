@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, test } from "vitest";
-import { mkdtemp, writeFile, readdir, readFile, rm, mkdir } from "node:fs/promises";
+import { chmod, mkdtemp, writeFile, readdir, readFile, rm, mkdir } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { pathToFileURL } from "node:url";
@@ -65,6 +65,160 @@ function execCli(
     );
   });
 }
+
+describe("account-bound ChatGPT command CLI wiring", () => {
+  const affinityArgs = [
+    "--remote-chrome",
+    "127.0.0.1:1",
+    "--remote-chrome-browser-id",
+    "expected",
+    "--remote-chrome-browser-ws",
+    "ws://127.0.0.1:1/devtools/browser/other",
+    "--expected-email",
+    "account@example.com",
+  ];
+
+  test("forwards parent remote Chrome options to chatgpt-inventory", async () => {
+    const result = await execCli(["chatgpt-inventory", ...affinityArgs, "--json"], {
+      env: { ...process.env, ORACLE_WRAPPER_CHATGPT_ACCOUNT_BOUND: "1" },
+    });
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("Remote Chrome browser id does not match");
+    expect(result.stderr).not.toContain("required option '--remote-chrome");
+  });
+
+  test.each([
+    ["subcommand", ["--timeout", "45s"]],
+    ["parent duration", []],
+    ["parent auto", []],
+  ])(
+    "forwards parent remote Chrome options to chatgpt-export with %s timeout",
+    async (placement, localTimeout) => {
+      const command = [
+        "chatgpt-export",
+        "--target-url",
+        "https://chatgpt.com/c/00000000-0000-0000-0000-000000000000",
+        ...affinityArgs,
+        "--remote-chrome-account-digest",
+        "a".repeat(64),
+        "--known-archived",
+        "false",
+        ...localTimeout,
+        "--json",
+      ];
+      const args =
+        placement === "parent duration"
+          ? ["--timeout", "45s", ...command]
+          : placement === "parent auto"
+            ? ["--timeout", "auto", ...command]
+            : command;
+      const result = await execCli(args, {
+        env: { ...process.env, ORACLE_WRAPPER_CHATGPT_ACCOUNT_BOUND: "1" },
+      });
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("Remote Chrome browser id does not match");
+      expect(result.stderr).not.toContain("required option '--remote-chrome");
+      expect(result.stderr).not.toMatch(/--timeout must be|\.trim is not a function/i);
+    },
+  );
+
+  test("rejects malformed hidden archive state before browser access", async () => {
+    const result = await execCli([
+      "chatgpt-export",
+      "--target-url",
+      "https://chatgpt.com/c/00000000-0000-0000-0000-000000000000",
+      "--known-archived",
+      "not-a-boolean",
+      "--json",
+    ]);
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain('Value must be exactly "true" or "false"');
+    expect(result.stderr).not.toContain("authoritative approved account affinity");
+  });
+
+  test.each([
+    ["raw remote Chrome", ["--remote-chrome", "127.0.0.1:1"]],
+    ["OBU", ["--obu-session-id", "obu-session", "--obu-tab-id", "obu-tab"]],
+  ])("rejects direct %s exports without approved account affinity", async (_name, affinity) => {
+    const result = await execCli([
+      "chatgpt-export",
+      "--target-url",
+      "https://chatgpt.com/c/00000000-0000-0000-0000-000000000000",
+      ...affinity,
+      "--json",
+    ]);
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("authoritative approved account affinity");
+  });
+
+  test("documents post-export archive as the only export mutation", async () => {
+    const result = await execCli(["chatgpt-export", "--help"]);
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("--archive-after-export");
+    expect(result.stdout).not.toContain("--no-recover-archived");
+    expect(result.stdout).toMatch(
+      /without changing it unless\s+post-export archiving is explicitly requested/,
+    );
+  });
+
+  test("rejects post-export archiving for OBU exports", async () => {
+    const result = await execCli([
+      "chatgpt-export",
+      "--target-url",
+      "https://chatgpt.com/c/00000000-0000-0000-0000-000000000000",
+      "--obu-tab-id",
+      "approved-tab",
+      "--archive-after-export",
+      "--json",
+    ]);
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("--archive-after-export is not supported for OBU exports");
+  });
+});
+
+describe("root session receipt reservation", () => {
+  test("does not reserve a session when receipt preflight fails", async () => {
+    const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-receipt-preflight-"));
+    const receiptPath = path.join(oracleHome, "session-id-receipt");
+    await writeFile(receiptPath, "unchanged\n", { mode: 0o600 });
+    if (process.platform !== "win32") {
+      await chmod(receiptPath, 0o644);
+    }
+
+    try {
+      const result = await execCli(
+        ["--provider", "openai", "--model", "gpt-5.1", "--wait", "-p", "receipt failure"],
+        {
+          env: {
+            ...process.env,
+            OPENAI_API_KEY: "sk-receipt-test",
+            ORACLE_HOME_DIR: oracleHome,
+            ORACLE_CLIENT_FACTORY: CLIENT_FACTORY,
+            ORACLE_DISABLE_KEYTAR: "1",
+            ORACLE_NO_DETACH: "1",
+            ORACLE_SESSION_ID_RECEIPT: receiptPath,
+          },
+        },
+      );
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toMatch(
+        process.platform === "win32" ? /disabled on Windows.*ACL/i : /private regular file/i,
+      );
+      const sessions = await readdir(path.join(oracleHome, "sessions")).catch(() => []);
+      expect(sessions).toEqual([]);
+      expect(await readFile(receiptPath, "utf8")).toBe("unchanged\n");
+    } finally {
+      await rm(oracleHome, { recursive: true, force: true });
+    }
+  });
+});
 
 async function writeFollowupFixture(
   oracleHome: string,

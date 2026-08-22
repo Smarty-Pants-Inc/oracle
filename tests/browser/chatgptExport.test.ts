@@ -1,17 +1,23 @@
+import { createHash } from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import {
   assertChatGptExportMutationAffinityForTest,
   backendToPayload,
-  archivedSettingsUrlFromConversationUrl,
   buildBackendConversationUrl,
-  buildArchivedConversationRecoveryHookForTest,
+  buildChatGptCaptureCleanupExpressionForTest,
+  buildReadOnlyConversationGetExpressionForTest,
   captureApprovedChatGptConversationBackend,
   buildScopedBackendCaptureHook,
   contentToText,
   conversationIdFromChatGptUrl,
   isSameConversationUrl,
   retrieveCapturedTextWithEvaluator,
+  formatChatGptCaptureTimeoutForTest,
   scanTextForSecretLikeMarkers,
+  writeChatGptExportBundleForTest,
 } from "../../src/browser/chatgptExport.js";
 
 describe("ChatGPT conversation export helpers", () => {
@@ -22,6 +28,9 @@ describe("ChatGPT conversation export helpers", () => {
       "abc-123",
     );
     expect(conversationIdFromChatGptUrl("https://chatgpt.com/g/g-p-123/c/abc-123/")).toBe(
+      "abc-123",
+    );
+    expect(conversationIdFromChatGptUrl("https://chatgpt.com/g/g-p-123/project/c/abc-123")).toBe(
       "abc-123",
     );
     expect(() => conversationIdFromChatGptUrl("https://chat.openai.com/c/abc")).toThrow(
@@ -66,73 +75,245 @@ describe("ChatGPT conversation export helpers", () => {
     );
     expect(isSameConversationUrl("https://chatgpt.com/c/conv-1", "conv-1")).toBe(true);
     expect(isSameConversationUrl("https://chatgpt.com/g/project/c/conv-1", "conv-1")).toBe(true);
+    expect(isSameConversationUrl("https://chatgpt.com/g/g-p-123/project/c/conv-1", "conv-1")).toBe(
+      true,
+    );
     expect(isSameConversationUrl("https://chatgpt.com/c/other", "conv-1")).toBe(false);
     expect(isSameConversationUrl("https://chatgpt.com/g/project/c/other", "conv-1")).toBe(false);
     expect(isSameConversationUrl("https://chatgpt.com/", "conv-1")).toBe(false);
   });
 
-  test("revalidates account and exact conversation before archive mutations", async () => {
+  test("requires and revalidates complete affinity before archive mutations", async () => {
     const expectedDigest = "a".repeat(64);
+    const expectedEmail = "owner@example.test";
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
         result: {
           value: expression.includes("/api/auth/session")
-            ? expectedDigest
+            ? { accountDigest: expectedDigest, email: expectedEmail }
             : "https://chatgpt.com/c/conv-1",
         },
       })),
     };
 
     await expect(
-      assertChatGptExportMutationAffinityForTest(runtime as never, expectedDigest, "conv-1"),
+      assertChatGptExportMutationAffinityForTest(
+        runtime as never,
+        expectedDigest,
+        "conv-1",
+        "archive mutation",
+        expectedEmail,
+      ),
     ).resolves.toBeUndefined();
+    await expect(
+      assertChatGptExportMutationAffinityForTest(runtime as never, expectedDigest, "conv-1"),
+    ).rejects.toThrow(/complete ChatGPT account affinity/i);
 
     runtime.evaluate.mockImplementation(async ({ expression }: { expression: string }) => ({
       result: {
         value: expression.includes("/api/auth/session")
-          ? expectedDigest
+          ? { accountDigest: expectedDigest, email: expectedEmail }
           : "https://chatgpt.com/c/other",
       },
     }));
     await expect(
-      assertChatGptExportMutationAffinityForTest(runtime as never, expectedDigest, "conv-1"),
+      assertChatGptExportMutationAffinityForTest(
+        runtime as never,
+        expectedDigest,
+        "conv-1",
+        "archive mutation",
+        expectedEmail,
+      ),
     ).rejects.toThrow(/conversation changed before archive mutation/i);
+
+    runtime.evaluate.mockImplementation(async ({ expression }: { expression: string }) => ({
+      result: {
+        value: expression.includes("/api/auth/session")
+          ? { accountDigest: "b".repeat(64), email: expectedEmail }
+          : "https://chatgpt.com/c/conv-1",
+      },
+    }));
+    await expect(
+      assertChatGptExportMutationAffinityForTest(
+        runtime as never,
+        expectedDigest,
+        "conv-1",
+        "archive mutation",
+        expectedEmail,
+      ),
+    ).rejects.toThrow(/account identity changed before archive mutation/i);
   });
 
-  test("derives archived-chat settings without leaving the approved project", () => {
-    expect(
-      archivedSettingsUrlFromConversationUrl("https://chatgpt.com/g/g-p-123-oracle/c/conv-1"),
-    ).toBe("https://chatgpt.com/g/g-p-123-oracle/project#settings/DataControls/ArchivedChats");
-    expect(archivedSettingsUrlFromConversationUrl("https://chatgpt.com/c/conv-1")).toBe(
-      "https://chatgpt.com/#settings/DataControls/ArchivedChats",
-    );
-  });
-
-  test("recovers only the exact archived conversation through ChatGPT's authenticated request", () => {
-    const hook = buildArchivedConversationRecoveryHookForTest("conv-1");
-    expect(hook).toContain('const TARGET = "https://chatgpt.com/backend-api/conversation/conv-1"');
-    expect(hook).toContain('url.pathname === "/backend-api/conversations"');
-    expect(hook).toContain('url.searchParams.get("is_archived") === "true"');
-    expect(hook).toContain('method: "PATCH"');
-    expect(hook).toContain("JSON.stringify({ is_archived: false })");
-    expect(hook).toContain("new Headers(request.headers)");
-    expect(hook).not.toContain("localStorage");
-    expect(hook).not.toContain("document.cookie");
-  });
-
-  test("capture hook scopes recording to one backend URL", () => {
-    const hook = buildScopedBackendCaptureHook(
+  test("binds read-only exact GETs to the expected bearer JWT identity", () => {
+    const expectedDigest = "a".repeat(64);
+    const expression = buildReadOnlyConversationGetExpressionForTest(
       "https://chatgpt.com/backend-api/conversation/conv-1",
+      expectedDigest,
+      "Owner@Example.Test",
     );
-    expect(hook).toContain('const TARGET = "https://chatgpt.com/backend-api/conversation/conv-1"');
+
+    expect(expression).toContain(
+      'const TARGET = "https://chatgpt.com/backend-api/conversation/conv-1"',
+    );
+    expect(expression).toContain('const EXPECTED_CONVERSATION_ID = "conv-1"');
+    expect(expression).toContain(`const EXPECTED_ACCOUNT_DIGEST = "${expectedDigest}"`);
+    expect(expression).toContain('const EXPECTED_EMAIL = "owner@example.test"');
+    expect(expression).toContain('payload?.["https://api.openai.com/auth"]');
+    expect(expression).toContain('payload?.["https://api.openai.com/profile"]');
+    expect(expression).toContain("crypto.subtle.digest");
+    expect(expression).toContain("cookieIdentity.accountDigest !== tokenIdentity.accountDigest");
+    expect(expression).toContain('headers.set("authorization", "Bearer " + accessToken)');
+    expect(expression).toContain("responseUrl !== TARGET");
+    expect(expression).toContain("conversationId !== EXPECTED_CONVERSATION_ID");
+    expect(expression).toContain('method: "GET"');
+    expect(expression).toContain('redirect: "error"');
+    expect(expression).not.toMatch(/\b(?:POST|PUT|PATCH|DELETE)\b/);
+    expect(expression).not.toContain("is_archived");
+    expect(expression).not.toContain("localStorage");
+    expect(expression).not.toContain("sessionStorage");
+  });
+
+  test("rejects a mismatched bearer identity inside the exact GET expression", async () => {
+    const userId = "approved-user";
+    const expectedDigest = createHash("sha256").update(userId).digest("hex");
+    const jwtPayload = Buffer.from(
+      JSON.stringify({
+        "https://api.openai.com/auth": { chatgpt_user_id: "other-user" },
+        "https://api.openai.com/profile": { email: "owner@example.test" },
+      }),
+    ).toString("base64url");
+    const expression = buildReadOnlyConversationGetExpressionForTest(
+      "https://chatgpt.com/backend-api/conversation/conv-1",
+      expectedDigest,
+      "owner@example.test",
+    );
+    const fetch = vi.fn(async (input: string) => {
+      if (input !== "/api/auth/session") throw new Error("backend GET must not run");
+      return {
+        ok: true,
+        json: async () => ({
+          user: { id: userId, email: "owner@example.test" },
+          accessToken: `header.${jwtPayload}.signature`,
+        }),
+      };
+    });
+    const run = Function("window", "location", "fetch", `return ${expression};`) as (
+      window: object,
+      location: { href: string },
+      fetch: typeof globalThis.fetch,
+    ) => Promise<unknown>;
+
+    await expect(run({}, { href: "https://chatgpt.com/" }, fetch as never)).rejects.toThrow(
+      /bearer identity does not match/i,
+    );
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  test("capture hooks expose deterministic raw-body cleanup", () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const hook = buildScopedBackendCaptureHook(targetApiUrl);
+    const cleanup = buildChatGptCaptureCleanupExpressionForTest(targetApiUrl);
+    expect(hook).toContain(`const TARGET = "${targetApiUrl}"`);
+    expect(hook).toContain("window !== window.top");
     expect(hook).toContain("url !== TARGET");
-    expect(hook).toContain("window.fetch");
-    expect(hook).toContain("XMLHttpRequest");
+    expect(hook).toContain("active = false");
+    expect(hook).toContain("window.fetch = originalFetch");
+    expect(hook).toContain("window.XMLHttpRequest = OriginalXHR");
+    expect(hook).toContain("wrappedFetch.__oracleChatGptBackendCaptureTarget = TARGET");
+    expect(hook).toContain("WrappedXHR.__oracleChatGptBackendCaptureTarget = TARGET");
     expect(hook).toContain(
       'sessionStorage.setItem("__oracleChatGptBackendCapture:" + TARGET, text)',
     );
+    expect(cleanup).toContain("sessionStorage.removeItem(CAPTURE_KEY)");
+    expect(cleanup).toContain("sessionStorage.getItem(CAPTURE_KEY) === null");
+    expect(cleanup).toContain('const WRAPPER_MARKER = "__oracleChatGptBackendCaptureTarget"');
+    expect(cleanup).toContain("globalCleared && storageCleared && fetchRestored && xhrRestored");
+    expect(cleanup).toContain("delete hit.text");
+    expect(cleanup).toContain("delete window.__oracleChatGptBackendCapture");
     expect(hook).not.toContain("localStorage");
     expect(hook).not.toContain("cookie");
+  });
+
+  test("capture cleanup verification fails when a raw wrapper remains installed", () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const cleanup = buildChatGptCaptureCleanupExpressionForTest(targetApiUrl);
+    const lingeringFetch = Object.assign(() => undefined, {
+      __oracleChatGptBackendCaptureTarget: targetApiUrl,
+    });
+    const windowStub = {
+      fetch: lingeringFetch,
+      XMLHttpRequest: function XMLHttpRequest() {},
+      __oracleChatGptBackendCapture: {
+        hits: [],
+        cleanup: () => undefined,
+      },
+    };
+    const sessionStorageStub = {
+      removeItem: () => undefined,
+      getItem: () => null,
+    };
+    const run = Function("window", "sessionStorage", `return ${cleanup};`) as (
+      window: typeof windowStub,
+      sessionStorage: typeof sessionStorageStub,
+    ) => boolean;
+
+    expect(run(windowStub, sessionStorageStub)).toBe(false);
+  });
+
+  test("capture timeout diagnostics expose only non-locating metadata", () => {
+    const secret = "raw-secret-body";
+    const privateUrl = "https://chatgpt.com/backend-api/conversation/private-conversation";
+    const privateTitle = "Private conversation title";
+    const message = formatChatGptCaptureTimeoutForTest({
+      href: "https://chatgpt.com/c/private-conversation",
+      title: privateTitle,
+      hit: {
+        kind: "fetch",
+        url: privateUrl,
+        status: 503,
+        ok: false,
+        contentType: "application/json",
+        chars: 321,
+        title: privateTitle,
+        conversation_id: "private-conversation",
+        current_node: "private-current-node",
+        mappingCount: 7,
+      },
+      hits: [
+        {
+          kind: "fetch",
+          url: privateUrl,
+          status: 503,
+          contentType: "application/json",
+          chars: 321,
+          title: privateTitle,
+          conversation_id: "private-conversation",
+          current_node: "private-current-node",
+          text: secret,
+          bodyPreview: secret,
+          error: secret,
+          mappingCount: 7,
+        },
+      ],
+    });
+    expect(message).toContain('"kind":"fetch"');
+    expect(message).toContain('"status":503');
+    expect(message).toContain('"contentType":"application/json"');
+    expect(message).toContain('"chars":321');
+    expect(message).toContain('"mappingCount":7');
+    expect(message).toContain('"hitCount":1');
+    for (const privateValue of [
+      privateUrl,
+      privateTitle,
+      "private-conversation",
+      "private-current-node",
+      secret,
+    ]) {
+      expect(message).not.toContain(privateValue);
+    }
+    expect(message).not.toMatch(/"(?:href|title|url|conversation_id|current_node)"/);
+    expect(message).not.toContain("bodyPreview");
+    expect(message).not.toContain('"text"');
   });
 
   test("retrieves persisted capture text after a transient miss", async () => {
@@ -143,6 +324,10 @@ describe("ChatGPT conversation export helpers", () => {
         expect(expression).toContain(
           'sessionStorage.getItem("__oracleChatGptBackendCapture:" + target)',
         );
+        expect(expression).not.toContain(
+          'sessionStorage.removeItem("__oracleChatGptBackendCapture:" + target)',
+        );
+        expect(expression).not.toContain("delete window.__oracleChatGptBackendCapture");
         attempts += 1;
         return (attempts === 1 ? null : payload) as never;
       },
@@ -153,6 +338,22 @@ describe("ChatGPT conversation export helpers", () => {
     expect(result).toBe(payload);
     expect(attempts).toBe(2);
   });
+
+  test.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, 1.5])(
+    "rejects invalid core chunk size %s before evaluating page state",
+    async (chunkSize) => {
+      const evaluate = vi.fn();
+      await expect(
+        retrieveCapturedTextWithEvaluator(
+          evaluate as never,
+          "https://chatgpt.com/backend-api/conversation/conv-1",
+          10,
+          chunkSize,
+        ),
+      ).rejects.toThrow(/finite positive integer/i);
+      expect(evaluate).not.toHaveBeenCalled();
+    },
+  );
 
   test("normalizes backend content types without losing structured values", () => {
     expect(contentToText({ content_type: "text", parts: ["hello", { ok: true }] })).toContain(
@@ -177,6 +378,102 @@ describe("ChatGPT conversation export helpers", () => {
     expect(scanTextForSecretLikeMarkers("conversation.md", "TOKEN=abc123").findings).toEqual([
       { path: "conversation.md", marker: "TOKEN assignment" },
     ]);
+  });
+
+  test("writes bundles only into fresh private directories without symlink parents", async () => {
+    const root = await fs.mkdtemp(
+      path.join(await fs.realpath(os.tmpdir()), "oracle-export-permissions-"),
+    );
+    const payload = {
+      target_url: "https://chatgpt.com/c/conv-1",
+      final_url: "https://chatgpt.com/c/conv-1",
+      conversation_id: "conv-1",
+      expected_conversation_id: "conv-1",
+      scope_ok: true,
+      extraction_method: "test",
+      turns: [],
+      stats: { turn_count: 0 },
+    };
+    const writeBundle = (outDir: string) =>
+      writeChatGptExportBundleForTest({
+        outDir,
+        rawText: '{"conversation_id":"conv-1","mapping":{}}',
+        payload,
+        captureInfo: {},
+      });
+
+    try {
+      const outDir = path.join(root, "bundle");
+      if (process.platform === "win32") {
+        await expect(writeBundle(outDir)).rejects.toThrow(/disabled on Windows.*ACL/i);
+        await expect(fs.stat(outDir)).rejects.toMatchObject({ code: "ENOENT" });
+        return;
+      }
+      await writeBundle(outDir);
+      expect((await fs.stat(outDir)).mode & 0o777).toBe(0o700);
+      for (const file of await fs.readdir(outDir)) {
+        expect((await fs.stat(path.join(outDir, file))).mode & 0o777).toBe(0o600);
+      }
+      await expect(writeBundle(outDir)).rejects.toThrow(/fresh path.*already exist/i);
+
+      const preexisting = path.join(root, "preexisting");
+      await fs.mkdir(preexisting, { mode: 0o700 });
+      await fs.chmod(preexisting, 0o700);
+      await expect(writeBundle(preexisting)).rejects.toThrow(/fresh path.*already exist/i);
+
+      const realParent = path.join(root, "real-parent");
+      const symlinkParent = path.join(root, "symlink-parent");
+      await fs.mkdir(realParent, { mode: 0o700 });
+      await fs.symlink(realParent, symlinkParent, "dir");
+      await expect(writeBundle(path.join(symlinkParent, "bundle"))).rejects.toThrow(
+        /parent components.*symlink/i,
+      );
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("removes a partial sensitive bundle when a precommit write fails", async () => {
+    if (process.platform === "win32") return;
+    const root = await fs.mkdtemp(
+      path.join(await fs.realpath(os.tmpdir()), "oracle-export-rollback-"),
+    );
+    const outDir = path.join(root, "bundle");
+    try {
+      await expect(
+        writeChatGptExportBundleForTest({
+          outDir,
+          rawText: '{"conversation_id":"conv-1","mapping":{}}',
+          payload: {
+            target_url: "https://chatgpt.com/c/conv-1",
+            stats: { turn_count: 0 },
+            unserializable: BigInt(1),
+          },
+          captureInfo: {},
+        }),
+      ).rejects.toThrow(/BigInt/i);
+      await expect(fs.stat(outDir)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed before creating exports when Windows ACL guarantees are unavailable", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    const outDir = path.join(os.tmpdir(), `oracle-export-windows-${Date.now()}`);
+    try {
+      await expect(
+        captureApprovedChatGptConversationBackend({
+          targetUrl: "https://chatgpt.com/c/conv-1",
+          outDir,
+        }),
+      ).rejects.toThrow(/disabled on Windows.*ACL/i);
+      await expect(fs.stat(outDir)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      if (platform) Object.defineProperty(process, "platform", platform);
+      await fs.rm(outDir, { recursive: true, force: true });
+    }
   });
 
   test("converts current-node path to normalized payload stats", () => {
