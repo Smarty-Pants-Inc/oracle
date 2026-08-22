@@ -7,7 +7,7 @@ import {
 
 export interface ChatGptInventoryCliOptions extends ChatGptRemoteAffinityCliOptions {
   json?: boolean;
-  timeoutMs?: number;
+  timeout?: number | "auto";
 }
 
 export async function handleChatGptInventoryCommand(
@@ -22,9 +22,10 @@ export async function handleChatGptInventoryCommand(
     throw new Error("chatgpt-inventory requires --json.");
   }
   const affinity = resolveChatGptRemoteEmailAffinity(options);
+  const timeoutMs = typeof options.timeout === "number" ? options.timeout * 1000 : undefined;
   const result = await captureChatGptConversationInventory({
     ...affinity,
-    timeoutMs: options.timeoutMs,
+    timeoutMs,
   });
   console.log(JSON.stringify(result));
 }

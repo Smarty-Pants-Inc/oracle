@@ -13,6 +13,7 @@ vi.mock("../../src/browser/chatgptInventory.js", () => ({
 describe("chatgpt-inventory JSON output", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    mocks.captureInventory.mockReset();
     vi.unstubAllEnvs();
   });
 
@@ -46,5 +47,24 @@ describe("chatgpt-inventory JSON output", () => {
     expect(log).toHaveBeenCalledWith(JSON.stringify(result));
     expect(log.mock.calls[0]?.[0]).not.toMatch(/[\r\n]/);
     expect(log.mock.calls[0]?.[0]).not.toContain(": ");
+  });
+
+  test("converts the inherited timeout from seconds to milliseconds", async () => {
+    mocks.captureInventory.mockResolvedValue({ accountDigest: "a".repeat(64), items: [] });
+    vi.stubEnv(CHATGPT_ACCOUNT_BOUND_WRAPPER_ENV, "1");
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await handleChatGptInventoryCommand({
+      remoteChrome: "127.0.0.1:9223",
+      remoteChromeBrowserId: "browser-a",
+      remoteChromeBrowserWs: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+      expectedEmail: "owner@example.test",
+      json: true,
+      timeout: 300,
+    });
+
+    expect(mocks.captureInventory).toHaveBeenCalledWith(
+      expect.objectContaining({ timeoutMs: 300_000 }),
+    );
   });
 });
