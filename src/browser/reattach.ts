@@ -66,6 +66,46 @@ export interface ReattachResult {
   answerMarkdown: string;
 }
 
+function reattachConversationId(runtime: BrowserRuntimeMetadata): string | undefined {
+  return runtime.conversationId ?? extractConversationIdFromUrl(runtime.tabUrl ?? "");
+}
+
+function remainingReattachMs(deadline: number): number {
+  return Math.max(0, deadline - Date.now());
+}
+
+async function assertReattachPageAffinity(
+  Runtime: ChromeClient["Runtime"],
+  expectedConversationId: string | undefined,
+  expectedAccountDigest: string | undefined,
+  deadline: number,
+  action: string,
+): Promise<void> {
+  const { result } = await Runtime.evaluate({ expression: "location.href", returnByValue: true });
+  const href = typeof result?.value === "string" ? result.value : "";
+  let currentUrl: URL;
+  try {
+    currentUrl = new URL(href);
+  } catch {
+    throw new Error(`ChatGPT page origin is unavailable before ${action}.`);
+  }
+  if (currentUrl.origin !== new URL(CHATGPT_URL).origin) {
+    throw new Error(`ChatGPT page origin changed before ${action}.`);
+  }
+  if (expectedConversationId && extractConversationIdFromUrl(href) !== expectedConversationId) {
+    throw new Error(`ChatGPT conversation changed before ${action}.`);
+  }
+  if (expectedAccountDigest) {
+    const remainingMs = remainingReattachMs(deadline);
+    if (remainingMs <= 0) {
+      throw new Error(`Reattach deadline elapsed before ${action}.`);
+    }
+    if ((await readChatGptAccountDigest(Runtime, remainingMs)) !== expectedAccountDigest) {
+      throw new Error(`Remote Chrome account identity changed before ${action}.`);
+    }
+  }
+}
+
 export async function resumeBrowserSession(
   runtime: BrowserRuntimeMetadata,
   config: BrowserSessionConfig | undefined,
@@ -202,6 +242,25 @@ export async function resumeBrowserSession(
       await Page.enable();
     }
 
+    const timeoutMs = config?.timeoutMs ?? 120_000;
+    const responseDeadline = Date.now() + timeoutMs;
+    const expectedConversationId = reattachConversationId(runtime);
+    const storedAccountDigest = identityBoundRemoteSession
+      ? expectedAccountDigest
+      : runtime.chatGptAccountDigest?.trim();
+    const expectedReattachAccountDigest =
+      storedAccountDigest && /^[a-f0-9]{64}$/.test(storedAccountDigest)
+        ? storedAccountDigest
+        : undefined;
+    const assertPageAffinity = async (action: string): Promise<void> => {
+      await assertReattachPageAffinity(
+        Runtime,
+        expectedConversationId,
+        expectedReattachAccountDigest,
+        responseDeadline,
+        action,
+      );
+    };
     const ensureConversationOpen = async () => {
       const { result } = await Runtime.evaluate({
         expression: "location.href",
@@ -210,15 +269,14 @@ export async function resumeBrowserSession(
       const href = typeof result?.value === "string" ? result.value : "";
       if (href.includes("/c/")) {
         const currentId = extractConversationIdFromUrl(href);
-        if (!runtime.conversationId || (currentId && currentId === runtime.conversationId)) {
+        if (!expectedConversationId || (currentId && currentId === expectedConversationId)) {
           return;
         }
       }
       const opened = await openConversationFromSidebarWithRetry(
         Runtime,
         {
-          conversationId:
-            runtime.conversationId ?? extractConversationIdFromUrl(runtime.tabUrl ?? ""),
+          conversationId: expectedConversationId,
           preferProjects: true,
           promptPreview: deps.promptPreview,
         },
@@ -232,20 +290,21 @@ export async function resumeBrowserSession(
 
     const waitForResponse = deps.waitForAssistantResponse ?? waitForAssistantResponse;
     const captureMarkdown = deps.captureAssistantMarkdown ?? captureAssistantMarkdown;
-    const timeoutMs = config?.timeoutMs ?? 120_000;
     const pingTimeoutMs = Math.min(5_000, Math.max(1_500, Math.floor(timeoutMs * 0.05)));
     await withTimeout(
       Runtime.evaluate({ expression: "1+1", returnByValue: true }),
       pingTimeoutMs,
       "Reattach target did not respond",
     );
-    if (identityBoundRemoteSession) {
-      const observedAccountDigest = await readChatGptAccountDigest(Runtime);
-      if (observedAccountDigest !== expectedAccountDigest) {
-        throw new Error("Remote Chrome account identity changed before session reattach.");
-      }
-    }
+    await assertReattachPageAffinity(
+      Runtime,
+      undefined,
+      expectedReattachAccountDigest,
+      responseDeadline,
+      "session reattach navigation",
+    );
     await ensureConversationOpen();
+    await assertPageAffinity("session reattach");
     const waitForHydration =
       deps.waitForConversationHydration ?? waitForResumedConversationHydration;
     const expectedConversationUrl = buildConversationUrl(
@@ -257,6 +316,7 @@ export async function resumeBrowserSession(
       requirePromptReady: false,
       expectedConversationUrl: expectedConversationUrl ?? undefined,
     });
+    await assertPageAffinity("reattach hydration");
     const minTurnIndex =
       (await readPromptPreviewTurnIndex(Runtime, deps.promptPreview)) ??
       (deps.promptPreview ? null : await readConversationTurnIndex(Runtime, logger));
@@ -266,10 +326,13 @@ export async function resumeBrowserSession(
       const researchResult = await withTimeout(
         waitForDeepResearch(Runtime, logger, timeoutMs, minTurnIndex ?? undefined, Page, client, {
           requireScopedTargetOwner: true,
+          expectedConversationId,
+          assertPageAffinity,
         }),
         timeoutMs + 5_000,
         "Reattach Deep Research response timed out",
       );
+      await assertPageAffinity("reattach Deep Research final return");
       await closeAttached();
       return {
         answerText: researchResult.text,
@@ -277,11 +340,19 @@ export async function resumeBrowserSession(
       };
     }
     const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
+    await assertPageAffinity("reattach response wait");
     const answer = await withTimeout(
-      waitForResponse(Runtime, timeoutMs, logger, minTurnIndex ?? undefined),
+      waitForResponse(
+        Runtime,
+        timeoutMs,
+        logger,
+        minTurnIndex ?? undefined,
+        expectedConversationId,
+      ),
       timeoutMs + 5_000,
       "Reattach response timed out",
     );
+    await assertPageAffinity("reattach response capture");
     const recovered = await recoverPromptEcho(
       Runtime,
       answer,
@@ -289,15 +360,23 @@ export async function resumeBrowserSession(
       logger,
       minTurnIndex,
       timeoutMs,
+      { expectedConversationId, assertPageAffinity },
     );
     const markdown =
       (await withTimeout(
-        captureMarkdown(Runtime, recovered.meta, logger),
+        captureMarkdown(
+          Runtime,
+          recovered.meta,
+          logger,
+          expectedConversationId,
+          assertPageAffinity,
+        ),
         15_000,
         "Reattach markdown capture timed out",
       )) ?? recovered.text;
     const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
 
+    await assertPageAffinity("reattach final return");
     await closeAttached();
     return { answerText: aligned.answerText, answerMarkdown: aligned.answerMarkdown };
   } catch (error) {
@@ -397,9 +476,33 @@ async function resumeBrowserSessionViaNewChrome(
     ],
   });
 
+  const timeoutMs = resolved.timeoutMs ?? 120_000;
+  const responseDeadline = Date.now() + timeoutMs;
+  const expectedConversationId = reattachConversationId(runtime);
+  const runtimeAccountDigest = runtime.chatGptAccountDigest?.trim();
+  const expectedAccountDigest =
+    runtimeAccountDigest && /^[a-f0-9]{64}$/.test(runtimeAccountDigest)
+      ? runtimeAccountDigest
+      : undefined;
+  const assertPageAffinity = async (action: string): Promise<void> => {
+    await assertReattachPageAffinity(
+      Runtime,
+      expectedConversationId,
+      expectedAccountDigest,
+      responseDeadline,
+      action,
+    );
+  };
   await navigateToChatGPT(Page, Runtime, CHATGPT_URL, logger);
   await ensureNotBlocked(Runtime, resolved.headless, logger);
   await ensureLoggedIn(Runtime, logger, { appliedCookies });
+  await assertReattachPageAffinity(
+    Runtime,
+    undefined,
+    expectedAccountDigest,
+    responseDeadline,
+    "new Chrome reattach navigation",
+  );
   if (resolved.url !== CHATGPT_URL) {
     await navigateToChatGPT(Page, Runtime, resolved.url, logger);
     await ensureNotBlocked(Runtime, resolved.headless, logger);
@@ -416,8 +519,7 @@ async function resumeBrowserSessionViaNewChrome(
     const opened = await openConversationFromSidebarWithRetry(
       Runtime,
       {
-        conversationId:
-          runtime.conversationId ?? extractConversationIdFromUrl(runtime.tabUrl ?? ""),
+        conversationId: expectedConversationId,
         preferProjects:
           resolved.url !== CHATGPT_URL ||
           Boolean(
@@ -433,15 +535,18 @@ async function resumeBrowserSessionViaNewChrome(
     await waitForLocationChange(Runtime, 15_000);
   }
 
+  const expectedConversationUrl =
+    conversationUrl ??
+    (expectedConversationId ? `${CHATGPT_URL}/c/${expectedConversationId}` : undefined);
   const waitForHydration = deps.waitForConversationHydration ?? waitForResumedConversationHydration;
   await waitForHydration(Runtime, resolved.inputTimeoutMs, logger, {
     requirePriorTurns: true,
     requirePromptReady: false,
-    expectedConversationUrl: conversationUrl ?? undefined,
+    expectedConversationUrl,
   });
+  await assertPageAffinity("new Chrome reattach hydration");
   const waitForResponse = deps.waitForAssistantResponse ?? waitForAssistantResponse;
   const captureMarkdown = deps.captureAssistantMarkdown ?? captureAssistantMarkdown;
-  const timeoutMs = resolved.timeoutMs ?? 120_000;
   const cleanup = async () => {
     if (client && typeof client.close === "function") {
       try {
@@ -479,8 +584,11 @@ async function resumeBrowserSessionViaNewChrome(
       client,
       {
         requireScopedTargetOwner: true,
+        expectedConversationId,
+        assertPageAffinity,
       },
     );
+    await assertPageAffinity("new Chrome reattach Deep Research final return");
     await cleanup();
     return {
       answerText: researchResult.text,
@@ -488,7 +596,15 @@ async function resumeBrowserSessionViaNewChrome(
     };
   }
   const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
-  const answer = await waitForResponse(Runtime, timeoutMs, logger, minTurnIndex ?? undefined);
+  await assertPageAffinity("new Chrome reattach response wait");
+  const answer = await waitForResponse(
+    Runtime,
+    timeoutMs,
+    logger,
+    minTurnIndex ?? undefined,
+    expectedConversationId,
+  );
+  await assertPageAffinity("new Chrome reattach response capture");
   const recovered = await recoverPromptEcho(
     Runtime,
     answer,
@@ -496,10 +612,19 @@ async function resumeBrowserSessionViaNewChrome(
     logger,
     minTurnIndex,
     timeoutMs,
+    { expectedConversationId, assertPageAffinity },
   );
-  const markdown = (await captureMarkdown(Runtime, recovered.meta, logger)) ?? recovered.text;
+  const markdown =
+    (await captureMarkdown(
+      Runtime,
+      recovered.meta,
+      logger,
+      expectedConversationId,
+      assertPageAffinity,
+    )) ?? recovered.text;
   const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
 
+  await assertPageAffinity("new Chrome reattach final return");
   await cleanup();
 
   return { answerText: aligned.answerText, answerMarkdown: aligned.answerMarkdown };

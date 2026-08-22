@@ -188,10 +188,13 @@ describe("ChatGPT conversation export helpers", () => {
       expectedDigest,
       "owner@example.test",
     );
+    const sessionTarget = "https://chatgpt.com/api/auth/session";
     const fetch = vi.fn(async (input: string) => {
-      if (input !== "/api/auth/session") throw new Error("backend GET must not run");
+      if (input !== sessionTarget) throw new Error("backend GET must not run");
       return {
         ok: true,
+        redirected: false,
+        url: sessionTarget,
         json: async () => ({
           user: { id: userId, email: "owner@example.test" },
           accessToken: `header.${jwtPayload}.signature`,
@@ -233,10 +236,13 @@ describe("ChatGPT conversation export helpers", () => {
     });
     let scheduledMs: number | undefined;
     let timeoutCallback: (() => void) | undefined;
+    const sessionTarget = "https://chatgpt.com/api/auth/session";
     const pageFetch = vi.fn((input: string, init?: { signal?: AbortSignal }) => {
-      if (input === "/api/auth/session") {
+      if (input === sessionTarget) {
         return Promise.resolve({
           ok: true,
+          redirected: false,
+          url: sessionTarget,
           json: async () => ({
             user: { id: userId, email: "owner@example.test" },
             accessToken: `header.${jwtPayload}.signature`,

@@ -55,7 +55,7 @@ describe("recoverConversationTab flow", () => {
     const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
     const recovered = await recoverConversationTab(meta, logger, {
       existingEndpoint: { host: "127.0.0.1", port: 9222 },
-      readyTimeoutMs: 1,
+      readyTimeoutMs: 1_000,
     });
 
     expect(openChatGptTarget).toHaveBeenCalledWith({
@@ -123,7 +123,7 @@ describe("recoverConversationTab flow", () => {
         browserId: "browser-a",
         accountDigest,
       },
-      readyTimeoutMs: 1,
+      readyTimeoutMs: 1_000,
     });
 
     expect(openChatGptTarget).toHaveBeenCalledWith({
@@ -301,7 +301,7 @@ describe("recoverConversationTab flow", () => {
           browserId: "browser-a",
           accountDigest,
         },
-        readyTimeoutMs: 1,
+        readyTimeoutMs: 1_000,
       }),
     ).rejects.toThrow(/conversation changed before recovery completed/i);
 
@@ -332,7 +332,7 @@ describe("recoverConversationTab flow", () => {
     const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
     const recovered = await recoverConversationTab(meta, logger, {
       existingEndpoint: { host: "127.0.0.1", port: 9222 },
-      readyTimeoutMs: 1,
+      readyTimeoutMs: 1_000,
     });
 
     expect(acquireManualLoginChromeForRun).toHaveBeenCalledWith(
@@ -382,18 +382,15 @@ describe("recoverConversationTab flow", () => {
     const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
     const recovered = await recoverConversationTab(remoteMeta, logger, {
       existingEndpoint: { host: "127.0.0.1", port: 9222 },
-      readyTimeoutMs: 1,
+      readyTimeoutMs: 1_000,
     });
 
     expect(recovered.chrome).toBeNull();
     expect(acquireManualLoginChromeForRun).not.toHaveBeenCalled();
   });
 
-  test("closes the newly opened target and kills launched Chrome when recovery never becomes ready", async () => {
-    const openChatGptTarget = vi
-      .fn()
-      .mockRejectedValueOnce(new Error("ECONNREFUSED"))
-      .mockResolvedValueOnce("target-2");
+  test("does not allocate a local profile after the recovery budget is exhausted", async () => {
+    const openChatGptTarget = vi.fn();
     const harvestChatGptTab = vi.fn();
     const chrome = { port: 53999, kill: vi.fn(), process: { unref: vi.fn() } };
     const acquireManualLoginChromeForRun = vi.fn(async () => ({ chrome }));
@@ -420,10 +417,59 @@ describe("recoverConversationTab flow", () => {
         existingEndpoint: { host: "127.0.0.1", port: 9222 },
         readyTimeoutMs: 0,
       }),
-    ).rejects.toThrow(/did not become ready/);
+    ).rejects.toThrow(/timed out while opening the recovery target/i);
 
-    expect(chrome.kill).toHaveBeenCalledTimes(1);
-    expect(closeTab).toHaveBeenCalledWith(53999, "target-2", logger, "127.0.0.1");
+    expect(openChatGptTarget).not.toHaveBeenCalled();
+    expect(acquireManualLoginChromeForRun).not.toHaveBeenCalled();
+    expect(closeTab).not.toHaveBeenCalled();
+    expect(chrome.kill).not.toHaveBeenCalled();
+  });
+  test("kills a Chrome allocation that resolves after the recovery deadline", async () => {
+    let resolveLateLaunch!: (value: {
+      chrome: { port: number; kill: () => Promise<void>; process: { unref: () => void } };
+    }) => void;
+    const chrome = { port: 53999, kill: vi.fn(async () => undefined), process: { unref: vi.fn() } };
+    const acquireManualLoginChromeForRun = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          resolveLateLaunch = resolve;
+        }),
+    );
+
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.doMock("../../src/browser/liveTabs.js", () => ({
+      extractConversationIdFromUrl: (url: string) =>
+        url.includes("/c/") ? url.split("/c/")[1] : null,
+      openChatGptTarget: vi.fn(),
+      harvestChatGptTab: vi.fn(),
+    }));
+    vi.doMock("../../src/browser/index.js", () => ({
+      acquireManualLoginChromeForRun,
+      isImageOnlyUiChromeText: () => false,
+    }));
+
+    // This module must load after vi.doMock so its static imports see the late allocation stub.
+    const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
+    try {
+      const failure = recoverConversationTab(meta, logger, { readyTimeoutMs: 100 }).catch(
+        (error: unknown) => error,
+      );
+      await Promise.resolve();
+      expect(acquireManualLoginChromeForRun).toHaveBeenCalledOnce();
+
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(failure).resolves.toMatchObject({
+        message: "Timed out while launching Chrome for conversation recovery.",
+      });
+
+      resolveLateLaunch({ chrome });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(chrome.kill).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("kills launched Chrome when opening the recovery target fails", async () => {
@@ -447,7 +493,7 @@ describe("recoverConversationTab flow", () => {
     const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
     await expect(
       recoverConversationTab(meta, logger, {
-        readyTimeoutMs: 1,
+        readyTimeoutMs: 1_000,
       }),
     ).rejects.toThrow(/CDP.New failed/);
 

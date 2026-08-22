@@ -190,9 +190,18 @@ describe("ChatGPT conversation inventory", () => {
         json: async () => ({ webSocketDebuggerUrl: browserWSEndpoint }),
       }),
     );
+    let resolveLateConnection!: (connection: {
+      client: ChromeClient;
+      targetId: string;
+      browserWSEndpoint: string;
+      close: () => Promise<void>;
+    }) => void;
+    const lateClose = vi.fn(async () => undefined);
     chromeMocks.connectToRemoteChromeTarget.mockImplementation(() => {
       signalTargetConnectionStarted();
-      return new Promise<never>(() => undefined);
+      return new Promise((resolve) => {
+        resolveLateConnection = resolve;
+      });
     });
 
     const capture = captureChatGptConversationInventory({
@@ -212,6 +221,22 @@ describe("ChatGPT conversation inventory", () => {
     expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).toMatch(
       /timed out while opening the disposable ChatGPT inventory target/i,
+    );
+
+    resolveLateConnection({
+      client: {} as ChromeClient,
+      targetId: "target-late",
+      browserWSEndpoint,
+      close: lateClose,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lateClose).toHaveBeenCalledOnce();
+    expect(chromeMocks.closeTab).toHaveBeenCalledWith(
+      9223,
+      "target-late",
+      expect.any(Function),
+      "127.0.0.1",
     );
   });
 

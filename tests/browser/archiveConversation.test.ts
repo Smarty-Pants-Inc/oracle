@@ -124,14 +124,15 @@ describe("archiveChatGptConversation", () => {
     expect(runtime.evaluate).toHaveBeenCalledWith(
       expect.objectContaining({
         awaitPromise: true,
-        expression: expect.stringContaining(`const remainingMs = ${remainingMs};`),
         returnByValue: true,
       }),
     );
-    expect(runtime.evaluate.mock.calls[0]?.[0]?.expression).toContain(
-      "const deadline = Date.now() + remainingMs;",
-    );
+    const expression = runtime.evaluate.mock.calls[0]?.[0]?.expression;
+    expect(expression).toContain("const deadline = ");
+    expect(expression).toContain("const confirmationBudgetMs = 1000;");
+    expect(expression).toContain("const confirmationDeadline = deadline - confirmationBudgetMs;");
   });
+
   test("bounds a stalled Runtime.evaluate by the caller remaining time", async () => {
     vi.useFakeTimers();
     try {
@@ -139,10 +140,10 @@ describe("archiveChatGptConversation", () => {
       const result = archiveChatGptConversation(runtime as never, vi.fn() as never, {
         mode: "always",
         conversationUrl: "https://chatgpt.com/c/abc",
-        remainingMs: 100,
+        remainingMs: 2_000,
       });
 
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(2_000);
 
       await expect(result).resolves.toMatchObject({
         attempted: true,
@@ -154,6 +155,24 @@ describe("archiveChatGptConversation", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  test("rejects an insufficient confirmation budget before evaluating the archive mutation", async () => {
+    const runtime = { evaluate: vi.fn() };
+
+    await expect(
+      archiveChatGptConversation(runtime as never, vi.fn() as never, {
+        mode: "always",
+        conversationUrl: "https://chatgpt.com/c/abc",
+        remainingMs: 1_000,
+      }),
+    ).resolves.toMatchObject({
+      attempted: false,
+      archived: false,
+      reason: "archive-not-confirmed",
+      error: "Archive deadline has insufficient confirmation budget.",
+    });
+    expect(runtime.evaluate).not.toHaveBeenCalled();
   });
 
   test("returns a non-archived result when the DOM action is not confirmed", async () => {
@@ -247,6 +266,8 @@ describe("archiveChatGptConversation", () => {
     );
     const fetch = vi.fn().mockResolvedValue({
       ok: true,
+      redirected: false,
+      url: "https://chatgpt.com/api/auth/session",
       json: async () => ({ user: { id: "account-b" } }),
     });
     const evaluate = new Function("location", "document", "fetch", `return ${expression};`) as (
@@ -282,6 +303,8 @@ describe("archiveChatGptConversation", () => {
     );
     const fetch = vi.fn().mockResolvedValue({
       ok: true,
+      redirected: false,
+      url: "https://chatgpt.com/api/auth/session",
       json: async () => ({ user: { id: "account-a" } }),
     });
     const evaluate = new Function("location", "document", "fetch", `return ${expression};`) as (
@@ -405,6 +428,8 @@ describe("archiveChatGptConversation", () => {
     };
     const response = (userId: string) => ({
       ok: true,
+      redirected: false,
+      url: "https://chatgpt.com/api/auth/session",
       json: async () => ({ user: { id: userId } }),
     });
     const fetch = vi
@@ -515,6 +540,8 @@ describe("archiveChatGptConversation", () => {
     };
     const fetch = vi.fn().mockResolvedValue({
       ok: true,
+      redirected: false,
+      url: "https://chatgpt.com/api/auth/session",
       json: async () => ({ user: { id: "account-a" } }),
     });
     const evaluate = new Function(
@@ -593,6 +620,10 @@ describe("archiveChatGptConversation", () => {
     expect(expression).toContain("const confirmationDeadline =");
     expect(expression).toContain("AbortController");
     expect(expression).toContain("Promise.withResolvers");
+    expect(expression).toContain("const target = 'https://chatgpt.com/api/auth/session';");
+    expect(expression).toContain("redirect: 'error'");
+    expect(expression).toContain("response.redirected");
+    expect(expression).toContain("response.url !== target");
     expect(expression).toContain("archive-not-confirmed");
     expect(expression).toContain("archive");
     expect(expression).not.toContain("delete");

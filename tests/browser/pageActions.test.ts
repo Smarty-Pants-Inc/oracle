@@ -1599,10 +1599,36 @@ describe("ensureLoggedIn", () => {
     const evaluate = vi.fn().mockResolvedValue({ result: { value: digest } });
     const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
 
-    await expect(readChatGptAccountDigest(runtime)).resolves.toBe(digest);
+    await expect(readChatGptAccountDigest(runtime, 250)).resolves.toBe(digest);
     expect(evaluate).toHaveBeenCalledWith(
       expect.objectContaining({ awaitPromise: true, returnByValue: true }),
     );
+    const expression = evaluate.mock.calls[0]?.[0]?.expression;
+    expect(expression).toContain('const target = "https://chatgpt.com/api/auth/session"');
+    expect(expression).toContain('new URL(location.href).origin !== "https://chatgpt.com"');
+    expect(expression).toContain("redirect: 'error'");
+    expect(expression).toContain("response.redirected");
+    expect(expression).toContain("response.url !== target");
+    expect(expression).toContain("const timeoutMs = 250");
+  });
+  test("bounds a stalled account digest CDP evaluation by its supplied deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = {
+        evaluate: vi.fn(() => new Promise<never>(() => undefined)),
+      } as unknown as ChromeClient["Runtime"];
+      const failure = readChatGptAccountDigest(runtime, 25).catch((error: unknown) => error);
+
+      await vi.advanceTimersByTimeAsync(25);
+
+      const error = await failure;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toMatch(
+        /timed out while reading authenticated ChatGPT account identity/i,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("rejects raw or unavailable account identifiers", async () => {

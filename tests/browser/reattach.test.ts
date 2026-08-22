@@ -76,8 +76,20 @@ describe("resumeBrowserSession", () => {
     expect(connect).toHaveBeenCalledWith(
       expect.objectContaining({ host: "127.0.0.1", port: 51559, target: "target-1" }),
     );
-    expect(waitForAssistantResponse).toHaveBeenCalled();
-    expect(captureAssistantMarkdown).toHaveBeenCalled();
+    expect(waitForAssistantResponse).toHaveBeenCalledWith(
+      expect.anything(),
+      2000,
+      logger,
+      expect.anything(),
+      "abc",
+    );
+    expect(captureAssistantMarkdown).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      logger,
+      "abc",
+      expect.any(Function),
+    );
     expect(waitForConversationHydration).toHaveBeenCalledWith(expect.anything(), 2000, logger, {
       requirePriorTurns: true,
       requirePromptReady: false,
@@ -139,7 +151,13 @@ describe("resumeBrowserSession", () => {
       promptPreview: "live reattach pro 123",
     });
 
-    expect(waitForAssistantResponse).toHaveBeenCalledWith(expect.anything(), 2000, logger, 3);
+    expect(waitForAssistantResponse).toHaveBeenCalledWith(
+      expect.anything(),
+      2000,
+      logger,
+      3,
+      "abc",
+    );
   });
 
   test("uses Deep Research completion path when reattaching research sessions", async () => {
@@ -212,9 +230,11 @@ describe("resumeBrowserSession", () => {
       2,
       expect.any(Object),
       expect.any(Object),
-      {
+      expect.objectContaining({
         requireScopedTargetOwner: true,
-      },
+        expectedConversationId: "deep",
+        assertPageAffinity: expect.any(Function),
+      }),
     );
     expect(waitForAssistantResponse).not.toHaveBeenCalled();
     expect(captureAssistantMarkdown).not.toHaveBeenCalled();

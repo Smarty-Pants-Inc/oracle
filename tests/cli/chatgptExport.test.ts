@@ -286,6 +286,20 @@ describe("ChatGPT export endpoint affinity", () => {
       ]),
     ).toThrow(/browser identity is conflicting/i);
   });
+  test("rejects a runtime browser receipt outside its configured authority", () => {
+    expect(() =>
+      resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-authority-conflict", [
+        session("authority-conflict", {
+          harvest: { conversationId: "thread-authority-conflict" },
+          config: config("127.0.0.1", 9223, "browser-a"),
+          runtime: {
+            chromeBrowserWSEndpoint: ws("browser-a", "127.0.0.1", 9224),
+            chatGptAccountDigest: accountDigest,
+          },
+        }),
+      ]),
+    ).toThrow(/authority/i);
+  });
 
   test.each(["", "127.0.0.1:9223junk", "127.0.0.1:9223.5"])(
     "rejects malformed explicit remote Chrome value %j",

@@ -187,15 +187,30 @@ async function runBeforeDeadline<T>(
   operation: () => Promise<T>,
   deadline: number,
   timeoutMessage: string,
+  disposeLateResult?: (result: T) => Promise<void> | void,
 ): Promise<T> {
   const remaining = remainingMs(deadline);
   if (remaining <= 0) throw new Error(timeoutMessage);
+  let timedOut = false;
   let timer: NodeJS.Timeout | undefined;
+  const operationResult = Promise.resolve().then(operation);
+  if (disposeLateResult) {
+    void operationResult
+      .then((result) => {
+        if (!timedOut) return;
+        return Promise.resolve(disposeLateResult(result)).catch(() => undefined);
+      })
+      .catch(() => undefined);
+  }
   try {
     return await Promise.race([
-      operation(),
+      operationResult,
       new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error(timeoutMessage)), remaining);
+        timer = setTimeout(() => {
+          timedOut = true;
+          reject(new Error(timeoutMessage));
+        }, remaining);
+        timer.unref?.();
       }),
     ]);
   } finally {
@@ -211,12 +226,14 @@ async function runCleanupBeforeDeadline<T>(
   operation: () => Promise<T>,
   deadline: number,
   timeoutMessage: string,
+  disposeLateResult?: (result: T) => Promise<void> | void,
 ): Promise<T> {
   if (remainingMs(deadline) > 0) {
-    return await runBeforeDeadline(operation, deadline, timeoutMessage);
+    return await runBeforeDeadline(operation, deadline, timeoutMessage, disposeLateResult);
   }
   void Promise.resolve()
     .then(operation)
+    .then((result) => Promise.resolve(disposeLateResult?.(result)))
     .catch(() => undefined);
   throw new Error(timeoutMessage);
 }
@@ -559,12 +576,16 @@ function buildReadOnlyConversationGetExpression(
   return `
 (async () => {
   const TARGET = ${jsString(targetApiUrl)};
+  const SESSION_TARGET = "https://chatgpt.com/api/auth/session";
   const EXPECTED_CONVERSATION_ID = ${jsString(expectedConversationId)};
   const EXPECTED_ACCOUNT_DIGEST = ${JSON.stringify(expectedAccountDigest ?? null)};
   const EXPECTED_EMAIL = ${JSON.stringify(expectedEmail?.trim().toLowerCase() || null)};
   const REMAINING_MS = ${JSON.stringify(pageBudgetMs)};
   const DEADLINE = Date.now() + REMAINING_MS;
   const timeoutError = () => new Error("Authenticated ChatGPT exact GET timed out.");
+  if (new URL(location.href).origin !== "https://chatgpt.com") {
+    throw new Error("Authenticated ChatGPT account identity origin is unavailable.");
+  }
   const requestWithinDeadline = async (input, init, readBody) => {
     const remaining = DEADLINE - Date.now();
     if (!Number.isFinite(remaining) || remaining <= 0) throw timeoutError();
@@ -614,8 +635,8 @@ function buildReadOnlyConversationGetExpression(
       return null;
     }
   };
-  const { body: session } = await requestWithinDeadline(
-    "/api/auth/session",
+  const { response: sessionResponse, body: session } = await requestWithinDeadline(
+    SESSION_TARGET,
     {
       method: "GET",
       cache: "no-store",
@@ -627,6 +648,9 @@ function buildReadOnlyConversationGetExpression(
       return await response.json();
     },
   );
+  if (sessionResponse.redirected || sessionResponse.url !== SESSION_TARGET) {
+    throw new Error("Authenticated ChatGPT account identity left the exact session endpoint.");
+  }
   const accessToken = typeof session?.accessToken === "string" ? session.accessToken.trim() : "";
   if (!accessToken) throw new Error("Authenticated ChatGPT access token is unavailable.");
   const cookieIdentity = await sessionIdentity(session);
@@ -733,6 +757,7 @@ async function closeOpenedChatGptTarget(
         }),
       deadline,
       "Timed out reconnecting to clean up the ChatGPT export target.",
+      (lateConnection) => lateConnection.close(),
     );
     await runCleanupBeforeDeadline(
       () => connection.close(),
@@ -843,16 +868,24 @@ function buildChatGptAccountDigestExpression(remainingMs: number): string {
   const pageBudgetMs = Number.isFinite(remainingMs) ? Math.max(0, remainingMs) : 0;
   return `(() => (async () => {
   const REMAINING_MS = ${JSON.stringify(pageBudgetMs)};
+  const TARGET = 'https://chatgpt.com/api/auth/session';
   if (REMAINING_MS <= 0) return null;
   const deadline = Date.now() + REMAINING_MS;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REMAINING_MS);
   try {
-    const response = await fetch('/api/auth/session', {
+    if (new URL(location.href).origin !== 'https://chatgpt.com') return null;
+    const response = await fetch(TARGET, {
       method: 'GET', cache: 'no-store', credentials: 'include', redirect: 'error',
       signal: controller.signal,
     });
-    if (!response.ok || controller.signal.aborted || Date.now() >= deadline) return null;
+    if (
+      !response.ok ||
+      response.redirected ||
+      response.url !== TARGET ||
+      controller.signal.aborted ||
+      Date.now() >= deadline
+    ) return null;
     const body = await response.json();
     if (controller.signal.aborted || Date.now() >= deadline) return null;
     const userId = typeof body?.user?.id === 'string' ? body.user.id.trim() : '';
@@ -1653,6 +1686,7 @@ async function captureChatGptConversationReadOnly({
       }),
     deadline,
     "Timed out connecting to the read-only ChatGPT export target.",
+    (lateConnection) => lateConnection.close(),
   );
   const targetId = opened.targetId;
 
@@ -1923,6 +1957,7 @@ export async function captureApprovedChatGptConversationBackend(
         }),
       deadline,
       "Timed out attaching to the approved ChatGPT export tab.",
+      (lateConnection) => lateConnection.client.close(),
     );
     if (!isSameConversationUrl(connected.tab.url, conversationId)) {
       await disposeChatGptExportConnection(
@@ -1950,6 +1985,14 @@ export async function captureApprovedChatGptConversationBackend(
           }),
         deadline,
         "Timed out creating the active ChatGPT export target.",
+        (lateTargetId) =>
+          closeOpenedChatGptTarget(
+            host,
+            port,
+            lateTargetId,
+            Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS,
+            browserWSEndpoint,
+          ).catch(() => undefined),
       );
       let opened: ChatGptTabConnection;
       try {
@@ -1966,6 +2009,7 @@ export async function captureApprovedChatGptConversationBackend(
             }),
           deadline,
           "Timed out attaching to the active ChatGPT export target.",
+          (lateConnection) => lateConnection.client.close(),
         );
       } catch (openError) {
         try {

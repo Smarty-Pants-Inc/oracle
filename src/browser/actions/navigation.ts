@@ -8,6 +8,11 @@ import {
 import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
+const DEFAULT_ACCOUNT_DIGEST_TIMEOUT_MS = 10_000;
+const ACCOUNT_DIGEST_TIMEOUT_ERROR =
+  "Timed out while reading authenticated ChatGPT account identity.";
+const CHATGPT_ORIGIN = "https://chatgpt.com";
+const CHATGPT_SESSION_URL = `${CHATGPT_ORIGIN}/api/auth/session`;
 
 export function installJavaScriptDialogAutoDismissal(
   Page: ChromeClient["Page"],
@@ -541,33 +546,71 @@ export async function ensureLoggedIn(
 }
 
 /** Returns only the SHA-256 digest of ChatGPT's authenticated user id. */
-export async function readChatGptAccountDigest(Runtime: ChromeClient["Runtime"]): Promise<string> {
-  const outcome = await Runtime.evaluate({
-    expression: `(() => (async () => {
-      try {
-        const response = await fetch('/api/auth/session', {
-          cache: 'no-store', credentials: 'include',
-        });
-        if (!response.ok) return null;
-        const body = await response.json();
-        const userId = typeof body?.user?.id === 'string' ? body.user.id.trim() : '';
-        if (!userId || !globalThis.crypto?.subtle) return null;
-        const bytes = new Uint8Array(await crypto.subtle.digest(
-          'SHA-256', new TextEncoder().encode(userId),
-        ));
-        return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
-      } catch {
-        return null;
-      }
-    })())()`,
-    awaitPromise: true,
-    returnByValue: true,
-  });
-  const digest = outcome.result?.value;
-  if (typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest)) {
-    throw new Error("Authenticated ChatGPT account identity is unavailable.");
+export async function readChatGptAccountDigest(
+  Runtime: ChromeClient["Runtime"],
+  remainingMs?: number,
+): Promise<string> {
+  const timeoutMs =
+    typeof remainingMs === "number" && Number.isFinite(remainingMs)
+      ? Math.max(0, Math.floor(remainingMs))
+      : DEFAULT_ACCOUNT_DIGEST_TIMEOUT_MS;
+  if (timeoutMs <= 0) {
+    throw new Error(ACCOUNT_DIGEST_TIMEOUT_ERROR);
   }
-  return digest;
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    const outcome = await Promise.race([
+      Runtime.evaluate({
+        expression: `(() => (async () => {
+          const timeoutMs = ${JSON.stringify(timeoutMs)};
+          const target = ${JSON.stringify(CHATGPT_SESSION_URL)};
+          let timeout;
+          try {
+            if (new URL(location.href).origin !== ${JSON.stringify(CHATGPT_ORIGIN)}) return null;
+            const deadline = Date.now() + timeoutMs;
+            const controller = new AbortController();
+            timeout = setTimeout(() => controller.abort(), timeoutMs);
+            const response = await fetch(target, {
+              method: 'GET', cache: 'no-store', credentials: 'include', redirect: 'error', signal: controller.signal,
+            });
+            if (
+              !response.ok ||
+              response.redirected ||
+              response.url !== target ||
+              controller.signal.aborted ||
+              Date.now() >= deadline
+            ) return null;
+            const body = await response.json();
+            const userId = typeof body?.user?.id === 'string' ? body.user.id.trim() : '';
+            if (!userId || !globalThis.crypto?.subtle) return null;
+            const bytes = new Uint8Array(await crypto.subtle.digest(
+              'SHA-256', new TextEncoder().encode(userId),
+            ));
+            return controller.signal.aborted || Date.now() >= deadline
+              ? null
+              : Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+          } catch {
+            return null;
+          } finally {
+            if (timeout !== undefined) clearTimeout(timeout);
+          }
+        })())()`,
+        awaitPromise: true,
+        returnByValue: true,
+      }),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(ACCOUNT_DIGEST_TIMEOUT_ERROR)), timeoutMs);
+        timeout.unref?.();
+      }),
+    ]);
+    const digest = outcome.result?.value;
+    if (typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest)) {
+      throw new Error("Authenticated ChatGPT account identity is unavailable.");
+    }
+    return digest;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 interface WelcomeBackLoginAttempt {

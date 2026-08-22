@@ -1660,7 +1660,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     }
     if (config.archiveConversations !== "never") {
       chatGptAccountDigest = await raceWithDisconnect(
-        readChatGptAccountDigest(Runtime).catch(() => null),
+        readChatGptAccountDigest(Runtime, remainingAccountAffinityMs()).catch(() => null),
       );
     }
     const assertAttachedConversation = async (action: string): Promise<void> => {
@@ -3290,6 +3290,7 @@ async function assertRemoteChatGptAccountAffinity(
   Runtime: ChromeClient["Runtime"],
   accountDigest: string | null | undefined,
   action: string,
+  remainingMs?: number,
 ): Promise<void> {
   const expectedAccountDigest = accountDigest?.trim();
   if (!expectedAccountDigest || !/^[a-f0-9]{64}$/.test(expectedAccountDigest)) {
@@ -3298,7 +3299,7 @@ async function assertRemoteChatGptAccountAffinity(
       { stage: "remote-browser-identity" },
     );
   }
-  if ((await readChatGptAccountDigest(Runtime)) !== expectedAccountDigest) {
+  if ((await readChatGptAccountDigest(Runtime, remainingMs)) !== expectedAccountDigest) {
     throw new BrowserAutomationError(`Remote Chrome account identity changed before ${action}.`, {
       stage: "remote-browser-identity",
     });
@@ -3597,7 +3598,10 @@ async function runRemoteBrowserMode(
       }
       await ensureNotBlocked(Runtime, config.headless, logger);
       await ensureLoggedIn(Runtime, logger, { remoteSession: true });
-      const observedAccountDigest = await readChatGptAccountDigest(Runtime);
+      const observedAccountDigest = await readChatGptAccountDigest(
+        Runtime,
+        remainingAccountAffinityMs(),
+      );
       if (observedAccountDigest !== expectedAccountDigest) {
         throw new BrowserAutomationError(
           "Remote Chrome account identity changed before submission.",
@@ -3628,7 +3632,7 @@ async function runRemoteBrowserMode(
           "Oracle prompt submission",
           remainingAccountAffinityMs(),
         )
-      : await readChatGptAccountDigest(Runtime);
+      : await readChatGptAccountDigest(Runtime, remainingAccountAffinityMs());
     if (expectedAccountDigest && observedAccountDigest !== expectedAccountDigest) {
       throw new BrowserAutomationError(
         "Remote Chrome account identity changed before submission.",
@@ -3656,7 +3660,12 @@ async function runRemoteBrowserMode(
           remainingAccountAffinityMs(),
         );
       }
-      await assertRemoteChatGptAccountAffinity(Runtime, config.remoteChromeAccountDigest, action);
+      await assertRemoteChatGptAccountAffinity(
+        Runtime,
+        config.remoteChromeAccountDigest,
+        action,
+        remainingAccountAffinityMs(),
+      );
     };
     const ensureRunConversationPinnedAfterSubmit = async (
       committedConversationUrl: string | undefined,

@@ -800,6 +800,57 @@ describe("connectToRemoteChromeTarget", () => {
     expect(browserClient.Target.closeTarget).toHaveBeenCalledWith({ targetId: "target-cleanup" });
     expect(browserClient.close).toHaveBeenCalledOnce();
   });
+  test("bounds hung CDP commands while destroying a dedicated remote target", async () => {
+    vi.useFakeTimers();
+    try {
+      const browserClient = {
+        Target: {
+          createTarget: vi.fn(async () => ({ targetId: "target-hung-cleanup" })),
+          attachToTarget: vi.fn(async () => ({ sessionId: "session-hung-cleanup" })),
+          detachFromTarget: vi.fn(async () => ({})),
+          closeTarget: vi.fn(() => new Promise<never>(() => undefined)),
+          getTargets: vi.fn(() => new Promise<never>(() => undefined)),
+        },
+        Network: { enable: vi.fn(async () => ({})) },
+        Page: { enable: vi.fn(async () => ({})), navigate: vi.fn(async () => ({})) },
+        Runtime: { enable: vi.fn(async () => ({})), evaluate: vi.fn(async () => ({ result: {} })) },
+        Input: { dispatchKeyEvent: vi.fn(async () => ({})) },
+        DOM: { enable: vi.fn(async () => ({})) },
+        on: vi.fn(),
+        once: vi.fn(),
+        removeListener: vi.fn(),
+        close: vi.fn(async () => {}),
+      };
+      cdpMock.mockResolvedValue(browserClient);
+      const { connectToRemoteChromeTarget } = await import("../../src/browser/chromeLifecycle.js");
+      const connection = await connectToRemoteChromeTarget(
+        "127.0.0.1",
+        9222,
+        vi.fn<(message: string) => void>(),
+        {
+          browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+          targetUrl: "https://chatgpt.com/",
+          closeTargetOnDispose: true,
+        },
+      );
+      const closing = connection.close().then(
+        () => null,
+        (error: unknown) => error,
+      );
+      await vi.advanceTimersByTimeAsync(1_500);
+
+      const error = await closing;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toMatch(/remote Chrome target cleanup failed/i);
+
+      expect(browserClient.Target.closeTarget).toHaveBeenCalledOnce();
+      expect(browserClient.Target.getTargets).toHaveBeenCalled();
+      expect(browserClient.close).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("accepts target-scoped disposal errors once target absence is confirmed", async () => {
     const browserClient = {
       Target: {

@@ -557,7 +557,13 @@ describe("ChatGPT export account receipt", () => {
     await exactGetStarted;
     expect(exactGetExpression).toContain("const REMAINING_MS = 150");
     expect(exactGetExpression).toContain("const DEADLINE = Date.now() + REMAINING_MS");
-    expect(exactGetExpression).toContain('requestWithinDeadline(\n    "/api/auth/session",');
+    expect(exactGetExpression).toContain(
+      'const SESSION_TARGET = "https://chatgpt.com/api/auth/session"',
+    );
+    expect(exactGetExpression).toContain("requestWithinDeadline(\n    SESSION_TARGET,");
+    expect(exactGetExpression).toContain(
+      "sessionResponse.redirected || sessionResponse.url !== SESSION_TARGET",
+    );
     expect(exactGetExpression).toContain("requestWithinDeadline(\n    TARGET,");
     expect(exactGetExpression).toContain("signal: controller.signal");
 
@@ -611,8 +617,18 @@ describe("ChatGPT export account receipt", () => {
         json: async () => ({ webSocketDebuggerUrl: browserWSEndpoint }),
       }),
     );
+    let resolveLateConnection!: (connection: {
+      client: ChromeClient;
+      targetId: string;
+      browserWSEndpoint: string;
+      close: () => Promise<void>;
+    }) => void;
+    const lateClose = vi.fn(async () => undefined);
     lifecycleMocks.connectToRemoteChromeTarget.mockImplementation(
-      () => new Promise<never>(() => undefined),
+      () =>
+        new Promise((resolve) => {
+          resolveLateConnection = resolve;
+        }),
     );
 
     const failure = captureApprovedChatGptConversationBackend({
@@ -635,6 +651,16 @@ describe("ChatGPT export account receipt", () => {
       /timed out connecting to the read-only ChatGPT export target/i,
     );
     expect(lifecycleMocks.connectToRemoteChromeTarget).toHaveBeenCalledOnce();
+
+    resolveLateConnection({
+      client: {} as ChromeClient,
+      targetId: "target-late",
+      browserWSEndpoint,
+      close: lateClose,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(lateClose).toHaveBeenCalledOnce();
   });
 
   test("bounds a stalled owned-target close to the cleanup allowance", async () => {
@@ -964,7 +990,16 @@ describe("ChatGPT export account receipt", () => {
         `const EXPECTED_EMAIL = ${expectedEmail ? `"${expectedEmail}"` : "null"}`,
       );
       expect(exactGetExpressions[0]).toContain('method: "GET"');
-      expect(exactGetExpressions[0]).toContain('requestWithinDeadline(\n    "/api/auth/session",');
+      expect(exactGetExpressions[0]).toContain(
+        'const SESSION_TARGET = "https://chatgpt.com/api/auth/session"',
+      );
+      expect(exactGetExpressions[0]).toContain("requestWithinDeadline(\n    SESSION_TARGET,");
+      expect(exactGetExpressions[0]).toContain(
+        "sessionResponse.redirected || sessionResponse.url !== SESSION_TARGET",
+      );
+      expect(exactGetExpressions[0]).toContain(
+        'new URL(location.href).origin !== "https://chatgpt.com"',
+      );
       expect(exactGetExpressions[0]).toContain(
         'headers.set("authorization", "Bearer " + accessToken)',
       );

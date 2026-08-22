@@ -8,6 +8,8 @@ export interface ChatGptAccountIdentity {
 const DEFAULT_ACCOUNT_IDENTITY_TIMEOUT_MS = 10_000;
 const ACCOUNT_IDENTITY_TIMEOUT_ERROR =
   "Timed out while reading authenticated ChatGPT account identity.";
+const CHATGPT_ORIGIN = "https://chatgpt.com";
+const CHATGPT_SESSION_URL = `${CHATGPT_ORIGIN}/api/auth/session`;
 
 /** Reads only the authenticated user id digest and normalized email from ChatGPT's page context. */
 export async function readChatGptAccountIdentity(
@@ -25,14 +27,21 @@ export async function readChatGptAccountIdentity(
     Runtime.evaluate({
       expression: `(() => (async () => {
         const timeoutMs = ${JSON.stringify(timeoutMs)};
+        const target = ${JSON.stringify(CHATGPT_SESSION_URL)};
         let timeout;
         try {
+          if (new URL(location.href).origin !== ${JSON.stringify(CHATGPT_ORIGIN)}) return null;
           const controller = new AbortController();
           timeout = setTimeout(() => controller.abort(), timeoutMs);
-          const response = await fetch('/api/auth/session', {
-            method: 'GET', cache: 'no-store', credentials: 'include', signal: controller.signal,
+          const response = await fetch(target, {
+            method: 'GET', cache: 'no-store', credentials: 'include', redirect: 'error', signal: controller.signal,
           });
-          if (!response.ok) return null;
+          if (
+            !response.ok ||
+            response.redirected ||
+            response.url !== target ||
+            controller.signal.aborted
+          ) return null;
           const body = await response.json();
           const userId = typeof body?.user?.id === 'string' ? body.user.id.trim() : '';
           const email = typeof body?.user?.email === 'string'

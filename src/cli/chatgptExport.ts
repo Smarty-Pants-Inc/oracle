@@ -12,7 +12,7 @@ import {
 import { DEFAULT_REMOTE_CHROME_HOST, DEFAULT_REMOTE_CHROME_PORT } from "../browser/liveTabs.js";
 import { extractStableConversationIdFromUrl } from "../browser/conversationUrl.js";
 import { sessionStore, type SessionMetadata } from "../sessionStore.js";
-import { browserIdFromWebSocketEndpoint } from "../browser/profileState.js";
+import { bindRemoteChromeBrowserWebSocketEndpoint } from "../browser/profileState.js";
 import {
   CHATGPT_ACCOUNT_BOUND_WRAPPER_ENV,
   hasChatGptRemoteAffinityFlags,
@@ -78,6 +78,7 @@ function storedRemoteChromeAffinities(
   metadata: SessionMetadata,
 ): ChatGptExportRemoteChromeTarget[] {
   const runtimeBrowserWSEndpoint = metadata.browser?.runtime?.chromeBrowserWSEndpoint?.trim();
+  const runtimeAccountDigest = metadata.browser?.runtime?.chatGptAccountDigest?.trim();
   const affinities = new Map<string, ChatGptExportRemoteChromeTarget>();
   for (const config of [metadata.options?.browserConfig, metadata.browser?.config]) {
     const endpoint = config?.remoteChrome;
@@ -90,8 +91,6 @@ function storedRemoteChromeAffinities(
     const configuredBrowserId = config?.remoteChromeBrowserId?.trim();
     const configuredBrowserWSEndpoint = config?.remoteChromeBrowserWSEndpoint?.trim();
     const configuredAccountDigest = config?.remoteChromeAccountDigest?.trim();
-    const runtimeAccountDigest = metadata.browser?.runtime?.chatGptAccountDigest?.trim();
-    const accountDigest = runtimeAccountDigest ?? configuredAccountDigest;
     if (
       configuredAccountDigest &&
       runtimeAccountDigest &&
@@ -99,25 +98,46 @@ function storedRemoteChromeAffinities(
     ) {
       throw new Error("Stored remote Chrome account identity is conflicting.");
     }
-    const browserWSEndpoint = runtimeBrowserWSEndpoint ?? configuredBrowserWSEndpoint;
-    if (!browserWSEndpoint || !accountDigest) {
-      throw new Error("Stored remote Chrome browser and account identity is unavailable.");
-    }
-    const browserId = browserIdFromWebSocketEndpoint(browserWSEndpoint);
-    if (configuredBrowserId && configuredBrowserId !== browserId) {
+    const configuredIdentity = configuredBrowserWSEndpoint
+      ? bindRemoteChromeBrowserWebSocketEndpoint({
+          browserWSEndpoint: configuredBrowserWSEndpoint,
+          host,
+          port,
+        })
+      : undefined;
+    const runtimeIdentity = runtimeBrowserWSEndpoint
+      ? bindRemoteChromeBrowserWebSocketEndpoint({
+          browserWSEndpoint: runtimeBrowserWSEndpoint,
+          host,
+          port,
+        })
+      : undefined;
+    if (
+      configuredIdentity &&
+      runtimeIdentity &&
+      configuredIdentity.browserWSEndpoint !== runtimeIdentity.browserWSEndpoint
+    ) {
       throw new Error("Stored remote Chrome browser identity is conflicting.");
     }
-    if (
-      configuredBrowserWSEndpoint &&
-      browserIdFromWebSocketEndpoint(configuredBrowserWSEndpoint) !== browserId
-    ) {
+    const identity = runtimeIdentity ?? configuredIdentity;
+    const accountDigest = runtimeAccountDigest ?? configuredAccountDigest;
+    if (!identity || !accountDigest) {
+      throw new Error("Stored remote Chrome browser and account identity is unavailable.");
+    }
+    if (configuredBrowserId && configuredBrowserId !== identity.browserId) {
       throw new Error("Stored remote Chrome browser identity is conflicting.");
     }
     if (!/^[a-f0-9]{64}$/.test(accountDigest)) {
       throw new Error("Stored remote Chrome account identity is invalid.");
     }
-    const affinity = { host, port, browserId, browserWSEndpoint, accountDigest };
-    affinities.set(`${host.toLowerCase()}:${port}\t${browserId}\t${accountDigest}`, affinity);
+    const affinity = {
+      host: host.toLowerCase(),
+      port,
+      browserId: identity.browserId,
+      browserWSEndpoint: identity.browserWSEndpoint,
+      accountDigest,
+    };
+    affinities.set(`${affinity.host}:${port}\t${identity.browserId}\t${accountDigest}`, affinity);
   }
   return [...affinities.values()];
 }

@@ -15,6 +15,8 @@ import {
 import { delay } from "./utils.js";
 import { isWsl, resolveWslChromeLaunchRoute } from "./wslHost.js";
 const execFileAsync = promisify(execFile);
+const REMOTE_TARGET_CLEANUP_TIMEOUT_MS = 1_000;
+const REMOTE_TARGET_CLEANUP_COMMAND_TIMEOUT_MS = 250;
 
 export interface ChromeLaunchDeps {
   platform?: NodeJS.Platform;
@@ -334,7 +336,36 @@ export async function listRemoteChromeTargets(options: {
   }
 }
 
-async function closeRemoteTargetAndConfirm(browser: ChromeClient, targetId: string): Promise<void> {
+async function runRemoteTargetCleanupCommand<T>(
+  operation: () => Promise<T>,
+  deadline: number,
+): Promise<T> {
+  const remainingMs = Math.max(0, deadline - Date.now());
+  if (remainingMs <= 0) {
+    throw new Error("Timed out during remote Chrome target cleanup.");
+  }
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation(),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error("Timed out during remote Chrome target cleanup.")),
+          Math.min(REMOTE_TARGET_CLEANUP_COMMAND_TIMEOUT_MS, remainingMs),
+        );
+        timeout.unref?.();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function closeRemoteTargetAndConfirm(
+  browser: ChromeClient,
+  targetId: string,
+  deadline = Date.now() + REMOTE_TARGET_CLEANUP_TIMEOUT_MS,
+): Promise<void> {
   const browserEvents = browser as ChromeClient & {
     removeListener?: (event: string, listener: (event: { targetId?: string }) => void) => void;
   };
@@ -359,18 +390,27 @@ async function closeRemoteTargetAndConfirm(browser: ChromeClient, targetId: stri
   let closeError: unknown;
   try {
     try {
-      const result = await browser.Target.closeTarget({ targetId });
+      const result = await runRemoteTargetCleanupCommand(
+        () => browser.Target.closeTarget({ targetId }),
+        deadline,
+      );
       if (result.success === false) {
         throw new Error("Remote Chrome target cleanup failed.");
       }
     } catch (error) {
       closeError = error;
     }
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      await Promise.race([delay(25), targetDestroyed]);
+    for (let attempt = 0; attempt < 40 && Date.now() < deadline; attempt += 1) {
+      await Promise.race([
+        delay(Math.min(25, Math.max(0, deadline - Date.now()))),
+        targetDestroyed,
+      ]);
       if (destroyed) return;
       try {
-        const remaining = await browser.Target.getTargets();
+        const remaining = await runRemoteTargetCleanupCommand(
+          () => browser.Target.getTargets(),
+          deadline,
+        );
         if (!(remaining.targetInfos ?? []).some((target) => target.targetId === targetId)) return;
       } catch {
         // Continue polling until the bounded cleanup window expires.
@@ -449,23 +489,31 @@ export async function connectToRemoteChromeTarget(
           await browser.close().catch(() => undefined);
           return;
         }
+        const cleanupDeadline = Date.now() + REMOTE_TARGET_CLEANUP_TIMEOUT_MS;
         let targetCleanupError: unknown;
         try {
-          await browser.Target.detachFromTarget({ sessionId: attached.sessionId });
+          await runRemoteTargetCleanupCommand(
+            () => browser.Target.detachFromTarget({ sessionId: attached.sessionId }),
+            cleanupDeadline,
+          );
         } catch (error) {
           targetCleanupError = error;
         }
         if (targetId) {
           try {
-            await closeRemoteTargetAndConfirm(browser, targetId);
+            await closeRemoteTargetAndConfirm(browser, targetId, cleanupDeadline);
             targetCleanupError = undefined;
           } catch (error) {
             targetCleanupError = error;
           }
         }
+        const browserCloseDeadline = Math.max(
+          cleanupDeadline,
+          Date.now() + REMOTE_TARGET_CLEANUP_COMMAND_TIMEOUT_MS,
+        );
         let browserCloseError: unknown;
         try {
-          await browser.close();
+          await runRemoteTargetCleanupCommand(() => browser.close(), browserCloseDeadline);
         } catch (error) {
           browserCloseError = error;
         }
@@ -482,16 +530,20 @@ export async function connectToRemoteChromeTarget(
       },
     };
   } catch (error) {
+    const cleanupDeadline = Date.now() + REMOTE_TARGET_CLEANUP_TIMEOUT_MS;
     const failures: unknown[] = [error];
     if (createdTarget && targetId) {
       try {
-        await closeRemoteTargetAndConfirm(browser, targetId);
+        await closeRemoteTargetAndConfirm(browser, targetId, cleanupDeadline);
       } catch (closeError) {
         failures.push(closeError);
       }
     }
     try {
-      await browser.close();
+      await runRemoteTargetCleanupCommand(
+        () => browser.close(),
+        Math.max(cleanupDeadline, Date.now() + REMOTE_TARGET_CLEANUP_COMMAND_TIMEOUT_MS),
+      );
     } catch (closeError) {
       failures.push(closeError);
     }
@@ -520,14 +572,20 @@ async function connectToBrowserWebSocket(
   while (Date.now() < deadline) {
     const remainingMs = Math.max(1, deadline - Date.now());
     try {
-      return await Promise.race([
-        CDP({ target: browserWSEndpoint, local: true }) as Promise<ChromeClient>,
-        new Promise<never>((_, reject) => {
-          setTimeout(() => {
-            reject(new Error("__oracle_remote_debugging_approval_timeout__"));
-          }, remainingMs);
-        }),
-      ]);
+      let timeout: NodeJS.Timeout | undefined;
+      try {
+        return await Promise.race([
+          CDP({ target: browserWSEndpoint, local: true }) as Promise<ChromeClient>,
+          new Promise<never>((_resolve, reject) => {
+            timeout = setTimeout(() => {
+              reject(new Error("__oracle_remote_debugging_approval_timeout__"));
+            }, remainingMs);
+            timeout.unref?.();
+          }),
+        ]);
+      } finally {
+        clearTimeout(timeout);
+      }
     } catch (error) {
       if (
         error instanceof Error &&

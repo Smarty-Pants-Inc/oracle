@@ -24,6 +24,58 @@ import { delay } from "./utils.js";
 const DEFAULT_READY_TIMEOUT_MS = 30_000;
 const READY_POLL_MS = 1_000;
 
+function remainingRecoveryOperationMs(deadline: number): number {
+  return Math.max(0, deadline - Date.now());
+}
+
+async function runBeforeRecoveryDeadline<T>(
+  operation: () => Promise<T>,
+  deadline: number,
+  action: string,
+  disposeLateResult?: (result: T) => Promise<void> | void,
+): Promise<T> {
+  const remaining = remainingRecoveryOperationMs(deadline);
+  const timeoutMessage = `Timed out while ${action}.`;
+  if (remaining <= 0) throw new Error(timeoutMessage);
+  let timedOut = false;
+  let timer: NodeJS.Timeout | undefined;
+  const operationResult = Promise.resolve().then(operation);
+  if (disposeLateResult) {
+    void operationResult
+      .then((result) => {
+        if (!timedOut) return;
+        return Promise.resolve(disposeLateResult(result)).catch(() => undefined);
+      })
+      .catch(() => undefined);
+  }
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      reject(new Error(timeoutMessage));
+    }, remaining);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([operationResult, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function runRecoveryCleanupBeforeDeadline(
+  operation: () => Promise<unknown>,
+  deadline: number,
+  action: string,
+): Promise<void> {
+  if (remainingRecoveryOperationMs(deadline) <= 0) {
+    void Promise.resolve()
+      .then(operation)
+      .catch(() => undefined);
+    return;
+  }
+  await runBeforeRecoveryDeadline(operation, deadline, action);
+}
+
 export interface RecoveredConversation {
   host: string;
   port: number;
@@ -85,20 +137,23 @@ async function waitForRecoveredConversationReady(
   endpoint: RecoveryEndpoint,
   ref: string,
   expectedUrl: string,
-  timeoutMs: number,
+  deadline: number,
   waitForReady: boolean,
 ): Promise<void> {
   const expectedConversationId = extractConversationIdFromUrl(expectedUrl);
   if (!expectedConversationId) {
     throw new Error("Saved ChatGPT conversation URL has no stable conversation id.");
   }
-  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     let harvested: ChatGptTabSummary | undefined;
     try {
-      harvested = await harvestChatGptTab({ ...endpoint, ref, expectedConversationId });
+      harvested = await runBeforeRecoveryDeadline(
+        () => harvestChatGptTab({ ...endpoint, ref, expectedConversationId }),
+        deadline,
+        "checking the recovered ChatGPT conversation",
+      );
     } catch {
-      // Keep polling until the bounded recovery deadline.
+      // Keep polling until the single recovery deadline.
     }
     if (harvested) {
       const observedConversationId = extractConversationIdFromUrl(harvested.url);
@@ -107,13 +162,12 @@ async function waitForRecoveredConversationReady(
           throw new Error("Recovered ChatGPT conversation changed before recovery completed.");
         }
       } else if (!waitForReady || isRecoveredConversationHarvestReady(harvested)) {
-        return;
-      } else {
-        // The saved conversation is still hydrating; keep polling.
+        if (Date.now() < deadline) return;
+        break;
       }
     }
     if (Date.now() < deadline) {
-      await delay(READY_POLL_MS);
+      await delay(Math.min(READY_POLL_MS, remainingRecoveryOperationMs(deadline)));
     }
   }
   const outcome = waitForReady ? "become ready" : "open the saved conversation";
@@ -124,8 +178,18 @@ async function closeRecoveryTarget(
   endpoint: RecoveryEndpoint,
   targetId: string,
   logger: BrowserLogger,
+  deadline: number,
 ): Promise<void> {
-  if (!(await closeTab(endpoint.port, targetId, logger, endpoint.host))) {
+  if (remainingRecoveryOperationMs(deadline) <= 0) {
+    void closeTab(endpoint.port, targetId, logger, endpoint.host).catch(() => undefined);
+    return;
+  }
+  const closed = await runBeforeRecoveryDeadline(
+    () => closeTab(endpoint.port, targetId, logger, endpoint.host),
+    deadline,
+    "closing the conversation recovery target",
+  );
+  if (!closed) {
     throw new Error("Conversation recovery target cleanup was not confirmed.");
   }
 }
@@ -167,11 +231,18 @@ async function openRecoveryTarget(
   endpoint: RecoveryEndpoint,
   url: string,
   logger: BrowserLogger,
+  deadline: number,
 ): Promise<string> {
   const expectedBrowserId = endpoint.browserId?.trim();
   const expectedAccountDigest = endpoint.accountDigest?.trim();
   if (!expectedBrowserId && !expectedAccountDigest) {
-    return openChatGptTarget({ ...endpoint, url });
+    return await runBeforeRecoveryDeadline(
+      () => openChatGptTarget({ ...endpoint, url }),
+      deadline,
+      "opening the recovery target",
+      (targetId) =>
+        closeRecoveryTarget(endpoint, targetId, logger, deadline).catch(() => undefined),
+    );
   }
   if (
     !expectedBrowserId ||
@@ -180,36 +251,73 @@ async function openRecoveryTarget(
   ) {
     throw new Error("Stored remote Chrome browser and account identity is incomplete.");
   }
-  const liveIdentity = await resolveRemoteChromeBrowserIdentity(endpoint);
+  const liveIdentity = await runBeforeRecoveryDeadline(
+    () => resolveRemoteChromeBrowserIdentity(endpoint),
+    deadline,
+    "resolving the remote Chrome browser identity for conversation recovery",
+  );
   if (liveIdentity.browserId !== expectedBrowserId) {
     throw new Error("Remote Chrome browser identity changed before conversation recovery.");
   }
-  const targetId = await openChatGptTarget({
-    host: endpoint.host,
-    port: endpoint.port,
-    browserWSEndpoint: liveIdentity.browserWSEndpoint,
-    url: CHATGPT_URL,
-  });
+  const targetId = await runBeforeRecoveryDeadline(
+    () =>
+      openChatGptTarget({
+        host: endpoint.host,
+        port: endpoint.port,
+        browserWSEndpoint: liveIdentity.browserWSEndpoint,
+        url: CHATGPT_URL,
+      }),
+    deadline,
+    "opening the bound conversation recovery target",
+    (lateTargetId) =>
+      closeRecoveryTarget(endpoint, lateTargetId, logger, deadline).catch(() => undefined),
+  );
   let connection: RemoteChromeConnection | undefined;
   let operationError: unknown;
   let ready = false;
   try {
-    connection = await connectToRemoteChromeTarget(endpoint.host, endpoint.port, logger, {
-      browserWSEndpoint: liveIdentity.browserWSEndpoint,
-      targetId,
-      closeTargetOnDispose: false,
-    });
+    connection = await runBeforeRecoveryDeadline(
+      () =>
+        connectToRemoteChromeTarget(endpoint.host, endpoint.port, logger, {
+          browserWSEndpoint: liveIdentity.browserWSEndpoint,
+          targetId,
+          closeTargetOnDispose: false,
+        }),
+      deadline,
+      "attaching to the bound conversation recovery target",
+      (lateConnection) =>
+        runRecoveryCleanupBeforeDeadline(
+          () => lateConnection.close(),
+          deadline,
+          "closing a late conversation recovery connection",
+        ),
+    );
     const { Page, Runtime } = connection.client;
-    await Promise.all([Page.enable(), Runtime.enable()]);
-    const deadline = Date.now() + 10_000;
+    await runBeforeRecoveryDeadline(
+      () => Page.enable(),
+      deadline,
+      "preparing conversation recovery",
+    );
+    await runBeforeRecoveryDeadline(
+      () => Runtime.enable(),
+      deadline,
+      "preparing conversation recovery",
+    );
     let lastError: unknown = null;
     while (Date.now() < deadline) {
       try {
-        const observedAccountDigest = await readChatGptAccountDigest(Runtime);
+        const observedAccountDigest = await readChatGptAccountDigest(
+          Runtime,
+          remainingRecoveryOperationMs(deadline),
+        );
         if (observedAccountDigest !== expectedAccountDigest) {
           throw new Error("Remote Chrome account identity changed before conversation recovery.");
         }
-        await Page.navigate({ url });
+        await runBeforeRecoveryDeadline(
+          () => Page.navigate({ url }),
+          deadline,
+          "navigating the recovered ChatGPT conversation",
+        );
         ready = true;
         break;
       } catch (error) {
@@ -217,7 +325,9 @@ async function openRecoveryTarget(
           throw error;
         }
         lastError = error;
-        await delay(100);
+        if (Date.now() < deadline) {
+          await delay(Math.min(100, remainingRecoveryOperationMs(deadline)));
+        }
       }
     }
     if (!ready) {
@@ -232,14 +342,18 @@ async function openRecoveryTarget(
   const cleanupErrors: unknown[] = [];
   if (connection) {
     try {
-      await connection.close();
+      await runRecoveryCleanupBeforeDeadline(
+        () => connection.close(),
+        deadline,
+        "closing the conversation recovery connection",
+      );
     } catch (error) {
       cleanupErrors.push(error);
     }
   }
   if (operationError || cleanupErrors.length) {
     try {
-      await closeRecoveryTarget(endpoint, targetId, logger);
+      await closeRecoveryTarget(endpoint, targetId, logger, deadline);
     } catch (error) {
       cleanupErrors.push(error);
     }
@@ -284,6 +398,7 @@ export async function recoverConversationTab(
     );
   }
   const readyTimeoutMs = options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
+  const deadline = Date.now() + Math.max(0, readyTimeoutMs);
   const waitForReady = options.waitForReady !== false;
   if (options.existingEndpoint) {
     let targetId: string | undefined;
@@ -292,19 +407,19 @@ export async function recoverConversationTab(
         `[browser] Recovery: opening saved conversation in existing Chrome at ` +
           `${options.existingEndpoint.host}:${options.existingEndpoint.port}`,
       );
-      targetId = await openRecoveryTarget(options.existingEndpoint, url, logger);
+      targetId = await openRecoveryTarget(options.existingEndpoint, url, logger, deadline);
       await waitForRecoveredConversationReady(
         options.existingEndpoint,
         targetId,
         url,
-        readyTimeoutMs,
+        deadline,
         waitForReady,
       );
       return { ...options.existingEndpoint, url, ref: targetId, chrome: null };
     } catch (error) {
       if (targetId) {
         try {
-          await closeRecoveryTarget(options.existingEndpoint, targetId, logger);
+          await closeRecoveryTarget(options.existingEndpoint, targetId, logger, deadline);
         } catch (cleanupError) {
           throw new AggregateError(
             [error, cleanupError],
@@ -313,7 +428,11 @@ export async function recoverConversationTab(
         }
       }
       logger("[browser] Recovery: existing Chrome could not reopen the saved conversation.");
-      if (options.existingEndpoint.browserId || options.existingEndpoint.accountDigest) {
+      if (
+        options.existingEndpoint.browserId ||
+        options.existingEndpoint.accountDigest ||
+        remainingRecoveryOperationMs(deadline) <= 0
+      ) {
         throw error;
       }
     }
@@ -324,20 +443,27 @@ export async function recoverConversationTab(
 
   logger("[browser] Recovery: relaunching Chrome with the stored recovery profile.");
 
-  const { chrome } = await acquireManualLoginChromeForRun(userDataDir, config, logger, meta.id, {});
+  const { chrome } = await runBeforeRecoveryDeadline(
+    () => acquireManualLoginChromeForRun(userDataDir, config, logger, meta.id, {}),
+    deadline,
+    "launching Chrome for conversation recovery",
+    async (lateLaunch) => {
+      await lateLaunch.chrome.kill();
+    },
+  );
   const host = chrome.host ?? "127.0.0.1";
   const port = chrome.port;
 
   let targetId: string | undefined;
   try {
-    targetId = await openChatGptTarget({ host, port, url });
-    await waitForRecoveredConversationReady(
-      { host, port },
-      targetId,
-      url,
-      readyTimeoutMs,
-      waitForReady,
+    targetId = await runBeforeRecoveryDeadline(
+      () => openChatGptTarget({ host, port, url }),
+      deadline,
+      "opening the recovery target",
+      (lateTargetId) =>
+        closeRecoveryTarget({ host, port }, lateTargetId, logger, deadline).catch(() => undefined),
     );
+    await waitForRecoveredConversationReady({ host, port }, targetId, url, deadline, waitForReady);
 
     logger(`[browser] Recovery: Chrome listening on ${host}:${port}; tab loaded.`);
 
@@ -346,16 +472,18 @@ export async function recoverConversationTab(
     const cleanupErrors: unknown[] = [];
     if (targetId) {
       try {
-        await closeRecoveryTarget({ host, port }, targetId, logger);
+        await closeRecoveryTarget({ host, port }, targetId, logger, deadline);
       } catch (cleanupError) {
         cleanupErrors.push(cleanupError);
       }
     }
-    try {
-      chrome.kill();
-    } catch {
-      // best-effort cleanup
-    }
+    await runRecoveryCleanupBeforeDeadline(
+      async () => {
+        await chrome.kill();
+      },
+      deadline,
+      "closing Chrome after conversation recovery",
+    ).catch(() => undefined);
     if (cleanupErrors.length) {
       throw new AggregateError(
         [error, ...cleanupErrors],

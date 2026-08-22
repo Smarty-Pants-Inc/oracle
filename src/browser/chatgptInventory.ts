@@ -20,16 +20,31 @@ async function runBeforeInventoryDeadline<T>(
   operation: () => Promise<T>,
   deadline: number,
   action: string,
+  disposeLateResult?: (result: T) => Promise<void> | void,
 ): Promise<T> {
   const remaining = deadline - Date.now();
   const timeoutMessage = `Timed out while ${action}.`;
   if (remaining <= 0) throw new Error(timeoutMessage);
+  let timedOut = false;
   let timer: NodeJS.Timeout | undefined;
+  const operationResult = Promise.resolve().then(operation);
+  if (disposeLateResult) {
+    void operationResult
+      .then((result) => {
+        if (!timedOut) return;
+        return Promise.resolve(disposeLateResult(result)).catch(() => undefined);
+      })
+      .catch(() => undefined);
+  }
   try {
     return await Promise.race([
-      operation(),
+      operationResult,
       new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error(timeoutMessage)), remaining);
+        timer = setTimeout(() => {
+          timedOut = true;
+          reject(new Error(timeoutMessage));
+        }, remaining);
+        timer.unref?.();
       }),
     ]);
   } finally {
@@ -46,6 +61,23 @@ async function runInventoryCleanup<T>(operation: () => Promise<T>, action: strin
     Date.now() + INVENTORY_CLEANUP_STEP_TIMEOUT_MS,
     action,
   );
+}
+
+async function disposeLateInventoryTarget(
+  connection: RemoteChromeConnection,
+  host: string,
+  port: number,
+): Promise<void> {
+  await runInventoryCleanup(
+    () => connection.close(),
+    "closing a late ChatGPT inventory connection",
+  ).catch(() => undefined);
+  if (connection.targetId) {
+    await runInventoryCleanup(
+      () => closeTab(port, connection.targetId!, () => {}, host),
+      "closing a late disposable ChatGPT inventory target",
+    ).catch(() => undefined);
+  }
 }
 
 export interface ChatGptInventoryOptions {
@@ -690,6 +722,7 @@ export async function captureChatGptConversationInventory(
         }),
       deadline,
       "opening the disposable ChatGPT inventory target",
+      (lateConnection) => disposeLateInventoryTarget(lateConnection, options.host, options.port),
     );
     const { Page, Runtime } = connection.client;
     const authCaptureHook = buildChatGptInventoryAuthCaptureHook();

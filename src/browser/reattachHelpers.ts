@@ -377,6 +377,10 @@ export async function recoverPromptEcho(
   logger: BrowserLogger,
   minTurnIndex: number | null,
   timeoutMs: number,
+  options: {
+    expectedConversationId?: string;
+    assertPageAffinity?: (action: string) => Promise<void>;
+  } = {},
 ): Promise<AssistantPayload> {
   if (!matcher || !matcher.isEcho(answer.text)) {
     return answer;
@@ -386,9 +390,12 @@ export async function recoverPromptEcho(
   let bestText: string | null = null;
   let stableCount = 0;
   while (Date.now() < deadline) {
-    const snapshot = await readAssistantSnapshot(Runtime, minTurnIndex ?? undefined).catch(
-      () => null,
-    );
+    await options.assertPageAffinity?.("reattach prompt-echo response read");
+    const snapshot = await readAssistantSnapshot(
+      Runtime,
+      minTurnIndex ?? undefined,
+      options.expectedConversationId,
+    ).catch(() => null);
     const text = typeof snapshot?.text === "string" ? snapshot.text.trim() : "";
     if (!text || matcher.isEcho(text)) {
       await delay(300);
