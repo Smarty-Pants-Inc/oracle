@@ -61,8 +61,7 @@ import { runBrowserMode } from "../../src/browser/index.js";
 type Transport = "local" | "remote";
 type RetargetPoint = "before-clear" | "before-upload";
 type FirstConversationRetargetPoint = "before-pin" | "before-follow-up";
-const transports =
-  process.platform === "win32" ? (["remote"] as const) : (["local", "remote"] as const);
+const transports = ["local", "remote"] as const;
 
 function resetMocks(): void {
   chromeMocks.launchChrome.mockReset();
@@ -148,6 +147,7 @@ async function runWithRetargetedAttachedConversation(
       browserTabRef: expectedUrl,
       cookieSync: false,
       headless: true,
+      manualLogin: false,
       modelStrategy: "ignore",
       ...(transport === "remote" ? { remoteChrome: { host: "127.0.0.1", port: 9223 } } : {}),
     },
@@ -257,6 +257,7 @@ async function runUnpinnedAttachmentRetarget(
       browserTabRef,
       cookieSync: false,
       headless: true,
+      manualLogin: false,
       modelStrategy: "ignore",
       ...(transport === "remote" ? { remoteChrome: { host: "127.0.0.1", port: 9223 } } : {}),
     },
