@@ -901,13 +901,12 @@ async function verifyPromptCommitted(
     const lastTurn = normalizedTurns[normalizedTurns.length - 1] ?? '';
     const lastMatched = matchesPromptText(lastTurn);
     const hasNewTurn = baseline < 0 ? false : normalizedTurns.length > baseline;
-    let submittedTurnIndex = baseline;
-    if (submittedTurnIndex < 0) {
-      for (let index = normalizedTurns.length - 1; index >= 0; index -= 1) {
-        if (isUserTurn(articles[index]) && matchesPromptText(normalizedTurns[index])) {
-          submittedTurnIndex = index;
-          break;
-        }
+    let submittedTurnIndex = -1;
+    const firstCandidateIndex = baseline < 0 ? 0 : baseline;
+    for (let index = normalizedTurns.length - 1; index >= firstCandidateIndex; index -= 1) {
+      if (isUserTurn(articles[index]) && matchesPromptText(normalizedTurns[index])) {
+        submittedTurnIndex = index;
+        break;
       }
     }
     const submittedTurnMatched =

@@ -1810,6 +1810,14 @@ function getSessionMode(metadata: SessionMetadata): SessionMode {
 function getBrowserConfigFromMetadata(metadata: SessionMetadata): BrowserSessionConfig | undefined {
   return metadata.options?.browserConfig ?? metadata.browser?.config;
 }
+async function attachRootSession(sessionId: string): Promise<void> {
+  const metadata = await sessionStore.readSession(sessionId);
+  const { attachSession } = await import("../src/cli/sessionDisplay.js");
+  await attachSession(sessionId);
+  if (!process.exitCode && metadata) {
+    await writeSessionIdReceipt(metadata.id);
+  }
+}
 
 async function runRootCommand(options: CliOptions): Promise<void> {
   perfTrace.mark("root-command-start");
@@ -2171,9 +2179,9 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   resolvedOptions.writeOutputPath = resolveOutputPath(options.writeOutput, process.cwd());
 
   if (options.status) {
-    const { attachSession, showStatus } = await import("../src/cli/sessionDisplay.js");
+    const { showStatus } = await import("../src/cli/sessionDisplay.js");
     if (options.session) {
-      await attachSession(options.session);
+      await attachRootSession(options.session);
     } else {
       await showStatus({ hours: 24, includeAll: false, limit: 100, showExamples: true });
     }
@@ -2181,8 +2189,7 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   }
 
   if (options.session) {
-    const { attachSession } = await import("../src/cli/sessionDisplay.js");
-    await attachSession(options.session);
+    await attachRootSession(options.session);
     return;
   }
 

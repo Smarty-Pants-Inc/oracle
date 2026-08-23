@@ -5,6 +5,7 @@ import {
   parseRemoteChromeTarget,
   resolveChatGptExportRemoteChrome,
   resolveChatGptExportRemoteChromeForSession,
+  resolveChatGptExportTimeoutMs,
 } from "../../src/cli/chatgptExport.js";
 
 function session(
@@ -20,6 +21,16 @@ function session(
     browser,
   };
 }
+describe("ChatGPT export timeout", () => {
+  test.each([
+    ["bare subcommand value", "45", 45_000],
+    ["parent numeric value", 45, 45_000],
+    ["explicit milliseconds", "500ms", 500],
+    ["automatic timeout", "auto", undefined],
+  ])("normalizes %s consistently", (_label, value, expected) => {
+    expect(resolveChatGptExportTimeoutMs(value)).toBe(expected);
+  });
+});
 
 describe("ChatGPT export endpoint affinity", () => {
   const ws = (browserId: string, host = "127.0.0.1", port = 9223) =>

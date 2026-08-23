@@ -111,6 +111,53 @@ describe("promptComposer", () => {
       vi.useRealTimers();
     }
   });
+  test("finds the submitted prompt after late prior-turn hydration shifts its index", async () => {
+    const turn = (role: "user" | "assistant", innerText: string) => ({
+      innerText,
+      getAttribute: (name: string) => (name === "data-message-author-role" ? role : null),
+      querySelector: () => null,
+    });
+    const topLevelTurns = [
+      turn("user", "old prompt"),
+      turn("assistant", "old answer"),
+      turn("assistant", "late hydrated answer"),
+      turn("user", "new prompt"),
+    ];
+    const document = {
+      querySelector: () => null,
+      querySelectorAll: (selector: string) => {
+        if (
+          selector === CONVERSATION_TURN_CONTAINER_SELECTOR ||
+          selector === CONVERSATION_TURN_SELECTOR
+        ) {
+          return topLevelTurns;
+        }
+        return [];
+      },
+    };
+    class FakeTextArea {}
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: Function(
+            "document",
+            "HTMLTextAreaElement",
+            "location",
+            `return ${expression};`,
+          )(document, FakeTextArea, { href: "https://chatgpt.com/c/reused" }),
+        },
+      })),
+    } as unknown as {
+      evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+    };
+
+    await expect(
+      promptComposer.verifyPromptCommitted(runtime as never, "new prompt", 150, undefined, 2),
+    ).resolves.toEqual({
+      turnsCount: 4,
+      conversationUrl: "https://chatgpt.com/c/reused",
+    });
+  });
 
   test("commit timeout throws a structured error with probe diagnostics", async () => {
     vi.useFakeTimers();

@@ -291,6 +291,17 @@ function assertCompatibleChatGptExportAffinitySources(options: ChatGptExportCliO
     );
   }
 }
+export function resolveChatGptExportTimeoutMs(
+  timeout: ChatGptExportCliOptions["timeout"],
+): number | undefined {
+  if (timeout === undefined || timeout === "auto") return undefined;
+  if (typeof timeout === "number") return timeout * 1000;
+  const normalized = timeout.trim();
+  if (/^[0-9]+(?:\.[0-9]+)?$/.test(normalized)) {
+    return Number.parseFloat(normalized) * 1000;
+  }
+  return parseDuration(normalized, Number.NaN);
+}
 
 export async function handleChatGptExportCommand(options: ChatGptExportCliOptions): Promise<void> {
   options.sessionId = normalizeExportSelector(options.sessionId, "--session-id");
@@ -347,12 +358,7 @@ export async function handleChatGptExportCommand(options: ChatGptExportCliOption
     accountBoundWrapper || options.remoteChrome === undefined
       ? undefined
       : parseRemoteChromeTarget(options.remoteChrome);
-  const timeoutMs =
-    options.timeout === undefined || options.timeout === "auto"
-      ? undefined
-      : typeof options.timeout === "number"
-        ? options.timeout * 1000
-        : parseDuration(options.timeout, Number.NaN);
+  const timeoutMs = resolveChatGptExportTimeoutMs(options.timeout);
   if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
     throw new Error("--timeout must be a duration like 45s, 2m, or 500ms.");
   }

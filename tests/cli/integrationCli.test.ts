@@ -90,8 +90,10 @@ describe("account-bound ChatGPT command CLI wiring", () => {
   });
 
   test.each([
-    ["subcommand", ["--timeout", "45s"]],
+    ["subcommand duration", ["--timeout", "45s"]],
+    ["subcommand bare seconds", ["--timeout", "45"]],
     ["parent duration", []],
+    ["parent bare seconds", []],
     ["parent auto", []],
   ])(
     "forwards parent remote Chrome options to chatgpt-export with %s timeout",
@@ -111,9 +113,11 @@ describe("account-bound ChatGPT command CLI wiring", () => {
       const args =
         placement === "parent duration"
           ? ["--timeout", "45s", ...command]
-          : placement === "parent auto"
-            ? ["--timeout", "auto", ...command]
-            : command;
+          : placement === "parent bare seconds"
+            ? ["--timeout", "45", ...command]
+            : placement === "parent auto"
+              ? ["--timeout", "auto", ...command]
+              : command;
       const result = await execCli(args, {
         env: { ...process.env, ORACLE_WRAPPER_CHATGPT_ACCOUNT_BOUND: "1" },
       });
@@ -220,6 +224,51 @@ describe("root session receipt reservation", () => {
       await rm(oracleHome, { recursive: true, force: true });
     }
   });
+  test.skipIf(process.platform === "win32")(
+    "publishes canonical receipts for legacy root session aliases",
+    async () => {
+      for (const aliasArgs of [
+        ["--session", "legacy-root-directory"],
+        ["--status", "--session", "legacy-root-directory"],
+      ]) {
+        const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-root-receipt-"));
+        const sessionDir = path.join(oracleHome, "sessions", "legacy-root-directory");
+        const receiptPath = path.join(oracleHome, "session-id-receipt");
+        await mkdir(sessionDir, { recursive: true });
+        await writeFile(
+          path.join(sessionDir, "meta.json"),
+          JSON.stringify({
+            id: "canonical-root-session",
+            createdAt: "2026-08-22T00:00:00.000Z",
+            status: "completed",
+            mode: "api",
+            model: "gpt-5.5-pro",
+            options: {},
+          }),
+          "utf8",
+        );
+        await writeFile(path.join(sessionDir, "output.log"), "Answer:\ndone\n", "utf8");
+        await writeFile(receiptPath, "", { mode: 0o600 });
+
+        try {
+          const result = await execCli(aliasArgs, {
+            env: {
+              ...process.env,
+              ORACLE_HOME_DIR: oracleHome,
+              ORACLE_DISABLE_KEYTAR: "1",
+              ORACLE_SESSION_ID_RECEIPT: receiptPath,
+            },
+            timeout: INTEGRATION_TIMEOUT,
+          });
+          expect(result.code).toBe(0);
+          expect(await readFile(receiptPath, "utf8")).toBe("canonical-root-session\n");
+        } finally {
+          await rm(oracleHome, { recursive: true, force: true });
+        }
+      }
+    },
+    INTEGRATION_TIMEOUT,
+  );
 });
 
 async function writeFollowupFixture(
