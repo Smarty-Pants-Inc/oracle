@@ -584,6 +584,7 @@ async function saveGeneratedImageButtonArtifacts(params: {
   await params.assertPageAffinity?.("generated image download button fallback");
   const targetPath = path.resolve(params.targetPath);
   const stagingDir = await createGeneratedImageStagingDir(targetPath);
+  let preserveStagingDir = false;
   try {
     const buttonDownloads = await saveAssistantDownloadButtonArtifacts({
       Browser: params.Browser,
@@ -598,7 +599,11 @@ async function saveGeneratedImageButtonArtifacts(params: {
       assertPageAffinity: params.assertPageAffinity,
       expectedConversationId: params.expectedConversationId,
       expectedAccountDigest: params.expectedAccountDigest,
+      onStagingRetained: () => {
+        preserveStagingDir = true;
+      },
     });
+    preserveStagingDir ||= Boolean(buttonDownloads.retainedStagingDir);
     const stagedImages: StagedGeneratedImage[] = [];
     for (const download of buttonDownloads) {
       await params.assertPageAffinity?.("generated image button artifact save");
@@ -633,7 +638,9 @@ async function saveGeneratedImageButtonArtifacts(params: {
     params.logger?.(`[browser] Saved ${savedImages.length} generated image download artifact(s).`);
     return savedImages;
   } finally {
-    await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
+    if (!preserveStagingDir) {
+      await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 }
 

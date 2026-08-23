@@ -23,6 +23,23 @@ const DOWNLOAD_BUTTON_WAIT_MS = 15_000;
 const DOWNLOAD_REDIRECT_LIMIT = 5;
 const DIAGNOSTIC_BODY_SNIPPET_BYTES = 180;
 
+export type SavedAssistantDownloadButtonArtifacts = SavedBrowserFile[] & {
+  readonly retainedStagingDir?: string;
+};
+
+// ponytail: one process-wide queue because Browser.setDownloadBehavior has no tab scope.
+let browserDownloadBehaviorQueue: Promise<void> = Promise.resolve();
+
+async function acquireBrowserDownloadBehaviorLock(): Promise<() => void> {
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const previous = browserDownloadBehaviorQueue;
+  browserDownloadBehaviorQueue = pending;
+  await previous;
+  return release;
+}
 type DownloadSourceKind = "sandbox" | "chatgpt-file-endpoint" | "browser-download";
 type DirectDownloadStrategy = "browser-fetch" | "node-fetch";
 
@@ -1221,18 +1238,21 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
   assertPageAffinity?: (action: string) => Promise<void>;
   expectedConversationId?: string;
   expectedAccountDigest?: string;
-}): Promise<SavedBrowserFile[]> {
+  onStagingRetained?: (stagingDir: string) => void;
+}): Promise<SavedAssistantDownloadButtonArtifacts> {
+  const savedFiles: SavedAssistantDownloadButtonArtifacts = [];
   if (
     (!params.sessionId && !params.downloadPath) ||
     (!params.Client && !params.Browser && !params.Page)
   ) {
-    return [];
+    return savedFiles;
   }
   const artifactsDir =
     params.downloadPath ?? resolveSessionArtifactsDir(params.sessionId as string);
   await fs.mkdir(artifactsDir, { recursive: true });
   await params.assertPageAffinity?.("browser download artifact collection");
   const stagingDir = await fs.mkdtemp(path.join(artifactsDir, ".oracle-download-"));
+  const releaseBrowserDownloadBehavior = await acquireBrowserDownloadBehaviorLock();
   let restoreDownloadBehavior: (() => Promise<void>) | null = null;
   try {
     restoreDownloadBehavior = await configureBrowserDownloadPath({
@@ -1251,7 +1271,7 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
       params.logger?.(
         "[browser] Browser download path could not be configured; skipping button fallback.",
       );
-      return [];
+      return savedFiles;
     }
 
     const buttonWaitMs = params.buttonWaitMs ?? DOWNLOAD_BUTTON_WAIT_MS;
@@ -1275,7 +1295,7 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
         params.logger?.(
           `[browser] No assistant download controls found for button fallback (inspected ${clickedResult.inspectedCount} control(s); category=${clickedResult.selectedCategory ?? "none"}).`,
         );
-        return [];
+        return savedFiles;
       }
       params.logger?.(
         `[browser] Clicked ${clickedResult.clicked.length} assistant download control(s) ` +
@@ -1397,7 +1417,6 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
     }
 
     await params.assertPageAffinity?.("browser download artifact final return");
-    const savedFiles: SavedBrowserFile[] = [];
     const publishedPaths = new Set<string>();
     for (const staged of stagedDownloads) {
       if (publishedPaths.has(staged.path)) {
@@ -1413,20 +1432,26 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
     }
     return savedFiles;
   } finally {
-    let resetSucceeded = true;
-    if (restoreDownloadBehavior) {
-      try {
-        await restoreDownloadBehavior();
-      } catch (error) {
-        resetSucceeded = false;
-        const message = error instanceof Error ? error.message : String(error);
-        params.logger?.(`[browser] Failed to restore browser download behavior: ${message}`);
+    try {
+      let resetSucceeded = true;
+      if (restoreDownloadBehavior) {
+        try {
+          await restoreDownloadBehavior();
+        } catch (error) {
+          resetSucceeded = false;
+          const message = error instanceof Error ? error.message : String(error);
+          params.logger?.(`[browser] Failed to restore browser download behavior: ${message}`);
+        }
       }
-    }
-    if (resetSucceeded) {
-      await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
-    } else {
-      params.logger?.("[browser] Preserved browser download staging after reset failure.");
+      if (resetSucceeded) {
+        await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
+      } else {
+        Object.defineProperty(savedFiles, "retainedStagingDir", { value: stagingDir });
+        params.onStagingRetained?.(stagingDir);
+        params.logger?.("[browser] Preserved browser download staging after reset failure.");
+      }
+    } finally {
+      releaseBrowserDownloadBehavior();
     }
   }
 }

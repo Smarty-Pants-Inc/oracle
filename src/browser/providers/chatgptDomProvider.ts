@@ -55,10 +55,7 @@ async function submitPromptViaAdapter(ctx: ProviderDomFlowContext): Promise<void
   );
   state.committedTurns = commit.turnsCount;
   state.committedConversationUrl = commit.conversationUrl;
-  if (
-    state.committedTurns != null &&
-    (state.baselineTurns == null || state.committedTurns > state.baselineTurns)
-  ) {
+  if (state.committedTurns != null && Number.isFinite(state.committedTurns)) {
     state.baselineTurns = Math.max(0, state.committedTurns - 1);
   }
 }

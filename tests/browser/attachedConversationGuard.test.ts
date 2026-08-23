@@ -25,6 +25,7 @@ const pageActionMocks = vi.hoisted(() => ({
   ensureLoggedIn: vi.fn(),
   ensureNotBlocked: vi.fn(),
   ensurePromptReady: vi.fn(),
+  navigateToChatGPT: vi.fn(),
   readAssistantSnapshot: vi.fn(),
   readChatGptAccountDigest: vi.fn(),
   uploadAttachmentFile: vi.fn(),
@@ -79,6 +80,7 @@ function resetMocks(): void {
   pageActionMocks.captureAssistantMarkdown.mockReset();
   pageActionMocks.clearPromptComposer.mockReset();
   pageActionMocks.ensureChatMode.mockReset();
+  pageActionMocks.navigateToChatGPT.mockReset();
   pageActionMocks.ensureLoggedIn.mockReset();
   pageActionMocks.ensureNotBlocked.mockReset();
   pageActionMocks.ensurePromptReady.mockReset();
@@ -272,6 +274,96 @@ async function runUnpinnedAttachmentRetarget(
   }).catch((error: unknown) => error);
 }
 
+async function runAttachedWorkConversationReset(transport: Transport): Promise<unknown> {
+  const workUrl = "https://chatgpt.com/c/work-thread";
+  const createdUrl = "https://chatgpt.com/c/created-after-reset";
+  const answer = "a".repeat(100);
+  let currentUrl = workUrl;
+  const Runtime = {
+    enable: vi.fn().mockResolvedValue({}),
+    evaluate: vi.fn(async () => ({ result: { value: currentUrl } })),
+  };
+  const client = {
+    DOM: {},
+    Emulation: { setFocusEmulationEnabled: vi.fn().mockResolvedValue({}) },
+    Input: {},
+    Network: {
+      clearBrowserCookies: vi.fn().mockResolvedValue({}),
+      enable: vi.fn().mockResolvedValue({}),
+    },
+    Page: {
+      enable: vi.fn().mockResolvedValue({}),
+      navigate: vi.fn().mockResolvedValue({}),
+      reload: vi.fn().mockResolvedValue({}),
+    },
+    Runtime,
+    Target: {},
+    close: vi.fn().mockResolvedValue(undefined),
+    on: vi.fn(),
+  };
+
+  vi.stubEnv("ORACLE_WRAPPER_EXPECTED_ACCOUNT_EMAIL", "");
+  vi.stubEnv("ORACLE_WRAPPER_REMOTE_ONLY", "0");
+  cookieMocks.clearStaleChatGptConversationCookies.mockResolvedValue(0);
+  liveTabMocks.connectToExistingChatGptTab.mockResolvedValue({
+    client,
+    targetId: "target-1",
+    tab: {
+      conversationId: "work-thread",
+      targetId: "target-1",
+      url: workUrl,
+    },
+  });
+  pageActionMocks.navigateToChatGPT.mockImplementation(
+    async (_Page: unknown, _Runtime: unknown, url: string) => {
+      currentUrl = url;
+    },
+  );
+  pageActionMocks.ensureChatMode.mockImplementation(async (...args: unknown[]) => {
+    const options = args[4] as { resetWorkConversation?: () => Promise<void> } | undefined;
+    await options?.resetWorkConversation?.();
+    return "switched";
+  });
+  pageActionMocks.captureAssistantMarkdown.mockResolvedValue(answer);
+  pageActionMocks.clearPromptComposer.mockResolvedValue(undefined);
+  pageActionMocks.ensureLoggedIn.mockResolvedValue(undefined);
+  pageActionMocks.ensureNotBlocked.mockResolvedValue(undefined);
+  pageActionMocks.ensurePromptReady.mockResolvedValue(undefined);
+  pageActionMocks.readAssistantSnapshot.mockResolvedValue(null);
+  pageActionMocks.readChatGptAccountDigest.mockResolvedValue("a".repeat(64));
+  pageActionMocks.waitForAssistantResponse.mockResolvedValue({ text: answer, meta: {} });
+  providerFlowMocks.runProviderSubmissionFlow.mockImplementation(
+    async (_adapter: unknown, context: { state?: Record<string, unknown> }) => {
+      currentUrl = createdUrl;
+      if (!context.state) return;
+      context.state.baselineTurns = 0;
+      await (context.state.onPromptSubmitted as (() => Promise<void>) | undefined)?.();
+      context.state.committedConversationUrl = createdUrl;
+    },
+  );
+  if (transport === "local") {
+    chromeMocks.launchChrome.mockResolvedValue({
+      kill: vi.fn().mockResolvedValue(undefined),
+      pid: 1,
+      port: 9222,
+      process: undefined,
+    });
+  }
+
+  return runBrowserMode({
+    prompt: "initial",
+    config: {
+      archiveConversations: "never",
+      browserTabRef: workUrl,
+      cookieSync: false,
+      headless: true,
+      manualLogin: false,
+      modelStrategy: "ignore",
+      ...(transport === "remote" ? { remoteChrome: { host: "127.0.0.1", port: 9223 } } : {}),
+    },
+  });
+}
+
 describe("attached conversation mutation guards", () => {
   beforeEach(() => {
     profileStateMocks.resolveRemoteChromeBrowserIdentity.mockResolvedValue({
@@ -360,6 +452,17 @@ describe("attached conversation mutation guards", () => {
       expect(providerFlowMocks.runProviderSubmissionFlow).toHaveBeenCalledOnce();
       expect(pageActionMocks.waitForAssistantResponse).toHaveBeenCalledOnce();
       expect(pageActionMocks.clearPromptComposer).toHaveBeenCalledTimes(2);
+    },
+  );
+  test.each(transports)(
+    "releases the attached %s Work conversation pin before starting a new Chat",
+    async (transport) => {
+      await expect(runAttachedWorkConversationReset(transport)).resolves.toMatchObject({
+        conversationId: "created-after-reset",
+        promptSubmitted: true,
+      });
+      expect(pageActionMocks.navigateToChatGPT).toHaveBeenCalledOnce();
+      expect(providerFlowMocks.runProviderSubmissionFlow).toHaveBeenCalledOnce();
     },
   );
 });

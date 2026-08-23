@@ -591,6 +591,59 @@ describe("collectGeneratedImageArtifacts", () => {
       await fs.rm(tmpDir, { recursive: true, force: true });
     }
   });
+  test("preserves outer image staging when its nested download reset fails", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-image-nested-reset-"));
+    const outputPath = path.join(tmpDir, "generated.png");
+    const png = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    let browserDownloadDir = "";
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("behavior-btn")) {
+          await fs.writeFile(path.join(browserDownloadDir, "nested.png"), png);
+          return {
+            result: { value: [{ text: "Download generated image", ariaLabel: "", testId: "" }] },
+          };
+        }
+        return { result: { value: [] } };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    const client = {
+      send: vi.fn(
+        async (
+          _method: string,
+          { behavior, downloadPath }: { behavior: "allow" | "default"; downloadPath?: string },
+        ) => {
+          if (behavior === "allow") {
+            browserDownloadDir = downloadPath ?? "";
+            return;
+          }
+          throw new Error("reset failed");
+        },
+      ),
+    } as unknown as ChromeClient;
+
+    try {
+      const result = await collectGeneratedImageArtifacts({
+        Client: client,
+        Runtime: runtime,
+        Network: {} as ChromeClient["Network"],
+        minTurnIndex: 0,
+        generateImagePath: outputPath,
+        answerText: "Here you go.",
+      });
+
+      await expect(fs.readFile(outputPath)).resolves.toEqual(png);
+      await expect(fs.stat(browserDownloadDir)).resolves.toMatchObject({});
+      await expect(fs.stat(path.dirname(browserDownloadDir))).resolves.toMatchObject({});
+      expect(path.dirname(path.dirname(browserDownloadDir))).toBe(tmpDir);
+      expect(result.savedImages[0]?.path).toBe(outputPath);
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   test("preserves an existing output when button artifact affinity rejects", async () => {
     const tmpDir = await fs.mkdtemp(
       path.join(os.tmpdir(), "oracle-chatgpt-image-button-affinity-"),

@@ -946,6 +946,7 @@ async function verifyPromptCommitted(
     };
   })()`;
 
+  const unclearedSubmittedTurnIndexes = new Set<number>();
   let lastProbe: CommitProbeState | undefined;
   while (Date.now() < deadline) {
     const { result } = await Runtime.evaluate({ expression: script, returnByValue: true });
@@ -962,19 +963,30 @@ async function verifyPromptCommitted(
       parsedConversationUrl && extractStableConversationIdFromUrl(parsedConversationUrl.pathname)
         ? info?.href
         : null;
-    const submittedTurnIsCurrentTail =
+    const submittedTurnIndex = info?.submittedTurnIndex;
+    const submittedTurnIsFresh =
       info?.submittedTurnMatched === true &&
       info.composerKnown === true &&
       info.composerCleared === true &&
-      typeof info.submittedTurnIndex === "number" &&
-      typeof turnsCount === "number" &&
-      info.submittedTurnIndex === turnsCount - 1;
-    if (baselineKnown && info?.hasNewTurn && submittedTurnIsCurrentTail && conversationUrl) {
+      typeof submittedTurnIndex === "number" &&
+      submittedTurnIndex >= 0 &&
+      !unclearedSubmittedTurnIndexes.has(submittedTurnIndex);
+    if (baselineKnown && info?.hasNewTurn && submittedTurnIsFresh && conversationUrl) {
       return {
         turnsCount:
           typeof turnsCount === "number" && Number.isFinite(turnsCount) ? turnsCount : null,
         conversationUrl,
       };
+    }
+    if (
+      baselineKnown &&
+      info?.hasNewTurn === true &&
+      info.submittedTurnMatched === true &&
+      typeof submittedTurnIndex === "number" &&
+      submittedTurnIndex >= 0 &&
+      info.composerCleared !== true
+    ) {
+      unclearedSubmittedTurnIndexes.add(submittedTurnIndex);
     }
     await delay(100);
   }

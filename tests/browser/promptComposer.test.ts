@@ -112,7 +112,7 @@ describe("promptComposer", () => {
       vi.useRealTimers();
     }
   });
-  test("finds the submitted prompt at a refreshed baseline after prior-turn hydration", async () => {
+  test("accepts a fresh submitted prompt followed by an assistant turn before the first probe", async () => {
     const turn = (role: "user" | "assistant", innerText: string) => ({
       innerText,
       getAttribute: (name: string) => (name === "data-message-author-role" ? role : null),
@@ -123,6 +123,7 @@ describe("promptComposer", () => {
       turn("assistant", "old answer"),
       turn("assistant", "late hydrated answer"),
       turn("user", "new prompt"),
+      turn("assistant", "Thinking"),
     ];
     const composer = {
       innerText: "",
@@ -159,12 +160,12 @@ describe("promptComposer", () => {
     await expect(
       promptComposer.verifyPromptCommitted(runtime as never, "new prompt", 150, undefined, 2),
     ).resolves.toEqual({
-      turnsCount: 4,
+      turnsCount: 5,
       conversationUrl: "https://chatgpt.com/c/reused",
     });
   });
 
-  test("does not combine a stale tail match with later composer clearance", async () => {
+  test("does not accept a stale matching tail after later hydration clears the composer", async () => {
     vi.useFakeTimers();
     try {
       const firstProbe = {

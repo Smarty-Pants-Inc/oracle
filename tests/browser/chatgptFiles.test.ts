@@ -941,6 +941,85 @@ describe("collectChatGptFileArtifacts", () => {
     }
   });
 
+  test("serializes browser-wide download behavior through reset across concurrent fallbacks", async () => {
+    const firstDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-download-first-"));
+    const secondDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-download-second-"));
+    const events: string[] = [];
+    let resetCount = 0;
+    let releaseFirstClick!: () => void;
+    let signalFirstClick!: () => void;
+    const firstClickGate = new Promise<void>((resolve) => {
+      releaseFirstClick = resolve;
+    });
+    const firstClickStarted = new Promise<void>((resolve) => {
+      signalFirstClick = resolve;
+    });
+    const client = {
+      send: vi.fn(
+        async (
+          _method: string,
+          { behavior }: { behavior: "allow" | "default"; downloadPath?: string },
+        ) => {
+          events.push(behavior);
+          if (behavior === "default" && ++resetCount === 1) {
+            throw new Error("reset failed");
+          }
+        },
+      ),
+    } as unknown as ChromeClient;
+    const firstRuntime = {
+      evaluate: vi.fn(async () => {
+        events.push("first-click");
+        signalFirstClick();
+        await firstClickGate;
+        return { result: { value: [{ text: "Download", ariaLabel: "", testId: "" }] } };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    const secondRuntime = {
+      evaluate: vi.fn(async () => {
+        events.push("second-click");
+        return { result: { value: [{ text: "Download", ariaLabel: "", testId: "" }] } };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    const first = saveAssistantDownloadButtonArtifacts({
+      Client: client,
+      Runtime: firstRuntime,
+      downloadPath: firstDir,
+      downloadWaitMs: 0,
+    });
+    await firstClickStarted;
+    const second = saveAssistantDownloadButtonArtifacts({
+      Client: client,
+      Runtime: secondRuntime,
+      downloadPath: secondDir,
+      downloadWaitMs: 0,
+    });
+    try {
+      expect(secondRuntime.evaluate).not.toHaveBeenCalled();
+      releaseFirstClick();
+      const [firstResult, secondResult] = await Promise.all([first, second]);
+
+      expect(events).toEqual([
+        "allow",
+        "first-click",
+        "default",
+        "allow",
+        "second-click",
+        "default",
+      ]);
+      expect(firstResult.retainedStagingDir).toBeDefined();
+      await expect(fs.stat(firstResult.retainedStagingDir as string)).resolves.toMatchObject({});
+      expect(secondResult.retainedStagingDir).toBeUndefined();
+      await expect(fs.readdir(secondDir)).resolves.toEqual([]);
+    } finally {
+      releaseFirstClick();
+      await Promise.allSettled([first, second]);
+      await fs.rm(firstDir, { recursive: true, force: true });
+      await fs.rm(secondDir, { recursive: true, force: true });
+    }
+  });
+
   test("preserves a browser-provided filename for a generic download endpoint", async () => {
     const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-file-filename-"));
     setOracleHomeDirOverrideForTest(tmpHome);

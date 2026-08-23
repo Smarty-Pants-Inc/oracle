@@ -1691,6 +1691,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           config.browserTabRef && !isResumingConversation
             ? async () => {
                 await navigateToChatGPT(Page, Runtime, config.url, logger);
+                runConversationId = undefined;
                 await ensureNotBlocked(Runtime, config.headless, logger);
                 await ensureLoggedIn(Runtime, logger);
                 await verifyLocalChatGptAccount("chat mode reset");
@@ -3820,6 +3821,7 @@ async function runRemoteBrowserMode(
         attachedExistingTab && !config.resumeConversationUrl
           ? async () => {
               await navigateToChatGPT(Page, Runtime, config.url, logger);
+              runConversationId = undefined;
               await ensureNotBlocked(Runtime, config.headless, logger);
               await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
             }
