@@ -1604,8 +1604,11 @@ describe("ensureLoggedIn", () => {
       expect.objectContaining({ awaitPromise: true, returnByValue: true }),
     );
     const expression = evaluate.mock.calls[0]?.[0]?.expression;
-    expect(expression).toContain('const target = "https://chatgpt.com/api/auth/session"');
-    expect(expression).toContain('new URL(location.href).origin !== "https://chatgpt.com"');
+    expect(expression).toContain("const pageOrigin = new URL(location.href).origin;");
+    expect(expression).toContain(
+      '["https://chatgpt.com","https://chat.openai.com"].includes(pageOrigin)',
+    );
+    expect(expression).toContain("const target = new URL('/api/auth/session', pageOrigin).href;");
     expect(expression).toContain("redirect: 'error'");
     expect(expression).toContain("response.redirected");
     expect(expression).toContain("response.url !== target");

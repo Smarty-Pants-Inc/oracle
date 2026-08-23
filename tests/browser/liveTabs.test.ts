@@ -182,6 +182,8 @@ describe("liveTabs helpers", () => {
     "https://chat.openai.com/",
     "https://chatgpt.com/g/g-project/project",
     "https://chatgpt.com/g/g-project/project/c/abc-123",
+    "https://chat.openai.com/g/g-project/project",
+    "https://chat.openai.com/g/g-project/project/c/abc-123",
     "https://chat.openai.com/c/abc-123?model=pro#answer",
   ])("accepts exact ChatGPT root, project, and conversation URL %s", (url) => {
     expect(isChatGptUrl(url)).toBe(true);
@@ -190,13 +192,14 @@ describe("liveTabs helpers", () => {
   test.each([
     "not a URL",
     "http://chatgpt.com/c/a",
+    "http://chat.openai.com/c/a",
     "https://chatgpt.com.evil.example/c/a",
     "https://chat.openai.com.evil.example/c/a",
     "https://sub.chatgpt.com/c/a",
     "https://chatgpt.com@evil.example/c/a",
     "https://evil.example@chatgpt.com/c/a",
     "https://chatgpt.com:443/c/a",
-    "https://chatgpt.com:8443/c/a",
+    "https://chat.openai.com:8443/c/a",
     "https://chatgpt.com./c/a",
     "https://constructor/c/a",
   ])("rejects malformed or spoofed ChatGPT URL %s", (url) => {
@@ -254,7 +257,7 @@ describe("liveTabs helpers", () => {
     expect(formatBrowserTabState(makeTab({ state: "stalled" }))).toBe("stalled");
   });
 
-  test("resolves current/id/url/conversation/title refs against live tabs", () => {
+  test("resolves exact current/id/url/conversation/title refs without crossing route scope", () => {
     const tabs = [
       makeTab({
         targetId: "target-1",
@@ -263,10 +266,22 @@ describe("liveTabs helpers", () => {
         conversationId: "a",
       }),
       makeTab({
+        targetId: "target-project",
+        title: "Review A Project",
+        url: "https://chatgpt.com/g/g-project/c/a",
+        conversationId: "a",
+      }),
+      makeTab({
         targetId: "target-2",
         title: "Review B",
         url: "https://chatgpt.com/c/b",
         conversationId: "b",
+      }),
+      makeTab({
+        targetId: "target-legacy-origin",
+        title: "Review A Legacy Origin",
+        url: "https://chat.openai.com/c/a",
+        conversationId: "a",
       }),
     ];
     expect(resolveChatGptTabFromSummariesForTest(tabs, "current").targetId).toBe("target-1");
@@ -278,9 +293,65 @@ describe("liveTabs helpers", () => {
     );
     expect(
       resolveChatGptTabFromSummariesForTest(tabs, "https://chatgpt.com/g/g-project/c/a").targetId,
-    ).toBe("target-1");
-    expect(resolveChatGptTabFromSummariesForTest(tabs, "b").targetId).toBe("target-2");
+    ).toBe("target-project");
+    expect(
+      resolveChatGptTabFromSummariesForTest(tabs, "https://chat.openai.com/c/a").targetId,
+    ).toBe("target-legacy-origin");
+    expect(() =>
+      resolveChatGptTabFromSummariesForTest(tabs, "https://chatgpt.com/g/other-project/c/a"),
+    ).toThrow(/without crossing its approved project scope/i);
+    for (const origin of ["https://chatgpt.com", "https://chat.openai.com"]) {
+      const rootUrl = `${origin}/c/a`;
+      const projectUrl = `${origin}/g/g-project/project/c/a`;
+      expect(() =>
+        resolveChatGptTabFromSummariesForTest(
+          [makeTab({ url: rootUrl, conversationId: "a" })],
+          projectUrl,
+        ),
+      ).toThrow(/without crossing its approved project scope/i);
+      expect(() =>
+        resolveChatGptTabFromSummariesForTest(
+          [makeTab({ url: projectUrl, conversationId: "a" })],
+          rootUrl,
+        ),
+      ).toThrow(/without crossing its approved project scope/i);
+    }
+    expect(resolveChatGptTabFromSummariesForTest(tabs, "a").targetId).toBe("target-1");
     expect(resolveChatGptTabFromSummariesForTest(tabs, "Review B").targetId).toBe("target-2");
+  });
+  test("resolves exact target ids and URLs without crossing route scope", () => {
+    const targets: ChromeTarget[] = [
+      { id: "target-1", type: "page", title: "Review A", url: "https://chatgpt.com/c/a" },
+      {
+        id: "target-project",
+        type: "page",
+        title: "Review A Project",
+        url: "https://chatgpt.com/g/g-project/c/a",
+      },
+      { id: "target-2", type: "page", title: "Review B", url: "https://chatgpt.com/c/b" },
+      {
+        id: "target-legacy-origin",
+        type: "page",
+        title: "Review A Legacy Origin",
+        url: "https://chat.openai.com/c/a",
+      },
+    ];
+    expect(resolveExactChatGptTargetForTest(targets, "target-2")?.id).toBe("target-2");
+    expect(resolveExactChatGptTargetForTest(targets, "https://chatgpt.com/c/a")?.id).toBe(
+      "target-1",
+    );
+    expect(
+      resolveExactChatGptTargetForTest(targets, "https://chatgpt.com/g/g-project/c/a")?.id,
+    ).toBe("target-project");
+    expect(resolveExactChatGptTargetForTest(targets, "https://chat.openai.com/c/a")?.id).toBe(
+      "target-legacy-origin",
+    );
+    expect(
+      resolveExactChatGptTargetForTest(targets, "https://chatgpt.com/g/other-project/c/a"),
+    ).toBeNull();
+    expect(resolveExactChatGptTargetForTest(targets, "a")?.id).toBe("target-1");
+    expect(resolveExactChatGptTargetForTest(targets, "current")).toBeNull();
+    expect(resolveExactChatGptTargetForTest(targets, "Review B")).toBeNull();
   });
 
   test.each([
@@ -308,23 +379,6 @@ describe("liveTabs helpers", () => {
         url: "https://chatgpt.com/",
       }),
     ).toBeUndefined();
-  });
-
-  test("resolves exact target ids and urls from target list before inspecting tabs", () => {
-    const targets: ChromeTarget[] = [
-      { id: "target-1", type: "page", title: "Review A", url: "https://chatgpt.com/c/a" },
-      { id: "target-2", type: "page", title: "Review B", url: "https://chatgpt.com/c/b" },
-    ];
-    expect(resolveExactChatGptTargetForTest(targets, "target-2")?.id).toBe("target-2");
-    expect(resolveExactChatGptTargetForTest(targets, "https://chatgpt.com/c/a")?.id).toBe(
-      "target-1",
-    );
-    expect(
-      resolveExactChatGptTargetForTest(targets, "https://chatgpt.com/g/g-project/c/a")?.id,
-    ).toBe("target-1");
-    expect(resolveExactChatGptTargetForTest(targets, "a")?.id).toBe("target-1");
-    expect(resolveExactChatGptTargetForTest(targets, "current")).toBeNull();
-    expect(resolveExactChatGptTargetForTest(targets, "Review B")).toBeNull();
   });
 
   test("rejects a full-URL ref before inspecting a retargeted same-origin tab", async () => {
@@ -427,7 +481,6 @@ describe("liveTabs helpers", () => {
   test.each([
     { ref: "current", expectedTargetId: "target-2" },
     { ref: "Review A", expectedTargetId: "target-1" },
-    { ref: "https://chatgpt.com/g/g-project/c/a", expectedTargetId: "target-1" },
   ])(
     "inspects and attaches $ref through the exact browser socket",
     async ({ ref, expectedTargetId }) => {
@@ -487,6 +540,57 @@ describe("liveTabs helpers", () => {
       await result.client.close();
     },
   );
+
+  test.each([
+    ["https://chatgpt.com/g/g-project/c/a", "target-project"],
+    ["https://chat.openai.com/c/a", "target-legacy-origin"],
+  ])("attaches an exact scoped conversation URL %s", async (ref, expectedTargetId) => {
+    const browserWSEndpoint = "ws://127.0.0.1:9222/devtools/browser/browser-a";
+    const tabInfo = {
+      "target-root": { title: "Review A Root", url: "https://chatgpt.com/c/a", focused: false },
+      "target-project": {
+        title: "Review A Project",
+        url: "https://chatgpt.com/g/g-project/c/a",
+        focused: false,
+      },
+      "target-legacy-origin": {
+        title: "Review A Legacy Origin",
+        url: "https://chat.openai.com/c/a",
+        focused: true,
+      },
+    } as const;
+    remoteChromeMocks.listRemoteChromeTargets.mockResolvedValue(
+      Object.entries(tabInfo).map(([targetId, info]) => ({
+        targetId,
+        type: "page",
+        url: info.url,
+      })),
+    );
+    remoteChromeMocks.connectToRemoteChromeTarget.mockImplementation(
+      async (
+        _host: string,
+        _port: number,
+        _logger: unknown,
+        options: { browserWSEndpoint?: string; targetId?: string },
+      ) =>
+        makeRemoteTabConnection(
+          options.targetId,
+          tabInfo[options.targetId as keyof typeof tabInfo],
+          options.browserWSEndpoint,
+        ),
+    );
+
+    const result = await connectToExistingChatGptTab({
+      host: "127.0.0.1",
+      port: 9222,
+      browserWSEndpoint,
+      ref,
+    });
+
+    expect(result.targetId).toBe(expectedTargetId);
+    expect(result.tab.url).toBe(tabInfo[expectedTargetId as keyof typeof tabInfo].url);
+    await result.client.close();
+  });
 
   test("rebinds a verified browser tab without requiring an account digest", async () => {
     const freshBrowserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
@@ -745,40 +849,61 @@ describe("liveTabs helpers", () => {
     );
   });
 
-  test("matches sessions by target id, url, and conversation id", () => {
-    const meta = {
-      id: "session-1",
-      createdAt: "2026-03-27T00:00:00.000Z",
-      status: "completed",
-      options: {},
-      mode: "browser",
-      browser: {
-        runtime: {
-          chromeHost: "127.0.0.1",
-          chromePort: 9222,
-          chromeTargetId: "target-1",
-          tabUrl: "https://chatgpt.com/c/abc",
-          conversationId: "abc",
+  test.each(["https://chatgpt.com", "https://chat.openai.com"])(
+    "matches sessions only within the exact route scope on %s",
+    (origin) => {
+      const meta = {
+        id: "session-1",
+        createdAt: "2026-03-27T00:00:00.000Z",
+        status: "completed",
+        options: {},
+        mode: "browser",
+        browser: {
+          runtime: {
+            chromeHost: "127.0.0.1",
+            chromePort: 9222,
+            chromeTargetId: "target-1",
+            tabUrl: `${origin}/g/g-project/project/c/abc`,
+            conversationId: "abc",
+          },
         },
-      },
-    } as SessionMetadata;
-    expect(
-      sessionMatchesTab(meta, {
-        host: "127.0.0.1",
-        port: 9222,
-        targetId: "target-1",
-        url: "https://chatgpt.com/c/abc",
-        conversationId: "abc",
-      }),
-    ).toBe(true);
-    expect(
-      sessionMatchesTab(meta, {
-        host: "127.0.0.1",
-        port: 9222,
-        targetId: "target-2",
-        url: "https://chatgpt.com/c/def",
-        conversationId: "def",
-      }),
-    ).toBe(false);
-  });
+      } as SessionMetadata;
+      expect(
+        sessionMatchesTab(meta, {
+          host: "127.0.0.1",
+          port: 9222,
+          targetId: "target-1",
+          url: `${origin}/g/g-project/project/c/abc`,
+          conversationId: "abc",
+        }),
+      ).toBe(true);
+      expect(
+        sessionMatchesTab(meta, {
+          host: "127.0.0.1",
+          port: 9222,
+          targetId: "target-1",
+          url: `${origin}/c/abc`,
+          conversationId: "abc",
+        }),
+      ).toBe(false);
+      expect(
+        sessionMatchesTab(meta, {
+          host: "127.0.0.1",
+          port: 9222,
+          targetId: "target-1",
+          url: `${origin}/g/other-project/project/c/abc`,
+          conversationId: "abc",
+        }),
+      ).toBe(false);
+      expect(
+        sessionMatchesTab(meta, {
+          host: "127.0.0.1",
+          port: 9222,
+          targetId: "target-2",
+          url: `${origin}/g/g-project/project/c/def`,
+          conversationId: "def",
+        }),
+      ).toBe(false);
+    },
+  );
 });

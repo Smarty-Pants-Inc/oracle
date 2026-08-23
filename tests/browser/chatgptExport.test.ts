@@ -24,25 +24,71 @@ import {
 const testNonWindows = process.platform === "win32" ? test.skip : test;
 
 describe("ChatGPT conversation export helpers", () => {
-  test("accepts only exact chatgpt.com conversation URLs", () => {
-    expect(conversationIdFromChatGptUrl("https://chatgpt.com/c/abc-123")).toBe("abc-123");
-    expect(conversationIdFromChatGptUrl("https://chatgpt.com/c/abc-123/")).toBe("abc-123");
-    expect(conversationIdFromChatGptUrl("https://chatgpt.com/g/project-1/c/abc-123")).toBe(
-      "abc-123",
-    );
-    expect(conversationIdFromChatGptUrl("https://chatgpt.com/g/g-p-123/c/abc-123/")).toBe(
-      "abc-123",
-    );
-    expect(conversationIdFromChatGptUrl("https://chatgpt.com/g/g-p-123/project/c/abc-123")).toBe(
-      "abc-123",
-    );
-    expect(() => conversationIdFromChatGptUrl("https://chat.openai.com/c/abc")).toThrow(
-      /chatgpt\.com\/c/,
-    );
+  test("accepts exact ChatGPT conversation URLs on both supported origins", () => {
+    for (const origin of ["https://chatgpt.com", "https://chat.openai.com"]) {
+      expect(conversationIdFromChatGptUrl(`${origin}/c/abc-123`)).toBe("abc-123");
+      expect(conversationIdFromChatGptUrl(`${origin}/c/abc-123/`)).toBe("abc-123");
+      expect(conversationIdFromChatGptUrl(`${origin}/g/project-1/c/abc-123`)).toBe("abc-123");
+      expect(conversationIdFromChatGptUrl(`${origin}/g/g-p-123/c/abc-123/`)).toBe("abc-123");
+      expect(conversationIdFromChatGptUrl(`${origin}/g/g-p-123/project/c/abc-123`)).toBe("abc-123");
+    }
     expect(() => conversationIdFromChatGptUrl("https://chatgpt.com/")).toThrow(/specific/i);
     expect(() => conversationIdFromChatGptUrl("https://chatgpt.com/g/example/project")).toThrow(
       /specific/i,
     );
+  });
+
+  test.each([
+    "http://chatgpt.com/c/abc",
+    "http://chat.openai.com/c/abc",
+    "https://chatgpt.com.evil.example/c/abc",
+    "https://chat.openai.com.evil.example/c/abc",
+    "https://chatgpt.com:443/c/abc",
+    "https://chat.openai.com:8443/c/abc",
+  ])("rejects a non-exact ChatGPT origin %s", (url) => {
+    expect(() => conversationIdFromChatGptUrl(url)).toThrow(/target-url/i);
+  });
+  test("derives exact backend conversation URL and scope check", () => {
+    expect(buildBackendConversationUrl("conv-1")).toBe(
+      "https://chatgpt.com/backend-api/conversation/conv-1",
+    );
+    expect(buildBackendConversationUrl("conv-1", "https://chat.openai.com")).toBe(
+      "https://chat.openai.com/backend-api/conversation/conv-1",
+    );
+    expect(
+      buildBackendConversationUrl("conv-1", "https://chat.openai.com/g/g-p-123/project/c/conv-1"),
+    ).toBe("https://chat.openai.com/backend-api/conversation/conv-1");
+
+    expect(isSameConversationUrl("https://chatgpt.com/c/conv-1", "conv-1")).toBe(true);
+    expect(
+      isSameConversationUrl(
+        "https://chatgpt.com/g/project/c/conv-1",
+        "https://chatgpt.com/g/project/c/conv-1",
+      ),
+    ).toBe(true);
+    expect(
+      isSameConversationUrl(
+        "https://chat.openai.com/g/project/c/conv-1",
+        "https://chat.openai.com/g/project/c/conv-1",
+      ),
+    ).toBe(true);
+    expect(
+      isSameConversationUrl(
+        "https://chatgpt.com/c/conv-1",
+        "https://chatgpt.com/g/project/c/conv-1",
+      ),
+    ).toBe(false);
+    expect(
+      isSameConversationUrl(
+        "https://chatgpt.com/g/project/c/conv-1",
+        "https://chatgpt.com/g/other-project/c/conv-1",
+      ),
+    ).toBe(false);
+    expect(
+      isSameConversationUrl("https://chat.openai.com/c/conv-1", "https://chatgpt.com/c/conv-1"),
+    ).toBe(false);
+    expect(isSameConversationUrl("https://chatgpt.com/g/project/c/conv-1", "conv-1")).toBe(false);
+    expect(isSameConversationUrl("https://chatgpt.com/", "conv-1")).toBe(false);
   });
 
   test("disposes a capture-hook registration that arrives after the export deadline", async () => {
@@ -111,80 +157,74 @@ describe("ChatGPT conversation export helpers", () => {
     }
   });
 
-  test("derives exact backend conversation URL and scope check", () => {
-    expect(buildBackendConversationUrl("conv-1")).toBe(
-      "https://chatgpt.com/backend-api/conversation/conv-1",
-    );
-    expect(isSameConversationUrl("https://chatgpt.com/c/conv-1", "conv-1")).toBe(true);
-    expect(isSameConversationUrl("https://chatgpt.com/g/project/c/conv-1", "conv-1")).toBe(true);
-    expect(isSameConversationUrl("https://chatgpt.com/g/g-p-123/project/c/conv-1", "conv-1")).toBe(
-      true,
-    );
-    expect(isSameConversationUrl("https://chatgpt.com/c/other", "conv-1")).toBe(false);
-    expect(isSameConversationUrl("https://chatgpt.com/g/project/c/other", "conv-1")).toBe(false);
-    expect(isSameConversationUrl("https://chatgpt.com/", "conv-1")).toBe(false);
-  });
+  test.each(["https://chatgpt.com", "https://chat.openai.com"])(
+    "requires and revalidates complete affinity before archive mutations on %s",
+    async (origin) => {
+      const expectedDigest = "a".repeat(64);
+      const expectedEmail = "owner@example.test";
+      const expectedConversationUrl = `${origin}/g/g-project/project/c/conv-1`;
+      const runtime = {
+        evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+          result: {
+            value: expression.includes("/api/auth/session")
+              ? { accountDigest: expectedDigest, email: expectedEmail }
+              : expectedConversationUrl,
+          },
+        })),
+      };
 
-  test("requires and revalidates complete affinity before archive mutations", async () => {
-    const expectedDigest = "a".repeat(64);
-    const expectedEmail = "owner@example.test";
-    const runtime = {
-      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+      await expect(
+        assertChatGptExportMutationAffinityForTest(
+          runtime as never,
+          expectedDigest,
+          expectedConversationUrl,
+          "archive mutation",
+          expectedEmail,
+        ),
+      ).resolves.toBeUndefined();
+      await expect(
+        assertChatGptExportMutationAffinityForTest(
+          runtime as never,
+          expectedDigest,
+          expectedConversationUrl,
+        ),
+      ).rejects.toThrow(/complete ChatGPT account affinity/i);
+
+      runtime.evaluate.mockImplementation(async ({ expression }: { expression: string }) => ({
         result: {
           value: expression.includes("/api/auth/session")
             ? { accountDigest: expectedDigest, email: expectedEmail }
-            : "https://chatgpt.com/c/conv-1",
+            : `${origin}/c/conv-1`,
         },
-      })),
-    };
+      }));
+      await expect(
+        assertChatGptExportMutationAffinityForTest(
+          runtime as never,
+          expectedDigest,
+          expectedConversationUrl,
+          "archive mutation",
+          expectedEmail,
+        ),
+      ).rejects.toThrow(/conversation changed before archive mutation/i);
 
-    await expect(
-      assertChatGptExportMutationAffinityForTest(
-        runtime as never,
-        expectedDigest,
-        "conv-1",
-        "archive mutation",
-        expectedEmail,
-      ),
-    ).resolves.toBeUndefined();
-    await expect(
-      assertChatGptExportMutationAffinityForTest(runtime as never, expectedDigest, "conv-1"),
-    ).rejects.toThrow(/complete ChatGPT account affinity/i);
-
-    runtime.evaluate.mockImplementation(async ({ expression }: { expression: string }) => ({
-      result: {
-        value: expression.includes("/api/auth/session")
-          ? { accountDigest: expectedDigest, email: expectedEmail }
-          : "https://chatgpt.com/c/other",
-      },
-    }));
-    await expect(
-      assertChatGptExportMutationAffinityForTest(
-        runtime as never,
-        expectedDigest,
-        "conv-1",
-        "archive mutation",
-        expectedEmail,
-      ),
-    ).rejects.toThrow(/conversation changed before archive mutation/i);
-
-    runtime.evaluate.mockImplementation(async ({ expression }: { expression: string }) => ({
-      result: {
-        value: expression.includes("/api/auth/session")
-          ? { accountDigest: "b".repeat(64), email: expectedEmail }
-          : "https://chatgpt.com/c/conv-1",
-      },
-    }));
-    await expect(
-      assertChatGptExportMutationAffinityForTest(
-        runtime as never,
-        expectedDigest,
-        "conv-1",
-        "archive mutation",
-        expectedEmail,
-      ),
-    ).rejects.toThrow(/account identity changed before archive mutation/i);
-  });
+      runtime.evaluate.mockImplementation(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: expression.includes("/api/auth/session")
+            ? { accountDigest: "b".repeat(64), email: expectedEmail }
+            : expectedConversationUrl,
+        },
+      }));
+      await expect(
+        assertChatGptExportMutationAffinityForTest(
+          runtime as never,
+          expectedDigest,
+          expectedConversationUrl,
+          "archive mutation",
+          expectedEmail,
+        ),
+      ).rejects.toThrow(/account identity changed before archive mutation/i);
+    },
+  );
 
   test("binds read-only exact GETs to the expected bearer JWT identity", () => {
     const expectedDigest = "a".repeat(64);

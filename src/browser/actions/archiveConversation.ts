@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type {
   BrowserArchiveMode,
   BrowserArchiveResult,
@@ -6,9 +7,11 @@ import type {
   ChromeClient,
 } from "../types.js";
 import { MAX_CHATGPT_ACCOUNT_ID_LENGTH } from "../chatgptAccount.js";
+import { isSameChatGptConversationUrl, parseChatGptConversationScope } from "../conversationUrl.js";
 
 const ARCHIVE_HOST_HANDOFF_MS = 250;
 const ARCHIVE_CONFIRMATION_BUDGET_MS = 1_000;
+const ARCHIVE_TOMBSTONES_KEY = "__oracleChatGptArchiveCancelled";
 
 export interface BrowserArchiveDecision {
   mode: BrowserArchiveMode;
@@ -65,15 +68,74 @@ export function resolveBrowserArchiveDecision({
 
 function resolveArchiveConversationAffinity(
   rawUrl?: string | null,
-): { origin: string; conversationId: string } | null {
-  try {
-    const parsed = new URL(rawUrl ?? "");
-    if (parsed.origin !== "https://chatgpt.com") return null;
-    const match = /^\/(?:c|g\/[^/]+(?:\/project)?\/c)\/([a-zA-Z0-9-]+)\/?$/.exec(parsed.pathname);
-    return match?.[1] ? { origin: parsed.origin, conversationId: match[1] } : null;
-  } catch {
-    return null;
-  }
+): { origin: string; conversationId: string; conversationUrl: string } | null {
+  const scope = parseChatGptConversationScope(rawUrl);
+  if (!scope) return null;
+  return {
+    origin: scope.origin,
+    conversationId: scope.conversationId,
+    conversationUrl: `${scope.origin}${scope.pathname}`,
+  };
+}
+function buildArchiveCancellationExpression(operationToken: string): string {
+  return `(() => {
+    const key = ${JSON.stringify(ARCHIVE_TOMBSTONES_KEY)};
+    const token = ${JSON.stringify(operationToken)};
+    try {
+      const tombstones = window[key] && typeof window[key] === 'object'
+        ? window[key]
+        : (window[key] = Object.create(null));
+      tombstones[token] = true;
+      return tombstones[token] === true;
+    } catch {
+      return false;
+    }
+  })()`;
+}
+
+function buildArchiveCleanupExpression(operationToken: string): string {
+  return `(() => {
+    const key = ${JSON.stringify(ARCHIVE_TOMBSTONES_KEY)};
+    const token = ${JSON.stringify(operationToken)};
+    try {
+      const tombstones = window[key];
+      if (!tombstones || tombstones[token] !== true) return false;
+      delete tombstones[token];
+      return tombstones[token] !== true;
+    } catch {
+      return false;
+    }
+  })()`;
+}
+
+function cancelTimedOutArchiveEvaluation(
+  Runtime: ChromeClient["Runtime"],
+  operation: Promise<unknown>,
+  operationToken: string,
+): void {
+  const cancellation = Promise.resolve().then(() =>
+    Runtime.evaluate({
+      expression: buildArchiveCancellationExpression(operationToken),
+      awaitPromise: false,
+      returnByValue: true,
+    }),
+  );
+  const lateResult = operation.then(
+    () => undefined,
+    () => undefined,
+  );
+  void Promise.allSettled([cancellation, lateResult]).then(([cancelled]) => {
+    if (cancelled.status !== "fulfilled" || cancelled.value.result?.value !== true) return;
+    void Promise.resolve()
+      .then(() =>
+        Runtime.evaluate({
+          expression: buildArchiveCleanupExpression(operationToken),
+          awaitPromise: false,
+          returnByValue: true,
+        }),
+      )
+      .catch(() => undefined);
+  });
 }
 
 export async function archiveChatGptConversation(
@@ -131,28 +193,34 @@ export async function archiveChatGptConversation(
       error,
     };
   }
+  const operationToken = randomUUID();
+  const pageDeadlineMs = Date.now() + pageRemainingMs;
+  const operation = Promise.resolve().then(() =>
+    Runtime.evaluate({
+      expression: buildArchiveConversationExpression({
+        expectedOrigin: affinity.origin,
+        expectedConversationId: affinity.conversationId,
+        expectedConversationUrl: affinity.conversationUrl,
+        expectedAccountDigest,
+        remainingMs: pageRemainingMs,
+        deadlineMs: pageDeadlineMs,
+        operationToken,
+      }),
+      awaitPromise: true,
+      returnByValue: true,
+    }),
+  );
   let timeout: NodeJS.Timeout | undefined;
+  let timedOut = false;
   const timeoutPromise = new Promise<never>((_resolve, reject) => {
-    timeout = setTimeout(
-      () => reject(new Error("Timed out while archiving ChatGPT conversation.")),
-      resolvedRemainingMs,
-    );
+    timeout = setTimeout(() => {
+      timedOut = true;
+      reject(new Error("Timed out while archiving ChatGPT conversation."));
+    }, resolvedRemainingMs);
     timeout.unref?.();
   });
   try {
-    const evaluated = await Promise.race([
-      Runtime.evaluate({
-        expression: buildArchiveConversationExpression({
-          expectedOrigin: affinity.origin,
-          expectedConversationId: affinity.conversationId,
-          expectedAccountDigest,
-          remainingMs: pageRemainingMs,
-        }),
-        awaitPromise: true,
-        returnByValue: true,
-      }),
-      timeoutPromise,
-    ]);
+    const evaluated = await Promise.race([operation, timeoutPromise]);
     const value = evaluated.result?.value as
       | { status: "archived"; conversationUrl?: string | null }
       | { status: "skipped"; reason: string; conversationUrl?: string | null }
@@ -160,25 +228,37 @@ export async function archiveChatGptConversation(
       | undefined;
     const reason = value?.status === "skipped" ? value.reason : "archive-failed";
     const error = value?.status === "failed" ? value.error : undefined;
-    const resolvedUrl =
-      reason === "affinity-mismatch"
-        ? (conversationUrl ?? undefined)
-        : (value?.conversationUrl ?? conversationUrl ?? undefined);
-    if (value?.status === "archived") {
+    const returnedUrl = value?.conversationUrl ?? affinity.conversationUrl;
+    const scopeMatches = isSameChatGptConversationUrl(returnedUrl, affinity.conversationUrl);
+    const resolvedUrl = scopeMatches
+      ? (value?.conversationUrl ?? conversationUrl)
+      : conversationUrl;
+    if (value?.status === "archived" && scopeMatches) {
       logger("[browser] Archived ChatGPT conversation after saving local artifacts.");
-      return { mode, attempted: true, archived: true, conversationUrl: resolvedUrl };
+      return { mode, attempted: true, archived: true, conversationUrl: resolvedUrl ?? undefined };
     }
-    logger(`[browser] ChatGPT archive skipped (${error ?? reason}).`);
+    const resolvedReason = value?.status === "archived" ? "affinity-mismatch" : reason;
+    const resolvedError =
+      value?.status === "archived" && !scopeMatches
+        ? "Archive result left the approved conversation scope."
+        : error;
+    logger(`[browser] ChatGPT archive skipped (${resolvedError ?? resolvedReason}).`);
     return {
       mode,
-      attempted: reason !== "affinity-mismatch",
+      attempted: resolvedReason !== "affinity-mismatch",
       archived: false,
-      reason,
-      conversationUrl: resolvedUrl,
-      error,
+      reason: resolvedReason,
+      conversationUrl: resolvedUrl ?? undefined,
+      error: resolvedError,
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (timedOut) {
+      cancelTimedOutArchiveEvaluation(Runtime, operation, operationToken);
+      logger(
+        "[browser] ChatGPT archive timeout cancellation was dispatched; page deadline gate remains active.",
+      );
+    }
     logger(`[browser] ChatGPT archive skipped (${message}).`);
     return {
       mode,
@@ -196,41 +276,69 @@ export async function archiveChatGptConversation(
 export function buildArchiveConversationExpressionForTest(options?: {
   expectedOrigin?: string;
   expectedConversationId?: string;
+  expectedConversationUrl?: string;
   expectedAccountDigest?: string;
   remainingMs?: number;
+  deadlineMs?: number;
+  operationToken?: string;
 }): string {
+  const expectedOrigin = options?.expectedOrigin ?? "https://chatgpt.com";
+  const expectedConversationId = options?.expectedConversationId ?? "abc";
   return buildArchiveConversationExpression({
-    expectedOrigin: options?.expectedOrigin ?? "https://chatgpt.com",
-    expectedConversationId: options?.expectedConversationId ?? "abc",
+    expectedOrigin,
+    expectedConversationId,
+    expectedConversationUrl:
+      options?.expectedConversationUrl ?? `${expectedOrigin}/c/${expectedConversationId}`,
     expectedAccountDigest: options?.expectedAccountDigest,
     remainingMs:
       typeof options?.remainingMs === "number" && Number.isFinite(options.remainingMs)
         ? Math.max(0, Math.floor(options.remainingMs))
         : 10_000,
+    deadlineMs:
+      typeof options?.deadlineMs === "number" && Number.isFinite(options.deadlineMs)
+        ? Math.floor(options.deadlineMs)
+        : undefined,
+    operationToken: options?.operationToken ?? "archive-test-operation",
   });
 }
 
 function buildArchiveConversationExpression({
   expectedOrigin,
   expectedConversationId,
+  expectedConversationUrl,
   expectedAccountDigest,
   remainingMs,
+  deadlineMs,
+  operationToken,
 }: {
   expectedOrigin: string;
   expectedConversationId: string;
+  expectedConversationUrl: string;
   expectedAccountDigest?: string;
   remainingMs: number;
+  deadlineMs?: number;
+  operationToken: string;
 }): string {
-  const deadlineExpression = `Date.now() + ${JSON.stringify(Math.max(0, Math.floor(remainingMs)))}`;
+  const deadlineExpression =
+    deadlineMs === undefined
+      ? `Date.now() + ${JSON.stringify(Math.max(0, Math.floor(remainingMs)))}`
+      : JSON.stringify(deadlineMs);
   return `(() => {
     const expectedOrigin = ${JSON.stringify(expectedOrigin)};
     const expectedConversationId = ${JSON.stringify(expectedConversationId)};
+    const expectedConversationUrl = ${JSON.stringify(expectedConversationUrl)};
     const expectedAccountDigest = ${JSON.stringify(expectedAccountDigest ?? null)};
+    const operationToken = ${JSON.stringify(operationToken)};
+    const tombstonesKey = ${JSON.stringify(ARCHIVE_TOMBSTONES_KEY)};
     const deadline = ${deadlineExpression};
     const remainingMs = Math.max(0, deadline - Date.now());
     const confirmationBudgetMs = ${ARCHIVE_CONFIRMATION_BUDGET_MS};
     const confirmationDeadline = deadline - confirmationBudgetMs;
     const fallbackAffinityDeadline = deadline - Math.min(350, confirmationBudgetMs);
+    const isCancelled = () => {
+      try { return window[tombstonesKey]?.[operationToken] === true; } catch { return false; }
+    };
+    const canContinue = (cutoff = deadline) => !isCancelled() && Date.now() < cutoff;
     let conversationUrl = typeof location === 'object' ? location.href : null;
     const sleep = (ms) => {
       const { promise, resolve } = Promise.withResolvers();
@@ -242,9 +350,14 @@ function buildArchiveConversationExpression({
         .replace(/\\s+/g, ' ')
         .trim()
         .toLowerCase();
+    const labelFor = (element) =>
+      normalize([
+        element.getAttribute?.('aria-label'),
+        element.getAttribute?.('title'),
+        element.textContent,
+      ].filter(Boolean).join(' '));
     const readAccountDigest = async (cutoff = deadline) => {
-      if (!expectedAccountDigest || Date.now() >= cutoff) return null;
-      const target = 'https://chatgpt.com/api/auth/session';
+      if (!expectedAccountDigest || !canContinue(cutoff)) return null;
       const controller = new AbortController();
       const { promise: timeout, resolve: resolveTimeout } = Promise.withResolvers();
       const timeoutId = setTimeout(() => {
@@ -254,7 +367,14 @@ function buildArchiveConversationExpression({
       try {
         return await Promise.race([
           (async () => {
-            if (new URL(location.href).origin !== 'https://chatgpt.com') return null;
+            let target;
+            try {
+              const pageOrigin = new URL(location.href).origin;
+              if (pageOrigin !== expectedOrigin) return null;
+              target = new URL('/api/auth/session', pageOrigin).href;
+            } catch {
+              return null;
+            }
             const response = await fetch(target, {
               method: 'GET', cache: 'no-store', credentials: 'include', redirect: 'error', signal: controller.signal,
             });
@@ -263,19 +383,19 @@ function buildArchiveConversationExpression({
               response.redirected ||
               response.url !== target ||
               controller.signal.aborted ||
-              Date.now() >= cutoff
+              !canContinue(cutoff)
             ) return null;
             const body = await response.json();
             const rawUserId = typeof body?.user?.id === 'string' ? body.user.id : '';
             const userId =
               rawUserId.length > 0 && rawUserId.length <= ${MAX_CHATGPT_ACCOUNT_ID_LENGTH} ? rawUserId.trim() : '';
-            if (!userId || !globalThis.crypto?.subtle) return null;
+            if (!userId || !globalThis.crypto?.subtle || !canContinue(cutoff)) return null;
             const bytes = new Uint8Array(await crypto.subtle.digest(
               'SHA-256', new TextEncoder().encode(userId),
             ));
-            return Date.now() >= cutoff
-              ? null
-              : Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+            return canContinue(cutoff)
+              ? Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+              : null;
           })().catch(() => null),
           timeout,
         ]);
@@ -284,15 +404,17 @@ function buildArchiveConversationExpression({
       }
     };
     const hasExpectedAffinity = async (cutoff = deadline) => {
-      if (Date.now() >= cutoff) return false;
+      if (!canContinue(cutoff)) return false;
       if (expectedAccountDigest && await readAccountDigest(cutoff) !== expectedAccountDigest) return false;
-      if (Date.now() >= cutoff) return false;
+      if (!canContinue(cutoff)) return false;
       conversationUrl = typeof location === 'object' ? location.href : null;
       try {
         const currentUrl = new URL(conversationUrl);
-        const match = currentUrl.pathname
-          .match(/^\\/(?:c|g\\/[^/]+(?:\\/project)?\\/c)\\/([a-zA-Z0-9-]+)\\/?$/);
-        return currentUrl.origin === expectedOrigin && match?.[1] === expectedConversationId;
+        if (currentUrl.origin !== expectedOrigin || currentUrl.search || currentUrl.hash) return false;
+        const currentScope = currentUrl.origin + currentUrl.pathname.replace(/\\/$/, '');
+        return currentScope === expectedConversationUrl &&
+          currentUrl.pathname.match(/(?:^|\\/)c\\/([a-zA-Z0-9-]+)(?:\\/)?$/)?.[1] === expectedConversationId &&
+          canContinue(cutoff);
       } catch {
         return false;
       }
@@ -303,44 +425,40 @@ function buildArchiveConversationExpression({
       const style = getComputedStyle(element);
       return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
     };
-    const labelFor = (element) =>
-      normalize([
-        element.getAttribute?.('aria-label'),
-        element.getAttribute?.('title'),
-        element.textContent,
-      ].filter(Boolean).join(' '));
-	    const click = (element) => {
-	      const rect = element.getBoundingClientRect();
-	      const eventInit = {
-	        bubbles: true,
-	        cancelable: true,
-	        view: window,
-	        clientX: rect.left + rect.width / 2,
-	        clientY: rect.top + rect.height / 2,
-	        button: 0,
-	      };
-	      if (typeof PointerEvent === 'function') {
-	        element.dispatchEvent(new PointerEvent('pointerdown', {
-	          ...eventInit,
-	          buttons: 1,
-	          pointerId: 1,
-	          pointerType: 'mouse',
-	          isPrimary: true,
-	        }));
-	      }
-	      element.dispatchEvent(new MouseEvent('mousedown', { ...eventInit, buttons: 1 }));
-	      if (typeof PointerEvent === 'function') {
-	        element.dispatchEvent(new PointerEvent('pointerup', {
-	          ...eventInit,
-	          buttons: 0,
-	          pointerId: 1,
-	          pointerType: 'mouse',
-	          isPrimary: true,
-	        }));
-	      }
-	      element.dispatchEvent(new MouseEvent('mouseup', { ...eventInit, buttons: 0 }));
-	      element.dispatchEvent(new MouseEvent('click', { ...eventInit, buttons: 0 }));
-	    };
+    const click = (element) => {
+      if (!canContinue()) return false;
+      const rect = element.getBoundingClientRect();
+      const eventInit = {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX: rect.left + rect.width / 2,
+        clientY: rect.top + rect.height / 2,
+        button: 0,
+      };
+      if (typeof PointerEvent === 'function') {
+        element.dispatchEvent(new PointerEvent('pointerdown', {
+          ...eventInit,
+          buttons: 1,
+          pointerId: 1,
+          pointerType: 'mouse',
+          isPrimary: true,
+        }));
+      }
+      element.dispatchEvent(new MouseEvent('mousedown', { ...eventInit, buttons: 1 }));
+      if (typeof PointerEvent === 'function') {
+        element.dispatchEvent(new PointerEvent('pointerup', {
+          ...eventInit,
+          buttons: 0,
+          pointerId: 1,
+          pointerType: 'mouse',
+          isPrimary: true,
+        }));
+      }
+      element.dispatchEvent(new MouseEvent('mouseup', { ...eventInit, buttons: 0 }));
+      element.dispatchEvent(new MouseEvent('click', { ...eventInit, buttons: 0 }));
+      return true;
+    };
     const findConversationMenuButton = () => {
       const buttons = Array.from(document.querySelectorAll('button,[role="button"]'))
         .filter((element) => element instanceof HTMLElement && isVisible(element));
@@ -411,73 +529,69 @@ function buildArchiveConversationExpression({
 	      );
 	    };
     const waitForArchiveConfirmation = async () => {
-      while (Date.now() < confirmationDeadline) {
+      while (canContinue(confirmationDeadline)) {
         if (conversationUrl && location.href !== conversationUrl) return true;
         if (hasArchiveConfirmation()) return true;
         await sleep(Math.min(150, Math.max(0, confirmationDeadline - Date.now())));
       }
       return false;
     };
-	    const verifyArchivedStateFromMenu = async () => {
-	      if (Date.now() >= deadline) return false;
-	      const menuButton = findConversationMenuButton();
-	      if (!menuButton) return false;
-	      click(menuButton);
-	      const remaining = deadline - Date.now();
-	      if (remaining <= 0) return false;
-	      await sleep(Math.min(300, remaining));
-	      const archived = hasUnarchiveMenuItem();
-	      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-	      return archived;
-	    };
-	    return (async () => {
+    const verifyArchivedStateFromMenu = async () => {
+      if (!canContinue()) return false;
+      const menuButton = findConversationMenuButton();
+      if (!menuButton || !click(menuButton)) return false;
+      const remaining = deadline - Date.now();
+      if (!canContinue() || remaining <= 0) return false;
+      await sleep(Math.min(300, remaining));
+      if (!canContinue()) return false;
+      const archived = hasUnarchiveMenuItem();
+      if (canContinue()) {
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      }
+      return archived;
+    };
+    return (async () => {
       if (!await hasExpectedAffinity()) {
         return { status: 'skipped', reason: 'affinity-mismatch', conversationUrl };
       }
-	      const menuButton = findConversationMenuButton();
-      if (!menuButton) {
+      const menuButton = findConversationMenuButton();
+      if (!menuButton || !canContinue(confirmationDeadline)) {
         return { status: 'skipped', reason: 'conversation-menu-not-found', conversationUrl };
       }
-      if (Date.now() >= confirmationDeadline) {
+      if (!click(menuButton)) {
         return { status: 'skipped', reason: 'archive-not-confirmed', conversationUrl };
       }
-      click(menuButton);
       await sleep(350);
       if (!await hasExpectedAffinity()) {
         return { status: 'skipped', reason: 'affinity-mismatch', conversationUrl };
       }
       const archiveItem = findArchiveMenuItem();
       if (!archiveItem) {
-        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        if (canContinue()) document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
         return { status: 'skipped', reason: 'archive-menu-item-not-found', conversationUrl };
-	      }
-      if (Date.now() >= confirmationDeadline) {
+      }
+      if (!canContinue(confirmationDeadline) || !click(archiveItem)) {
         return { status: 'skipped', reason: 'archive-not-confirmed', conversationUrl };
       }
-	      click(archiveItem);
-	      await sleep(350);
-	      const confirmButton = findArchiveConfirmationButton();
-	      if (confirmButton) {
-        if (!await hasExpectedAffinity()) {
-          return { status: 'skipped', reason: 'affinity-mismatch', conversationUrl };
-        }
-        if (Date.now() >= confirmationDeadline) {
+      await sleep(350);
+      const confirmButton = findArchiveConfirmationButton();
+      if (confirmButton) {
+        if (!await hasExpectedAffinity() || !canContinue(confirmationDeadline) || !click(confirmButton)) {
           return { status: 'skipped', reason: 'archive-not-confirmed', conversationUrl };
         }
-	        click(confirmButton);
-	        await sleep(500);
-	      }
-	      if (await waitForArchiveConfirmation()) {
-	        return { status: 'archived', conversationUrl };
-	      }
-	      if (!await hasExpectedAffinity(fallbackAffinityDeadline)) {
+        await sleep(500);
+      }
+      if (await waitForArchiveConfirmation()) {
+        return { status: 'archived', conversationUrl };
+      }
+      if (!await hasExpectedAffinity(fallbackAffinityDeadline)) {
         return { status: 'skipped', reason: 'affinity-mismatch', conversationUrl };
-	      }
-	      if (await verifyArchivedStateFromMenu()) {
-	        return { status: 'archived', conversationUrl };
-	      }
-	      return { status: 'skipped', reason: 'archive-not-confirmed', conversationUrl };
-	    })().catch((error) => ({
+      }
+      if (await verifyArchivedStateFromMenu()) {
+        return { status: 'archived', conversationUrl };
+      }
+      return { status: 'skipped', reason: 'archive-not-confirmed', conversationUrl };
+    })().catch((error) => ({
       status: 'failed',
       error: error instanceof Error ? error.message : String(error),
       conversationUrl,

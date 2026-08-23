@@ -11,7 +11,12 @@ import {
 } from "./constants.js";
 import { captureAssistantMarkdown, readAssistantSnapshot } from "./actions/assistantResponse.js";
 import { buildConversationTurnListExpression } from "./conversationTurns.js";
-import { extractStableConversationIdFromUrl } from "./conversationUrl.js";
+import {
+  extractStableConversationIdFromUrl,
+  isSameChatGptConversationUrl,
+  parseChatGptConversationScope,
+  parseChatGptUrl,
+} from "./conversationUrl.js";
 import { delay } from "./utils.js";
 import {
   closeTab,
@@ -28,11 +33,6 @@ export const DEFAULT_REMOTE_CHROME_PORT = 9222;
 
 const LOGIN_CTA_PATTERN =
   /\b(log in|login|sign up|sign in|continue with google|continue with microsoft)\b/i;
-const CHATGPT_HOSTS: Record<string, true> = {
-  "chatgpt.com": true,
-  "chat.openai.com": true,
-};
-const ABSOLUTE_URL_AUTHORITY_PATTERN = /^[a-z][a-z\d+.-]*:\/\/([^/?#\\]*)/iu;
 
 class ChatGptOriginError extends Error {}
 export interface ChromeTarget {
@@ -85,16 +85,19 @@ export interface ChatGptTabSummary {
 interface ResolveChatGptTabOptions extends HostPort {
   ref?: string;
   closeTargetOnDispose?: boolean;
+  expectedConversationUrl?: string;
 }
 
 interface InspectChatGptTabOptions extends HostPort {
   target: ChromeTarget;
   expectedConversationId?: string;
+  expectedConversationUrl?: string;
 }
 
 interface HarvestChatGptTabOptions extends ResolveChatGptTabOptions {
   target?: ChromeTarget;
   expectedConversationId?: string;
+  expectedConversationUrl?: string;
   stallWindowMs?: number;
 }
 
@@ -153,29 +156,6 @@ function buildTargetFingerprint(
     .digest("hex");
 }
 
-function parseChatGptUrl(value: unknown): URL | null {
-  const raw = normalizeUrl(value);
-  const authority = ABSOLUTE_URL_AUTHORITY_PATTERN.exec(raw)?.[1];
-  if (!authority) return null;
-  try {
-    const parsed = new URL(raw);
-    const hostname = parsed.hostname.toLowerCase();
-    if (
-      parsed.protocol !== "https:" ||
-      parsed.username ||
-      parsed.password ||
-      parsed.port ||
-      !Object.hasOwn(CHATGPT_HOSTS, hostname) ||
-      authority.toLowerCase() !== hostname
-    ) {
-      return null;
-    }
-    return parsed;
-  } catch {
-    return null;
-  }
-}
-
 export function isChatGptUrl(url: string): boolean {
   return parseChatGptUrl(url) !== null;
 }
@@ -203,8 +183,7 @@ export async function assertChatGptTabOrigin(
 }
 
 function isChatGptConversationUrl(url: string): boolean {
-  const parsed = parseChatGptUrl(url);
-  return parsed ? /\/c\//.test(parsed.pathname) : false;
+  return parseChatGptConversationScope(url) !== null;
 }
 
 function isChatGptTarget(target: ChromeTarget): boolean {
@@ -213,6 +192,10 @@ function isChatGptTarget(target: ChromeTarget): boolean {
 
 function extractTargetId(target: ChromeTarget | undefined | null): string | null {
   return target?.targetId ?? target?.id ?? null;
+}
+
+function exactConversationRef(ref: string | undefined): string | undefined {
+  return parseChatGptConversationScope(String(ref ?? "").trim()) ? String(ref).trim() : undefined;
 }
 
 export function expectedConversationIdForRef(
@@ -236,11 +219,38 @@ export function assertExpectedConversationId(
   }
 }
 
+export function assertExpectedConversationUrl(
+  expectedConversationUrl: string | undefined,
+  observedUrl: string,
+  action: string,
+): void {
+  if (!expectedConversationUrl) return;
+  if (!isSameChatGptConversationUrl(observedUrl, expectedConversationUrl)) {
+    throw new Error(`ChatGPT conversation changed before ${action}.`);
+  }
+}
+
+function assertExpectedConversation(
+  expectedConversationId: string | undefined,
+  expectedConversationUrl: string | undefined,
+  observedUrl: string,
+  action: string,
+): void {
+  if (expectedConversationUrl) {
+    assertExpectedConversationUrl(expectedConversationUrl, observedUrl, action);
+    return;
+  }
+  assertExpectedConversationId(expectedConversationId, observedUrl, action);
+}
+
 function escapeLiteral(value: string): string {
   return JSON.stringify(value);
 }
 
-function buildTabInspectionExpression(expectedConversationId?: string): string {
+function buildTabInspectionExpression(
+  expectedConversationId?: string,
+  expectedConversationUrl?: string,
+): string {
   const inputSelectorsLiteral = JSON.stringify(INPUT_SELECTORS);
   const sendSelectorsLiteral = JSON.stringify(SEND_BUTTON_SELECTORS);
   const answerSelectorsLiteral = JSON.stringify(ANSWER_SELECTORS);
@@ -250,6 +260,10 @@ function buildTabInspectionExpression(expectedConversationId?: string): string {
   const expectedConversationLiteral =
     typeof expectedConversationId === "string" && expectedConversationId.trim().length > 0
       ? JSON.stringify(expectedConversationId.trim())
+      : "null";
+  const expectedConversationUrlLiteral =
+    typeof expectedConversationUrl === "string" && expectedConversationUrl.trim().length > 0
+      ? JSON.stringify(expectedConversationUrl.trim())
       : "null";
   return `(() => {
       const INPUT_SELECTORS = ${inputSelectorsLiteral};
@@ -261,9 +275,24 @@ function buildTabInspectionExpression(expectedConversationId?: string): string {
       const LOGIN_CTA = ${LOGIN_CTA_PATTERN.toString()};
       const normalize = (value) => String(value ?? '').replace(/\\s+/g, ' ').trim();
       const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
+      const EXPECTED_CONVERSATION_URL = ${expectedConversationUrlLiteral};
       const currentHref = typeof location === 'object' && location.href ? location.href : '';
-      const currentConversationId = currentHref.match(/\\/c\\/([a-zA-Z0-9_-]+)/)?.[1] ?? null;
-      if (EXPECTED_CONVERSATION_ID && currentConversationId !== EXPECTED_CONVERSATION_ID) {
+      let currentConversationId = null;
+      let currentScope = null;
+      try {
+        const currentUrl = new URL(currentHref);
+        currentScope = currentUrl.origin + currentUrl.pathname.replace(/\\/$/, '');
+        currentConversationId = currentUrl.pathname.match(/(?:^|\\/)c\\/([a-zA-Z0-9_-]+)(?:\\/)?$/)?.[1] ?? null;
+      } catch {}
+      if (EXPECTED_CONVERSATION_URL) {
+        try {
+          const expectedUrl = new URL(EXPECTED_CONVERSATION_URL);
+          const expectedScope = expectedUrl.origin + expectedUrl.pathname.replace(/\\/$/, '');
+          if (currentScope !== expectedScope) return { url: currentHref, scopeMismatch: true };
+        } catch {
+          return { url: currentHref, scopeMismatch: true };
+        }
+      } else if (EXPECTED_CONVERSATION_ID && currentConversationId !== EXPECTED_CONVERSATION_ID) {
         return { url: currentHref, scopeMismatch: true };
       }
       const isVisible = (node) => {
@@ -523,10 +552,15 @@ export async function inspectChatGptTab(
   }
 
   const client = await connectToTarget(host, port, targetId, options.browserWSEndpoint);
+  const { Runtime } = client;
   try {
-    const { Runtime } = client;
     const initialUrl = await assertChatGptTabOrigin(Runtime, "live tab inspection");
-    assertExpectedConversationId(options.expectedConversationId, initialUrl, "live tab inspection");
+    assertExpectedConversation(
+      options.expectedConversationId,
+      options.expectedConversationUrl,
+      initialUrl,
+      "live tab inspection",
+    );
     const expectedAccountDigest = options.accountDigest?.trim();
     if (expectedAccountDigest) {
       const observedAccountDigest = await readChatGptAccountDigest(Runtime);
@@ -535,7 +569,10 @@ export async function inspectChatGptTab(
       }
     }
     const evaluation = await Runtime.evaluate({
-      expression: buildTabInspectionExpression(options.expectedConversationId),
+      expression: buildTabInspectionExpression(
+        options.expectedConversationId,
+        options.expectedConversationUrl,
+      ),
       returnByValue: true,
       awaitPromise: true,
     });
@@ -560,14 +597,16 @@ export async function inspectChatGptTab(
     };
     const inspectedUrl = normalizeUrl(info.url ?? target.url ?? "");
     requireChatGptUrl(inspectedUrl, "live tab inspection");
-    assertExpectedConversationId(
+    assertExpectedConversation(
       options.expectedConversationId,
+      options.expectedConversationUrl,
       inspectedUrl,
       "live tab inspection evaluation",
     );
     const snapshotUrl = await assertChatGptTabOrigin(Runtime, "live tab inspection snapshot");
-    assertExpectedConversationId(
+    assertExpectedConversation(
       options.expectedConversationId,
+      options.expectedConversationUrl,
       snapshotUrl,
       "live tab inspection snapshot",
     );
@@ -577,8 +616,9 @@ export async function inspectChatGptTab(
       options.expectedConversationId,
     ).catch(() => null);
     const finalUrl = await assertChatGptTabOrigin(Runtime, "live tab inspection completion");
-    assertExpectedConversationId(
+    assertExpectedConversation(
       options.expectedConversationId,
+      options.expectedConversationUrl,
       finalUrl,
       "live tab inspection completion",
     );
@@ -698,25 +738,27 @@ function resolveChatGptTabFromSummaries(
     return chatGptSummaries[0] as ChatGptTabSummary;
   }
   const exactId = chatGptSummaries.find((tab) => tab.targetId === trimmedRef);
-  if (exactId) {
-    return exactId;
-  }
+  if (exactId) return exactId;
   const exactUrl = chatGptSummaries.find((tab) => tab.url === trimmedRef);
-  if (exactUrl) {
-    return exactUrl;
+  if (exactUrl) return exactUrl;
+  const scopedRef = exactConversationRef(trimmedRef);
+  if (scopedRef) {
+    const exactConversation = chatGptSummaries.find((tab) =>
+      isSameChatGptConversationUrl(tab.url, scopedRef),
+    );
+    if (exactConversation) return exactConversation;
+    throw new Error(
+      "No ChatGPT tab matched the requested conversation URL without crossing its approved project scope.",
+    );
   }
   const refConversationId = extractConversationIdFromUrl(trimmedRef) ?? trimmedRef;
   const exactConversation = chatGptSummaries.find(
     (tab) => tab.conversationId === refConversationId,
   );
-  if (exactConversation) {
-    return exactConversation;
-  }
+  if (exactConversation) return exactConversation;
   const lower = trimmedRef.toLowerCase();
   const titleMatches = chatGptSummaries.filter((tab) => tab.title.toLowerCase().includes(lower));
-  if (titleMatches.length === 1) {
-    return titleMatches[0] as ChatGptTabSummary;
-  }
+  if (titleMatches.length === 1) return titleMatches[0] as ChatGptTabSummary;
   if (titleMatches.length > 1) {
     throw new Error(
       'Multiple ChatGPT tabs match the requested reference. Use "oracle-tabs" or "oracle status --browser-tabs" to choose a unique target.',
@@ -737,17 +779,23 @@ export function resolveChatGptTabFromSummariesForTest(
 function resolveExactChatGptTarget(targets: ChromeTarget[], ref?: string): ChromeTarget | null {
   const chatGptTargets = targets.filter(isChatGptTarget);
   const trimmedRef = String(ref ?? "").trim();
-  if (!trimmedRef || trimmedRef.toLowerCase() === "current") {
-    return null;
+  if (!trimmedRef || trimmedRef.toLowerCase() === "current") return null;
+  const targetById = chatGptTargets.find((target) => extractTargetId(target) === trimmedRef);
+  if (targetById) return targetById;
+  const exactUrl = chatGptTargets.find((target) => normalizeUrl(target.url ?? "") === trimmedRef);
+  if (exactUrl) return exactUrl;
+  const scopedRef = exactConversationRef(trimmedRef);
+  if (scopedRef) {
+    return (
+      chatGptTargets.find((target) => isSameChatGptConversationUrl(target.url ?? "", scopedRef)) ??
+      null
+    );
   }
   const refConversationId = extractConversationIdFromUrl(trimmedRef) ?? trimmedRef;
   return (
-    chatGptTargets.find((target) => extractTargetId(target) === trimmedRef) ??
-    chatGptTargets.find((target) => normalizeUrl(target.url ?? "") === trimmedRef) ??
     chatGptTargets.find(
       (target) => extractConversationIdFromUrl(target.url ?? "") === refConversationId,
-    ) ??
-    null
+    ) ?? null
   );
 }
 
@@ -863,6 +911,8 @@ export async function resolveChatGptTab(
       )
     : await listChatGptTargets({ host, port });
   const exactTarget = resolveExactChatGptTarget(targets, options.ref);
+  const expectedConversationUrl =
+    options.expectedConversationUrl ?? exactConversationRef(options.ref);
   const expectedConversationId = expectedConversationIdForRef(
     options.ref,
     exactTarget ?? undefined,
@@ -874,10 +924,12 @@ export async function resolveChatGptTab(
       browserWSEndpoint,
       accountDigest: options.accountDigest,
       expectedConversationId,
+      expectedConversationUrl,
       target: exactTarget,
     });
-    assertExpectedConversationId(
+    assertExpectedConversation(
       expectedConversationId ?? expectedConversationIdForRef(options.ref, tab),
+      expectedConversationUrl,
       tab.url,
       "live tab resolution",
     );
@@ -890,9 +942,10 @@ export async function resolveChatGptTab(
     browserWSEndpoint,
     options.accountDigest,
   );
-  const tab = resolveChatGptTabFromSummaries(summaries, options.ref);
-  assertExpectedConversationId(
+  const tab = resolveChatGptTabFromSummaries(summaries, options.ref ?? expectedConversationUrl);
+  assertExpectedConversation(
     expectedConversationIdForRef(options.ref, tab),
+    expectedConversationUrl,
     tab.url,
     "live tab resolution",
   );
@@ -908,11 +961,12 @@ async function revalidateConnectedChatGptTab(
   client: ChromeClient,
   tab: ChatGptTabSummary,
   expectedConversationId: string | undefined,
+  expectedConversationUrl: string | undefined,
   accountDigest: string | undefined,
   action: string,
 ): Promise<void> {
   const url = await assertChatGptTabOrigin(client.Runtime, action);
-  assertExpectedConversationId(expectedConversationId, url, action);
+  assertExpectedConversation(expectedConversationId, expectedConversationUrl, url, action);
   const expectedAccountDigest = accountDigest?.trim();
   if (expectedAccountDigest) {
     const observedAccountDigest = await readChatGptAccountDigest(client.Runtime);
@@ -939,6 +993,8 @@ export async function connectToExistingChatGptTab(
       })) as ChromeTarget[]
     ).filter(isChatGptTarget);
     const exactTarget = resolveExactChatGptTarget(targets, options.ref);
+    const expectedConversationUrl =
+      options.expectedConversationUrl ?? exactConversationRef(options.ref);
     let expectedConversationId = expectedConversationIdForRef(
       options.ref,
       exactTarget ?? undefined,
@@ -951,6 +1007,7 @@ export async function connectToExistingChatGptTab(
           browserWSEndpoint,
           accountDigest: options.accountDigest,
           expectedConversationId,
+          expectedConversationUrl,
         })
       : resolveChatGptTabFromSummaries(
           await collectChatGptTabsFromTargets(
@@ -960,10 +1017,15 @@ export async function connectToExistingChatGptTab(
             browserWSEndpoint,
             options.accountDigest,
           ),
-          options.ref,
+          options.ref ?? expectedConversationUrl,
         );
     expectedConversationId ??= expectedConversationIdForRef(options.ref, tab);
-    assertExpectedConversationId(expectedConversationId, tab.url, "live tab resolution");
+    assertExpectedConversation(
+      expectedConversationId,
+      expectedConversationUrl,
+      tab.url,
+      "live tab resolution",
+    );
     const connection = await connectToRemoteChromeTarget(host, port, noopLogger, {
       browserWSEndpoint,
       targetId: tab.targetId,
@@ -974,6 +1036,7 @@ export async function connectToExistingChatGptTab(
         connection.client,
         tab,
         expectedConversationId,
+        expectedConversationUrl,
         options.accountDigest,
         "existing-tab connection",
       );
@@ -989,11 +1052,23 @@ export async function connectToExistingChatGptTab(
   }
   const targets = await listChatGptTargets({ host, port });
   const exactTarget = resolveExactChatGptTarget(targets, options.ref);
+  const expectedConversationUrl =
+    options.expectedConversationUrl ?? exactConversationRef(options.ref);
   const tab = exactTarget
     ? summaryFromTarget(host, port, exactTarget)
-    : await resolveChatGptTab({ host, port, ref: options.ref });
+    : await resolveChatGptTab({
+        host,
+        port,
+        ref: options.ref,
+        expectedConversationUrl,
+      });
   const expectedConversationId = expectedConversationIdForRef(options.ref, exactTarget ?? tab);
-  assertExpectedConversationId(expectedConversationId, tab.url, "live tab resolution");
+  assertExpectedConversation(
+    expectedConversationId,
+    expectedConversationUrl,
+    tab.url,
+    "live tab resolution",
+  );
   const targetId = exactTarget ? extractTargetId(exactTarget) : tab.targetId;
   if (!targetId) {
     throw new Error("Resolved ChatGPT tab is missing a target id.");
@@ -1004,6 +1079,7 @@ export async function connectToExistingChatGptTab(
       client,
       tab,
       expectedConversationId,
+      expectedConversationUrl,
       options.accountDigest,
       "existing-tab connection",
     );
@@ -1039,6 +1115,8 @@ export async function harvestChatGptTab(
 ): Promise<ChatGptTabSummary> {
   const browserWSEndpoint = await refreshBoundBrowserEndpoint(options);
   const { host, port } = normalizeHostPort(options);
+  const expectedConversationUrl =
+    options.expectedConversationUrl ?? exactConversationRef(options.ref);
   const initialExpectedConversationId =
     options.expectedConversationId ?? expectedConversationIdForRef(options.ref, options.target);
   const resolved = options.target
@@ -1046,12 +1124,23 @@ export async function harvestChatGptTab(
         ...options,
         browserWSEndpoint,
         expectedConversationId: initialExpectedConversationId,
+        expectedConversationUrl,
         target: options.target,
       })
-    : await resolveChatGptTab({ ...options, browserWSEndpoint, ref: options.ref });
+    : await resolveChatGptTab({
+        ...options,
+        browserWSEndpoint,
+        ref: options.ref,
+        expectedConversationUrl,
+      });
   const expectedConversationId =
     initialExpectedConversationId ?? expectedConversationIdForRef(options.ref, resolved);
-  assertExpectedConversationId(expectedConversationId, resolved.url, "live tab resolution");
+  assertExpectedConversation(
+    expectedConversationId,
+    expectedConversationUrl,
+    resolved.url,
+    "live tab resolution",
+  );
   const client = await connectToTarget(host, port, resolved.targetId, browserWSEndpoint);
   try {
     const { Runtime } = client;
@@ -1059,11 +1148,17 @@ export async function harvestChatGptTab(
       client,
       resolved,
       expectedConversationId,
+      expectedConversationUrl,
       options.accountDigest,
       "live tab harvest",
     );
     const snapshotUrl = await assertChatGptTabOrigin(Runtime, "live tab harvest snapshot");
-    assertExpectedConversationId(expectedConversationId, snapshotUrl, "live tab harvest snapshot");
+    assertExpectedConversation(
+      expectedConversationId,
+      expectedConversationUrl,
+      snapshotUrl,
+      "live tab harvest snapshot",
+    );
     const snapshot = await readAssistantSnapshot(Runtime, undefined, expectedConversationId).catch(
       () => null,
     );
@@ -1072,6 +1167,7 @@ export async function harvestChatGptTab(
       host,
       browserWSEndpoint,
       expectedConversationId,
+      expectedConversationUrl,
       port,
       target: {
         targetId: resolved.targetId,
@@ -1080,8 +1176,9 @@ export async function harvestChatGptTab(
         type: "page",
       },
     });
-    assertExpectedConversationId(
+    assertExpectedConversation(
       expectedConversationId,
+      expectedConversationUrl,
       nowSummary.url,
       "live tab harvest completion",
     );
@@ -1097,7 +1194,12 @@ export async function harvestChatGptTab(
     let assistantMarkdown: string | null = null;
     if (snapshotMatchesLatestTurn && (snapshot?.messageId || snapshot?.turnId)) {
       const captureUrl = await assertChatGptTabOrigin(Runtime, "live tab harvest capture");
-      assertExpectedConversationId(expectedConversationId, captureUrl, "live tab harvest capture");
+      assertExpectedConversation(
+        expectedConversationId,
+        expectedConversationUrl,
+        captureUrl,
+        "live tab harvest capture",
+      );
       assistantMarkdown = await captureAssistantMarkdown(
         Runtime,
         {
@@ -1137,6 +1239,7 @@ export async function harvestChatGptTab(
         browserWSEndpoint,
         port,
         expectedConversationId,
+        expectedConversationUrl,
         target: {
           targetId: harvested.targetId,
           title: harvested.title,
@@ -1144,8 +1247,9 @@ export async function harvestChatGptTab(
           type: "page",
         },
       });
-      assertExpectedConversationId(
+      assertExpectedConversation(
         expectedConversationId,
+        expectedConversationUrl,
         followup.url,
         "live tab harvest completion",
       );
@@ -1171,8 +1275,9 @@ export async function harvestChatGptTab(
     } else {
       harvested.state = classifyTabState(harvested);
     }
-    assertExpectedConversationId(
+    assertExpectedConversation(
       expectedConversationId,
+      expectedConversationUrl,
       harvested.url,
       "live tab harvest completion",
     );
@@ -1200,6 +1305,15 @@ export function sessionMatchesTab(meta: SessionMetadata, tab: Partial<ChatGptTab
   const runtime = meta?.browser?.runtime ?? {};
   const harvest = meta?.browser?.harvest ?? {};
   const conversationId = tab.conversationId ?? extractConversationIdFromUrl(tab.url ?? "");
+  const tabUrl = tab.url ?? "";
+  const runtimeUrl = typeof runtime.tabUrl === "string" ? runtime.tabUrl : "";
+  const harvestUrl = typeof harvest.url === "string" ? harvest.url : "";
+  const runtimeRouteMatches = runtimeUrl
+    ? isSameChatGptConversationUrl(tabUrl, runtimeUrl)
+    : Boolean(conversationId && runtime.conversationId === conversationId);
+  const harvestRouteMatches = harvestUrl
+    ? isSameChatGptConversationUrl(tabUrl, harvestUrl)
+    : Boolean(conversationId && harvest.conversationId === conversationId);
   const portMatches = [runtime.chromePort, meta?.browser?.config?.remoteChrome?.port]
     .filter(Boolean)
     .some(
@@ -1210,21 +1324,16 @@ export function sessionMatchesTab(meta: SessionMetadata, tab: Partial<ChatGptTab
   const hostMatches = [runtime.chromeHost, meta?.browser?.config?.remoteChrome?.host]
     .filter(Boolean)
     .every((host) => !host || host === (tab.host ?? host));
-  if (!hostMatches) {
-    return false;
-  }
-  const matches = [
-    runtime.chromeTargetId && runtime.chromeTargetId === tab.targetId,
-    harvest.targetId && harvest.targetId === tab.targetId,
-    runtime.tabUrl && runtime.tabUrl === tab.url,
-    harvest.url && harvest.url === tab.url,
-    conversationId && runtime.conversationId && runtime.conversationId === conversationId,
-    conversationId && harvest.conversationId && harvest.conversationId === conversationId,
-  ].some(Boolean);
+  if (!hostMatches) return false;
+  const targetIdMatches =
+    (runtime.chromeTargetId &&
+      runtime.chromeTargetId === tab.targetId &&
+      (!runtimeUrl || runtimeRouteMatches)) ||
+    (harvest.targetId && harvest.targetId === tab.targetId && (!harvestUrl || harvestRouteMatches));
+  const exactUrlMatches = runtimeRouteMatches || harvestRouteMatches;
   return Boolean(
-    matches ||
-    (portMatches &&
-      conversationId &&
-      (runtime.conversationId === conversationId || harvest.conversationId === conversationId)),
+    targetIdMatches ||
+    exactUrlMatches ||
+    (portMatches && conversationId && (runtimeRouteMatches || harvestRouteMatches)),
   );
 }

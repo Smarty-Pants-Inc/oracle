@@ -100,43 +100,53 @@ describe("browser conversation archive policy", () => {
 });
 
 describe("archiveChatGptConversation", () => {
-  test("returns archived result when the DOM action succeeds", async () => {
-    const runtime = {
-      evaluate: vi.fn().mockResolvedValue({
-        result: { value: { status: "archived", conversationUrl: "https://chatgpt.com/c/abc" } },
-      }),
-    };
-    const logger = vi.fn();
-    const remainingMs = 10_000;
+  test.each(["https://chatgpt.com", "https://chat.openai.com"])(
+    "returns archived result when the DOM action succeeds on %s",
+    async (origin) => {
+      const conversationUrl = `${origin}/c/abc`;
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: { value: { status: "archived", conversationUrl } },
+        }),
+      };
+      const logger = vi.fn();
+      const remainingMs = 10_000;
 
-    await expect(
-      archiveChatGptConversation(runtime as never, logger as never, {
+      await expect(
+        archiveChatGptConversation(runtime as never, logger as never, {
+          mode: "auto",
+          conversationUrl,
+          remainingMs,
+        }),
+      ).resolves.toMatchObject({
         mode: "auto",
-        conversationUrl: "https://chatgpt.com/c/abc",
-        remainingMs,
-      }),
-    ).resolves.toMatchObject({
-      mode: "auto",
-      attempted: true,
-      archived: true,
-      conversationUrl: "https://chatgpt.com/c/abc",
-    });
-    expect(runtime.evaluate).toHaveBeenCalledWith(
-      expect.objectContaining({
-        awaitPromise: true,
-        returnByValue: true,
-      }),
-    );
-    const expression = runtime.evaluate.mock.calls[0]?.[0]?.expression;
-    expect(expression).toContain("const deadline = ");
-    expect(expression).toContain("const confirmationBudgetMs = 1000;");
-    expect(expression).toContain("const confirmationDeadline = deadline - confirmationBudgetMs;");
-  });
+        attempted: true,
+        archived: true,
+        conversationUrl,
+      });
+      expect(runtime.evaluate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          awaitPromise: true,
+          returnByValue: true,
+        }),
+      );
+      const expression = runtime.evaluate.mock.calls[0]?.[0]?.expression;
+      expect(expression).toContain("const deadline = ");
+      expect(expression).toContain("const confirmationBudgetMs = 1000;");
+      expect(expression).toContain("const confirmationDeadline = deadline - confirmationBudgetMs;");
+    },
+  );
 
-  test("bounds a stalled Runtime.evaluate by the caller remaining time", async () => {
+  test("bounds a stalled Runtime.evaluate and dispatches cancellation", async () => {
     vi.useFakeTimers();
     try {
-      const runtime = { evaluate: vi.fn(() => new Promise<never>(() => {})) };
+      const runtime = {
+        evaluate: vi.fn(({ awaitPromise }: { awaitPromise?: boolean }) =>
+          awaitPromise
+            ? new Promise<never>(() => {})
+            : Promise.resolve({ result: { value: true } }),
+        ),
+      };
       const result = archiveChatGptConversation(runtime as never, vi.fn() as never, {
         mode: "always",
         conversationUrl: "https://chatgpt.com/c/abc",
@@ -151,7 +161,19 @@ describe("archiveChatGptConversation", () => {
         reason: "archive-failed",
         error: "Timed out while archiving ChatGPT conversation.",
       });
-      expect(runtime.evaluate).toHaveBeenCalledOnce();
+      expect(runtime.evaluate).toHaveBeenCalledTimes(2);
+      expect(runtime.evaluate).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ awaitPromise: true, returnByValue: true }),
+      );
+      expect(runtime.evaluate).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          awaitPromise: false,
+          returnByValue: true,
+          expression: expect.stringContaining("__oracleChatGptArchiveCancelled"),
+        }),
+      );
     } finally {
       vi.useRealTimers();
     }
@@ -227,8 +249,36 @@ describe("archiveChatGptConversation", () => {
       reason: "affinity-mismatch",
     });
   });
+  test.each(["https://chatgpt.com", "https://chat.openai.com"])(
+    "rejects an archived result that crosses root/project scope on %s",
+    async (origin) => {
+      const projectUrl = `${origin}/g/g-project/project/c/abc`;
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: { value: { status: "archived", conversationUrl: `${origin}/c/abc` } },
+        }),
+      };
 
-  test.each(["https://attacker.example/c/abc", "https://chatgpt.com:8443/c/abc"])(
+      await expect(
+        archiveChatGptConversation(runtime as never, vi.fn() as never, {
+          mode: "always",
+          conversationUrl: projectUrl,
+        }),
+      ).resolves.toMatchObject({
+        attempted: false,
+        archived: false,
+        reason: "affinity-mismatch",
+        error: "Archive result left the approved conversation scope.",
+      });
+    },
+  );
+
+  test.each([
+    "https://attacker.example/c/abc",
+    "https://chatgpt.com:8443/c/abc",
+    "https://chat.openai.com:8443/c/abc",
+    "https://chat.openai.com.evil.example/c/abc",
+  ])(
     "rejects noncanonical conversation URL %s before evaluating the page",
     async (conversationUrl) => {
       const runtime = { evaluate: vi.fn() };
@@ -248,80 +298,97 @@ describe("archiveChatGptConversation", () => {
     },
   );
 
-  test("checks account affinity inside the evaluator before DOM mutation", async () => {
-    const expectedAccountDigest = createHash("sha256").update("account-a").digest("hex");
-    const expression = buildArchiveConversationExpressionForTest({
-      expectedConversationId: "abc",
-      expectedAccountDigest,
-    });
-    expect(expression).toContain("rawUserId.length > 0 && rawUserId.length <= 512");
-    const domAccess = vi.fn();
-    const document = new Proxy(
-      {},
-      {
-        get() {
-          domAccess();
-          throw new Error("DOM mutation path reached");
+  test.each(["https://chatgpt.com", "https://chat.openai.com"])(
+    "checks account affinity inside the evaluator before DOM mutation on %s",
+    async (origin) => {
+      const expectedAccountDigest = createHash("sha256").update("account-a").digest("hex");
+      const expression = buildArchiveConversationExpressionForTest({
+        expectedOrigin: origin,
+        expectedConversationUrl: `${origin}/c/abc`,
+        expectedConversationId: "abc",
+        expectedAccountDigest,
+      });
+      expect(expression).toContain("rawUserId.length > 0 && rawUserId.length <= 512");
+      const domAccess = vi.fn();
+      const document = new Proxy(
+        {},
+        {
+          get() {
+            domAccess();
+            throw new Error("DOM mutation path reached");
+          },
         },
-      },
-    );
-    const fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      redirected: false,
-      url: "https://chatgpt.com/api/auth/session",
-      json: async () => ({ user: { id: "account-b" } }),
-    });
-    const evaluate = new Function("location", "document", "fetch", `return ${expression};`) as (
-      location: { href: string },
-      document: object,
-      fetch: typeof globalThis.fetch,
-    ) => Promise<{
-      status: string;
-      reason?: string;
-    }>;
+      );
+      const sessionTarget = `${origin}/api/auth/session`;
+      const fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        redirected: false,
+        url: sessionTarget,
+        json: async () => ({ user: { id: "account-b" } }),
+      });
+      const evaluate = new Function("location", "document", "fetch", `return ${expression};`) as (
+        location: { href: string },
+        document: object,
+        fetch: typeof globalThis.fetch,
+      ) => Promise<{
+        status: string;
+        reason?: string;
+      }>;
 
-    await expect(
-      evaluate({ href: "https://chatgpt.com/c/abc" }, document, fetch as never),
-    ).resolves.toMatchObject({ status: "skipped", reason: "affinity-mismatch" });
-    expect(domAccess).not.toHaveBeenCalled();
-  });
+      await expect(
+        evaluate({ href: `${origin}/c/abc` }, document, fetch as never),
+      ).resolves.toMatchObject({ status: "skipped", reason: "affinity-mismatch" });
+      expect(fetch).toHaveBeenCalledWith(sessionTarget, expect.anything());
+      expect(domAccess).not.toHaveBeenCalled();
+    },
+  );
 
-  test("checks exact ChatGPT origin inside the evaluator before DOM mutation", async () => {
-    const expectedAccountDigest = createHash("sha256").update("account-a").digest("hex");
-    const expression = buildArchiveConversationExpressionForTest({
-      expectedConversationId: "abc",
-      expectedAccountDigest,
-    });
-    const domAccess = vi.fn();
-    const document = new Proxy(
-      {},
-      {
-        get() {
-          domAccess();
-          throw new Error("DOM mutation path reached");
+  test.each([
+    ["https://chatgpt.com", "https://chat.openai.com"],
+    ["https://chat.openai.com", "https://chatgpt.com"],
+    ["https://chatgpt.com", "https://attacker.example"],
+  ])(
+    "checks exact ChatGPT origin before DOM mutation (%s expected, %s observed)",
+    async (expectedOrigin, actualOrigin) => {
+      const expectedAccountDigest = createHash("sha256").update("account-a").digest("hex");
+      const expression = buildArchiveConversationExpressionForTest({
+        expectedOrigin,
+        expectedConversationUrl: `${expectedOrigin}/c/abc`,
+        expectedConversationId: "abc",
+        expectedAccountDigest,
+      });
+      const domAccess = vi.fn();
+      const document = new Proxy(
+        {},
+        {
+          get() {
+            domAccess();
+            throw new Error("DOM mutation path reached");
+          },
         },
-      },
-    );
-    const fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      redirected: false,
-      url: "https://chatgpt.com/api/auth/session",
-      json: async () => ({ user: { id: "account-a" } }),
-    });
-    const evaluate = new Function("location", "document", "fetch", `return ${expression};`) as (
-      location: { href: string },
-      document: object,
-      fetch: typeof globalThis.fetch,
-    ) => Promise<{
-      status: string;
-      reason?: string;
-    }>;
+      );
+      const fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        redirected: false,
+        url: `${expectedOrigin}/api/auth/session`,
+        json: async () => ({ user: { id: "account-a" } }),
+      });
+      const evaluate = new Function("location", "document", "fetch", `return ${expression};`) as (
+        location: { href: string },
+        document: object,
+        fetch: typeof globalThis.fetch,
+      ) => Promise<{
+        status: string;
+        reason?: string;
+      }>;
 
-    await expect(
-      evaluate({ href: "https://attacker.example/c/abc" }, document, fetch as never),
-    ).resolves.toMatchObject({ status: "skipped", reason: "affinity-mismatch" });
-    expect(domAccess).not.toHaveBeenCalled();
-  });
+      await expect(
+        evaluate({ href: `${actualOrigin}/c/abc` }, document, fetch as never),
+      ).resolves.toMatchObject({ status: "skipped", reason: "affinity-mismatch" });
+      expect(fetch).not.toHaveBeenCalled();
+      expect(domAccess).not.toHaveBeenCalled();
+    },
+  );
 
   test("fails closed when the in-page account probe rejects", async () => {
     const expression = buildArchiveConversationExpressionForTest({
@@ -608,26 +675,35 @@ describe("archiveChatGptConversation", () => {
     expect(archiveItem.dispatchEvent).toHaveBeenCalled();
   });
 
-  test("keeps the archive expression scoped to Archive actions", () => {
-    const expression = buildArchiveConversationExpressionForTest();
-    expect(expression).toContain("findConversationMenuButton");
-    expect(expression).toContain("visibleMenuCandidates");
-    expect(expression).toContain("findArchiveMenuItem");
-    expect(expression).toContain("findArchiveConfirmationButton");
-    expect(expression).toContain("hasUnarchiveMenuItem");
-    expect(expression).toContain("PointerEvent");
-    expect(expression).toContain("waitForArchiveConfirmation");
-    expect(expression).toContain("const remainingMs =");
-    expect(expression).toContain("const confirmationDeadline =");
-    expect(expression).toContain("AbortController");
-    expect(expression).toContain("Promise.withResolvers");
-    expect(expression).toContain("const target = 'https://chatgpt.com/api/auth/session';");
-    expect(expression).toContain("redirect: 'error'");
-    expect(expression).toContain("response.redirected");
-    expect(expression).toContain("response.url !== target");
-    expect(expression).toContain("archive-not-confirmed");
-    expect(expression).toContain("const deadline = Date.now() + 10000;");
-    expect(expression).toContain("archive");
-    expect(expression).not.toContain("delete");
-  });
+  test.each(["https://chatgpt.com", "https://chat.openai.com"])(
+    "keeps the archive expression scoped to Archive actions on %s",
+    (origin) => {
+      const expression = buildArchiveConversationExpressionForTest({
+        expectedOrigin: origin,
+        expectedConversationUrl: `${origin}/g/g-project/project/c/abc`,
+      });
+      expect(expression).toContain("findConversationMenuButton");
+      expect(expression).toContain("visibleMenuCandidates");
+      expect(expression).toContain("findArchiveMenuItem");
+      expect(expression).toContain("findArchiveConfirmationButton");
+      expect(expression).toContain("hasUnarchiveMenuItem");
+      expect(expression).toContain("PointerEvent");
+      expect(expression).toContain("waitForArchiveConfirmation");
+      expect(expression).toContain("const remainingMs =");
+      expect(expression).toContain("const confirmationDeadline =");
+      expect(expression).toContain("AbortController");
+      expect(expression).toContain("Promise.withResolvers");
+      expect(expression).toContain(`const expectedOrigin = "${origin}";`);
+      expect(expression).toContain("const pageOrigin = new URL(location.href).origin;");
+      expect(expression).toContain("target = new URL('/api/auth/session', pageOrigin).href;");
+      expect(expression).toContain("if (pageOrigin !== expectedOrigin) return null;");
+      expect(expression).toContain("redirect: 'error'");
+      expect(expression).toContain("response.redirected");
+      expect(expression).toContain("response.url !== target");
+      expect(expression).toContain("archive-not-confirmed");
+      expect(expression).toContain("const deadline = Date.now() + 10000;");
+      expect(expression).toContain("archive");
+      expect(expression).not.toContain("delete");
+    },
+  );
 });

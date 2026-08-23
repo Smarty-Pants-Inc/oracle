@@ -479,7 +479,7 @@ describe("ChatGPT export account receipt", () => {
         evaluatedExpressions.push(expression);
         if (expression === "document.readyState") return { result: { value: "complete" } };
         if (expression === "location.href" || expression.includes('typeof location === "object"')) {
-          return { result: { value: "https://chatgpt.com/" } };
+          return { result: { value: "https://chatgpt.com/c/conv-active" } };
         }
         if (expression === "document.title") return { result: { value: "ChatGPT" } };
         if (
@@ -580,7 +580,7 @@ describe("ChatGPT export account receipt", () => {
       expect.any(Function),
       {
         browserWSEndpoint,
-        targetUrl: "https://chatgpt.com/",
+        targetUrl: "https://chatgpt.com/c/conv-active",
         closeTargetOnDispose: true,
       },
     );
@@ -610,7 +610,7 @@ describe("ChatGPT export account receipt", () => {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
         if (expression === "document.readyState") return { result: { value: "complete" } };
         if (expression === "location.href" || expression.includes('typeof location === "object"')) {
-          return { result: { value: "https://chatgpt.com/" } };
+          return { result: { value: "https://chatgpt.com/c/conv-scrub" } };
         }
         if (expression === "document.title") return { result: { value: "ChatGPT" } };
         if (
@@ -692,7 +692,7 @@ describe("ChatGPT export account receipt", () => {
           });
         }
         if (expression === "location.href" || expression.includes('typeof location === "object"')) {
-          return Promise.resolve({ result: { value: "https://chatgpt.com/" } });
+          return Promise.resolve({ result: { value: "https://chatgpt.com/c/conv-active" } });
         }
         if (expression === "document.title") {
           return Promise.resolve({ result: { value: "ChatGPT" } });
@@ -743,7 +743,7 @@ describe("ChatGPT export account receipt", () => {
     expect(exactGetExpression).toContain("const REMAINING_MS = 150");
     expect(exactGetExpression).toContain("const DEADLINE = Date.now() + REMAINING_MS");
     expect(exactGetExpression).toContain(
-      'const SESSION_TARGET = "https://chatgpt.com/api/auth/session"',
+      "const SESSION_TARGET = new URL('/api/auth/session', PAGE_ORIGIN).href;",
     );
     expect(exactGetExpression).toContain("requestWithinDeadline(\n    SESSION_TARGET,");
     expect(exactGetExpression).toContain(
@@ -934,7 +934,7 @@ describe("ChatGPT export account receipt", () => {
         if (expression === "document.readyState")
           return Promise.resolve({ result: { value: "complete" } });
         if (expression === "location.href" || expression.includes('typeof location === "object"')) {
-          return Promise.resolve({ result: { value: "https://chatgpt.com/" } });
+          return Promise.resolve({ result: { value: "https://chatgpt.com/c/conv-close-stall" } });
         }
         if (expression === "document.title")
           return Promise.resolve({ result: { value: "ChatGPT" } });
@@ -1013,7 +1013,9 @@ describe("ChatGPT export account receipt", () => {
         if (expression === "document.readyState")
           return Promise.resolve({ result: { value: "complete" } });
         if (expression === "location.href" || expression.includes('typeof location === "object"')) {
-          return Promise.resolve({ result: { value: "https://chatgpt.com/" } });
+          return Promise.resolve({
+            result: { value: "https://chatgpt.com/c/conv-pending-cleanup" },
+          });
         }
         if (expression === "document.title")
           return Promise.resolve({ result: { value: "ChatGPT" } });
@@ -1074,7 +1076,7 @@ describe("ChatGPT export account receipt", () => {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
         if (expression === "document.readyState") return { result: { value: "complete" } };
         if (expression === "location.href" || expression.includes('typeof location === "object"')) {
-          return { result: { value: "https://chatgpt.com/" } };
+          return { result: { value: "https://chatgpt.com/c/conv-active" } };
         }
         if (expression === "document.title") return { result: { value: "ChatGPT" } };
         if (
@@ -1161,7 +1163,7 @@ describe("ChatGPT export account receipt", () => {
       expect.any(Function),
       {
         browserWSEndpoint,
-        targetUrl: "https://chatgpt.com/",
+        targetUrl: "https://chatgpt.com/c/conv-active",
         closeTargetOnDispose: true,
       },
     );
@@ -1212,7 +1214,7 @@ describe("ChatGPT export account receipt", () => {
             expression === "location.href" ||
             expression.includes('typeof location === "object"')
           ) {
-            return { result: { value: "https://chatgpt.com/" } };
+            return { result: { value: "https://chatgpt.com/c/conv-archived" } };
           }
           if (expression === "document.title") {
             return { result: { value: "ChatGPT" } };
@@ -1290,7 +1292,7 @@ describe("ChatGPT export account receipt", () => {
         expect.any(Function),
         {
           browserWSEndpoint,
-          targetUrl: "https://chatgpt.com/",
+          targetUrl: "https://chatgpt.com/c/conv-archived",
           closeTargetOnDispose: true,
         },
       );
@@ -1307,25 +1309,24 @@ describe("ChatGPT export account receipt", () => {
       );
       expect(exactGetExpressions[0]).toContain('method: "GET"');
       expect(exactGetExpressions[0]).toContain(
-        'const SESSION_TARGET = "https://chatgpt.com/api/auth/session"',
-      );
-      expect(exactGetExpressions[0]).toContain("requestWithinDeadline(\n    SESSION_TARGET,");
-      expect(exactGetExpressions[0]).toContain(
-        "sessionResponse.redirected || sessionResponse.url !== SESSION_TARGET",
+        "const SESSION_TARGET = new URL('/api/auth/session', PAGE_ORIGIN).href;",
       );
       expect(exactGetExpressions[0]).toContain(
-        'new URL(location.href).origin !== "https://chatgpt.com"',
+        '!["https://chatgpt.com","https://chat.openai.com"].includes(PAGE_ORIGIN)',
       );
+      expect(exactGetExpressions[0]).toContain('const EXPECTED_PAGE_PATH = "/c/conv-archived"');
       expect(exactGetExpressions[0]).toContain(
         'headers.set("authorization", "Bearer " + accessToken)',
       );
       const exactGetIndex = evaluatedExpressions.findIndex((expression) =>
         expression.includes('kind: "authenticated-exact-get"'),
       );
-      expect(evaluatedExpressions[exactGetIndex - 2]).toContain('typeof location === "object"');
-      expect(evaluatedExpressions[exactGetIndex - 1]).toContain("/api/auth/session");
+      expect(evaluatedExpressions[exactGetIndex - 3]).toContain('typeof location === "object"');
+      expect(evaluatedExpressions[exactGetIndex - 2]).toContain("/api/auth/session");
+      expect(evaluatedExpressions[exactGetIndex - 1]).toBe("location.href");
       expect(evaluatedExpressions[exactGetIndex + 1]).toContain('typeof location === "object"');
       expect(evaluatedExpressions[exactGetIndex + 2]).toContain("/api/auth/session");
+      expect(evaluatedExpressions[exactGetIndex + 3]).toBe("location.href");
       expect(evaluatedExpressions.join("\n")).not.toMatch(/\b(?:POST|PUT|PATCH|DELETE)\b/);
       expect(archiveMocks.archiveChatGptConversation).not.toHaveBeenCalled();
       expect(close).toHaveBeenCalledOnce();
@@ -1363,7 +1364,7 @@ describe("ChatGPT export account receipt", () => {
         if (expression === "document.readyState") {
           readyChecks += 1;
           if (readyChecks === 1) return { result: { value: "loading" } };
-          currentUrl = "https://chatgpt.com/";
+          currentUrl = "https://chatgpt.com/c/conv-archived";
           loaded = true;
           return { result: { value: "complete" } };
         }
@@ -1429,7 +1430,7 @@ describe("ChatGPT export account receipt", () => {
       expect.any(Function),
       {
         browserWSEndpoint,
-        targetUrl: "https://chatgpt.com/",
+        targetUrl: "https://chatgpt.com/c/conv-archived",
         closeTargetOnDispose: true,
       },
     );
@@ -1461,7 +1462,7 @@ describe("ChatGPT export account receipt", () => {
           locationReads += 1;
           return {
             result: {
-              value: locationReads === 1 ? "https://chatgpt.com/" : "https://evil.example/",
+              value: "https://chatgpt.com/c/conv-archived",
             },
           };
         }
@@ -1534,7 +1535,7 @@ describe("ChatGPT export account receipt", () => {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
         if (expression === "document.readyState") return { result: { value: "complete" } };
         if (expression === "location.href") {
-          return { result: { value: "https://chatgpt.com/" } };
+          return { result: { value: "https://chatgpt.com/c/conv-active" } };
         }
         if (expression === "document.title") return { result: { value: "ChatGPT" } };
         if (expression.includes('typeof location === "object"')) {
@@ -1648,7 +1649,7 @@ describe("ChatGPT export account receipt", () => {
       expect.any(Function),
       {
         browserWSEndpoint,
-        targetUrl: "https://chatgpt.com/",
+        targetUrl: "https://chatgpt.com/c/conv-archived",
         closeTargetOnDispose: true,
       },
     );
@@ -1678,7 +1679,7 @@ describe("ChatGPT export account receipt", () => {
           return { result: { value: "complete" } };
         }
         if (expression === "location.href" || expression.includes('typeof location === "object"')) {
-          return { result: { value: "https://chatgpt.com/" } };
+          return { result: { value: "https://chatgpt.com/c/conv-archived" } };
         }
         if (expression === "document.title") {
           return { result: { value: "ChatGPT" } };

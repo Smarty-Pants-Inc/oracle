@@ -9,11 +9,10 @@ import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
 import { MAX_CHATGPT_ACCOUNT_ID_LENGTH } from "../chatgptAccount.js";
+import { CHATGPT_ORIGINS } from "../conversationUrl.js";
 const DEFAULT_ACCOUNT_DIGEST_TIMEOUT_MS = 10_000;
 const ACCOUNT_DIGEST_TIMEOUT_ERROR =
   "Timed out while reading authenticated ChatGPT account identity.";
-const CHATGPT_ORIGIN = "https://chatgpt.com";
-const CHATGPT_SESSION_URL = `${CHATGPT_ORIGIN}/api/auth/session`;
 
 export function installJavaScriptDialogAutoDismissal(
   Page: ChromeClient["Page"],
@@ -564,10 +563,11 @@ export async function readChatGptAccountDigest(
       Runtime.evaluate({
         expression: `(() => (async () => {
           const timeoutMs = ${JSON.stringify(timeoutMs)};
-          const target = ${JSON.stringify(CHATGPT_SESSION_URL)};
           let timeout;
           try {
-            if (new URL(location.href).origin !== ${JSON.stringify(CHATGPT_ORIGIN)}) return null;
+            const pageOrigin = new URL(location.href).origin;
+            if (!${JSON.stringify(CHATGPT_ORIGINS)}.includes(pageOrigin)) return null;
+            const target = new URL('/api/auth/session', pageOrigin).href;
             const deadline = Date.now() + timeoutMs;
             const controller = new AbortController();
             timeout = setTimeout(() => controller.abort(), timeoutMs);

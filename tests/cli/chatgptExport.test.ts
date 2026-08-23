@@ -73,17 +73,65 @@ describe("ChatGPT export endpoint affinity", () => {
     ).rejects.toThrow(new RegExp(`${label} cannot be empty`, "i"));
   });
 
-  test("matches a root target URL to project conversation evidence", () => {
-    expect(
-      resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-1", [
-        session("project", {
+  test.each(["https://chatgpt.com", "https://chat.openai.com"])(
+    "matches an exact project conversation scope on %s",
+    (origin) => {
+      const targetUrl = `${origin}/g/g-project/project/c/thread-1`;
+      expect(
+        resolveChatGptExportRemoteChrome(targetUrl, [
+          session("project", {
+            config: {
+              url: targetUrl,
+              ...config("127.0.0.1", 9223, "browser-a"),
+            },
+          }),
+        ]),
+      ).toEqual(affinity("127.0.0.1", 9223, "browser-a"));
+    },
+  );
+
+  test.each([
+    {
+      label: "chatgpt root target versus project evidence",
+      targetUrl: "https://chatgpt.com/c/thread-1",
+      storedUrl: "https://chatgpt.com/g/g-project/project/c/thread-1",
+    },
+    {
+      label: "chatgpt project target versus root evidence",
+      targetUrl: "https://chatgpt.com/g/g-project/project/c/thread-1",
+      storedUrl: "https://chatgpt.com/c/thread-1",
+    },
+    {
+      label: "chatgpt project target versus another project",
+      targetUrl: "https://chatgpt.com/g/g-project/project/c/thread-1",
+      storedUrl: "https://chatgpt.com/g/other-project/project/c/thread-1",
+    },
+    {
+      label: "chat.openai.com root target versus project evidence",
+      targetUrl: "https://chat.openai.com/c/thread-1",
+      storedUrl: "https://chat.openai.com/g/g-project/project/c/thread-1",
+    },
+    {
+      label: "chat.openai.com project target versus root evidence",
+      targetUrl: "https://chat.openai.com/g/g-project/project/c/thread-1",
+      storedUrl: "https://chat.openai.com/c/thread-1",
+    },
+    {
+      label: "chat.openai.com project target versus another project",
+      targetUrl: "https://chat.openai.com/g/g-project/project/c/thread-1",
+      storedUrl: "https://chat.openai.com/g/other-project/project/c/thread-1",
+    },
+  ])("rejects $label", ({ targetUrl, storedUrl }) => {
+    expect(() =>
+      resolveChatGptExportRemoteChrome(targetUrl, [
+        session("scope-mismatch", {
           config: {
-            url: "https://chatgpt.com/g/g-project/c/thread-1",
+            url: storedUrl,
             ...config("127.0.0.1", 9223, "browser-a"),
           },
         }),
       ]),
-    ).toEqual(affinity("127.0.0.1", 9223, "browser-a"));
+    ).toThrow(/no stored browser session matches/i);
   });
 
   test("matches stored conversation ids when no conversation URL is available", () => {
@@ -122,18 +170,19 @@ describe("ChatGPT export endpoint affinity", () => {
     ).toThrow(/no stored browser session matches/i);
   });
 
-  test("deduplicates a parent and follow-up stored on the same browser affinity", () => {
+  test("deduplicates a parent and follow-up stored on the same exact browser affinity", () => {
     const browserConfig = config("127.0.0.1", 9224, "browser-a");
+    const targetUrl = "https://chat.openai.com/g/g-project/project/c/thread-2";
     expect(
-      resolveChatGptExportRemoteChrome("https://chatgpt.com/g/g-project/c/thread-2", [
+      resolveChatGptExportRemoteChrome(targetUrl, [
         session("parent", {
-          harvest: { url: "https://chatgpt.com/c/thread-2" },
+          harvest: { url: targetUrl },
           config: browserConfig,
         }),
         session(
           "follow-up",
           { config: browserConfig },
-          { browserResumeConversationUrl: "https://chatgpt.com/c/thread-2" },
+          { browserResumeConversationUrl: targetUrl },
         ),
       ]),
     ).toEqual(affinity("127.0.0.1", 9224, "browser-a"));

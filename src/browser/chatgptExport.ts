@@ -34,6 +34,13 @@ import {
   readChatGptAccountIdentity,
 } from "./chatgptAccount.js";
 import {
+  CHATGPT_ORIGIN,
+  CHATGPT_ORIGINS,
+  isSameChatGptConversationUrl,
+  parseChatGptConversationScope,
+  parseChatGptUrl,
+} from "./conversationUrl.js";
+import {
   archiveRepairRequiredForCleanup,
   OracleArchiveRepairRequiredError,
 } from "../cli/archiveRepair.js";
@@ -414,43 +421,36 @@ const SECRET_MARKER_MENTIONS = [
 ];
 
 export function conversationIdFromChatGptUrl(rawUrl: string): string {
-  let parsed: URL;
-  try {
-    parsed = new URL(rawUrl);
-  } catch {
+  const scope = parseChatGptConversationScope(rawUrl);
+  if (!scope) {
     throw new Error(
-      "target-url must be https://chatgpt.com/c/<conversation-id> or https://chatgpt.com/g/<project>/project/c/<conversation-id>",
+      "target-url must be a specific HTTPS ChatGPT conversation URL on chatgpt.com or chat.openai.com",
     );
   }
-  if (
-    !isChatGptUrl(rawUrl) ||
-    parsed.hostname.toLowerCase() !== "chatgpt.com" ||
-    parsed.search ||
-    parsed.hash
-  ) {
-    throw new Error(
-      "target-url must be https://chatgpt.com/c/<conversation-id> or https://chatgpt.com/g/<project>/project/c/<conversation-id>",
-    );
-  }
-  const match = /^(?:\/c|\/g\/[^/?#]+\/(?:project\/)?c)\/([^/?#]+)\/?$/.exec(parsed.pathname);
-  if (!match?.[1]) {
-    throw new Error(
-      "target-url must be a specific ChatGPT conversation URL: https://chatgpt.com/c/<conversation-id> or https://chatgpt.com/g/<project>/project/c/<conversation-id>",
-    );
-  }
-  return match[1];
+  return scope.conversationId;
 }
 
-export function buildBackendConversationUrl(conversationId: string): string {
-  return `https://chatgpt.com/backend-api/conversation/${conversationId}`;
+export function buildBackendConversationUrl(
+  conversationId: string,
+  originOrTargetUrl: string = CHATGPT_ORIGIN,
+): string {
+  let origin = originOrTargetUrl;
+  try {
+    origin = new URL(originOrTargetUrl).origin;
+  } catch {
+    // Treat an origin string as-is; the exact ChatGPT policy below validates it.
+  }
+  const parsed = parseChatGptUrl(`${origin}/`);
+  if (!parsed) throw new Error("Unsupported ChatGPT origin.");
+  return `${parsed.origin}/backend-api/conversation/${encodeURIComponent(conversationId)}`;
 }
 
-export function isSameConversationUrl(actualUrl: string, expectedConversationId: string): boolean {
-  try {
-    return conversationIdFromChatGptUrl(actualUrl) === expectedConversationId;
-  } catch {
-    return false;
+export function isSameConversationUrl(actualUrl: string, expectedUrlOrId: string): boolean {
+  if (parseChatGptConversationScope(expectedUrlOrId)) {
+    return isSameChatGptConversationUrl(actualUrl, expectedUrlOrId);
   }
+  const actual = parseChatGptConversationScope(actualUrl);
+  return Boolean(actual?.pathname === `/c/${expectedUrlOrId}`);
 }
 
 async function assertChatGptExportAccountAffinity(
@@ -493,7 +493,7 @@ async function assertChatGptExportAccountAffinity(
 async function assertChatGptExportCaptureAffinity(
   Runtime: ChromeClient["Runtime"],
   expectedAccountDigest: string,
-  conversationId: string,
+  expectedConversationUrl: string,
   action: string,
   expectedEmail: string | undefined,
   deadline: number,
@@ -511,7 +511,7 @@ async function assertChatGptExportCaptureAffinity(
     "conversation URL",
     deadline,
   );
-  if (!isSameConversationUrl(currentUrl, conversationId)) {
+  if (!isSameConversationUrl(currentUrl, expectedConversationUrl)) {
     throw new Error(`ChatGPT conversation changed before ${action}.`);
   }
 }
@@ -519,7 +519,7 @@ async function assertChatGptExportCaptureAffinity(
 async function assertChatGptExportMutationAffinity(
   Runtime: ChromeClient["Runtime"],
   expectedAccountDigest: string | undefined,
-  conversationId: string,
+  expectedConversationUrl: string,
   action: string,
   expectedEmail: string | undefined,
   deadline: number,
@@ -530,7 +530,7 @@ async function assertChatGptExportMutationAffinity(
   await assertChatGptExportCaptureAffinity(
     Runtime,
     expectedAccountDigest,
-    conversationId,
+    expectedConversationUrl,
     action,
     expectedEmail,
     deadline,
@@ -722,11 +722,12 @@ export function buildReadOnlyConversationGetExpressionForTest(
   expectedEmail?: string,
   remainingMs = DEFAULT_EXPORT_TIMEOUT_MS,
   operationToken: string = randomUUID(),
+  expectedConversationUrl?: string,
 ): string {
   const url = new URL(targetApiUrl);
   const prefix = "/backend-api/conversation/";
   if (
-    url.origin !== "https://chatgpt.com" ||
+    !parseChatGptUrl(`${url.origin}/`) ||
     !url.pathname.startsWith(prefix) ||
     url.pathname.length === prefix.length ||
     url.search ||
@@ -746,13 +747,21 @@ export function buildReadOnlyConversationGetExpressionForTest(
   ) {
     throw new Error("Expected ChatGPT account affinity is invalid.");
   }
+  const decodedConversationId = decodeURIComponent(url.pathname.slice(prefix.length));
+  const approvedScope = expectedConversationUrl
+    ? parseChatGptConversationScope(expectedConversationUrl)
+    : undefined;
+  if (approvedScope && approvedScope.conversationId !== decodedConversationId) {
+    throw new Error("Expected an exact ChatGPT conversation URL.");
+  }
   return buildReadOnlyConversationGetExpression(
     targetApiUrl,
-    decodeURIComponent(url.pathname.slice(prefix.length)),
+    decodedConversationId,
     normalizedDigest,
     normalizedEmail,
     remainingMs,
     operationToken,
+    approvedScope ? `${approvedScope.origin}${approvedScope.pathname}` : undefined,
   );
 }
 
@@ -763,8 +772,15 @@ function buildReadOnlyConversationGetExpression(
   expectedEmail: string | undefined,
   remainingMs: number,
   operationToken: string,
+  expectedConversationUrl?: string,
 ): string {
   const pageBudgetMs = Number.isFinite(remainingMs) ? Math.max(0, remainingMs) : 0;
+  const approvedScope = expectedConversationUrl
+    ? parseChatGptConversationScope(expectedConversationUrl)
+    : undefined;
+  if (expectedConversationUrl && !approvedScope) {
+    throw new Error("Expected an exact ChatGPT conversation URL.");
+  }
   const operationTokenLiteral = jsString(operationToken);
   return `
 (async () => {
@@ -775,7 +791,6 @@ function buildReadOnlyConversationGetExpression(
     try { return window[TOMBSTONES_KEY]?.[OPERATION_TOKEN] === true; } catch { return false; }
   };
   if (isCancelled()) throw new Error("Authenticated ChatGPT exact GET was cancelled.");
-  const SESSION_TARGET = "https://chatgpt.com/api/auth/session";
   const EXPECTED_CONVERSATION_ID = ${jsString(expectedConversationId)};
   const EXPECTED_ACCOUNT_DIGEST = ${JSON.stringify(expectedAccountDigest ?? null)};
   const EXPECTED_EMAIL = ${JSON.stringify(expectedEmail ?? null)};
@@ -786,9 +801,19 @@ function buildReadOnlyConversationGetExpression(
   const EMAIL_PATTERN = /^[^@\\s]{1,64}@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
   const DEADLINE = Date.now() + REMAINING_MS;
   const timeoutError = () => new Error("Authenticated ChatGPT exact GET timed out.");
-  if (new URL(location.href).origin !== "https://chatgpt.com") {
-    throw new Error("Authenticated ChatGPT account identity origin is unavailable.");
+  const PAGE_URL = new URL(location.href);
+  const PAGE_ORIGIN = PAGE_URL.origin;
+  const EXPECTED_PAGE_ORIGIN = ${JSON.stringify(approvedScope?.origin ?? new URL(targetApiUrl).origin)};
+  const EXPECTED_PAGE_PATH = ${JSON.stringify(approvedScope?.pathname ?? null)};
+  if (
+    !${JSON.stringify(CHATGPT_ORIGINS)}.includes(PAGE_ORIGIN) ||
+    PAGE_ORIGIN !== EXPECTED_PAGE_ORIGIN ||
+    (EXPECTED_PAGE_PATH && PAGE_URL.pathname.replace(/\\/$/, '') !== EXPECTED_PAGE_PATH) ||
+    (EXPECTED_PAGE_PATH && (PAGE_URL.search || PAGE_URL.hash))
+  ) {
+    throw new Error("Authenticated ChatGPT exact GET left the approved conversation scope.");
   }
+  const SESSION_TARGET = new URL('/api/auth/session', PAGE_ORIGIN).href;
   const requestWithinDeadline = async (input, init, readBody) => {
     const remaining = DEADLINE - Date.now();
     if (!Number.isFinite(remaining) || remaining <= 0) throw timeoutError();
@@ -1263,13 +1288,14 @@ function buildChatGptAccountDigestExpression(remainingMs: number): string {
   const pageBudgetMs = Number.isFinite(remainingMs) ? Math.max(0, remainingMs) : 0;
   return `(() => (async () => {
   const REMAINING_MS = ${JSON.stringify(pageBudgetMs)};
-  const TARGET = 'https://chatgpt.com/api/auth/session';
   if (REMAINING_MS <= 0) return null;
   const deadline = Date.now() + REMAINING_MS;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REMAINING_MS);
   try {
-    if (new URL(location.href).origin !== 'https://chatgpt.com') return null;
+    const PAGE_ORIGIN = new URL(location.href).origin;
+    if (!${JSON.stringify(CHATGPT_ORIGINS)}.includes(PAGE_ORIGIN)) return null;
+    const TARGET = new URL('/api/auth/session', PAGE_ORIGIN).href;
     const response = await fetch(TARGET, {
       method: 'GET', cache: 'no-store', credentials: 'include', redirect: 'error',
       signal: controller.signal,
@@ -1950,6 +1976,9 @@ async function finalizeCapturedExport({
   captureInfo: JsonRecord;
 }): Promise<Omit<ChatGptConversationExportResult, "archiveRecovery" | "postExportArchive">> {
   const conversationId = conversationIdFromChatGptUrl(targetUrl);
+  if (!isSameConversationUrl(tabUrl, targetUrl)) {
+    throw new Error("Captured tab was not the approved ChatGPT conversation.");
+  }
   if (backend.conversation_id !== conversationId) {
     throw new Error("Captured backend data did not match the approved conversation.");
   }
@@ -2015,6 +2044,7 @@ async function evaluateReadOnlyConversationGet(
   expectedEmail: string | undefined,
   deadline: number,
   operationToken: string = randomUUID(),
+  expectedConversationUrl?: string,
 ): Promise<CaptureHitSummary> {
   const outcome = await runBeforeDeadline(
     () =>
@@ -2026,6 +2056,7 @@ async function evaluateReadOnlyConversationGet(
           expectedEmail,
           remainingMs(deadline),
           operationToken,
+          expectedConversationUrl ?? `${new URL(targetApiUrl).origin}/c/${conversationId}`,
         ),
         awaitPromise: true,
         returnByValue: true,
@@ -2050,6 +2081,7 @@ export function evaluateReadOnlyConversationGetForTest(
   expectedEmail: string | undefined,
   deadline: number,
   operationToken?: string,
+  expectedConversationUrl?: string,
 ): Promise<CaptureHitSummary> {
   return evaluateReadOnlyConversationGet(
     Runtime,
@@ -2059,6 +2091,7 @@ export function evaluateReadOnlyConversationGetForTest(
     expectedEmail,
     deadline,
     operationToken,
+    expectedConversationUrl,
   );
 }
 
@@ -2109,7 +2142,7 @@ async function captureChatGptConversationReadOnly({
       () =>
         connectToRemoteChromeTarget(host, port, () => {}, {
           browserWSEndpoint: boundIdentity.browserWSEndpoint,
-          targetUrl: "https://chatgpt.com/",
+          targetUrl,
           closeTargetOnDispose: true,
         }),
       deadline,
@@ -2158,6 +2191,9 @@ async function captureChatGptConversationReadOnly({
       "export target URL",
       deadline,
     );
+    if (!isSameConversationUrl(tabUrl, targetUrl)) {
+      throw new Error("Read-only ChatGPT export target is not the approved conversation.");
+    }
     const tabTitle = await evaluateByValue<string>(
       Runtime,
       "document.title",
@@ -2165,9 +2201,10 @@ async function captureChatGptConversationReadOnly({
       deadline,
     );
 
-    await assertChatGptExportAccountAffinity(
+    await assertChatGptExportCaptureAffinity(
       Runtime,
       accountDigest,
+      targetUrl,
       "ChatGPT export exact GET",
       expectedEmail,
       deadline,
@@ -2185,6 +2222,7 @@ async function captureChatGptConversationReadOnly({
         expectedEmail,
         deadline,
         readOnlyOperationToken,
+        targetUrl,
       );
     } catch (error) {
       getError = error;
@@ -2192,9 +2230,10 @@ async function captureChatGptConversationReadOnly({
     let postGetAffinityError: unknown;
     if (Date.now() < deadline) {
       try {
-        await assertChatGptExportAccountAffinity(
+        await assertChatGptExportCaptureAffinity(
           Runtime,
           accountDigest,
+          targetUrl,
           "ChatGPT export exact GET completion",
           expectedEmail,
           deadline,
@@ -2350,8 +2389,10 @@ export async function captureApprovedChatGptConversationBackend(
   };
   const chunkSize = options.chunkSize ?? 250_000;
   assertValidExportChunkSize(chunkSize);
-  const conversationId = conversationIdFromChatGptUrl(options.targetUrl);
-  const targetApiUrl = buildBackendConversationUrl(conversationId);
+  const targetScope = parseChatGptConversationScope(options.targetUrl);
+  if (!targetScope) throw new Error("Approved ChatGPT conversation URL is invalid.");
+  const conversationId = targetScope.conversationId;
+  const targetApiUrl = buildBackendConversationUrl(conversationId, targetScope.origin);
   const host = options.host ?? DEFAULT_REMOTE_CHROME_HOST;
   const port = options.port ?? DEFAULT_REMOTE_CHROME_PORT;
   const expectedBrowserId = options.browserId?.trim();
@@ -2437,6 +2478,7 @@ export async function captureApprovedChatGptConversationBackend(
           browserId: expectedBrowserId,
           accountDigest: expectedAccountDigest,
           ref: tabRef,
+          expectedConversationUrl: options.targetUrl,
         }),
       deadline,
       "Timed out attaching to the approved ChatGPT export tab.",
@@ -2444,7 +2486,7 @@ export async function captureApprovedChatGptConversationBackend(
       cleanupTracker,
       "target",
     );
-    if (!isSameConversationUrl(connected.tab.url, conversationId)) {
+    if (!isSameConversationUrl(connected.tab.url, options.targetUrl)) {
       try {
         await disposeChatGptExportConnection(connected.client, cleanupDeadline);
       } catch (cleanupError) {
@@ -2492,7 +2534,7 @@ export async function captureApprovedChatGptConversationBackend(
               host,
               port,
               browserWSEndpoint,
-              url: "https://chatgpt.com/",
+              url: options.targetUrl,
               onTargetCreated: (createdId) => {
                 createdTargetId = createdId;
               },
@@ -2542,6 +2584,7 @@ export async function captureApprovedChatGptConversationBackend(
               browserId: expectedBrowserId,
               accountDigest: expectedAccountDigest,
               ref: targetId,
+              expectedConversationUrl: options.targetUrl,
               closeTargetOnDispose: true,
             }),
           deadline,
@@ -2592,7 +2635,7 @@ export async function captureApprovedChatGptConversationBackend(
           deadline,
           "Timed out navigating the active ChatGPT export target.",
         );
-        const tabUrl = await waitForConversationUrl(Runtime, conversationId, deadline);
+        const tabUrl = await waitForConversationUrl(Runtime, options.targetUrl, deadline);
         await waitForDocument(Runtime, deadline);
         resolved = {
           client: opened.client,
@@ -2723,7 +2766,7 @@ export async function captureApprovedChatGptConversationBackend(
     await assertChatGptExportCaptureAffinity(
       Runtime,
       pinnedAccountDigest,
-      conversationId,
+      options.targetUrl,
       "ChatGPT export capture completion",
       expectedEmail,
       deadline,
@@ -2762,7 +2805,7 @@ export async function captureApprovedChatGptConversationBackend(
       await assertChatGptExportMutationAffinity(
         Runtime,
         expectedAccountDigest,
-        conversationId,
+        options.targetUrl,
         "post-export archive",
         expectedEmail,
         deadline,
@@ -2884,8 +2927,10 @@ export async function captureApprovedChatGptConversationBackendViaObu(
     errors: [],
     pendingKinds: new Map(),
   };
-  const conversationId = conversationIdFromChatGptUrl(options.targetUrl);
-  const targetApiUrl = buildBackendConversationUrl(conversationId);
+  const targetScope = parseChatGptConversationScope(options.targetUrl);
+  if (!targetScope) throw new Error("Approved ChatGPT conversation URL is invalid.");
+  const conversationId = targetScope.conversationId;
+  const targetApiUrl = buildBackendConversationUrl(conversationId, targetScope.origin);
   const sessionId = options.sessionId ?? "obu-mcp";
   const outDir = path.resolve(options.outDir);
   const chunkSize = options.chunkSize ?? 250_000;
@@ -2893,7 +2938,7 @@ export async function captureApprovedChatGptConversationBackendViaObu(
   const evaluate: EvaluateExpression = <T>(expression: string, timeoutLabel?: string) =>
     evaluateObuByValue<T>(sessionId, options.tabId, expression, deadline, timeoutLabel);
   const currentUrl = await evaluate<string>("location.href", "current URL check");
-  if (!isSameConversationUrl(currentUrl, conversationId)) {
+  if (!isSameConversationUrl(currentUrl, options.targetUrl)) {
     throw new Error("Resolved OBU tab is not the approved target conversation.");
   }
   const accountDigest = await readChatGptAccountDigestWithEvaluator(
@@ -2974,7 +3019,7 @@ export async function captureApprovedChatGptConversationBackendViaObu(
     await cleanupCaptureWithEvaluator(evaluate, targetApiUrl);
     rawCapturePending = false;
     const completionUrl = await evaluate<string>("location.href", "capture completion URL check");
-    if (!isSameConversationUrl(completionUrl, conversationId)) {
+    if (!isSameConversationUrl(completionUrl, options.targetUrl)) {
       throw new Error("OBU conversation changed during capture.");
     }
     if (

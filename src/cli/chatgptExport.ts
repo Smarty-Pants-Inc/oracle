@@ -9,6 +9,10 @@ import {
   captureApprovedChatGptConversationBackendViaObu,
   conversationIdFromChatGptUrl,
 } from "../browser/chatgptExport.js";
+import {
+  parseChatGptConversationScope,
+  type ChatGptConversationScope,
+} from "../browser/conversationUrl.js";
 import { DEFAULT_REMOTE_CHROME_HOST, DEFAULT_REMOTE_CHROME_PORT } from "../browser/liveTabs.js";
 import { normalizeChatGptAccountDigest } from "../browser/chatgptAccount.js";
 import { sessionStore } from "../sessionStore.js";
@@ -87,10 +91,36 @@ function storedConversationIds(metadata: SessionMetadata): Set<string> {
   }
   return ids;
 }
+function canonicalConversationScope(scope: ChatGptConversationScope): string {
+  return `${scope.origin}${scope.pathname}`;
+}
 
-function sessionMatchesConversation(metadata: SessionMetadata, conversationId: string): boolean {
+function storedConversationScopes(metadata: SessionMetadata): Set<string> {
+  const scopes = new Set<string>();
+  for (const url of storedConversationUrls(metadata)) {
+    if (typeof url !== "string") continue;
+    const scope = parseChatGptConversationScope(url);
+    if (scope) scopes.add(canonicalConversationScope(scope));
+  }
+  return scopes;
+}
+
+function sessionMatchesConversation(metadata: SessionMetadata, targetUrl: string): boolean {
+  const target = parseChatGptConversationScope(targetUrl);
+  if (!target) return false;
+  const targetScope = canonicalConversationScope(target);
+  const scopes = storedConversationScopes(metadata);
   const ids = storedConversationIds(metadata);
-  if (!ids.has(conversationId)) return false;
+  if (scopes.size > 0) {
+    if (!scopes.has(targetScope)) return false;
+    if (scopes.size > 1 || [...ids].some((id) => id !== target.conversationId)) {
+      throw new Error("Stored Oracle session has conflicting ChatGPT conversation identities.");
+    }
+    return true;
+  }
+  if (target.pathname !== `/c/${target.conversationId}` || !ids.has(target.conversationId)) {
+    return false;
+  }
   if (ids.size > 1) {
     throw new Error("Stored Oracle session has conflicting ChatGPT conversation identities.");
   }
@@ -178,7 +208,7 @@ export function resolveChatGptExportRemoteChrome(
   targetUrl: string,
   sessions: SessionMetadata[],
 ): ChatGptExportRemoteChromeTarget {
-  const conversationId = conversationIdFromChatGptUrl(targetUrl);
+  conversationIdFromChatGptUrl(targetUrl);
   const affinities = new Map<string, ChatGptExportRemoteChromeTarget>();
   const resolutionHint =
     process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1"
@@ -187,7 +217,7 @@ export function resolveChatGptExportRemoteChrome(
   let matchedSessionCount = 0;
 
   for (const metadata of sessions) {
-    if (!sessionMatchesConversation(metadata, conversationId)) continue;
+    if (!sessionMatchesConversation(metadata, targetUrl)) continue;
     matchedSessionCount += 1;
     const storedAffinities = storedRemoteChromeAffinities(metadata);
     if (storedAffinities.length === 0) {
@@ -224,11 +254,11 @@ export function resolveChatGptExportRemoteChromeForSession(
   metadata: SessionMetadata | null,
 ): ChatGptExportRemoteChromeTarget {
   validateSessionIdSelector(sessionId);
-  const conversationId = conversationIdFromChatGptUrl(targetUrl);
+  conversationIdFromChatGptUrl(targetUrl);
   if (!metadata || metadata.id !== sessionId) {
     throw new Error("The requested stored Oracle session was not found.");
   }
-  if (!sessionMatchesConversation(metadata, conversationId)) {
+  if (!sessionMatchesConversation(metadata, targetUrl)) {
     throw new Error("The requested stored Oracle session does not match the ChatGPT conversation.");
   }
   return resolveChatGptExportRemoteChrome(targetUrl, [metadata]);

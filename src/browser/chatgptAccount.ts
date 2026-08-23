@@ -1,6 +1,6 @@
 import type { ChromeClient } from "./types.js";
+import { CHATGPT_ORIGINS } from "./conversationUrl.js";
 import { withTimeout } from "./reattachHelpers.js";
-
 export interface ChatGptAccountIdentity {
   accountDigest: string;
   email: string;
@@ -29,19 +29,22 @@ export function normalizeChatGptAccountDigest(value: unknown): string | undefine
 
 export interface EvaluatedChatGptPageAffinity {
   expectedConversationId?: string;
+  expectedConversationUrl?: string;
   expectedAccountDigest?: string;
 }
 
 export function buildEvaluatedChatGptPageAffinityGuard({
   expectedConversationId,
+  expectedConversationUrl,
   expectedAccountDigest,
 }: EvaluatedChatGptPageAffinity): string {
   const conversationId = expectedConversationId?.trim() || undefined;
+  const conversationUrl = expectedConversationUrl?.trim() || undefined;
   const accountDigest = normalizeChatGptAccountDigest(expectedAccountDigest);
   if (expectedAccountDigest !== undefined && !accountDigest) {
     throw new Error("Expected ChatGPT account affinity is invalid.");
   }
-  if (!conversationId && !accountDigest) return "";
+  if (!conversationId && !conversationUrl && !accountDigest) return "";
 
   return `
     const assertOracleChatGptPageAffinity = async () => {
@@ -51,17 +54,29 @@ export function buildEvaluatedChatGptPageAffinityGuard({
       } catch {
         throw new Error('ChatGPT page origin is unavailable.');
       }
-      if (pageUrl.origin !== ${JSON.stringify(CHATGPT_ORIGIN)}) {
+      const allowedOrigins = ${JSON.stringify(CHATGPT_ORIGINS)};
+      if (!allowedOrigins.includes(pageUrl.origin)) {
         throw new Error('ChatGPT page origin changed.');
       }
       const expectedConversationId = ${JSON.stringify(conversationId ?? null)};
+      const expectedConversationUrl = ${JSON.stringify(conversationUrl ?? null)};
       const conversationMatch = /^(?:\\/c|\\/g\\/[^/?#]+\\/(?:project\\/)?c)\\/([a-zA-Z0-9-]+)\\/?$/.exec(pageUrl.pathname);
-      if (expectedConversationId && conversationMatch?.[1] !== expectedConversationId) {
+      const currentScope = pageUrl.origin + pageUrl.pathname.replace(/\\/$/, '');
+      if (expectedConversationUrl) {
+        let approvedScope;
+        try {
+          const approvedUrl = new URL(expectedConversationUrl);
+          approvedScope = approvedUrl.origin + approvedUrl.pathname.replace(/\\/$/, '');
+        } catch {
+          throw new Error('Expected ChatGPT conversation scope is invalid.');
+        }
+        if (currentScope !== approvedScope) throw new Error('ChatGPT conversation changed.');
+      } else if (expectedConversationId && conversationMatch?.[1] !== expectedConversationId) {
         throw new Error('ChatGPT conversation changed.');
       }
       const expectedAccountDigest = ${JSON.stringify(accountDigest ?? null)};
       if (!expectedAccountDigest) return;
-      const target = ${JSON.stringify(CHATGPT_SESSION_URL)};
+      const target = new URL('/api/auth/session', pageUrl.origin).href;
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), ${DEFAULT_ACCOUNT_IDENTITY_TIMEOUT_MS});
       try {
@@ -92,8 +107,6 @@ export function buildEvaluatedChatGptPageAffinityGuard({
 const DEFAULT_ACCOUNT_IDENTITY_TIMEOUT_MS = 10_000;
 const ACCOUNT_IDENTITY_TIMEOUT_ERROR =
   "Timed out while reading authenticated ChatGPT account identity.";
-const CHATGPT_ORIGIN = "https://chatgpt.com";
-const CHATGPT_SESSION_URL = `${CHATGPT_ORIGIN}/api/auth/session`;
 
 /** Reads only the authenticated user id digest and normalized email from ChatGPT's page context. */
 export async function readChatGptAccountIdentity(
@@ -111,10 +124,11 @@ export async function readChatGptAccountIdentity(
     Runtime.evaluate({
       expression: `(() => (async () => {
         const timeoutMs = ${JSON.stringify(timeoutMs)};
-        const target = ${JSON.stringify(CHATGPT_SESSION_URL)};
         let timeout;
         try {
-          if (new URL(location.href).origin !== ${JSON.stringify(CHATGPT_ORIGIN)}) return null;
+          const pageOrigin = new URL(location.href).origin;
+          if (!${JSON.stringify(CHATGPT_ORIGINS)}.includes(pageOrigin)) return null;
+          const target = new URL('/api/auth/session', pageOrigin).href;
           const controller = new AbortController();
           timeout = setTimeout(() => controller.abort(), timeoutMs);
           const response = await fetch(target, {
