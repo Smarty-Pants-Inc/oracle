@@ -17,6 +17,7 @@ import {
   closeTab,
   connectToRemoteChromeTarget,
   listRemoteChromeTargets,
+  type RemoteChromeConnection,
 } from "./chromeLifecycle.js";
 import { resolveRemoteChromeBrowserIdentity } from "./profileState.js";
 import { readChatGptAccountDigest } from "./pageActions.js";
@@ -389,46 +390,96 @@ export async function listChatGptTargets(options: HostPort = {}): Promise<Chrome
 }
 
 export async function openChatGptTarget(
-  options: HostPort & { url?: string } = {},
+  options: HostPort & {
+    url?: string;
+    /** Retained for source compatibility; the temporary handoff is always awaited. */
+    returnTargetBeforeClose?: boolean;
+    onHandoffError?: (error: unknown) => void;
+    onTargetCreated?: (targetId: string) => void;
+  } = {},
 ): Promise<string> {
   const { host, port } = normalizeHostPort(options);
   const url = options.url ?? "https://chatgpt.com/";
   requireChatGptUrl(url, "opening a ChatGPT tab");
+  const reportHandoffError = (error: unknown): void => {
+    try {
+      options.onHandoffError?.(error);
+    } catch {
+      // Handoff reporting must not replace the original failure.
+    }
+  };
+  const closeAfterHandoffFailure = async (
+    targetId: string,
+    handoffError: unknown,
+  ): Promise<never> => {
+    try {
+      const closed = await closeTab(port, targetId, noopLogger, host);
+      if (closed) {
+        reportHandoffError(handoffError);
+        throw handoffError;
+      }
+      throw new Error("Remote Chrome target cleanup was not confirmed.");
+    } catch (cleanupError) {
+      const failure =
+        cleanupError === handoffError
+          ? handoffError
+          : new AggregateError(
+              [handoffError, cleanupError],
+              "Remote Chrome target handoff and cleanup failed.",
+            );
+      reportHandoffError(failure);
+      throw failure;
+    }
+  };
   if (options.browserWSEndpoint) {
-    const connection = await connectToRemoteChromeTarget(host, port, noopLogger, {
-      browserWSEndpoint: options.browserWSEndpoint,
-      targetUrl: url,
-      closeTargetOnDispose: false,
-    });
-    const targetId = connection.targetId;
+    let createdTargetId: string | undefined;
+    let connection: RemoteChromeConnection;
+    try {
+      connection = await connectToRemoteChromeTarget(host, port, noopLogger, {
+        browserWSEndpoint: options.browserWSEndpoint,
+        targetUrl: url,
+        closeTargetOnDispose: false,
+        onTargetCreated: (targetId) => {
+          createdTargetId = targetId;
+          options.onTargetCreated?.(targetId);
+        },
+      });
+    } catch (error) {
+      if (createdTargetId) {
+        await closeAfterHandoffFailure(createdTargetId, error);
+      }
+      reportHandoffError(error);
+      throw error;
+    }
+    const targetId = connection.targetId ?? createdTargetId;
     if (!targetId) {
-      await connection.close();
+      try {
+        await connection.close();
+      } catch (error) {
+        reportHandoffError(error);
+      }
       throw new Error("Remote Chrome did not return a target id.");
+    }
+    if (!createdTargetId) {
+      createdTargetId = targetId;
+      options.onTargetCreated?.(targetId);
     }
     try {
       await connection.close();
     } catch (closeError) {
-      const cleanupErrors: unknown[] = [];
-      try {
-        const closed = await closeTab(port, targetId, noopLogger, host);
-        if (!closed) {
-          cleanupErrors.push(new Error("Remote Chrome target cleanup was not confirmed."));
-        }
-      } catch (cleanupError) {
-        cleanupErrors.push(cleanupError);
-      }
-      if (cleanupErrors.length > 0) {
-        throw new AggregateError(
-          [closeError, ...cleanupErrors],
-          "Remote Chrome target handoff and cleanup failed.",
-        );
-      }
-      throw closeError;
+      await closeAfterHandoffFailure(targetId, closeError);
     }
     return targetId;
   }
   const target = await CDP.New({ host, port, url });
-  return target.id;
+  const targetId = target.id;
+  if (!targetId) throw new Error("Remote Chrome did not return a target id.");
+  try {
+    options.onTargetCreated?.(targetId);
+  } catch (error) {
+    await closeAfterHandoffFailure(targetId, error);
+  }
+  return targetId;
 }
 
 async function connectToTarget(

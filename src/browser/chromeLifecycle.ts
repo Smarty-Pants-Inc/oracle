@@ -18,6 +18,26 @@ const execFileAsync = promisify(execFile);
 const REMOTE_TARGET_CLEANUP_TIMEOUT_MS = 1_000;
 const REMOTE_TARGET_CLEANUP_COMMAND_TIMEOUT_MS = 250;
 const REMOTE_TARGET_ATTACH_TIMEOUT_MS = 5_000;
+const SIGNAL_RUNTIME_HINT_TIMEOUT_MS = 250;
+
+async function persistRuntimeHintBeforeSignalExit(
+  emitRuntimeHint: (() => Promise<void>) | undefined,
+): Promise<void> {
+  if (!emitRuntimeHint) return;
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      emitRuntimeHint(),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, SIGNAL_RUNTIME_HINT_TIMEOUT_MS);
+      }),
+    ]);
+  } catch {
+    // Signal handling must reach the exit path even if hint persistence fails.
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export interface ChromeLaunchDeps {
   platform?: NodeJS.Platform;
@@ -163,7 +183,7 @@ export function registerTerminationHooks(
     void (async () => {
       if (leaveRunning) {
         // Ensure reattach hints are written before we exit.
-        await opts?.emitRuntimeHint?.().catch(() => undefined);
+        await persistRuntimeHintBeforeSignalExit(opts?.emitRuntimeHint);
         if (inFlight) {
           logger('Session still in flight; reattach with "oracle session <slug>" to continue.');
         }
@@ -471,6 +491,7 @@ export async function connectToRemoteChromeTarget(
     browserWSEndpoint?: string;
     closeTargetOnDispose?: boolean;
     approvalWaitMs?: number;
+    onTargetCreated?: (targetId: string) => void;
   },
 ): Promise<RemoteChromeConnection> {
   if (!options.browserWSEndpoint) {
@@ -505,6 +526,7 @@ export async function connectToRemoteChromeTarget(
       });
       targetId = created.targetId;
       createdTarget = true;
+      options.onTargetCreated?.(targetId);
       logger("Opened a dedicated remote Chrome tab.");
     }
     const attached = await attachToRemoteTarget(browser, targetId);

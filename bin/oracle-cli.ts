@@ -67,6 +67,7 @@ import { applyHiddenAliases } from "../src/cli/hiddenAliases.js";
 import type { BrowserSessionRunnerDeps } from "../src/browser/sessionRunner.js";
 import { isMediaFile } from "../src/browser/prompt.js";
 import { handleChatGptInventoryCommand } from "../src/cli/chatgptInventory.js";
+import { oracleCliExitCodeForError } from "../src/cli/archiveRepair.js";
 import { formatCompactNumber } from "../src/cli/format.js";
 import { formatIntroLine } from "../src/cli/tagline.js";
 import { warnIfOversizeBundle } from "../src/cli/bundleWarnings.js";
@@ -3170,5 +3171,5 @@ void main().catch((error: unknown) => {
   } else {
     console.error(chalk.red("✖"), error);
   }
-  process.exitCode = 1;
+  process.exitCode = oracleCliExitCodeForError(error);
 });

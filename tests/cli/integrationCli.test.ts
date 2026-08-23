@@ -19,6 +19,7 @@ const TSX_LOADER = pathToFileURL(
   path.join(process.cwd(), "node_modules", "tsx", "dist", "loader.mjs"),
 ).href;
 const CLIENT_FACTORY = path.join(process.cwd(), "tests", "fixtures", "mockClientFactory.cjs");
+const CLI_ERROR_FIXTURE = path.join(process.cwd(), "tests", "fixtures", "cli-error-child.ts");
 const INTEGRATION_TIMEOUT = 60000;
 const AZURE_ENV_KEYS = [
   "AZURE_OPENAI_ENDPOINT",
@@ -53,6 +54,27 @@ function execCli(
     execFile(
       process.execPath,
       ["--import", "tsx", CLI_ENTRY, ...args],
+      options,
+      (error, stdout, stderr) => {
+        const code = typeof error?.code === "number" ? error.code : error ? 1 : 0;
+        resolve({
+          code,
+          stdout: typeof stdout === "string" ? stdout : stdout.toString("utf8"),
+          stderr: typeof stderr === "string" ? stderr : stderr.toString("utf8"),
+        });
+      },
+    );
+  });
+}
+
+function execCliErrorFixture(
+  mode: "archive-repair" | "ordinary",
+  options: ExecFileOptions = {},
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    execFile(
+      process.execPath,
+      ["--import", "tsx", CLI_ERROR_FIXTURE, mode],
       options,
       (error, stdout, stderr) => {
         const code = typeof error?.code === "number" ? error.code : error ? 1 : 0;
@@ -2397,4 +2419,18 @@ module.exports = () => ({
     },
     INTEGRATION_TIMEOUT,
   );
+});
+describe("archive repair child-process contract", () => {
+  test("maps archive repair to exit 20 with generic stderr", async () => {
+    const result = await execCliErrorFixture("archive-repair");
+    expect(result.code).toBe(20);
+    expect(result.stderr).toContain("Archive cleanup could not be confirmed; repair is required.");
+    expect(result.stderr).not.toContain("sensitive operation details");
+  });
+
+  test("keeps ordinary child failures at exit 1", async () => {
+    const result = await execCliErrorFixture("ordinary");
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("ordinary child failure");
+  });
 });

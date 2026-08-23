@@ -517,7 +517,154 @@ export async function writeSessionIdReceipt(
   }
 }
 
+export function validateSessionIdSelector(sessionId: string): string {
+  if (
+    typeof sessionId !== "string" ||
+    sessionId === "." ||
+    sessionId === ".." ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(sessionId) ||
+    sessionId.includes("\0") ||
+    sessionId.includes("/") ||
+    sessionId.includes("\\") ||
+    path.isAbsolute(sessionId)
+  ) {
+    throw new Error("Oracle session ID selector is invalid.");
+  }
+  return sessionId;
+}
+
+function sameFileIdentity(
+  left: { dev: number; ino: number },
+  right: { dev: number; ino: number },
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function isPrivateMetadataFile(stat: { mode: number; uid?: number }): boolean {
+  const uid = process.getuid?.();
+  return (stat.mode & 0o777) === 0o600 && uid !== undefined && stat.uid === uid;
+}
+
+function isSafeOwnedDirectory(stat: {
+  mode: number;
+  uid?: number;
+  isDirectory: () => boolean;
+}): boolean {
+  const uid = process.getuid?.();
+  return stat.isDirectory() && uid !== undefined && stat.uid === uid && (stat.mode & 0o022) === 0;
+}
+
+async function verifyNoSymlinkAncestors(targetPath: string): Promise<void> {
+  const stat = await fs.lstat(path.resolve(targetPath));
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error("Oracle session storage path is unsafe.");
+  }
+}
+
+async function verifyArchiveDirectory(targetPath: string, label: string): Promise<void> {
+  if (process.platform === "win32" || !constants.O_NOFOLLOW || process.getuid === undefined) {
+    throw new Error(`${label} is unsafe.`);
+  }
+  await verifyNoSymlinkAncestors(targetPath);
+  const initial = await fs.lstat(targetPath);
+  if (!isSafeOwnedDirectory(initial)) {
+    throw new Error(`${label} is unsafe.`);
+  }
+  const handle = await fs.open(
+    targetPath,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    const opened = await handle.stat();
+    const current = await fs.lstat(targetPath);
+    if (
+      !isSafeOwnedDirectory(opened) ||
+      !sameFileIdentity(opened, initial) ||
+      !sameFileIdentity(opened, current)
+    ) {
+      throw new Error(`${label} changed before metadata read.`);
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+async function verifyArchiveStorageRoots(): Promise<void> {
+  const oracleHome = path.resolve(getOracleHomeDir());
+  const sessionsRoot = path.resolve(getSessionsDir());
+  await verifyArchiveDirectory(oracleHome, "Oracle session storage ancestor");
+  await verifyArchiveDirectory(sessionsRoot, "Oracle sessions root");
+}
+
+async function readVerifiedSessionMetadataFile(
+  sessionId: string,
+  filename: string,
+  requirePrivate = false,
+): Promise<string | null> {
+  const directoryPath = sessionDir(sessionId);
+  const metadataPath = path.join(directoryPath, filename);
+  if (requirePrivate) {
+    try {
+      await verifyArchiveStorageRoots();
+      await verifyArchiveDirectory(directoryPath, "Oracle session directory");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  }
+  const directoryFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+  const fileFlags = constants.O_RDONLY | constants.O_NOFOLLOW;
+  let directoryHandle;
+  try {
+    directoryHandle = await fs.open(directoryPath, directoryFlags);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new Error("Oracle session directory is unsafe.", { cause: error });
+  }
+  try {
+    const directoryStat = await directoryHandle.stat();
+    const directoryPathStat = await fs.lstat(directoryPath);
+    if (
+      !directoryStat.isDirectory() ||
+      !sameFileIdentity(directoryStat, directoryPathStat) ||
+      (requirePrivate && !isSafeOwnedDirectory(directoryStat))
+    ) {
+      throw new Error("Oracle session directory is unsafe.");
+    }
+
+    let metadataHandle;
+    try {
+      metadataHandle = await fs.open(metadataPath, fileFlags);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw new Error("Oracle session metadata file is unsafe.", { cause: error });
+    }
+    try {
+      const metadataStat = await metadataHandle.stat();
+      const [metadataPathStat, currentDirectoryPathStat] = await Promise.all([
+        fs.lstat(metadataPath),
+        fs.lstat(directoryPath),
+      ]);
+      if (
+        !metadataStat.isFile() ||
+        (requirePrivate && !isPrivateMetadataFile(metadataStat)) ||
+        (requirePrivate && !isPrivateMetadataFile(metadataPathStat)) ||
+        !sameFileIdentity(metadataStat, metadataPathStat) ||
+        !sameFileIdentity(directoryStat, currentDirectoryPathStat)
+      ) {
+        throw new Error("Oracle session metadata file is unsafe.");
+      }
+      return await metadataHandle.readFile("utf8");
+    } finally {
+      await metadataHandle.close();
+    }
+  } finally {
+    await directoryHandle.close();
+  }
+}
+
 function sessionDir(id: string): string {
+  validateSessionIdSelector(id);
   return path.join(getSessionsDir(), id);
 }
 
@@ -551,10 +698,6 @@ async function writeSessionMetadataFile(
 
 function requestPath(id: string): string {
   return path.join(sessionDir(id), LEGACY_REQUEST_FILENAME);
-}
-
-function legacySessionPath(id: string): string {
-  return path.join(sessionDir(id), LEGACY_SESSION_FILENAME);
 }
 
 function logPath(id: string): string {
@@ -780,15 +923,58 @@ export async function initializeSession(
 }
 
 export async function readSessionMetadata(sessionId: string): Promise<SessionMetadata | null> {
+  validateSessionIdSelector(sessionId);
   const modern = await readModernSessionMetadata(sessionId, { reconcile: true, persist: false });
-  if (modern) {
-    return modern;
-  }
-  const legacy = await readLegacySessionMetadata(sessionId, { reconcile: true, persist: false });
-  if (legacy) {
-    return legacy;
+  if (modern) return modern;
+  return await readLegacySessionMetadata(sessionId, { reconcile: true, persist: false });
+}
+
+export async function readSessionMetadataForArchiveAffinity(
+  sessionId: string,
+): Promise<SessionMetadata | null> {
+  validateSessionIdSelector(sessionId);
+  for (const filename of [METADATA_FILENAME, LEGACY_SESSION_FILENAME]) {
+    const raw = await readVerifiedSessionMetadataFile(sessionId, filename, true);
+    if (raw === null) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+    if (isSessionMetadataRecord(parsed) && parsed.id === sessionId) {
+      return parsed;
+    }
+    if (isSessionMetadataRecord(parsed)) {
+      return null;
+    }
   }
   return null;
+}
+
+export async function listSessionMetadataForArchiveAffinity(): Promise<SessionMetadata[]> {
+  if (process.platform === "win32" || !constants.O_NOFOLLOW || process.getuid === undefined) {
+    return [];
+  }
+  try {
+    await verifyArchiveStorageRoots();
+  } catch {
+    return [];
+  }
+  const entries = await fs.readdir(getSessionsDir()).catch(() => []);
+  const trusted: SessionMetadata[] = [];
+  for (const entry of entries) {
+    try {
+      validateSessionIdSelector(entry);
+      const metadata = await readSessionMetadataForArchiveAffinity(entry);
+      if (metadata?.id === entry) trusted.push(metadata);
+    } catch {
+      // Automatic affinity must fail closed for unsafe or mismatched records.
+    }
+  }
+  return trusted.sort((left, right) => {
+    return new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime();
+  });
 }
 
 export async function updateSessionMetadata(
@@ -813,8 +999,9 @@ async function readModernSessionMetadata(
   sessionId: string,
   options: ReadSessionMetadataOptions,
 ): Promise<SessionMetadata | null> {
+  const raw = await readVerifiedSessionMetadataFile(sessionId, METADATA_FILENAME);
+  if (raw === null) return null;
   try {
-    const raw = await fs.readFile(metaPath(sessionId), "utf8");
     const parsed = JSON.parse(raw) as SessionMetadata | StoredRunOptions;
     if (!isSessionMetadataRecord(parsed)) {
       return null;
@@ -830,8 +1017,9 @@ async function readLegacySessionMetadata(
   sessionId: string,
   options: ReadSessionMetadataOptions,
 ): Promise<SessionMetadata | null> {
+  const raw = await readVerifiedSessionMetadataFile(sessionId, LEGACY_SESSION_FILENAME);
+  if (raw === null) return null;
   try {
-    const raw = await fs.readFile(legacySessionPath(sessionId), "utf8");
     const parsed = JSON.parse(raw) as SessionMetadata;
     const enriched = await attachModelRuns(parsed, sessionId);
     return options.reconcile ? reconcileSessionMetadata(enriched, options) : enriched;
@@ -878,7 +1066,6 @@ function isSessionMetadataRecord(value: unknown): value is SessionMetadata {
     value && typeof (value as SessionMetadata).id === "string" && (value as SessionMetadata).status,
   );
 }
-
 async function attachModelRuns(meta: SessionMetadata, sessionId: string): Promise<SessionMetadata> {
   const runs = await listModelRunFiles(sessionId);
   if (runs.length === 0) {
@@ -908,7 +1095,12 @@ export async function listSessionsMetadata(): Promise<SessionMetadata[]> {
   const entries = await fs.readdir(getSessionsDir()).catch(() => []);
   const metas: SessionMetadata[] = [];
   for (const entry of entries) {
-    let meta = await readRawSessionMetadata(entry);
+    let meta: SessionMetadata | null;
+    try {
+      meta = await readRawSessionMetadata(entry);
+    } catch {
+      continue;
+    }
     if (meta) {
       // Keep stored metadata consistent with status reconciliation done by `oracle status`.
       meta = await reconcileSessionMetadata(meta, { persist: true });
@@ -1020,9 +1212,20 @@ export async function deleteSessionsOlderThan({
   let deleted = 0;
 
   for (const entry of entries) {
-    const dir = sessionDir(entry);
+    let dir: string;
+    try {
+      validateSessionIdSelector(entry);
+      dir = sessionDir(entry);
+    } catch {
+      continue;
+    }
     let createdMs: number | undefined;
-    const meta = await readSessionMetadata(entry);
+    let meta: SessionMetadata | null = null;
+    try {
+      meta = await readSessionMetadata(entry);
+    } catch {
+      continue;
+    }
     if (meta?.createdAt) {
       const parsed = Date.parse(meta.createdAt);
       if (!Number.isNaN(parsed)) {

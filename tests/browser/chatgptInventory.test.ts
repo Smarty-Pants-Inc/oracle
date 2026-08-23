@@ -23,6 +23,7 @@ describe("ChatGPT conversation inventory", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     vi.unstubAllGlobals();
     vi.useRealTimers();
   });
@@ -131,15 +132,112 @@ describe("ChatGPT conversation inventory", () => {
     expect(hook).toContain("const MAX_JWT_SEGMENT_LENGTH = 8192");
     expect(hook.indexOf("match.slice(1).some")).toBeLessThan(hook.indexOf("atob("));
   });
-  test("embeds absolute self-expiry in the inventory authorization hook", () => {
+  test("derives inventory authorization hook self-expiry from one page clock sample", () => {
     const hook = buildChatGptInventoryAuthCaptureHook(1_000);
-
-    expect(hook).toContain("const EXPIRES_AT = 1000;");
+    expect(hook).toContain("const BUDGET_MS = 1000;");
+    expect(hook).toContain("const pageNow = Date.now();");
+    expect(hook).toContain("expiresAt = Number.isFinite(BUDGET_MS) ? startedAt + BUDGET_MS");
     expect(hook).toContain("Date.now() >= EXPIRES_AT");
     expect(hook).toContain("expiryTimer = setTimeout");
     expect(hook).toContain("clearTimeout(expiryTimer)");
   });
+  test.each([1_000, 9_000_000])("keeps the full budget with page clock %d", (pageNow) => {
+    const hook = buildChatGptInventoryAuthCaptureHook(250);
+    const windowStub = { fetch: () => undefined } as Record<string, unknown>;
+    const storage: Record<string, string> = {};
+    const sessionStorage = {
+      getItem: (key: string) => storage[key] ?? null,
+      setItem: (key: string, value: string) => {
+        storage[key] = value;
+      },
+    };
+    const setTimeoutStub = vi.fn(() => 1);
+    const run = Function("window", "Date", "setTimeout", "sessionStorage", hook) as (
+      window: Record<string, unknown>,
+      Date: { now: () => number },
+      setTimeout: (callback: () => void, ms: number) => number,
+      sessionStorage: {
+        getItem(key: string): string | null;
+        setItem(key: string, value: string): void;
+      },
+    ) => void;
+    run(windowStub, { now: () => pageNow }, setTimeoutStub, sessionStorage);
+    expect(windowStub.__oracleChatGptInventory).toBeDefined();
+    expect(setTimeoutStub).toHaveBeenCalledWith(expect.any(Function), 250);
+  });
+  test("does not renew the hook expiry when it executes in a later document", () => {
+    const hook = buildChatGptInventoryAuthCaptureHook(250);
+    const stored: Record<string, string> = {};
+    const sessionStorage = {
+      getItem: (key: string) => stored[key] ?? null,
+      setItem: (key: string, value: string) => {
+        stored[key] = value;
+      },
+    };
+    const firstWindow = { fetch: () => undefined } as Record<string, unknown>;
+    const laterWindow = { fetch: () => undefined } as Record<string, unknown>;
+    const setTimeoutStub = vi.fn(() => 1);
+    let pageNow = 1_000;
+    const run = Function("window", "Date", "setTimeout", "sessionStorage", hook) as (
+      window: Record<string, unknown>,
+      Date: { now: () => number },
+      setTimeout: (callback: () => void, ms: number) => number,
+      sessionStorage: {
+        getItem(key: string): string | null;
+        setItem(key: string, value: string): void;
+      },
+    ) => void;
+    run(firstWindow, { now: () => pageNow }, setTimeoutStub, sessionStorage);
+    pageNow += 100;
+    run(laterWindow, { now: () => pageNow }, setTimeoutStub, sessionStorage);
+    expect(stored.__oracleChatGptInventoryExpiryAt).toBe("1250");
+    expect(setTimeoutStub).toHaveBeenNthCalledWith(1, expect.any(Function), 250);
+    expect(setTimeoutStub).toHaveBeenNthCalledWith(2, expect.any(Function), 150);
+  });
+  test("fails closed across documents when session storage throws", () => {
+    const hook = buildChatGptInventoryAuthCaptureHook(250);
+    const throwingStorage = {
+      getItem: () => {
+        throw new Error("blocked");
+      },
+      setItem: () => {
+        throw new Error("blocked");
+      },
+    };
+    const run = Function("window", "Date", "setTimeout", "sessionStorage", hook) as Function;
+    const firstWindow = { fetch: () => undefined };
+    const laterWindow = { fetch: () => undefined };
+    const setTimeoutStub = vi.fn(() => 1);
+    run(firstWindow, { now: () => 1_000 }, setTimeoutStub, throwingStorage);
+    run(laterWindow, { now: () => 1_100 }, setTimeoutStub, throwingStorage);
+    expect((firstWindow as Record<string, unknown>).__oracleChatGptInventory).toBeUndefined();
+    expect((laterWindow as Record<string, unknown>).__oracleChatGptInventory).toBeUndefined();
+    expect(setTimeoutStub).not.toHaveBeenCalled();
+  });
 
+  test.each([
+    ["future start", "2000", "2250", 1000],
+    ["inconsistent expiry", "1000", "1300", 1100],
+    ["backward clock", "1000", "1250", 900],
+  ])("fails closed for persisted %s state", (_label, startedAt, expiresAt, pageNow) => {
+    const hook = buildChatGptInventoryAuthCaptureHook(250);
+    const storage: Record<string, string> = {
+      __oracleChatGptInventoryStartedAt: startedAt,
+      __oracleChatGptInventoryExpiryAt: expiresAt,
+    };
+    const sessionStorage = {
+      getItem: (key: string) => storage[key] ?? null,
+      setItem: (key: string, value: string) => {
+        storage[key] = value;
+      },
+    };
+    const windowStub = { fetch: () => undefined } as Record<string, unknown>;
+    const setTimeoutStub = vi.fn(() => 1);
+    const run = Function("window", "Date", "setTimeout", "sessionStorage", hook) as Function;
+    run(windowStub, { now: () => pageNow }, setTimeoutStub, sessionStorage);
+    expect(windowStub.__oracleChatGptInventory).toBeUndefined();
+    expect(setTimeoutStub).not.toHaveBeenCalled();
+  });
   test("rejects a restarted browser before opening inventory", async () => {
     vi.stubGlobal(
       "fetch",
@@ -234,10 +332,18 @@ describe("ChatGPT conversation inventory", () => {
     await targetConnectionStarted;
     await vi.advanceTimersByTimeAsync(100);
 
+    await vi.advanceTimersByTimeAsync(8_000);
     const error = await failure;
-    expect(error).toBeInstanceOf(Error);
-    expect((error as Error).message).toMatch(
-      /timed out while opening the disposable ChatGPT inventory target/i,
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).message).toMatch(
+      /inventory and disposable-target cleanup both failed/i,
+    );
+    expect((error as AggregateError).errors).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          message: "Late ChatGPT inventory cleanup could not be confirmed.",
+        }),
+      ]),
     );
 
     resolveLateConnection({
@@ -459,6 +565,18 @@ describe("ChatGPT conversation inventory", () => {
         expectedEmail: "owner@example.test",
       }),
     ).rejects.toThrow(/connection and disposable-target cleanup both failed/i);
+    inventoryCalls = 0;
+    close.mockRejectedValueOnce(new Error("owned target close was not confirmed"));
+    chromeMocks.closeTab.mockResolvedValueOnce(true);
+    await expect(
+      captureChatGptConversationInventory({
+        host: "127.0.0.1",
+        port: 9223,
+        browserId: "browser-a",
+        browserWSEndpoint,
+        expectedEmail: "owner@example.test",
+      }),
+    ).resolves.toEqual({ accountDigest, items: [] });
   });
 
   test("keeps every fallback retry reachable with the default inventory timeout", async () => {
@@ -706,10 +824,11 @@ describe("ChatGPT conversation inventory", () => {
     expect(chromeMocks.closeTab).not.toHaveBeenCalled();
   });
 
-  test("reports failed cleanup when a late authorization hook registration resolves after timeout", async () => {
-    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+  test("preserves the aggregate operation error when late registration and target close both fail in archive mode", async () => {
+    vi.stubEnv("ORACLE_ARCHIVE_REQUEST", "1");
     vi.useFakeTimers();
     vi.setSystemTime(0);
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
@@ -757,7 +876,11 @@ describe("ChatGPT conversation inventory", () => {
     resolveRegistration({ identifier: "late-inventory-hook" });
     const failure = await capture.catch((error: unknown) => error);
 
-    expect(failure).toBeInstanceOf(AggregateError);
+    expect(failure).toMatchObject({
+      name: "OracleArchiveRepairRequiredError",
+      code: 20,
+      message: "Archive cleanup could not be confirmed; repair is required.",
+    });
     expect(removeScript).toHaveBeenCalledWith({ identifier: "late-inventory-hook" });
     expect(chromeMocks.closeTab).toHaveBeenCalledWith(
       9223,
@@ -765,6 +888,116 @@ describe("ChatGPT conversation inventory", () => {
       expect.any(Function),
       "127.0.0.1",
     );
+  });
+
+  test("raises the archive repair contract for unconfirmed cleanup in archive requests", async () => {
+    vi.stubEnv("ORACLE_ARCHIVE_REQUEST", "1");
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ webSocketDebuggerUrl: browserWSEndpoint }),
+      }),
+    );
+    const accountDigest = "a".repeat(64);
+    let inventoryCalls = 0;
+    const Runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("document.readyState")) {
+          return { result: { value: { href: "https://chatgpt.com/", readyState: "complete" } } };
+        }
+        if (expression.includes("Boolean(window.__oracleChatGptInventory?.ready)")) {
+          return { result: { value: true } };
+        }
+        if (expression.includes("inventory.readCookieIdentity(")) {
+          return {
+            result: {
+              value: {
+                ok: true,
+                status: 200,
+                url: "https://chatgpt.com/api/auth/session",
+                redirected: false,
+                accountDigest,
+                email: "owner@example.test",
+              },
+            },
+          };
+        }
+        if (expression.includes("inventory.bindRetainedAuthorization(")) {
+          return {
+            result: {
+              value: {
+                ok: true,
+                status: 200,
+                url: "https://chatgpt.com/api/auth/session",
+                redirected: false,
+                accountDigest,
+                email: "owner@example.test",
+              },
+            },
+          };
+        }
+        if (expression.includes("inventory.fetchPage")) {
+          inventoryCalls += 1;
+          const archived = inventoryCalls > 1;
+          const url = `https://chatgpt.com/backend-api/conversations?offset=0&limit=100&order=updated&is_archived=${archived}`;
+          return {
+            result: {
+              value: {
+                ok: true,
+                status: 200,
+                url,
+                redirected: false,
+                body: { items: [], total: 0, limit: 100, offset: 0 },
+              },
+            },
+          };
+        }
+        if (expression.includes("const inventory = window.__oracleChatGptInventory;")) {
+          return { result: { value: false } };
+        }
+        return { result: { value: undefined } };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    const Page = {
+      enable: vi.fn(async () => undefined),
+      addScriptToEvaluateOnNewDocument: vi.fn(async () => ({ identifier: "inventory-hook" })),
+      removeScriptToEvaluateOnNewDocument: vi.fn(async () => undefined),
+      navigate: vi.fn(async () => ({ frameId: "inventory-frame" })),
+    };
+    chromeMocks.connectToRemoteChromeTarget.mockResolvedValue({
+      client: { Page, Runtime },
+      targetId: "inventory-target",
+      browserWSEndpoint,
+      close: vi.fn().mockRejectedValue(new Error("private target close failed")),
+    });
+
+    await expect(
+      captureChatGptConversationInventory({
+        host: "127.0.0.1",
+        port: 9223,
+        browserId: "browser-a",
+        browserWSEndpoint,
+        expectedEmail: "owner@example.test",
+        timeoutMs: 100,
+      }),
+    ).rejects.toMatchObject({ name: "OracleArchiveRepairRequiredError", code: 20 });
+    delete process.env.ORACLE_ARCHIVE_REQUEST;
+  });
+
+  test("rejects non-finite inventory timeouts before opening a target", async () => {
+    await expect(
+      captureChatGptConversationInventory({
+        host: "127.0.0.1",
+        port: 9223,
+        browserId: "browser-a",
+        browserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+        expectedEmail: "owner@example.test",
+        timeoutMs: Number.POSITIVE_INFINITY,
+      }),
+    ).rejects.toThrow(/timeout must be finite and positive/i);
+    expect(chromeMocks.connectToRemoteChromeTarget).not.toHaveBeenCalled();
   });
 
   test("bounds stalled cleanup steps and still attempts later disposable-target cleanup", async () => {

@@ -55,6 +55,42 @@ test("fallback-closes a structured target when handoff detach fails", async () =
   );
 });
 
+test("does not return a target until the temporary handoff completes", async () => {
+  let releaseHandoff!: () => void;
+  const handoff = new Promise<void>((resolve) => {
+    releaseHandoff = resolve;
+  });
+  const close = vi.fn(() => handoff);
+  const createdTargetIds: string[] = [];
+  remoteChromeMocks.connectToRemoteChromeTarget.mockImplementation(async (...args: unknown[]) => {
+    const options = args[3] as { onTargetCreated?: (targetId: string) => void };
+    options.onTargetCreated?.("target-new");
+    return { targetId: "target-new", close };
+  });
+
+  const opened = openChatGptTarget({
+    host: "127.0.0.1",
+    port: 9223,
+    browserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+    onTargetCreated: (targetId) => createdTargetIds.push(targetId),
+  });
+  let settled = false;
+  void opened.then(() => {
+    settled = true;
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(createdTargetIds).toEqual(["target-new"]);
+  expect(settled).toBe(false);
+  expect(remoteChromeMocks.closeTab).not.toHaveBeenCalled();
+
+  releaseHandoff();
+  await expect(opened).resolves.toBe("target-new");
+  expect(close).toHaveBeenCalledOnce();
+  expect(remoteChromeMocks.closeTab).not.toHaveBeenCalled();
+});
+
 function makeTab(overrides: Partial<ChatGptTabSummary> = {}): ChatGptTabSummary {
   return {
     targetId: "target-1",

@@ -47,6 +47,7 @@ describe("ChatGPT export account receipt", () => {
   }
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     vi.unstubAllGlobals();
     vi.useRealTimers();
     liveTabMocks.connectToExistingChatGptTab.mockReset();
@@ -184,6 +185,111 @@ describe("ChatGPT export account receipt", () => {
     expect(archiveOptions).toMatchObject({ remainingMs: expect.any(Number) });
     expect(archiveOptions).not.toHaveProperty("deadline");
     expect(liveTabMocks.openChatGptTarget).not.toHaveBeenCalled();
+  });
+
+  test("does not raise archive repair when mutation affinity fails before archive invocation", async () => {
+    const outDir = await freshOutputDir("oracle-chatgpt-export-pre-mutation-affinity-");
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const accountDigest = "a".repeat(64);
+    const mismatchedDigest = "b".repeat(64);
+    const rawText = JSON.stringify({
+      title: "Affinity receipt",
+      conversation_id: "conv-affinity",
+      current_node: null,
+      mapping: {},
+    });
+    let affinityChecks = 0;
+    vi.stubEnv("ORACLE_ARCHIVE_REQUEST", "1");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ webSocketDebuggerUrl: browserWSEndpoint }),
+      }),
+    );
+    const Runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (
+          expression.includes("/api/auth/session") &&
+          !expression.includes('kind: "authenticated-exact-get"')
+        ) {
+          affinityChecks += 1;
+          return {
+            result: {
+              value: {
+                accountDigest: affinityChecks === 3 ? mismatchedDigest : accountDigest,
+                email: "owner@example.test",
+              },
+            },
+          };
+        }
+        if (expression === "location.href" || expression.includes('typeof location === "object"')) {
+          return { result: { value: "https://chatgpt.com/c/conv-affinity" } };
+        }
+        if (expression.includes("const summaries =")) {
+          return {
+            result: {
+              value: {
+                href: "https://chatgpt.com/c/conv-affinity",
+                title: "Affinity receipt",
+                hit: {
+                  url: "https://chatgpt.com/backend-api/conversation/conv-affinity",
+                  status: 200,
+                  chars: rawText.length,
+                  conversation_id: "conv-affinity",
+                },
+                hits: [],
+              },
+            },
+          };
+        }
+        if (expression.includes("String(text).slice")) {
+          return { result: { value: rawText } };
+        }
+        if (expression.includes("sessionStorage.removeItem")) {
+          return { result: { value: true } };
+        }
+        throw new Error(`Unexpected Runtime.evaluate expression: ${expression.slice(0, 80)}`);
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    const close = vi.fn(async () => undefined);
+    const Page = {
+      addScriptToEvaluateOnNewDocument: vi.fn(async () => ({ identifier: "capture-hook" })),
+      removeScriptToEvaluateOnNewDocument: vi.fn(async () => undefined),
+      enable: vi.fn(async () => ({})),
+      reload: vi.fn(async () => ({})),
+    };
+    liveTabMocks.connectToExistingChatGptTab.mockResolvedValue({
+      client: { Runtime, Page, close },
+      targetId: "target-affinity",
+      tab: {
+        targetId: "target-affinity",
+        type: "page",
+        title: "Affinity receipt",
+        url: "https://chatgpt.com/c/conv-affinity",
+      },
+    });
+
+    const failure = await captureApprovedChatGptConversationBackend({
+      targetUrl: "https://chatgpt.com/c/conv-affinity",
+      outDir,
+      host: "127.0.0.1",
+      port: 9223,
+      browserId: "browser-a",
+      browserWSEndpoint,
+      accountDigest,
+      expectedEmail: "owner@example.test",
+      archiveAfterExport: true,
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toMatch(
+      /account identity changed before post-export archive/i,
+    );
+    expect(failure).not.toMatchObject({ name: "OracleArchiveRepairRequiredError", code: 20 });
+    expect(archiveMocks.archiveChatGptConversation).not.toHaveBeenCalled();
+    expect(affinityChecks).toBe(3);
+    expect(close).toHaveBeenCalledOnce();
   });
 
   test("removes capture hooks, raw state, and registration after capture failure", async () => {
@@ -349,7 +455,7 @@ describe("ChatGPT export account receipt", () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
-  test("exports a known-active conversation by exact GET without changing archive state", async () => {
+  test("exports a known-active conversation by exact GET and warns only when final target disposal fails", async () => {
     const outDir = await freshOutputDir("oracle-chatgpt-export-active-");
     const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
     const accountDigest = "a".repeat(64);
@@ -409,7 +515,7 @@ describe("ChatGPT export account receipt", () => {
       }),
     } as unknown as ChromeClient["Runtime"];
     const Page = { enable: vi.fn(async () => ({})) };
-    const close = vi.fn(async () => undefined);
+    const close = vi.fn().mockRejectedValue(new Error("detach failed for private-target-id"));
     lifecycleMocks.connectToRemoteChromeTarget.mockResolvedValue({
       client: { Runtime, Page },
       targetId: "target-active",
@@ -440,6 +546,10 @@ describe("ChatGPT export account receipt", () => {
         archiveStatePreserved: true,
       },
     });
+    expect(result.cleanupWarnings).toEqual([
+      "ChatGPT export target cleanup could not be confirmed.",
+    ]);
+    expect(JSON.stringify(result.cleanupWarnings)).not.toContain("private-target-id");
     expect(result).not.toHaveProperty("accountDigest");
     const payload = JSON.parse(await fs.readFile(result.payloadPath, "utf8"));
     const markdown = await fs.readFile(result.markdownPath, "utf8");
@@ -477,6 +587,78 @@ describe("ChatGPT export account receipt", () => {
     expect(liveTabMocks.connectToExistingChatGptTab).not.toHaveBeenCalled();
     expect(liveTabMocks.openChatGptTarget).not.toHaveBeenCalled();
     expect(archiveMocks.archiveChatGptConversation).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledOnce();
+  });
+  test("rejects an exact GET result when raw in-page capture scrubbing cannot be verified", async () => {
+    const outDir = await freshOutputDir("oracle-chatgpt-export-raw-scrub-");
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const accountDigest = "a".repeat(64);
+    const rawText = JSON.stringify({
+      title: "Scrub receipt",
+      conversation_id: "conv-scrub",
+      current_node: null,
+      mapping: {},
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ webSocketDebuggerUrl: browserWSEndpoint }),
+      }),
+    );
+    const Runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression === "document.readyState") return { result: { value: "complete" } };
+        if (expression === "location.href" || expression.includes('typeof location === "object"')) {
+          return { result: { value: "https://chatgpt.com/" } };
+        }
+        if (expression === "document.title") return { result: { value: "ChatGPT" } };
+        if (
+          expression.includes("/api/auth/session") &&
+          !expression.includes("authenticated-exact-get")
+        ) {
+          return { result: { value: { accountDigest, email: "owner@example.test" } } };
+        }
+        if (expression.includes("authenticated-exact-get")) {
+          return {
+            result: {
+              value: {
+                kind: "authenticated-exact-get",
+                url: "https://chatgpt.com/backend-api/conversation/conv-scrub",
+                status: 200,
+                ok: true,
+                chars: rawText.length,
+                conversation_id: "conv-scrub",
+              },
+            },
+          };
+        }
+        if (expression.includes("String(text).slice")) return { result: { value: rawText } };
+        if (expression.includes("sessionStorage.removeItem")) return { result: { value: false } };
+        throw new Error(`Unexpected Runtime.evaluate expression: ${expression.slice(0, 80)}`);
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    const close = vi.fn(async () => undefined);
+    lifecycleMocks.connectToRemoteChromeTarget.mockResolvedValue({
+      client: { Runtime, Page: { enable: vi.fn(async () => undefined) } },
+      targetId: "target-scrub",
+      browserWSEndpoint,
+      close,
+    });
+
+    await expect(
+      captureApprovedChatGptConversationBackend({
+        targetUrl: "https://chatgpt.com/c/conv-scrub",
+        outDir,
+        host: "127.0.0.1",
+        port: 9223,
+        browserId: "browser-a",
+        browserWSEndpoint,
+        accountDigest,
+        expectedEmail: "owner@example.test",
+        knownArchived: false,
+      }),
+    ).rejects.toThrow(/raw capture cleanup could not be verified/i);
     expect(close).toHaveBeenCalledOnce();
   });
 
@@ -672,6 +854,65 @@ describe("ChatGPT export account receipt", () => {
     );
   });
 
+  test("closes an active target reported before a stalled handoff resolves", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ webSocketDebuggerUrl: browserWSEndpoint }),
+      }),
+    );
+    liveTabMocks.connectToExistingChatGptTab.mockRejectedValue(
+      new Error("approved target missing"),
+    );
+    liveTabMocks.openChatGptTarget.mockImplementation(
+      async (options: { onTargetCreated?: (targetId: string) => void }) => {
+        options.onTargetCreated?.("target-created-before-handoff");
+        return await new Promise<never>(() => undefined);
+      },
+    );
+    const close = vi.fn().mockRejectedValue(new Error("temporary detach failed"));
+    lifecycleMocks.connectToRemoteChromeTarget.mockResolvedValue({
+      targetId: "target-created-before-handoff",
+      close,
+    });
+    lifecycleMocks.closeTab.mockResolvedValue(true);
+
+    const capture = captureApprovedChatGptConversationBackend({
+      targetUrl: "https://chatgpt.com/c/conv-active-handoff-stall",
+      outDir: "/tmp/oracle-chatgpt-export-active-handoff-stall",
+      host: "127.0.0.1",
+      port: 9223,
+      browserId: "browser-a",
+      browserWSEndpoint,
+      accountDigest: "a".repeat(64),
+      expectedEmail: "owner@example.test",
+      knownArchived: false,
+      archiveAfterExport: true,
+      timeoutMs: 250,
+    });
+    const failure = capture.catch((error: unknown) => error);
+
+    await vi.advanceTimersByTimeAsync(250);
+
+    const error = await failure;
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(
+      /timed out creating the active ChatGPT export target/i,
+    );
+    expect(liveTabMocks.openChatGptTarget).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+    expect(lifecycleMocks.closeTab).toHaveBeenCalledWith(
+      9223,
+      "target-created-before-handoff",
+      expect.any(Function),
+      "127.0.0.1",
+    );
+  });
+
   test("bounds a stalled owned-target close to the cleanup allowance", async () => {
     const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
     const accountDigest = "a".repeat(64);
@@ -749,6 +990,72 @@ describe("ChatGPT export account receipt", () => {
     await expect(failure).resolves.toMatchObject({
       message: "Read-only ChatGPT export and target cleanup failed.",
     });
+  });
+
+  test("reports unresolved late target cleanup at the shared cleanup deadline", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const accountDigest = "a".repeat(64);
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ webSocketDebuggerUrl: browserWSEndpoint }),
+      }),
+    );
+    let signalExactGetStarted!: () => void;
+    const exactGetStarted = new Promise<void>((resolve) => {
+      signalExactGetStarted = resolve;
+    });
+    const Runtime = {
+      evaluate: vi.fn(({ expression }: { expression: string }) => {
+        if (expression === "document.readyState")
+          return Promise.resolve({ result: { value: "complete" } });
+        if (expression === "location.href" || expression.includes('typeof location === "object"')) {
+          return Promise.resolve({ result: { value: "https://chatgpt.com/" } });
+        }
+        if (expression === "document.title")
+          return Promise.resolve({ result: { value: "ChatGPT" } });
+        if (expression.includes('kind: "authenticated-exact-get"')) {
+          signalExactGetStarted();
+          return new Promise<never>(() => undefined);
+        }
+        if (expression.includes("/api/auth/session")) {
+          return Promise.resolve({
+            result: { value: { accountDigest, email: "owner@example.test" } },
+          });
+        }
+        throw new Error(`Unexpected Runtime.evaluate expression: ${expression.slice(0, 80)}`);
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    const close = vi.fn(() => new Promise<void>(() => undefined));
+    lifecycleMocks.connectToRemoteChromeTarget.mockResolvedValue({
+      client: { Runtime, Page: { enable: vi.fn(async () => undefined) } },
+      targetId: "target-pending-cleanup",
+      browserWSEndpoint,
+      close,
+    });
+
+    const failure = captureApprovedChatGptConversationBackend({
+      targetUrl: "https://chatgpt.com/c/conv-pending-cleanup",
+      outDir: "/tmp/oracle-chatgpt-export-pending-cleanup",
+      host: "127.0.0.1",
+      port: 9223,
+      browserId: "browser-a",
+      browserWSEndpoint,
+      accountDigest,
+      expectedEmail: "owner@example.test",
+      knownArchived: false,
+      timeoutMs: 250,
+    }).catch((error: unknown) => error);
+    await exactGetStarted;
+    await vi.advanceTimersByTimeAsync(250);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(failure).resolves.toMatchObject({
+      message: "Read-only ChatGPT export and target cleanup failed.",
+    });
+    expect(close).toHaveBeenCalledOnce();
   });
 
   test("cleans captured exact-GET state when the CDP result handoff fails", async () => {

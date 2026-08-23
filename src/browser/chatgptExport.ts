@@ -1,8 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import type { ChildProcess } from "node:child_process";
 import type { BrowserArchiveResult, ChromeClient } from "./types.js";
 import { archiveChatGptConversation } from "./actions/archiveConversation.js";
 import {
@@ -33,13 +33,18 @@ import {
   normalizeChatGptAccountEmail,
   readChatGptAccountIdentity,
 } from "./chatgptAccount.js";
+import {
+  archiveRepairRequiredForCleanup,
+  OracleArchiveRepairRequiredError,
+} from "../cli/archiveRepair.js";
 
-const execFileAsync = promisify(execFile);
 const WINDOWS_EXPORT_UNAVAILABLE_MESSAGE =
   "ChatGPT conversation export is disabled on Windows until owner-exclusive ACLs can be established and verified.";
 
 const DEFAULT_EXPORT_TIMEOUT_MS = 45_000;
 const EXPORT_CLEANUP_ALLOWANCE_MS = 1_000;
+const OBU_PROCESS_TERM_GRACE_MS = 100;
+const READ_ONLY_CAPTURE_TOMBSTONES_KEY = "__oracleChatGptBackendCaptureCancelled";
 
 function assertValidExportChunkSize(chunkSize: number): void {
   if (!Number.isFinite(chunkSize) || !Number.isInteger(chunkSize) || chunkSize <= 0) {
@@ -54,6 +59,21 @@ function assertValidExportTimeout(timeoutMs: number): void {
 }
 
 type JsonRecord = Record<string, unknown>;
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+}
+
+function createDeferred<T>(): Deferred<T> {
+  let resolve!: Deferred<T>["resolve"];
+  let reject!: Deferred<T>["reject"];
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 interface BackendMessage {
   id?: string;
@@ -196,23 +216,92 @@ const EXACT_GET_CAPTURE_PROVENANCE: CaptureProvenance = {
 };
 
 type EvaluateExpression = <T>(expression: string, timeoutLabel?: string) => Promise<T>;
+
+interface ExportCleanupIssue {
+  error: unknown;
+  kind: "target" | "capture";
+}
+
+interface ExportCleanupTracker {
+  pending: Set<Promise<void>>;
+  errors: ExportCleanupIssue[];
+  pendingKinds: Map<Promise<void>, ExportCleanupIssue["kind"]>;
+}
+
+function trackExportCleanup<T>(
+  tracker: ExportCleanupTracker,
+  operation: Promise<T>,
+  disposeLateResult: (result: T) => Promise<void> | void,
+  timedOut: () => boolean,
+  kind: ExportCleanupIssue["kind"] = "target",
+): void {
+  let pending: Promise<void>;
+  pending = operation
+    .then((result) => (timedOut() ? Promise.resolve(disposeLateResult(result)) : undefined))
+    .catch((error) => {
+      if (timedOut()) tracker.errors.push({ error, kind });
+    })
+    .then(() => undefined)
+    .finally(() => {
+      tracker.pending.delete(pending);
+      tracker.pendingKinds.delete(pending);
+    });
+  tracker.pending.add(pending);
+  tracker.pendingKinds.set(pending, kind);
+}
+
+async function waitForExportCleanup(
+  tracker: ExportCleanupTracker,
+  deadline: number,
+): Promise<void> {
+  if (tracker.pending.size === 0) return;
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) {
+    for (const kind of tracker.pendingKinds.values()) {
+      tracker.errors.push({ error: sanitizedExportCleanupError(kind), kind });
+    }
+    return;
+  }
+  await Promise.race([Promise.allSettled(tracker.pending), delay(remaining)]);
+  if (tracker.pending.size > 0) {
+    for (const kind of tracker.pendingKinds.values()) {
+      tracker.errors.push({ error: sanitizedExportCleanupError(kind), kind });
+    }
+  }
+}
+
+function sanitizedExportCleanupError(kind: ExportCleanupIssue["kind"]): Error {
+  return new Error(
+    kind === "target"
+      ? "ChatGPT export target cleanup could not be confirmed."
+      : "ChatGPT export capture cleanup could not be confirmed.",
+  );
+}
+
 async function runBeforeDeadline<T>(
   operation: () => Promise<T>,
   deadline: number,
   timeoutMessage: string,
   disposeLateResult?: (result: T) => Promise<void> | void,
+  cleanupTracker?: ExportCleanupTracker,
+  cleanupKind: ExportCleanupIssue["kind"] = "target",
 ): Promise<T> {
   const remaining = remainingMs(deadline);
   if (remaining <= 0) throw new Error(timeoutMessage);
   let timedOut = false;
   let timer: NodeJS.Timeout | undefined;
   const operationResult = Promise.resolve().then(operation);
-  if (disposeLateResult) {
+  if (disposeLateResult && cleanupTracker) {
+    trackExportCleanup(
+      cleanupTracker,
+      operationResult,
+      disposeLateResult,
+      () => timedOut,
+      cleanupKind,
+    );
+  } else if (disposeLateResult) {
     void operationResult
-      .then((result) => {
-        if (!timedOut) return;
-        return Promise.resolve(disposeLateResult(result)).catch(() => undefined);
-      })
+      .then((result) => (timedOut ? Promise.resolve(disposeLateResult(result)) : undefined))
       .catch(() => undefined);
   }
   try {
@@ -256,13 +345,28 @@ async function registerCaptureHookBeforeDeadline<T>(
   register: () => Promise<T>,
   remove: (registration: T) => Promise<void>,
   deadline: number,
+  cleanupDeadline: number,
   timeoutMessage: string,
+  cleanupTracker: ExportCleanupTracker,
+  cleanupKind: ExportCleanupIssue["kind"] = "capture",
 ): Promise<T> {
   const remaining = remainingMs(deadline);
   if (remaining <= 0) throw new Error(timeoutMessage);
   let timedOut = false;
   let timer: NodeJS.Timeout | undefined;
   const registration = Promise.resolve().then(register);
+  trackExportCleanup(
+    cleanupTracker,
+    registration,
+    (lateRegistration) =>
+      runCleanupBeforeDeadline(
+        () => remove(lateRegistration),
+        cleanupDeadline,
+        "Timed out removing a late ChatGPT export capture hook.",
+      ),
+    () => timedOut,
+    cleanupKind,
+  );
   try {
     return await Promise.race([
       registration,
@@ -274,33 +378,6 @@ async function registerCaptureHookBeforeDeadline<T>(
         timer.unref?.();
       }),
     ]);
-  } catch (error) {
-    if (!timedOut) throw error;
-    const cleanupDeadline = Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS;
-    try {
-      const lateRegistration = await runCleanupBeforeDeadline(
-        () => registration,
-        cleanupDeadline,
-        "Timed out waiting for the late ChatGPT export capture hook registration.",
-        (lateResult) =>
-          runCleanupBeforeDeadline(
-            () => remove(lateResult),
-            Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS,
-            "Timed out removing a late ChatGPT export capture hook.",
-          ),
-      );
-      await runCleanupBeforeDeadline(
-        () => remove(lateRegistration),
-        cleanupDeadline,
-        "Timed out removing a late ChatGPT export capture hook.",
-      );
-    } catch (cleanupError) {
-      throw new AggregateError(
-        [error, cleanupError],
-        "ChatGPT export capture hook registration and cleanup failed.",
-      );
-    }
-    throw error;
   } finally {
     clearTimeout(timer);
   }
@@ -581,38 +658,63 @@ export function buildScopedBackendCaptureHook(targetApiUrl: string): string {
 `.trim();
 }
 
-function buildCaptureCleanupExpression(targetApiUrl: string): string {
+function buildCaptureCleanupExpression(targetApiUrl: string, operationToken?: string): string {
+  const tokenLiteral = operationToken === undefined ? "null" : jsString(operationToken);
   return `
 (() => {
   const TARGET = ${jsString(targetApiUrl)};
+  const OPERATION_TOKEN = ${tokenLiteral};
+  const TOMBSTONES_KEY = ${jsString(READ_ONLY_CAPTURE_TOMBSTONES_KEY)};
   const CAPTURE_KEY = "__oracleChatGptBackendCapture:" + TARGET;
   const WRAPPER_MARKER = "__oracleChatGptBackendCaptureTarget";
+  let tombstoneSet = OPERATION_TOKEN === null;
+  if (OPERATION_TOKEN !== null) {
+    try {
+      let tombstones = window[TOMBSTONES_KEY];
+      if (!tombstones || typeof tombstones !== "object") {
+        tombstones = Object.create(null);
+        window[TOMBSTONES_KEY] = tombstones;
+      }
+      tombstones[OPERATION_TOKEN] = true;
+      tombstoneSet = tombstones[OPERATION_TOKEN] === true;
+    } catch {}
+  }
   const capture = window.__oracleChatGptBackendCapture;
-  try { capture?.cleanup?.(); } catch {}
-  if (Array.isArray(capture?.hits)) {
-    for (const hit of capture.hits) {
-      if (hit && typeof hit === "object") delete hit.text;
+  const ownsCapture =
+    OPERATION_TOKEN === null || capture?.operationToken === OPERATION_TOKEN;
+  const canCleanCapture = tombstoneSet && ownsCapture;
+  if (canCleanCapture) {
+    try { capture?.cleanup?.(); } catch {}
+    if (Array.isArray(capture?.hits)) {
+      for (const hit of capture.hits) {
+        if (hit && typeof hit === "object") delete hit.text;
+      }
+      capture.hits.length = 0;
     }
-    capture.hits.length = 0;
   }
   let storageCleared = false;
   try {
     sessionStorage.removeItem(CAPTURE_KEY);
     storageCleared = sessionStorage.getItem(CAPTURE_KEY) === null;
   } catch {}
-  if (window.__oracleChatGptBackendCapture === capture) {
+  if (canCleanCapture && window.__oracleChatGptBackendCapture === capture) {
     delete window.__oracleChatGptBackendCapture;
   }
-  const globalCleared = typeof window.__oracleChatGptBackendCapture === "undefined";
+  const globalCleared = OPERATION_TOKEN !== null && !ownsCapture
+    ? true
+    : typeof window.__oracleChatGptBackendCapture === "undefined";
   const fetchRestored = window.fetch?.[WRAPPER_MARKER] !== TARGET;
   const xhrRestored = window.XMLHttpRequest?.[WRAPPER_MARKER] !== TARGET;
-  return globalCleared && storageCleared && fetchRestored && xhrRestored;
+  return tombstoneSet && globalCleared && storageCleared && fetchRestored && xhrRestored;
 })()
 `.trim();
 }
 
-export function buildChatGptCaptureCleanupExpressionForTest(targetApiUrl: string): string {
-  return buildCaptureCleanupExpression(targetApiUrl);
+export function buildChatGptCaptureCleanupExpressionForTest(
+  targetApiUrl: string,
+  operationToken?: string,
+): string {
+  return buildCaptureCleanupExpression(targetApiUrl, operationToken);
 }
 
 export function buildReadOnlyConversationGetExpressionForTest(
@@ -620,6 +722,7 @@ export function buildReadOnlyConversationGetExpressionForTest(
   expectedAccountDigest?: string,
   expectedEmail?: string,
   remainingMs = DEFAULT_EXPORT_TIMEOUT_MS,
+  operationToken: string = randomUUID(),
 ): string {
   const url = new URL(targetApiUrl);
   const prefix = "/backend-api/conversation/";
@@ -650,6 +753,7 @@ export function buildReadOnlyConversationGetExpressionForTest(
     normalizedDigest,
     normalizedEmail,
     remainingMs,
+    operationToken,
   );
 }
 
@@ -659,11 +763,19 @@ function buildReadOnlyConversationGetExpression(
   expectedAccountDigest: string | undefined,
   expectedEmail: string | undefined,
   remainingMs: number,
+  operationToken: string,
 ): string {
   const pageBudgetMs = Number.isFinite(remainingMs) ? Math.max(0, remainingMs) : 0;
+  const operationTokenLiteral = jsString(operationToken);
   return `
 (async () => {
   const TARGET = ${jsString(targetApiUrl)};
+  const OPERATION_TOKEN = ${operationTokenLiteral};
+  const TOMBSTONES_KEY = ${jsString(READ_ONLY_CAPTURE_TOMBSTONES_KEY)};
+  const isCancelled = () => {
+    try { return window[TOMBSTONES_KEY]?.[OPERATION_TOKEN] === true; } catch { return false; }
+  };
+  if (isCancelled()) throw new Error("Authenticated ChatGPT exact GET was cancelled.");
   const SESSION_TARGET = "https://chatgpt.com/api/auth/session";
   const EXPECTED_CONVERSATION_ID = ${jsString(expectedConversationId)};
   const EXPECTED_ACCOUNT_DIGEST = ${JSON.stringify(expectedAccountDigest ?? null)};
@@ -781,6 +893,7 @@ function buildReadOnlyConversationGetExpression(
   if (response.redirected || responseUrl !== TARGET) {
     throw new Error("Authenticated ChatGPT exact GET left the approved backend URL.");
   }
+  if (isCancelled()) throw new Error("Authenticated ChatGPT exact GET was cancelled.");
   let parsed = null;
   try { parsed = JSON.parse(text); } catch {}
   const conversationId = typeof parsed?.conversation_id === "string" ? parsed.conversation_id : null;
@@ -801,7 +914,9 @@ function buildReadOnlyConversationGetExpression(
       : null,
     current_node: typeof parsed?.current_node === "string" ? parsed.current_node : null
   };
+  if (isCancelled()) throw new Error("Authenticated ChatGPT exact GET was cancelled.");
   window.__oracleChatGptBackendCapture = {
+    operationToken: OPERATION_TOKEN,
     target: TARGET,
     hits: [{ ...hit, text, capturedAt: new Date().toISOString() }]
   };
@@ -891,13 +1006,7 @@ async function closeOpenedChatGptTarget(
       deadline,
       "Timed out reconnecting to clean up the ChatGPT export target.",
       (lateConnection) =>
-        closeExportConnectionOrTarget(
-          lateConnection,
-          host,
-          port,
-          targetId,
-          Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS,
-        ),
+        closeExportConnectionOrTarget(lateConnection, host, port, targetId, deadline),
     );
     await closeExportConnectionOrTarget(connection, host, port, targetId, deadline);
     return;
@@ -934,6 +1043,158 @@ async function evaluateByValue<T>(
   return result.result?.value as T;
 }
 
+function obuMethodLabel(method: string): string {
+  return /^[A-Za-z][A-Za-z0-9_.-]*$/.test(method) ? method : "request";
+}
+
+function signalObuProcess(child: ChildProcess | undefined, signal: NodeJS.Signals): void {
+  if (!child) return;
+  const pid = child.pid;
+  if (
+    process.platform !== "win32" &&
+    typeof pid === "number" &&
+    Number.isInteger(pid) &&
+    pid > 1 &&
+    pid !== process.pid
+  ) {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch {
+      // Fall back to signaling the direct child when its process group is unavailable.
+    }
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    // The process may have exited as the deadline elapsed.
+  }
+}
+
+function obuProcessGroupExists(child: ChildProcess): boolean | undefined {
+  const pid = child.pid;
+  if (
+    process.platform === "win32" ||
+    typeof pid !== "number" ||
+    !Number.isInteger(pid) ||
+    pid <= 1 ||
+    pid === process.pid
+  ) {
+    return undefined;
+  }
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+    if (code === "ESRCH") return false;
+    if (code === "EPERM") return true;
+    return undefined;
+  }
+}
+
+function terminateObuProcess(child: ChildProcess | undefined): void {
+  if (!child) return;
+  signalObuProcess(child, "SIGTERM");
+  const events = child as unknown as {
+    once?: (event: string, listener: (...args: unknown[]) => void) => unknown;
+    removeListener?: (event: string, listener: (...args: unknown[]) => void) => unknown;
+  };
+  if (typeof events.once !== "function") {
+    signalObuProcess(child, "SIGKILL");
+    return;
+  }
+  let childExited = false;
+  let listenersRemoved = false;
+  const removeListeners = (listener: (...args: unknown[]) => void): void => {
+    if (listenersRemoved) return;
+    listenersRemoved = true;
+    for (const event of ["exit", "close", "error"]) {
+      try {
+        events.removeListener?.(event, listener);
+      } catch {
+        // Listener removal is best effort.
+      }
+    }
+  };
+  const onExit = (): void => {
+    childExited = true;
+    removeListeners(onExit);
+  };
+  try {
+    events.once("exit", onExit);
+    events.once("close", onExit);
+    events.once("error", onExit);
+  } catch {
+    removeListeners(onExit);
+    signalObuProcess(child, "SIGKILL");
+    return;
+  }
+  setTimeout(() => {
+    removeListeners(onExit);
+    const groupExists = obuProcessGroupExists(child);
+    if (groupExists !== false) {
+      signalObuProcess(child, "SIGKILL");
+      return;
+    }
+    if (!childExited && child.exitCode == null && child.signalCode == null) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // The process may have exited as the grace period elapsed.
+      }
+    }
+  }, OBU_PROCESS_TERM_GRACE_MS);
+}
+
+async function runObuProcess(args: string[], deadline: number, method: string): Promise<string> {
+  const label = obuMethodLabel(method);
+  const remaining = remainingMs(deadline);
+  const timeoutError = new Error(`Timed out waiting for obu cdp ${label}.`);
+  const { promise, resolve, reject } = createDeferred<string>();
+  let child: ChildProcess | undefined;
+  let timer: NodeJS.Timeout | undefined;
+  let settled = false;
+  const finish = (callback: () => void): void => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    callback();
+  };
+  timer = setTimeout(() => {
+    terminateObuProcess(child);
+    finish(() => reject(timeoutError));
+  }, remaining);
+  timer.unref?.();
+  try {
+    const spawnObu = execFile as unknown as (
+      file: string,
+      args: string[],
+      options: { maxBuffer: number; encoding: "utf8"; detached: boolean },
+      callback: (error: Error | null, stdout: string, stderr: string) => void,
+    ) => ChildProcess;
+    child = spawnObu(
+      "obu",
+      args,
+      {
+        maxBuffer: 64 * 1024 * 1024,
+        encoding: "utf8",
+        detached: process.platform !== "win32",
+      },
+      (error, stdout) => {
+        if (error) {
+          finish(() => reject(new Error(`obu cdp ${label} process failed.`)));
+          return;
+        }
+        finish(() => resolve(typeof stdout === "string" ? stdout : String(stdout ?? "")));
+      },
+    );
+  } catch {
+    finish(() => reject(new Error(`obu cdp ${label} process failed.`)));
+  }
+  return await promise;
+}
+
 async function runObuCdp(
   sessionId: string,
   tabId: string,
@@ -943,44 +1204,40 @@ async function runObuCdp(
   cleanup = false,
   enforceDeadline = true,
 ): Promise<JsonRecord> {
-  const timeout = `${Math.max(1, Math.ceil(remainingMs(deadline) / 1_000))}s`;
-  const run = () =>
-    execFileAsync(
-      "obu",
-      [
-        "cdp",
-        "--session-id",
-        sessionId,
-        "--tab-id",
-        tabId,
-        "--method",
-        method,
-        "--params",
-        JSON.stringify(params),
-        "--timeout",
-        timeout,
-      ],
-      { maxBuffer: 64 * 1024 * 1024 },
-    );
-  const { stdout, stderr } = await (cleanup
-    ? runCleanupBeforeDeadline(run, deadline, `Timed out waiting for obu cdp ${method}.`)
+  const processDeadline = cleanup
+    ? deadline
     : enforceDeadline
-      ? runBeforeDeadline(run, deadline, `Timed out waiting for obu cdp ${method}.`)
-      : run());
+      ? deadline
+      : deadline + EXPORT_CLEANUP_ALLOWANCE_MS;
+  const timeout = `${Math.max(1, Math.ceil(remainingMs(processDeadline) / 1_000))}s`;
+  const stdout = await runObuProcess(
+    [
+      "cdp",
+      "--session-id",
+      sessionId,
+      "--tab-id",
+      tabId,
+      "--method",
+      method,
+      "--params",
+      JSON.stringify(params),
+      "--timeout",
+      timeout,
+    ],
+    processDeadline,
+    method,
+  );
   let envelope: JsonRecord;
   try {
     envelope = JSON.parse(stdout) as JsonRecord;
-  } catch (error) {
-    throw new Error(
-      `obu cdp ${method} returned non-JSON output: ${stderr || stdout || String(error)}`,
-    );
+  } catch {
+    throw new Error(`obu cdp ${obuMethodLabel(method)} returned an invalid response.`);
   }
   if (envelope.error) {
-    throw new Error(`obu cdp ${method} failed: ${JSON.stringify(envelope.error)}`);
+    throw new Error(`obu cdp ${obuMethodLabel(method)} returned an error.`);
   }
   return asRecord(envelope.result);
 }
-
 async function evaluateObuByValue<T>(
   sessionId: string,
   tabId: string,
@@ -1064,9 +1321,10 @@ async function readChatGptAccountDigestWithEvaluator(
 async function cleanupCaptureWithEvaluator(
   evaluate: EvaluateExpression,
   targetApiUrl: string,
+  operationToken?: string,
 ): Promise<void> {
   const cleaned = await evaluate<boolean>(
-    buildCaptureCleanupExpression(targetApiUrl),
+    buildCaptureCleanupExpression(targetApiUrl, operationToken),
     "capture cleanup",
   );
   if (cleaned !== true) {
@@ -1757,6 +2015,7 @@ async function evaluateReadOnlyConversationGet(
   expectedAccountDigest: string,
   expectedEmail: string | undefined,
   deadline: number,
+  operationToken: string = randomUUID(),
 ): Promise<CaptureHitSummary> {
   const outcome = await runBeforeDeadline(
     () =>
@@ -1767,6 +2026,7 @@ async function evaluateReadOnlyConversationGet(
           expectedAccountDigest,
           expectedEmail,
           remainingMs(deadline),
+          operationToken,
         ),
         awaitPromise: true,
         returnByValue: true,
@@ -1790,6 +2050,7 @@ export function evaluateReadOnlyConversationGetForTest(
   expectedAccountDigest: string,
   expectedEmail: string | undefined,
   deadline: number,
+  operationToken?: string,
 ): Promise<CaptureHitSummary> {
   return evaluateReadOnlyConversationGet(
     Runtime,
@@ -1798,6 +2059,7 @@ export function evaluateReadOnlyConversationGetForTest(
     expectedAccountDigest,
     expectedEmail,
     deadline,
+    operationToken,
   );
 }
 
@@ -1827,6 +2089,13 @@ async function captureChatGptConversationReadOnly({
   chunkSize: number;
 }): Promise<ChatGptConversationExportResult> {
   const conversationId = conversationIdFromChatGptUrl(targetUrl);
+  const readOnlyOperationToken = randomUUID();
+  const cleanupDeadline = deadline + EXPORT_CLEANUP_ALLOWANCE_MS;
+  const cleanupTracker: ExportCleanupTracker = {
+    pending: new Set(),
+    errors: [],
+    pendingKinds: new Map(),
+  };
   const boundIdentity = bindRemoteChromeBrowserWebSocketEndpoint({
     browserWSEndpoint,
     host,
@@ -1835,24 +2104,39 @@ async function captureChatGptConversationReadOnly({
   if (boundIdentity.browserId !== browserId) {
     throw new Error("Read-only ChatGPT export browser id does not match its WebSocket.");
   }
-  const opened = await runBeforeDeadline(
-    () =>
-      connectToRemoteChromeTarget(host, port, () => {}, {
-        browserWSEndpoint: boundIdentity.browserWSEndpoint,
-        targetUrl: "https://chatgpt.com/",
-        closeTargetOnDispose: true,
-      }),
-    deadline,
-    "Timed out connecting to the read-only ChatGPT export target.",
-    (lateConnection) =>
-      closeExportConnectionOrTarget(
-        lateConnection,
-        host,
-        port,
-        lateConnection.targetId ?? "",
-        Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS,
-      ),
-  );
+  let opened: RemoteChromeConnection;
+  try {
+    opened = await runBeforeDeadline(
+      () =>
+        connectToRemoteChromeTarget(host, port, () => {}, {
+          browserWSEndpoint: boundIdentity.browserWSEndpoint,
+          targetUrl: "https://chatgpt.com/",
+          closeTargetOnDispose: true,
+        }),
+      deadline,
+      "Timed out connecting to the read-only ChatGPT export target.",
+      (lateConnection) =>
+        closeExportConnectionOrTarget(
+          lateConnection,
+          host,
+          port,
+          lateConnection.targetId ?? "",
+          cleanupDeadline,
+        ),
+      cleanupTracker,
+      "target",
+    );
+  } catch (error) {
+    if (process.env.ORACLE_ARCHIVE_REQUEST === "1") {
+      await waitForExportCleanup(cleanupTracker, cleanupDeadline);
+      const repairRequired = archiveRepairRequiredForCleanup(
+        cleanupTracker.errors.length > 0,
+        error,
+      );
+      if (repairRequired) throw repairRequired;
+    }
+    throw error;
+  }
   const targetId = opened.targetId;
 
   let completedResult: ChatGptConversationExportResult | undefined;
@@ -1901,6 +2185,7 @@ async function captureChatGptConversationReadOnly({
         accountDigest,
         expectedEmail,
         deadline,
+        readOnlyOperationToken,
       );
     } catch (error) {
       getError = error;
@@ -1994,8 +2279,7 @@ async function captureChatGptConversationReadOnly({
     operationError = error;
   }
 
-  const cleanupDeadline = Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS;
-  const cleanupErrors: unknown[] = [];
+  let captureCleanupError: unknown;
   if (captureCleanupRequired) {
     try {
       await cleanupCaptureWithEvaluator(
@@ -2006,22 +2290,47 @@ async function captureChatGptConversationReadOnly({
             `Timed out waiting for ${timeoutLabel ?? "capture cleanup"}.`,
           ),
         targetApiUrl,
+        readOnlyOperationToken,
       );
     } catch (error) {
-      cleanupErrors.push(error);
+      captureCleanupError = error;
     }
   }
+  let targetCleanupError: unknown;
   try {
     await closeExportConnectionOrTarget(opened, host, port, targetId ?? "", cleanupDeadline);
   } catch (error) {
-    cleanupErrors.push(error);
+    targetCleanupError = error;
   }
-  const errors = operationError ? [operationError, ...cleanupErrors] : cleanupErrors;
-  if (errors.length > 1) {
-    throw new AggregateError(errors, "Read-only ChatGPT export and target cleanup failed.");
+  const cleanupErrors = [
+    captureCleanupError,
+    targetCleanupError,
+    ...cleanupTracker.errors.map((issue) => issue.error),
+  ].filter((error) => error !== undefined);
+  const repairRequired = archiveRepairRequiredForCleanup(cleanupErrors.length > 0, operationError);
+  if (repairRequired) throw repairRequired;
+  if (operationError) {
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [operationError, ...cleanupErrors],
+        "Read-only ChatGPT export and target cleanup failed.",
+      );
+    }
+    throw operationError;
   }
-  if (errors.length === 1) throw errors[0];
+  if (captureCleanupError) {
+    if (targetCleanupError) {
+      throw new AggregateError(
+        [captureCleanupError, targetCleanupError],
+        "Read-only ChatGPT export and target cleanup failed.",
+      );
+    }
+    throw captureCleanupError;
+  }
   if (!completedResult) throw new Error("Read-only ChatGPT export did not produce a result.");
+  if (targetCleanupError) {
+    completedResult.cleanupWarnings = ["ChatGPT export target cleanup could not be confirmed."];
+  }
   return completedResult;
 }
 
@@ -2034,6 +2343,12 @@ export async function captureApprovedChatGptConversationBackend(
   const timeoutMs = options.timeoutMs ?? DEFAULT_EXPORT_TIMEOUT_MS;
   assertValidExportTimeout(timeoutMs);
   const deadline = Date.now() + timeoutMs;
+  const cleanupDeadline = deadline + EXPORT_CLEANUP_ALLOWANCE_MS;
+  const cleanupTracker: ExportCleanupTracker = {
+    pending: new Set(),
+    errors: [],
+    pendingKinds: new Map(),
+  };
   const chunkSize = options.chunkSize ?? 250_000;
   assertValidExportChunkSize(chunkSize);
   const conversationId = conversationIdFromChatGptUrl(options.targetUrl);
@@ -2127,12 +2442,15 @@ export async function captureApprovedChatGptConversationBackend(
       deadline,
       "Timed out attaching to the approved ChatGPT export tab.",
       (lateConnection) => lateConnection.client.close(),
+      cleanupTracker,
+      "target",
     );
     if (!isSameConversationUrl(connected.tab.url, conversationId)) {
-      await disposeChatGptExportConnection(
-        connected.client,
-        Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS,
-      ).catch(() => undefined);
+      try {
+        await disposeChatGptExportConnection(connected.client, cleanupDeadline);
+      } catch (cleanupError) {
+        cleanupTracker.errors.push({ error: cleanupError, kind: "target" });
+      }
       throw new Error("Resolved ChatGPT tab is not the approved target conversation.");
     }
     resolved = {
@@ -2144,25 +2462,76 @@ export async function captureApprovedChatGptConversationBackend(
     };
   } catch (error) {
     if (options.knownArchived === false) {
-      const targetId = await runBeforeDeadline(
-        () =>
-          openChatGptTarget({
-            host,
-            port,
-            browserWSEndpoint,
-            url: "https://chatgpt.com/",
-          }),
-        deadline,
-        "Timed out creating the active ChatGPT export target.",
-        (lateTargetId) =>
-          closeOpenedChatGptTarget(
-            host,
-            port,
-            lateTargetId,
-            Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS,
-            browserWSEndpoint,
-          ).catch(() => undefined),
-      );
+      let targetId: string | undefined;
+      let createdTargetId: string | undefined;
+      let targetCleanupPromise: Promise<void> | undefined;
+      let targetCleanupError: unknown;
+      const closeCreatedTarget = (id: string): Promise<void> => {
+        targetCleanupPromise ??= closeOpenedChatGptTarget(
+          host,
+          port,
+          id,
+          cleanupDeadline,
+          browserWSEndpoint,
+        );
+        return targetCleanupPromise;
+      };
+      const disposeLateTarget = async (id: string): Promise<void> => {
+        try {
+          await closeCreatedTarget(id);
+        } catch (error) {
+          if (targetCleanupError === undefined) {
+            targetCleanupError = error;
+            cleanupTracker.errors.push({ error, kind: "target" });
+          }
+        }
+      };
+      try {
+        targetId = await runBeforeDeadline(
+          () =>
+            openChatGptTarget({
+              host,
+              port,
+              browserWSEndpoint,
+              url: "https://chatgpt.com/",
+              onTargetCreated: (createdId) => {
+                createdTargetId = createdId;
+              },
+            }),
+          deadline,
+          "Timed out creating the active ChatGPT export target.",
+          disposeLateTarget,
+        );
+        if (!targetId) {
+          throw new Error("Active ChatGPT export target did not return a target id.");
+        }
+      } catch (setupError) {
+        const knownTargetId = createdTargetId ?? targetId;
+        if (knownTargetId) {
+          try {
+            await closeCreatedTarget(knownTargetId);
+          } catch (error) {
+            targetCleanupError ??= error;
+          }
+        }
+        await waitForExportCleanup(cleanupTracker, cleanupDeadline);
+        const cleanupErrors = [
+          targetCleanupError,
+          ...cleanupTracker.errors.map((issue) => issue.error),
+        ].filter((cleanupError) => cleanupError !== undefined);
+        const repairRequired = archiveRepairRequiredForCleanup(
+          cleanupErrors.length > 0,
+          setupError,
+        );
+        if (repairRequired) throw repairRequired;
+        if (cleanupErrors.length > 0) {
+          throw new AggregateError(
+            [setupError, ...cleanupErrors],
+            "Active ChatGPT export setup and target cleanup failed.",
+          );
+        }
+        throw setupError;
+      }
       let opened: ChatGptTabConnection;
       try {
         opened = await runBeforeDeadline(
@@ -2179,19 +2548,26 @@ export async function captureApprovedChatGptConversationBackend(
           deadline,
           "Timed out attaching to the active ChatGPT export target.",
           (lateConnection) => lateConnection.client.close(),
+          cleanupTracker,
+          "target",
         );
       } catch (openError) {
+        let closeError: unknown;
         try {
-          await closeOpenedChatGptTarget(
-            host,
-            port,
-            targetId,
-            Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS,
-            browserWSEndpoint,
-          );
-        } catch (closeError) {
+          await closeOpenedChatGptTarget(host, port, targetId, cleanupDeadline, browserWSEndpoint);
+        } catch (error) {
+          closeError = error;
+        }
+        await waitForExportCleanup(cleanupTracker, cleanupDeadline);
+        const cleanupErrors = [
+          closeError,
+          ...cleanupTracker.errors.map((issue) => issue.error),
+        ].filter((cleanupError) => cleanupError !== undefined);
+        const repairRequired = archiveRepairRequiredForCleanup(cleanupErrors.length > 0, openError);
+        if (repairRequired) throw repairRequired;
+        if (cleanupErrors.length > 0) {
           throw new AggregateError(
-            [openError, closeError],
+            [openError, ...cleanupErrors],
             "Active ChatGPT export setup and target cleanup failed.",
           );
         }
@@ -2227,14 +2603,22 @@ export async function captureApprovedChatGptConversationBackend(
           recovery: { attempted: false, recovered: false, status: "not-needed" },
         };
       } catch (openError) {
+        let closeError: unknown;
         try {
-          await disposeChatGptExportConnection(
-            opened.client,
-            Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS,
-          );
-        } catch (closeError) {
+          await disposeChatGptExportConnection(opened.client, cleanupDeadline);
+        } catch (error) {
+          closeError = error;
+        }
+        await waitForExportCleanup(cleanupTracker, cleanupDeadline);
+        const cleanupErrors = [
+          closeError,
+          ...cleanupTracker.errors.map((issue) => issue.error),
+        ].filter((cleanupError) => cleanupError !== undefined);
+        const repairRequired = archiveRepairRequiredForCleanup(cleanupErrors.length > 0, openError);
+        if (repairRequired) throw repairRequired;
+        if (cleanupErrors.length > 0) {
           throw new AggregateError(
-            [openError, closeError],
+            [openError, ...cleanupErrors],
             "Active ChatGPT export navigation and target cleanup failed.",
           );
         }
@@ -2267,13 +2651,14 @@ export async function captureApprovedChatGptConversationBackend(
       throw new Error(`${reason} No archive-state changes were attempted.`, { cause: error });
     }
   }
-  const { client, targetId, tabUrl, tabTitle, recovery } = resolved;
-  const { Page, Runtime } = client;
-  let completedResult: ChatGptConversationExportResult | undefined;
   let operationError: unknown;
   let pinnedAccountDigest: string | undefined;
   let captureScriptIdentifier: string | undefined;
   let rawCapturePending = false;
+  let postExportArchiveAttempted = false;
+  const { client, targetId, tabUrl, tabTitle, recovery } = resolved;
+  const { Page, Runtime } = client;
+  let completedResult: ChatGptConversationExportResult | undefined;
   try {
     pinnedAccountDigest = await assertChatGptExportAccountAffinity(
       Runtime,
@@ -2292,7 +2677,9 @@ export async function captureApprovedChatGptConversationBackend(
           identifier: lateRegistration.identifier,
         }),
       deadline,
+      cleanupDeadline,
       "Timed out registering the ChatGPT export capture hook.",
+      cleanupTracker,
     );
     captureScriptIdentifier = registration.identifier;
     rawCapturePending = true;
@@ -2362,7 +2749,6 @@ export async function captureApprovedChatGptConversationBackend(
           url_before_reload: tabUrl,
           title_before_reload: tabTitle,
         },
-        hit,
         non_claims: [
           "No cookie values, localStorage, profile stores, or unrelated history were read.",
           "The hook captured only the exact target backend conversation URL during page load.",
@@ -2383,18 +2769,20 @@ export async function captureApprovedChatGptConversationBackend(
         deadline,
       );
       postExportArchive = await runBeforeDeadline(
-        () =>
-          archiveChatGptConversation(Runtime, () => {}, {
+        () => {
+          postExportArchiveAttempted = true;
+          return archiveChatGptConversation(Runtime, () => {}, {
             mode: "always",
             conversationUrl: options.targetUrl,
             expectedAccountDigest,
             remainingMs: remainingMs(deadline),
-          }),
+          });
+        },
         deadline,
         "Timed out archiving the exported ChatGPT conversation.",
       );
       if (!postExportArchive.archived) {
-        throw new Error(`Post-export archive failed: ${JSON.stringify(postExportArchive)}`);
+        throw new Error("Post-export ChatGPT archive could not be confirmed.");
       }
     }
     completedResult = {
@@ -2405,9 +2793,8 @@ export async function captureApprovedChatGptConversationBackend(
   } catch (error) {
     operationError = error;
   }
-  const cleanupDeadline = Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS;
-  const cleanupErrors: unknown[] = [];
-  const cleanupWarnings: string[] = [];
+  const captureCleanupErrors: Error[] = [];
+  const targetCleanupErrors: Error[] = [];
   if (captureScriptIdentifier) {
     try {
       await runCleanupBeforeDeadline(
@@ -2416,9 +2803,8 @@ export async function captureApprovedChatGptConversationBackend(
         "Timed out removing the ChatGPT export capture hook during cleanup.",
       );
       captureScriptIdentifier = undefined;
-    } catch (error) {
-      cleanupErrors.push(error);
-      cleanupWarnings.push("ChatGPT export capture-hook cleanup could not be confirmed.");
+    } catch {
+      captureCleanupErrors.push(sanitizedExportCleanupError("capture"));
     }
   }
   if (rawCapturePending) {
@@ -2433,21 +2819,46 @@ export async function captureApprovedChatGptConversationBackend(
         targetApiUrl,
       );
       rawCapturePending = false;
-    } catch (error) {
-      cleanupErrors.push(error);
-      cleanupWarnings.push("ChatGPT export in-page capture cleanup could not be confirmed.");
+    } catch {
+      captureCleanupErrors.push(sanitizedExportCleanupError("capture"));
     }
   }
   try {
     await disposeChatGptExportConnection(client, cleanupDeadline);
-  } catch (error) {
-    cleanupErrors.push(error);
+  } catch {
+    targetCleanupErrors.push(sanitizedExportCleanupError("target"));
+  }
+  await waitForExportCleanup(cleanupTracker, cleanupDeadline);
+  for (const issue of cleanupTracker.errors) {
+    (issue.kind === "capture" ? captureCleanupErrors : targetCleanupErrors).push(
+      sanitizedExportCleanupError(issue.kind),
+    );
+  }
+  const cleanupWarnings: string[] = [];
+  if (targetCleanupErrors.length > 0) {
     cleanupWarnings.push("ChatGPT export target cleanup could not be confirmed.");
   }
-  const errors = operationError ? [operationError, ...cleanupErrors] : cleanupErrors;
-  if (operationError || !completedResult) {
+  const errors = [
+    ...(operationError ? [operationError] : []),
+    ...captureCleanupErrors,
+    ...targetCleanupErrors,
+  ];
+  if (operationError && postExportArchiveAttempted && process.env.ORACLE_ARCHIVE_REQUEST === "1") {
+    throw new OracleArchiveRepairRequiredError(undefined, { cause: operationError });
+  }
+  const repairRequired = archiveRepairRequiredForCleanup(
+    captureCleanupErrors.length + targetCleanupErrors.length > 0,
+    operationError,
+  );
+  if (repairRequired) throw repairRequired;
+  if (operationError || !completedResult || captureCleanupErrors.length > 0) {
     if (errors.length > 1) {
-      throw new AggregateError(errors, "ChatGPT export and target cleanup failed.");
+      throw new AggregateError(
+        errors,
+        captureCleanupErrors.length > 0
+          ? "ChatGPT export and capture cleanup failed."
+          : "ChatGPT export and target cleanup failed.",
+      );
     }
     if (errors.length === 1) throw errors[0];
   }
@@ -2465,12 +2876,21 @@ export async function captureApprovedChatGptConversationBackendViaObu(
   const timeoutMs = options.timeoutMs ?? DEFAULT_EXPORT_TIMEOUT_MS;
   assertValidExportTimeout(timeoutMs);
   const deadline = Date.now() + timeoutMs;
-  const chunkSize = options.chunkSize ?? 250_000;
-  assertValidExportChunkSize(chunkSize);
+  const cleanupDeadline = deadline + EXPORT_CLEANUP_ALLOWANCE_MS;
+  // Keep the late registration process alive for one extra bounded allowance so a hook
+  // that completes after the shared cleanup wait can still be removed.
+  const lateRegistrationDeadline = cleanupDeadline + EXPORT_CLEANUP_ALLOWANCE_MS;
+  const cleanupTracker: ExportCleanupTracker = {
+    pending: new Set(),
+    errors: [],
+    pendingKinds: new Map(),
+  };
   const conversationId = conversationIdFromChatGptUrl(options.targetUrl);
   const targetApiUrl = buildBackendConversationUrl(conversationId);
   const sessionId = options.sessionId ?? "obu-mcp";
   const outDir = path.resolve(options.outDir);
+  const chunkSize = options.chunkSize ?? 250_000;
+  assertValidExportChunkSize(chunkSize);
   const evaluate: EvaluateExpression = <T>(expression: string, timeoutLabel?: string) =>
     evaluateObuByValue<T>(sessionId, options.tabId, expression, deadline, timeoutLabel);
   const currentUrl = await evaluate<string>("location.href", "current URL check");
@@ -2494,7 +2914,7 @@ export async function captureApprovedChatGptConversationBackendViaObu(
           options.tabId,
           "Page.addScriptToEvaluateOnNewDocument",
           { source: buildScopedBackendCaptureHook(targetApiUrl) },
-          deadline,
+          lateRegistrationDeadline,
           false,
           false,
         ),
@@ -2504,17 +2924,23 @@ export async function captureApprovedChatGptConversationBackendViaObu(
         if (!lateIdentifier) {
           throw new Error("OBU capture hook registration did not return an identifier.");
         }
+        const lateCleanupDeadline = Math.max(
+          cleanupDeadline,
+          Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS,
+        );
         await runObuCdp(
           sessionId,
           options.tabId,
           "Page.removeScriptToEvaluateOnNewDocument",
           { identifier: lateIdentifier },
-          Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS,
+          lateCleanupDeadline,
           true,
         );
       },
       deadline,
+      cleanupDeadline,
       "Timed out registering the OBU ChatGPT export capture hook.",
+      cleanupTracker,
     );
     captureScriptIdentifier =
       typeof registration.identifier === "string" ? registration.identifier : undefined;
@@ -2596,7 +3022,6 @@ export async function captureApprovedChatGptConversationBackendViaObu(
     operationError = error;
   }
 
-  const cleanupDeadline = Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS;
   const cleanupErrors: unknown[] = [];
   if (captureScriptIdentifier) {
     try {
@@ -2632,9 +3057,18 @@ export async function captureApprovedChatGptConversationBackendViaObu(
       cleanupErrors.push(error);
     }
   }
+  await waitForExportCleanup(cleanupTracker, cleanupDeadline);
+  cleanupErrors.push(...cleanupTracker.errors.map((issue) => issue.error));
   const errors = operationError ? [operationError, ...cleanupErrors] : cleanupErrors;
+  const repairRequired = archiveRepairRequiredForCleanup(cleanupErrors.length > 0, operationError);
+  if (repairRequired) throw repairRequired;
   if (errors.length > 1) {
-    throw new AggregateError(errors, "OBU ChatGPT export and capture cleanup failed.");
+    throw new AggregateError(
+      errors,
+      operationError instanceof Error && /registering.*capture hook/i.test(operationError.message)
+        ? "OBU ChatGPT export capture hook registration and cleanup failed."
+        : "OBU ChatGPT export and capture cleanup failed.",
+    );
   }
   if (errors.length === 1) throw errors[0];
   if (!completedResult) throw new Error("OBU ChatGPT export did not produce a result.");

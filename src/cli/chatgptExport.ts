@@ -11,7 +11,10 @@ import {
 } from "../browser/chatgptExport.js";
 import { DEFAULT_REMOTE_CHROME_HOST, DEFAULT_REMOTE_CHROME_PORT } from "../browser/liveTabs.js";
 import { normalizeChatGptAccountDigest } from "../browser/chatgptAccount.js";
-import { sessionStore, type SessionMetadata } from "../sessionStore.js";
+import { sessionStore } from "../sessionStore.js";
+import { validateSessionIdSelector } from "../sessionManager.js";
+import type { SessionMetadata } from "../sessionManager.js";
+import { OracleArchiveRepairRequiredError } from "./archiveRepair.js";
 import { bindRemoteChromeBrowserWebSocketEndpoint } from "../browser/profileState.js";
 import {
   CHATGPT_ACCOUNT_BOUND_WRAPPER_ENV,
@@ -215,14 +218,14 @@ export function resolveChatGptExportRemoteChrome(
   return affinities.values().next().value as ChatGptExportRemoteChromeTarget;
 }
 
-/** Resolves one known Oracle session to its recorded browser affinity. */
 export function resolveChatGptExportRemoteChromeForSession(
   targetUrl: string,
-  _sessionId: string,
+  sessionId: string,
   metadata: SessionMetadata | null,
 ): ChatGptExportRemoteChromeTarget {
+  validateSessionIdSelector(sessionId);
   const conversationId = conversationIdFromChatGptUrl(targetUrl);
-  if (!metadata) {
+  if (!metadata || metadata.id !== sessionId) {
     throw new Error("The requested stored Oracle session was not found.");
   }
   if (!sessionMatchesConversation(metadata, conversationId)) {
@@ -302,9 +305,23 @@ export function resolveChatGptExportTimeoutMs(
   }
   return parseDuration(normalized, Number.NaN);
 }
+export function assertChatGptExportCleanupForArchiveRequest(
+  result: { cleanupWarnings?: string[] },
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  if (result.cleanupWarnings?.length && env.ORACLE_ARCHIVE_REQUEST === "1") {
+    throw new OracleArchiveRepairRequiredError(
+      "ChatGPT export cleanup could not be confirmed; archive repair is required.",
+      { cause: new Error(result.cleanupWarnings.join(" ")) },
+    );
+  }
+}
 
 export async function handleChatGptExportCommand(options: ChatGptExportCliOptions): Promise<void> {
-  options.sessionId = normalizeExportSelector(options.sessionId, "--session-id");
+  options.sessionId =
+    options.sessionId === undefined
+      ? undefined
+      : validateSessionIdSelector(normalizeExportSelector(options.sessionId, "--session-id")!);
   options.obuSessionId = normalizeExportSelector(options.obuSessionId, "--obu-session-id");
   options.obuTabId = normalizeExportSelector(options.obuTabId, "--obu-tab-id");
   const targetUrl = options.targetUrl?.trim();
@@ -375,9 +392,14 @@ export async function handleChatGptExportCommand(options: ChatGptExportCliOption
           ? resolveChatGptExportRemoteChromeForSession(
               targetUrl,
               options.sessionId,
-              await sessionStore.readSession(options.sessionId),
+              await (sessionStore.readSessionMetadataForArchiveAffinity?.(options.sessionId) ??
+                sessionStore.readSession(options.sessionId)),
             )
-          : resolveChatGptExportRemoteChrome(targetUrl, await sessionStore.listSessions());
+          : resolveChatGptExportRemoteChrome(
+              targetUrl,
+              await (sessionStore.listSessionsMetadataForArchiveAffinity?.() ??
+                sessionStore.listSessions()),
+            );
   const { host, port } = remoteChromeAffinity;
   const boundRemoteChromeAffinity =
     "browserId" in remoteChromeAffinity
@@ -409,7 +431,7 @@ export async function handleChatGptExportCommand(options: ChatGptExportCliOption
         knownArchived: accountBoundWrapper ? options.knownArchived : undefined,
         archiveAfterExport: accountBoundWrapper ? options.archiveAfterExport : undefined,
       });
-
+  assertChatGptExportCleanupForArchiveRequest(result);
   if (options.json) {
     console.log(JSON.stringify(result, null, 2));
     return;

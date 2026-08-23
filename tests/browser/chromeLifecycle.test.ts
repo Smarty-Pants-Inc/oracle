@@ -171,6 +171,49 @@ describe("registerTerminationHooks", () => {
     expect(chrome.kill).toHaveBeenCalledTimes(1);
     expect(cleanupMock).toHaveBeenCalledWith(userDataDir, logger, { lockRemovalMode: "never" });
   });
+  test("bounds a stalled runtime hint before completing signal shutdown", async () => {
+    const { registerTerminationHooks } = await import("../../src/browser/chromeLifecycle.js");
+    vi.useFakeTimers();
+    const previousExitCode = process.exitCode;
+    process.exitCode = undefined;
+    const chrome = {
+      kill: vi.fn().mockResolvedValue(undefined),
+      pid: 1234,
+      port: 9222,
+    };
+    const emitRuntimeHint = vi.fn(() => new Promise<void>(() => undefined));
+    const removeHooks = registerTerminationHooks(
+      chrome as unknown as LaunchedChrome,
+      "/tmp/oracle-stalled-runtime-hint-profile",
+      true,
+      vi.fn<(message: string) => void>(),
+      {
+        isInFlight: () => true,
+        emitRuntimeHint,
+      },
+    );
+
+    try {
+      process.emit("SIGTERM");
+      process.emit("SIGINT");
+      expect(emitRuntimeHint).toHaveBeenCalledTimes(1);
+      expect(process.exitCode).toBeUndefined();
+
+      await vi.advanceTimersByTimeAsync(249);
+      expect(process.exitCode).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(process.exitCode).toBe(1);
+
+      process.emit("SIGQUIT");
+      await vi.advanceTimersByTimeAsync(250);
+      expect(emitRuntimeHint).toHaveBeenCalledTimes(1);
+      expect(process.exitCode).toBe(1);
+    } finally {
+      removeHooks();
+      process.exitCode = previousExitCode;
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("copied-profile launch flags", () => {

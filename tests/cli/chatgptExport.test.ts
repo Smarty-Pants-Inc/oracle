@@ -1,12 +1,14 @@
 import { describe, expect, test } from "vitest";
 import type { SessionMetadata } from "../../src/sessionStore.js";
 import {
+  assertChatGptExportCleanupForArchiveRequest,
   handleChatGptExportCommand,
   parseRemoteChromeTarget,
   resolveChatGptExportRemoteChrome,
   resolveChatGptExportRemoteChromeForSession,
   resolveChatGptExportTimeoutMs,
 } from "../../src/cli/chatgptExport.js";
+import { OracleArchiveRepairRequiredError } from "../../src/cli/archiveRepair.js";
 
 function session(
   id: string,
@@ -29,6 +31,15 @@ describe("ChatGPT export timeout", () => {
     ["automatic timeout", "auto", undefined],
   ])("normalizes %s consistently", (_label, value, expected) => {
     expect(resolveChatGptExportTimeoutMs(value)).toBe(expected);
+  });
+});
+describe("ChatGPT export archive cleanup contract", () => {
+  test("uses exit-code error only for private archive requests", () => {
+    const result = { cleanupWarnings: ["cleanup unconfirmed"] };
+    expect(() =>
+      assertChatGptExportCleanupForArchiveRequest(result, { ORACLE_ARCHIVE_REQUEST: "1" }),
+    ).toThrow(OracleArchiveRepairRequiredError);
+    expect(() => assertChatGptExportCleanupForArchiveRequest(result, {})).not.toThrow();
   });
 });
 
@@ -186,7 +197,7 @@ describe("ChatGPT export endpoint affinity", () => {
     expect(
       resolveChatGptExportRemoteChromeForSession(
         "https://chatgpt.com/c/thread-legacy-options",
-        "legacy-directory-key",
+        "legacy",
         legacy,
       ),
     ).toEqual({
@@ -247,6 +258,15 @@ describe("ChatGPT export endpoint affinity", () => {
         session("other", { harvest: { conversationId: "different-thread" } }),
       ),
     ).toThrow(/requested stored Oracle session does not match the ChatGPT conversation/i);
+  });
+  test("rejects named affinity metadata with a mismatched stored session ID", () => {
+    expect(() =>
+      resolveChatGptExportRemoteChromeForSession(
+        "https://chatgpt.com/c/thread-exact",
+        "selected-session",
+        session("other-session", { harvest: { conversationId: "thread-exact" } }),
+      ),
+    ).toThrow(/requested stored Oracle session was not found/i);
   });
   test("fails closed with a supported recovery hint when no session matches", () => {
     const resolve = () =>

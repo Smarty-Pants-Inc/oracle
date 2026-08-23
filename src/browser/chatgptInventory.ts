@@ -1,4 +1,5 @@
 import type { ChromeClient } from "./types.js";
+import { archiveRepairRequiredForCleanup } from "../cli/archiveRepair.js";
 import {
   closeTab,
   connectToRemoteChromeTarget,
@@ -23,11 +24,53 @@ const INVENTORY_RETRY_DELAYS_MS = [15_000, 45_000, 120_000, 240_000] as const;
 const INVENTORY_DEFAULT_TIMEOUT_MS =
   30_000 + INVENTORY_RETRY_DELAYS_MS.reduce((total, delay) => total + delay, 0);
 const INVENTORY_CLEANUP_STEP_TIMEOUT_MS = 2_000;
+
+interface InventoryLateCleanupTracker {
+  pending: Set<Promise<void>>;
+  errors: unknown[];
+}
+
+function trackLateInventoryOperation<T>(
+  tracker: InventoryLateCleanupTracker,
+  operation: Promise<T>,
+  disposeLateResult: (result: T) => Promise<void> | void,
+  timedOut: () => boolean,
+  action: string,
+): void {
+  let pending: Promise<void>;
+  pending = operation
+    .then((result) => (timedOut() ? Promise.resolve(disposeLateResult(result)) : undefined))
+    .catch((error) => {
+      if (timedOut()) {
+        tracker.errors.push(new Error(`${action} could not be confirmed.`, { cause: error }));
+      }
+    })
+    .then(() => undefined)
+    .finally(() => tracker.pending.delete(pending));
+  tracker.pending.add(pending);
+}
+
+async function waitForLateInventoryCleanup(
+  tracker: InventoryLateCleanupTracker,
+  deadline: number,
+): Promise<void> {
+  if (tracker.pending.size === 0) return;
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) {
+    tracker.errors.push(new Error("Late ChatGPT inventory cleanup could not be confirmed."));
+    return;
+  }
+  await Promise.race([Promise.allSettled(tracker.pending), delay(remaining)]);
+  if (tracker.pending.size > 0) {
+    tracker.errors.push(new Error("Late ChatGPT inventory cleanup could not be confirmed."));
+  }
+}
+
 async function runBeforeInventoryDeadline<T>(
   operation: () => Promise<T>,
   deadline: number,
   action: string,
-  disposeLateResult?: (result: T) => Promise<void> | void,
+  lateCleanup?: { tracker: InventoryLateCleanupTracker; dispose: (result: T) => Promise<void> },
 ): Promise<T> {
   const remaining = deadline - Date.now();
   const timeoutMessage = `Timed out while ${action}.`;
@@ -35,13 +78,14 @@ async function runBeforeInventoryDeadline<T>(
   let timedOut = false;
   let timer: NodeJS.Timeout | undefined;
   const operationResult = Promise.resolve().then(operation);
-  if (disposeLateResult) {
-    void operationResult
-      .then((result) => {
-        if (!timedOut) return;
-        return Promise.resolve(disposeLateResult(result)).catch(() => undefined);
-      })
-      .catch(() => undefined);
+  if (lateCleanup) {
+    trackLateInventoryOperation(
+      lateCleanup.tracker,
+      operationResult,
+      lateCleanup.dispose,
+      () => timedOut,
+      action,
+    );
   }
   try {
     return await Promise.race([
@@ -58,21 +102,33 @@ async function runBeforeInventoryDeadline<T>(
     clearTimeout(timer);
   }
 }
+
 function remainingInventoryOperationMs(deadline: number): number {
   return Math.max(0, deadline - Date.now());
 }
 
-async function runInventoryCleanup<T>(operation: () => Promise<T>, action: string): Promise<T> {
+function inventoryCleanupStepDeadline(deadline: number): number {
+  return Math.min(deadline, Date.now() + INVENTORY_CLEANUP_STEP_TIMEOUT_MS);
+}
+
+async function runInventoryCleanup<T>(
+  operation: () => Promise<T>,
+  deadline: number,
+  action: string,
+): Promise<T> {
   return await runBeforeInventoryDeadline(
     operation,
-    Date.now() + INVENTORY_CLEANUP_STEP_TIMEOUT_MS,
+    inventoryCleanupStepDeadline(deadline),
     action,
   );
 }
+
 async function registerInventoryCaptureHookBeforeDeadline<T>(
   register: () => Promise<T>,
   remove: (registration: T) => Promise<void>,
   deadline: number,
+  cleanupDeadline: number,
+  lateCleanup: InventoryLateCleanupTracker,
 ): Promise<T> {
   const timeoutMessage = "Timed out while registering ChatGPT inventory authorization capture.";
   const remaining = deadline - Date.now();
@@ -80,6 +136,18 @@ async function registerInventoryCaptureHookBeforeDeadline<T>(
   let timedOut = false;
   let timer: NodeJS.Timeout | undefined;
   const registration = Promise.resolve().then(register);
+  trackLateInventoryOperation(
+    lateCleanup,
+    registration,
+    (lateRegistration) =>
+      runInventoryCleanup(
+        () => remove(lateRegistration),
+        cleanupDeadline,
+        "removing a very late ChatGPT inventory authorization capture",
+      ),
+    () => timedOut,
+    "Late ChatGPT inventory authorization capture cleanup",
+  );
   try {
     return await Promise.race([
       registration,
@@ -91,58 +159,38 @@ async function registerInventoryCaptureHookBeforeDeadline<T>(
         timer.unref?.();
       }),
     ]);
-  } catch (error) {
-    if (!timedOut) throw error;
-    const cleanupDeadline = Date.now() + INVENTORY_CLEANUP_STEP_TIMEOUT_MS;
-    try {
-      const lateRegistration = await runBeforeInventoryDeadline(
-        () => registration,
-        cleanupDeadline,
-        "waiting for a late ChatGPT inventory authorization capture registration",
-        (lateResult) =>
-          runInventoryCleanup(
-            () => remove(lateResult),
-            "removing a very late ChatGPT inventory authorization capture",
-          ),
-      );
-      await runBeforeInventoryDeadline(
-        () => remove(lateRegistration),
-        cleanupDeadline,
-        "removing a late ChatGPT inventory authorization capture",
-      );
-    } catch (cleanupError) {
-      throw new AggregateError(
-        [error, cleanupError],
-        "ChatGPT inventory authorization capture registration and cleanup failed.",
-      );
-    }
-    throw error;
   } finally {
     clearTimeout(timer);
   }
 }
-
 async function disposeLateInventoryTarget(
   connection: RemoteChromeConnection,
   host: string,
   port: number,
+  deadline: number,
 ): Promise<void> {
+  const lateCleanupDeadline = Math.max(deadline, Date.now() + INVENTORY_CLEANUP_STEP_TIMEOUT_MS);
   let targetCloseConfirmed = false;
   try {
     await runInventoryCleanup(
       () => connection.close(),
+      lateCleanupDeadline,
       "closing a late ChatGPT inventory connection",
     );
     targetCloseConfirmed = true;
   } catch {
-    // Fall back to the direct target close below.
+    // Fall back to the direct target close within the same finite grace window.
   }
-  if (!targetCloseConfirmed && connection.targetId) {
-    await runInventoryCleanup(
-      () => closeTab(port, connection.targetId!, () => {}, host),
-      "closing a late disposable ChatGPT inventory target",
-    ).catch(() => undefined);
+  if (targetCloseConfirmed) return;
+  if (!connection.targetId) {
+    throw new Error("Late ChatGPT inventory target cleanup was not confirmed.");
   }
+  const closed = await runInventoryCleanup(
+    () => closeTab(port, connection.targetId!, () => {}, host),
+    lateCleanupDeadline,
+    "closing a late disposable ChatGPT inventory target",
+  );
+  if (!closed) throw new Error("Late ChatGPT inventory target cleanup was not confirmed.");
 }
 
 export interface ChatGptInventoryOptions {
@@ -262,13 +310,14 @@ export function parseChatGptConversationListPage(
   const total = parseNonNegativeInteger(page.total, "total");
   const limit = parseNonNegativeInteger(page.limit, "limit");
   const offset = parseNonNegativeInteger(page.offset, "offset");
-  if (page.items.length > limit) {
+  if (page.items.length > limit)
     throw new Error("Unexpected ChatGPT conversation list schema: items exceed limit.");
-  }
   const items = page.items.map((value, index): ChatGptInventoryItem => {
     const item = asRecord(value);
-    const conversationId = item?.id ?? item?.conversation_id;
-    if (!item || typeof conversationId !== "string" || !conversationId.trim()) {
+    if (!item)
+      throw new Error(`Unexpected ChatGPT conversation list schema: item ${index} is invalid.`);
+    const conversationId = item.id ?? item.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId.trim()) {
       throw new Error(
         `Unexpected ChatGPT conversation list schema: item ${index} has no conversation id.`,
       );
@@ -305,28 +354,79 @@ export async function paginateChatGptConversationList(
       );
     }
     const nextOffset = offset + page.items.length;
-    if (page.total < nextOffset) {
+    if (page.total < nextOffset)
       throw new Error(
         "Unexpected ChatGPT conversation list pagination: total precedes returned items.",
       );
-    }
-    if (page.items.length === 0 && nextOffset < page.total) {
+    if (page.items.length === 0 && nextOffset < page.total)
       throw new Error("Unexpected ChatGPT conversation list pagination: empty page before total.");
-    }
     items.push(...page.items);
     if (nextOffset >= page.total) return items;
     offset = nextOffset;
   }
 }
 
-export function buildChatGptInventoryAuthCaptureHook(expiresAt = Number.POSITIVE_INFINITY): string {
-  const expiresAtLiteral = Number.isFinite(expiresAt)
-    ? String(Math.max(0, Math.floor(expiresAt)))
+export function buildChatGptInventoryAuthCaptureHook(
+  remainingMs = Number.POSITIVE_INFINITY,
+): string {
+  const budgetLiteral = Number.isFinite(remainingMs)
+    ? String(Math.max(0, Math.floor(remainingMs)))
     : "Infinity";
   return `
 (() => {
   const KEY = "__oracleChatGptInventory";
-  const EXPIRES_AT = ${expiresAtLiteral};
+  const EXPIRY_KEY = "__oracleChatGptInventoryExpiryAt";
+  const START_KEY = "__oracleChatGptInventoryStartedAt";
+  const BUDGET_MS = ${budgetLiteral};
+  const pageNow = Date.now();
+  const storage = typeof sessionStorage === "object" ? sessionStorage : null;
+  let storageReliable = Number.isFinite(BUDGET_MS) && storage !== null;
+  const readStored = (key) => {
+    if (!storage) return null;
+    try {
+      return storage.getItem(key);
+    } catch {
+      storageReliable = false;
+      return null;
+    }
+  };
+  const writeStored = (key, value) => {
+    if (!storage) return;
+    try {
+      storage.setItem(key, value);
+      if (storage.getItem(key) !== value) storageReliable = false;
+    } catch {
+      storageReliable = false;
+    }
+  };
+  const storedStart = readStored(START_KEY);
+  const storedExpiry = readStored(EXPIRY_KEY);
+  let startedAt = pageNow;
+  let expiresAt = Number.isFinite(BUDGET_MS) ? startedAt + BUDGET_MS : Infinity;
+  if (Number.isFinite(BUDGET_MS) && (storedStart !== null || storedExpiry !== null)) {
+    const persistedStart = Number(storedStart);
+    const persistedExpiry = Number(storedExpiry);
+    if (
+      storedStart === null ||
+      storedExpiry === null ||
+      !Number.isFinite(persistedStart) ||
+      !Number.isFinite(persistedExpiry) ||
+      persistedExpiry !== persistedStart + BUDGET_MS ||
+      persistedStart > pageNow ||
+      pageNow > persistedExpiry
+    ) {
+      try { window[KEY]?.cleanup?.(); } catch {}
+      return;
+    }
+    startedAt = persistedStart;
+    expiresAt = persistedExpiry;
+  }
+  if (Number.isFinite(BUDGET_MS)) {
+    writeStored(START_KEY, String(startedAt));
+    writeStored(EXPIRY_KEY, String(expiresAt));
+    if (!storageReliable) return;
+  }
+  const EXPIRES_AT = expiresAt;
   if (Number.isFinite(EXPIRES_AT) && Date.now() >= EXPIRES_AT) {
     try { window[KEY]?.cleanup?.(); } catch {}
     return;
@@ -781,11 +881,16 @@ export async function captureChatGptConversationInventory(
     throw new Error("ChatGPT inventory browser id does not match its WebSocket.");
   }
   const timeoutMs = options.timeoutMs ?? INVENTORY_DEFAULT_TIMEOUT_MS;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("ChatGPT inventory timeout must be finite and positive.");
+  }
   const pageSize = options.pageSize ?? 100;
   if (!Number.isInteger(pageSize) || pageSize <= 0) {
     throw new Error("ChatGPT inventory page size must be a positive integer.");
   }
   const deadline = Date.now() + timeoutMs;
+  const cleanupDeadline = deadline + INVENTORY_CLEANUP_STEP_TIMEOUT_MS * 4;
+  const lateCleanup: InventoryLateCleanupTracker = { pending: new Set(), errors: [] };
   let connection: RemoteChromeConnection | undefined;
   let cleanupRequired = false;
   let captureScriptIdentifier: string | undefined;
@@ -793,11 +898,7 @@ export async function captureChatGptConversationInventory(
   let operationError: unknown;
   try {
     const liveIdentity = await runBeforeInventoryDeadline(
-      () =>
-        resolveRemoteChromeBrowserIdentity({
-          host: options.host,
-          port: options.port,
-        }),
+      () => resolveRemoteChromeBrowserIdentity({ host: options.host, port: options.port }),
       deadline,
       "resolving the remote Chrome browser identity for ChatGPT inventory",
     );
@@ -814,10 +915,16 @@ export async function captureChatGptConversationInventory(
         }),
       deadline,
       "opening the disposable ChatGPT inventory target",
-      (lateConnection) => disposeLateInventoryTarget(lateConnection, options.host, options.port),
+      {
+        tracker: lateCleanup,
+        dispose: (lateConnection) =>
+          disposeLateInventoryTarget(lateConnection, options.host, options.port, cleanupDeadline),
+      },
     );
     const { Page, Runtime } = connection.client;
-    const authCaptureHook = buildChatGptInventoryAuthCaptureHook(deadline);
+    const authCaptureHook = buildChatGptInventoryAuthCaptureHook(
+      remainingInventoryOperationMs(deadline),
+    );
     await runBeforeInventoryDeadline(
       () => Page.enable(),
       deadline,
@@ -844,6 +951,8 @@ export async function captureChatGptConversationInventory(
         return Page.removeScriptToEvaluateOnNewDocument({ identifier });
       },
       deadline,
+      cleanupDeadline,
+      lateCleanup,
     );
     captureScriptIdentifier = registration.identifier?.trim();
     if (!captureScriptIdentifier) {
@@ -915,6 +1024,7 @@ export async function captureChatGptConversationInventory(
               awaitPromise: false,
               returnByValue: true,
             }),
+          cleanupDeadline,
           "cleaning up ChatGPT inventory authorization capture",
         );
         if (cleanup.exceptionDetails || cleanup.result?.value !== true) {
@@ -924,42 +1034,51 @@ export async function captureChatGptConversationInventory(
         cleanupErrors.push(error);
       }
     }
-    if (captureScriptIdentifier) {
+    const cleanupScriptIdentifier = captureScriptIdentifier;
+    if (cleanupScriptIdentifier) {
       try {
         await runInventoryCleanup(
-          () => Page.removeScriptToEvaluateOnNewDocument({ identifier: captureScriptIdentifier }),
+          () => Page.removeScriptToEvaluateOnNewDocument({ identifier: cleanupScriptIdentifier }),
+          cleanupDeadline,
           "removing ChatGPT inventory authorization capture",
         );
+        captureScriptIdentifier = undefined;
       } catch (error) {
         cleanupErrors.push(error);
       }
     }
     let targetCloseConfirmed = false;
+    let targetCloseError: unknown;
     try {
       await runInventoryCleanup(
-        () => connection.close(),
+        () => connection!.close(),
+        cleanupDeadline,
         "closing the ChatGPT inventory connection",
       );
       targetCloseConfirmed = true;
     } catch (error) {
-      cleanupErrors.push(error);
+      targetCloseError = error;
     }
     if (!targetCloseConfirmed) {
       try {
         const closed = connection.targetId
           ? await runInventoryCleanup(
-              () => closeTab(options.port, connection.targetId!, () => {}, options.host),
+              () => closeTab(options.port, connection!.targetId!, () => {}, options.host),
+              cleanupDeadline,
               "closing the disposable ChatGPT inventory target",
             )
           : false;
-        if (!closed) {
-          throw new Error("ChatGPT inventory target cleanup was not confirmed.");
-        }
-      } catch (error) {
-        cleanupErrors.push(error);
+        if (!closed) throw new Error("ChatGPT inventory target cleanup was not confirmed.");
+      } catch (fallbackError) {
+        cleanupErrors.push(
+          targetCloseError ?? new Error("ChatGPT inventory connection cleanup was not confirmed."),
+          fallbackError,
+        );
       }
     }
   }
+  await waitForLateInventoryCleanup(lateCleanup, cleanupDeadline);
+  cleanupErrors.push(...lateCleanup.errors);
   const closeError =
     cleanupErrors.length > 1
       ? new AggregateError(
@@ -967,6 +1086,8 @@ export async function captureChatGptConversationInventory(
           "ChatGPT inventory connection and disposable-target cleanup both failed.",
         )
       : cleanupErrors[0];
+  const repairRequired = archiveRepairRequiredForCleanup(cleanupErrors.length > 0, operationError);
+  if (repairRequired) throw repairRequired;
   if (operationError && closeError) {
     throw new AggregateError(
       [operationError, closeError],
