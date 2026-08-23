@@ -603,14 +603,23 @@ async function readVerifiedSessionMetadataFile(
 ): Promise<string | null> {
   const directoryPath = sessionDir(sessionId);
   const metadataPath = path.join(directoryPath, filename);
-  if (requirePrivate) {
+  if (!requirePrivate) {
     try {
-      await verifyArchiveStorageRoots();
-      await verifyArchiveDirectory(directoryPath, "Oracle session directory");
+      return await fs.readFile(metadataPath, "utf8");
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+        return null;
+      }
       throw error;
     }
+  }
+  try {
+    await verifyArchiveStorageRoots();
+    await verifyArchiveDirectory(directoryPath, "Oracle session directory");
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT")
+      return null;
+    throw error;
   }
   const directoryFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
   const fileFlags = constants.O_RDONLY | constants.O_NOFOLLOW;
@@ -618,7 +627,8 @@ async function readVerifiedSessionMetadataFile(
   try {
     directoryHandle = await fs.open(directoryPath, directoryFlags);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT")
+      return null;
     throw new Error("Oracle session directory is unsafe.", { cause: error });
   }
   try {
@@ -627,7 +637,7 @@ async function readVerifiedSessionMetadataFile(
     if (
       !directoryStat.isDirectory() ||
       !sameFileIdentity(directoryStat, directoryPathStat) ||
-      (requirePrivate && !isSafeOwnedDirectory(directoryStat))
+      !isSafeOwnedDirectory(directoryStat)
     ) {
       throw new Error("Oracle session directory is unsafe.");
     }
@@ -636,7 +646,9 @@ async function readVerifiedSessionMetadataFile(
     try {
       metadataHandle = await fs.open(metadataPath, fileFlags);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+        return null;
+      }
       throw new Error("Oracle session metadata file is unsafe.", { cause: error });
     }
     try {
@@ -647,8 +659,8 @@ async function readVerifiedSessionMetadataFile(
       ]);
       if (
         !metadataStat.isFile() ||
-        (requirePrivate && !isPrivateMetadataFile(metadataStat)) ||
-        (requirePrivate && !isPrivateMetadataFile(metadataPathStat)) ||
+        !isPrivateMetadataFile(metadataStat) ||
+        !isPrivateMetadataFile(metadataPathStat) ||
         !sameFileIdentity(metadataStat, metadataPathStat) ||
         !sameFileIdentity(directoryStat, currentDirectoryPathStat)
       ) {

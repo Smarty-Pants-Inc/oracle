@@ -709,7 +709,6 @@ function buildCaptureCleanupExpression(targetApiUrl: string, operationToken?: st
 })()
 `.trim();
 }
-
 export function buildChatGptCaptureCleanupExpressionForTest(
   targetApiUrl: string,
   operationToken?: string,
