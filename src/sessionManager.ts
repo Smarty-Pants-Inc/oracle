@@ -603,7 +603,10 @@ async function readVerifiedSessionMetadataFile(
 ): Promise<string | null> {
   const directoryPath = sessionDir(sessionId);
   const metadataPath = path.join(directoryPath, filename);
-  if (!requirePrivate) {
+  if (
+    !requirePrivate &&
+    (process.platform === "win32" || !constants.O_NOFOLLOW || !constants.O_DIRECTORY)
+  ) {
     try {
       return await fs.readFile(metadataPath, "utf8");
     } catch (error) {
@@ -613,13 +616,15 @@ async function readVerifiedSessionMetadataFile(
       throw error;
     }
   }
-  try {
-    await verifyArchiveStorageRoots();
-    await verifyArchiveDirectory(directoryPath, "Oracle session directory");
-  } catch (error) {
-    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT")
-      return null;
-    throw error;
+  if (requirePrivate) {
+    try {
+      await verifyArchiveStorageRoots();
+      await verifyArchiveDirectory(directoryPath, "Oracle session directory");
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT")
+        return null;
+      throw error;
+    }
   }
   const directoryFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
   const fileFlags = constants.O_RDONLY | constants.O_NOFOLLOW;
@@ -637,7 +642,7 @@ async function readVerifiedSessionMetadataFile(
     if (
       !directoryStat.isDirectory() ||
       !sameFileIdentity(directoryStat, directoryPathStat) ||
-      !isSafeOwnedDirectory(directoryStat)
+      (requirePrivate && !isSafeOwnedDirectory(directoryStat))
     ) {
       throw new Error("Oracle session directory is unsafe.");
     }
@@ -659,8 +664,8 @@ async function readVerifiedSessionMetadataFile(
       ]);
       if (
         !metadataStat.isFile() ||
-        !isPrivateMetadataFile(metadataStat) ||
-        !isPrivateMetadataFile(metadataPathStat) ||
+        (requirePrivate && !isPrivateMetadataFile(metadataStat)) ||
+        (requirePrivate && !isPrivateMetadataFile(metadataPathStat)) ||
         !sameFileIdentity(metadataStat, metadataPathStat) ||
         !sameFileIdentity(directoryStat, currentDirectoryPathStat)
       ) {
