@@ -11,11 +11,12 @@ import type {
 import { asOracleUserError, type OracleResponseMetadata } from "../oracle.js";
 import { renderMarkdownAnsi } from "./markdownRenderer.js";
 import { formatFinishLine } from "../oracle/finishLine.js";
-import { sessionStore, wait } from "../sessionStore.js";
+import { redactSubmittedPromptText, sessionStore, wait } from "../sessionStore.js";
 import { formatTokenCount, formatTokenValue } from "../oracle/runUtils.js";
 import type { BrowserLogger } from "../browser/types.js";
 import { resumeBrowserSession } from "../browser/reattach.js";
 import { hasRecoverableChatGptConversation } from "../browser/reattachability.js";
+import { resolveStoredOpenBrowserUseTabAffinity } from "../browser/openBrowserUse.js";
 import {
   appendArtifacts,
   saveBrowserTranscriptArtifact,
@@ -299,10 +300,44 @@ export async function attachSession(
 
   const hasChromeDisconnect = metadata.response?.incompleteReason === "chrome-disconnected";
   const hasIncompleteCapture = metadata.response?.incompleteReason === "incomplete-capture";
+  const errorStage = metadata.error?.details?.stage;
+  const errorCode = metadata.error?.details?.code;
+  const hasPreparedObuPrompt = Boolean(
+    runtime?.browserTransport === "obu" &&
+    (runtime.promptSubmitted === true || runtime.submittedPromptText?.trim()),
+  );
+  const hasTurnAffinityFailure =
+    metadata.status === "error" &&
+    hasPreparedObuPrompt &&
+    errorStage === "chatgpt-turn-affinity" &&
+    (errorCode === "turn-affinity-unavailable" ||
+      errorCode === "turn-affinity-missing" ||
+      errorCode === "assistant-affinity-unavailable");
+  const hasConversationAffinityFailure =
+    metadata.status === "error" &&
+    hasPreparedObuPrompt &&
+    errorStage === "chatgpt-scope" &&
+    errorCode === "conversation-affinity-unavailable";
   const statusAllowsReattach =
     metadata.status === "running" ||
-    (metadata.status === "error" && (hasChromeDisconnect || hasIncompleteCapture));
+    (metadata.status === "error" &&
+      (hasChromeDisconnect ||
+        hasIncompleteCapture ||
+        hasTurnAffinityFailure ||
+        hasConversationAffinityFailure));
+  const hasExactObuTabAffinity = (() => {
+    try {
+      resolveStoredOpenBrowserUseTabAffinity({
+        runtime,
+        configs: [metadata.browser?.config, metadata.options.browserConfig],
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  })();
   const hasFallbackSessionInfo = Boolean(
+    hasExactObuTabAffinity ||
     runtime?.chromePort ||
     runtime?.chromeBrowserWSEndpoint ||
     runtime?.chromeProfileRoot ||
@@ -329,11 +364,14 @@ export async function attachSession(
     hasFallbackSessionInfo &&
     !workerAlive &&
     (hasRecoverableConversation ||
+      hasExactObuTabAffinity ||
       (runtime?.browserTransport !== "obu" && runtime?.promptSubmitted) ||
       hasLiveChromeFallback ||
       completedDeepResearchPlaceholder) &&
     (hasChromeDisconnect ||
       hasIncompleteCapture ||
+      hasTurnAffinityFailure ||
+      hasConversationAffinityFailure ||
       completedDeepResearchPlaceholder ||
       (runtime?.controllerPid && !controllerAlive));
 
@@ -357,7 +395,11 @@ export async function attachSession(
           }) as unknown as BrowserLogger,
           { verbose: true },
         ),
-        { promptPreview: metadata.promptPreview },
+        {
+          promptPreview: metadata.promptPreview,
+          promptText: metadata.options.prompt,
+          followUpPrompts: metadata.options.browserFollowUps,
+        },
       );
       const completedConfig = browserConfigWithRuntime(metadata, result.runtime);
       const outputTokens = estimateTokenCount(result.answerMarkdown);
@@ -782,7 +824,7 @@ export function formatUserErrorMetadata(metadata?: SessionUserErrorMetadata): st
     parts.push(`message=${metadata.message}`);
   }
   if (metadata.details && Object.keys(metadata.details).length > 0) {
-    parts.push(`details=${JSON.stringify(metadata.details)}`);
+    parts.push(`details=${JSON.stringify(redactSubmittedPromptText(metadata.details))}`);
   }
   return parts.length > 0 ? parts.join(" | ") : null;
 }

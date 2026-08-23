@@ -1,7 +1,7 @@
 import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import fs from "node:fs/promises";
-import { sessionStore } from "../../sessionStore.js";
+import { redactSubmittedPromptText, sessionStore } from "../../sessionStore.js";
 
 // URIs:
 // - oracle-session://<id>/metadata
@@ -37,7 +37,7 @@ export function registerSessionResources(server: McpServer): void {
             contents: [
               {
                 uri: uri.href,
-                text: JSON.stringify(metadata, null, 2),
+                text: JSON.stringify(redactSubmittedPromptText(metadata), null, 2),
               },
             ],
           };

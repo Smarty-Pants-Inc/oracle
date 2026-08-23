@@ -53,6 +53,9 @@ describe("runBrowserSessionExecution", () => {
         answerTokens: 12,
         answerChars: 20,
         conversationId: "foo",
+        submittedPromptText: "prompt",
+        submittedPromptIndex: 1,
+        submittedAttachmentNames: ["context.txt"],
       };
     });
     const result = await runBrowserSessionExecution(
@@ -84,7 +87,13 @@ describe("runBrowserSessionExecution", () => {
       reasoningTokens: 0,
       totalTokens: 54,
     });
-    expect(result.runtime).toMatchObject({ chromePid: undefined, conversationId: "foo" });
+    expect(result.runtime).toMatchObject({
+      chromePid: undefined,
+      conversationId: "foo",
+      submittedPromptText: "prompt",
+      submittedPromptIndex: 1,
+      submittedAttachmentNames: ["context.txt"],
+    });
     expect(result.artifacts).toEqual([{ kind: "transcript", path: "/tmp/transcript.md" }]);
     expect(result.warnings).toEqual([expect.objectContaining({ code: "obu-tab-finalize-failed" })]);
     expect(persistRuntimeHint).toHaveBeenCalledWith(

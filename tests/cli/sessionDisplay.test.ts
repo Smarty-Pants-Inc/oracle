@@ -29,6 +29,10 @@ const sessionStoreMock = vi.hoisted(() => ({
 vi.mock("../../src/sessionStore.ts", () => ({
   sessionStore: sessionStoreMock,
   wait: waitMock,
+  redactSubmittedPromptText: (value: unknown) =>
+    JSON.parse(
+      JSON.stringify(value, (key, entry) => (key === "submittedPromptText" ? "[redacted]" : entry)),
+    ),
 }));
 
 vi.mock("../../src/sessionManager.ts", () => ({
@@ -115,6 +119,22 @@ describe("formatUserErrorMetadata", () => {
         details: { path: "foo.txt" },
       }),
     ).toBe('file-validation | message=Too big | details={"path":"foo.txt"}');
+  });
+
+  test("redacts submitted prompt text nested in browser runtime details", () => {
+    const formatted = formatUserErrorMetadata({
+      category: "browser-automation",
+      message: "Reconnect required",
+      details: {
+        runtime: {
+          submittedPromptText: "private exact prompt",
+          submittedPromptIndex: 0,
+        },
+      },
+    });
+
+    expect(formatted).toContain('"submittedPromptText":"[redacted]"');
+    expect(formatted).not.toContain("private exact prompt");
   });
 });
 

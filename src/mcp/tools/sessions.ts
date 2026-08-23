@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { sessionStore } from "../../sessionStore.js";
+import { redactSubmittedPromptText, sessionStore } from "../../sessionStore.js";
 import { sessionsInputSchema } from "../types.js";
 
 const sessionsInputShape = {
@@ -103,7 +103,9 @@ export function registerSessionsTool(server: McpServer): void {
         const request = (await sessionStore.readRequest(id)) ?? undefined;
         return {
           content: textContent(log),
-          structuredContent: { session: { metadata, log, request } },
+          structuredContent: {
+            session: { metadata: redactSubmittedPromptText(metadata), log, request },
+          },
         };
       }
 

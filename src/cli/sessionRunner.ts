@@ -48,6 +48,7 @@ import { readFiles } from "../oracle/files.js";
 import { cwd as getCwd } from "node:process";
 import { resumeBrowserSession } from "../browser/reattach.js";
 import { hasRecoverableChatGptConversation } from "../browser/reattachability.js";
+import { resolveStoredOpenBrowserUseTabAffinity } from "../browser/openBrowserUse.js";
 import { estimateTokenCount } from "../browser/utils.js";
 import type { BrowserLogger } from "../browser/types.js";
 import { formatElapsed } from "../oracle/format.js";
@@ -532,9 +533,19 @@ export async function performSessionRun({
       (cloudflareDetails?.stage === "cloudflare-challenge" ||
         cloudflareDetails?.code === "cloudflare-challenge");
     const browserCanReattach = !browserConfig?.copyProfileSource;
-    const hasReattachableRuntime = (runtime: BrowserRuntimeMetadata | null | undefined): boolean =>
-      hasRecoverableChatGptConversation(runtime) ||
-      (runtime?.browserTransport !== "obu" && runtime?.promptSubmitted === true);
+    const hasReattachableRuntime = (
+      runtime: BrowserRuntimeMetadata | null | undefined,
+    ): boolean => {
+      if (hasRecoverableChatGptConversation(runtime)) return true;
+      if (runtime?.browserTransport !== "obu") return runtime?.promptSubmitted === true;
+      if (runtime.promptSubmitted !== true && !runtime.submittedPromptText?.trim()) return false;
+      try {
+        resolveStoredOpenBrowserUseTabAffinity({ runtime, configs: [browserConfig] });
+        return true;
+      } catch {
+        return false;
+      }
+    };
     let reattachGuidanceLogged = false;
     const logBrowserReattachGuidance = (
       runtime: BrowserRuntimeMetadata | null | undefined,
@@ -1258,6 +1269,8 @@ async function autoReattachUntilComplete({
       };
       const result = await resumeBrowserSession(currentRuntime, reattachConfig, logger, {
         promptPreview: sessionMeta.promptPreview,
+        promptText: runOptions.prompt,
+        followUpPrompts: runOptions.browserFollowUps,
       });
       if (result.runtime) {
         applyOpenBrowserUseRuntime(currentBrowserConfig, result.runtime);
@@ -1391,6 +1404,19 @@ async function autoReattachUntilComplete({
         });
       }
       log(dim(`Auto-reattach attempt ${attempt} failed: ${message}`));
+      const reattachCode = (userError?.details as { code?: string } | undefined)?.code;
+      if (
+        reattachCode === "follow-ups-pending" ||
+        reattachCode === "follow-up-affinity-missing" ||
+        reattachCode === "follow-up-transcript-unavailable"
+      ) {
+        log(
+          dim(
+            "Auto-reattach stopped because the remaining planned follow-ups require an explicit retry.",
+          ),
+        );
+        return false;
+      }
     }
     if (attempt >= attemptLimit) {
       log(dim(`Auto-reattach stopped after ${attempt} attempt(s) without capturing an answer.`));

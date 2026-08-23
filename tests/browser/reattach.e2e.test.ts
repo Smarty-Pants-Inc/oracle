@@ -78,6 +78,101 @@ describe("browser reattach end-to-end (simulated)", () => {
     }
   }, 20_000);
 
+  test.each([
+    {
+      label: "before its conversation URL stabilizes",
+      errorMessage: "The accepted prompt has not received a stable conversation URL yet.",
+      errorStage: "chatgpt-scope",
+      errorCode: "conversation-affinity-unavailable",
+    },
+    {
+      label: "before its assistant branch is bound",
+      errorMessage: "The committed ChatGPT user turn has no assistant response to bind.",
+      errorStage: "chatgpt-turn-affinity",
+      errorCode: "assistant-affinity-unavailable",
+    },
+  ])(
+    "reattaches a prepared OBU prompt $label",
+    async ({ errorMessage, errorStage, errorCode }) => {
+      const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-reattach-"));
+      const { setOracleHomeDirOverrideForTest } = await import("../../src/oracleHome.js");
+      setOracleHomeDirOverrideForTest(tmpHome);
+
+      try {
+        const { resumeBrowserSession } = await import("../../src/browser/reattach.js");
+        const resumeMock = vi.mocked(resumeBrowserSession);
+        resumeMock.mockResolvedValue({ answerText: "ok text", answerMarkdown: "ok markdown" });
+        const obuAffinity = {
+          browserTransport: "obu" as const,
+          obuSessionId: "stored-session",
+          obuTabId: 7,
+          chatGptAccountEmail: "paul@smartypants.ai",
+          chatGptWorkspaceName: "Paul Bettner",
+          chatGptAccountDigest: "a".repeat(64),
+          chatGptWorkspaceDigest: "b".repeat(64),
+        };
+
+        const { sessionStore } = await import("../../src/sessionStore.js");
+        const { attachSession } = await import("../../src/cli/sessionDisplay.js");
+
+        await sessionStore.ensureStorage();
+        const sessionMeta = await sessionStore.createSession(
+          {
+            prompt: "Exact stored prompt",
+            model: "gpt-5.6-sol-pro",
+            mode: "browser",
+            browserConfig: obuAffinity,
+          },
+          "/repo",
+        );
+        await sessionStore.updateSession(sessionMeta.id, {
+          status: "error",
+          mode: "browser",
+          browser: {
+            config: obuAffinity,
+            runtime: {
+              ...obuAffinity,
+              promptSubmitted: false,
+              submittedPromptText: "Exact stored prompt",
+              submittedPromptIndex: 0,
+              controllerPid: 2_147_483_647,
+            },
+          },
+          error: {
+            category: "browser-automation",
+            message: errorMessage,
+            details: {
+              stage: errorStage,
+              code: errorCode,
+            },
+          },
+        });
+
+        const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+        await attachSession(sessionMeta.id, { suppressMetadata: true, renderPrompt: false });
+        logSpy.mockRestore();
+
+        expect(resumeMock).toHaveBeenCalledWith(
+          expect.objectContaining({
+            obuSessionId: "stored-session",
+            obuTabId: 7,
+            promptSubmitted: false,
+            submittedPromptText: "Exact stored prompt",
+            submittedPromptIndex: 0,
+          }),
+          expect.objectContaining({ browserTransport: "obu" }),
+          expect.any(Function),
+          expect.objectContaining({ promptText: "Exact stored prompt" }),
+        );
+        expect((await sessionStore.readSession(sessionMeta.id))?.status).toBe("completed");
+      } finally {
+        await fs.rm(tmpHome, { recursive: true, force: true });
+        setOracleHomeDirOverrideForTest(null);
+      }
+    },
+    20_000,
+  );
+
   test("does not reattach an errored chrome-disconnected session without a conversation URL", async () => {
     const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-reattach-"));
     const { setOracleHomeDirOverrideForTest } = await import("../../src/oracleHome.js");

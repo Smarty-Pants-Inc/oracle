@@ -123,6 +123,12 @@ export interface BrowserRuntimeMetadata {
   promptTurnIndex?: number;
   promptTurnId?: string;
   promptMessageId?: string;
+  /** Exact composer text for the currently bound submitted turn. */
+  submittedPromptText?: string;
+  /** Zero-based position in the initial prompt plus planned follow-ups. */
+  submittedPromptIndex?: number;
+  /** Attachment basenames rendered with the currently submitted prompt. */
+  submittedAttachmentNames?: string[];
   /** Exact assistant branch paired with the committed user turn. */
   assistantTurnIndex?: number;
   assistantTurnId?: string;
@@ -333,6 +339,20 @@ export interface SessionMetadata {
   transport?: SessionTransportMetadata;
   error?: SessionUserErrorMetadata;
   lifecycle?: SessionLifecycleMetadata;
+}
+
+/** Remove recovery-only composer text before session metadata leaves Oracle. */
+export function redactSubmittedPromptText<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((entry) => redactSubmittedPromptText(entry)) as T;
+  }
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, entry]) => [
+      key,
+      key === "submittedPromptText" ? "[redacted]" : redactSubmittedPromptText(entry),
+    ]),
+  ) as T;
 }
 
 export type SessionStatus = "pending" | "running" | "completed" | "partial" | "error" | "cancelled";

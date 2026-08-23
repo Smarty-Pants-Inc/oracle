@@ -14,6 +14,10 @@ const mockSessionStore = {
 vi.mock("../../src/sessionStore.js", () => ({
   sessionStore: mockSessionStore,
   wait: vi.fn(async () => {}),
+  redactSubmittedPromptText: (value: unknown) =>
+    JSON.parse(
+      JSON.stringify(value, (key, entry) => (key === "submittedPromptText" ? "[redacted]" : entry)),
+    ),
 }));
 
 describe("sessionDisplay helpers", () => {

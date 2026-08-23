@@ -33,6 +33,7 @@ import { CHATGPT_URL } from "./constants.js";
 import { delay } from "./utils.js";
 import {
   buildConversationTurnListExpression,
+  captureConversationUserTurnBinding,
   readBoundConversationTurn,
   type BoundConversationTurn,
   type ConversationTurnBinding,
@@ -89,6 +90,8 @@ export interface ReattachDeps {
     config: BrowserSessionConfig | undefined,
   ) => Promise<ReattachResult>;
   promptPreview?: string;
+  promptText?: string;
+  followUpPrompts?: string[];
   promptBinding?: ConversationTurnBinding;
 }
 
@@ -112,6 +115,65 @@ function storedConversationTurnBinding(
     assistantMessageId: explicit?.assistantMessageId ?? runtime.assistantMessageId,
   };
   return Object.values(binding).some((value) => value !== undefined) ? binding : null;
+}
+
+function hasExactConversationPromptBinding(binding: ConversationTurnBinding | null): boolean {
+  return Boolean(
+    binding?.promptTurnId ||
+    binding?.promptMessageId ||
+    (binding?.promptDigest && Number.isInteger(binding.promptTurnIndex)),
+  );
+}
+
+function resolveReattachPromptText(
+  runtime: BrowserRuntimeMetadata,
+  deps: ReattachDeps,
+): string | undefined {
+  const submittedPrompt = runtime.submittedPromptText?.trim();
+  if (submittedPrompt) return submittedPrompt;
+  const hasPlannedFollowUps = (deps.followUpPrompts ?? []).some((prompt) => prompt.trim());
+  return hasPlannedFollowUps ? undefined : deps.promptText?.trim() || undefined;
+}
+
+function hasPotentialSubmittedPrompt(runtime: BrowserRuntimeMetadata): boolean {
+  return runtime.promptSubmitted === true || Boolean(runtime.submittedPromptText?.trim());
+}
+
+function assertPlannedFollowUpsComplete(runtime: BrowserRuntimeMetadata, deps: ReattachDeps): void {
+  const followUps = (deps.followUpPrompts ?? []).map((prompt) => prompt.trim()).filter(Boolean);
+  if (followUps.length === 0) return;
+  const submittedPromptIndex = runtime.submittedPromptIndex;
+  if (
+    typeof submittedPromptIndex !== "number" ||
+    !Number.isInteger(submittedPromptIndex) ||
+    submittedPromptIndex < 0 ||
+    submittedPromptIndex > followUps.length
+  ) {
+    throw new BrowserAutomationError(
+      "Stored browser reattach cannot prove which planned prompt completed; refusing to mark the multi-turn session complete.",
+      { stage: "browser-follow-ups", code: "follow-up-affinity-missing" },
+    );
+  }
+  const remainingFollowUps = followUps.length - submittedPromptIndex;
+  if (remainingFollowUps > 0) {
+    throw new BrowserAutomationError(
+      `Captured the exact submitted turn, but ${remainingFollowUps} planned browser follow-up${remainingFollowUps === 1 ? "" : "s"} remain; refusing to mark the session complete automatically.`,
+      {
+        stage: "browser-follow-ups",
+        code: "follow-ups-pending",
+        submittedPromptIndex,
+        remainingFollowUps,
+      },
+    );
+  }
+  throw new BrowserAutomationError(
+    "The final planned follow-up is bound, but reattach cannot prove the full multi-turn transcript; refusing to mark the session complete.",
+    {
+      stage: "browser-follow-ups",
+      code: "follow-up-transcript-unavailable",
+      submittedPromptIndex,
+    },
+  );
 }
 
 const BOUND_TURN_TERMINAL_CONFIG = { barConfirmCycles: 3, minStableMs: 1_200 };
@@ -389,6 +451,12 @@ export async function resumeBrowserSession(
       expectedConversationUrl: expectedConversationUrl ?? undefined,
     });
     const turnBinding = storedConversationTurnBinding(runtime, deps.promptBinding);
+    if (turnBinding && !hasExactConversationPromptBinding(turnBinding)) {
+      throw new BrowserAutomationError(
+        "Stored Chrome reattach has no exact prompt turn affinity.",
+        { stage: "chatgpt-turn-affinity", code: "turn-affinity-missing" },
+      );
+    }
     const assertCaptureAffinity = async (): Promise<void> => {
       if (expectedConversationUrl) {
         await ensureChatGptScopeRetained(Runtime, expectedConversationUrl);
@@ -404,6 +472,7 @@ export async function resumeBrowserSession(
       const assistant = await waitForBoundAssistantTurn(Runtime, turnBinding, timeoutMs, logger);
       await assertCaptureAffinity();
       const result = await captureBoundAssistantResult(Runtime, assistant, captureMarkdown, logger);
+      assertPlannedFollowUpsComplete(liveRuntime, deps);
       await closeAttached();
       return result;
     }
@@ -424,6 +493,7 @@ export async function resumeBrowserSession(
         await waitForBoundAssistantTurn(Runtime, turnBinding, timeoutMs, logger);
       }
       await assertCaptureAffinity();
+      assertPlannedFollowUpsComplete(liveRuntime, deps);
       await closeAttached();
       return {
         answerText: researchResult.text,
@@ -451,6 +521,7 @@ export async function resumeBrowserSession(
         "Reattach markdown capture timed out",
       )) ?? recovered.text;
     const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
+    assertPlannedFollowUpsComplete(liveRuntime, deps);
 
     await closeAttached();
     return { answerText: aligned.answerText, answerMarkdown: aligned.answerMarkdown };
@@ -511,6 +582,7 @@ async function resumeBrowserSessionViaObu(
     BrowserRuntimeMetadata,
     "assistantTurnIndex" | "assistantTurnId" | "assistantMessageId"
   > = {};
+  let turnBinding = storedConversationTurnBinding(runtime, deps.promptBinding);
   const expectation = {
     email: affinity.email,
     workspaceName: affinity.workspaceName,
@@ -528,6 +600,7 @@ async function resumeBrowserSessionViaObu(
     chatGptWorkspaceName: affinity.workspaceName,
     chatGptAccountDigest: affinity.accountDigest,
     chatGptWorkspaceDigest: affinity.workspaceDigest,
+    ...(turnBinding ?? {}),
     ...assistantBinding,
     tabUrl: conversationUrl ?? runtime.tabUrl,
     conversationId: expectedConversationId ?? runtime.conversationId,
@@ -562,6 +635,7 @@ async function resumeBrowserSessionViaObu(
       logger,
     });
     connection = await connectionReady;
+    routeRetained = true;
     const { Runtime, DOM, Page } = connection.client;
     await Promise.all([Runtime.enable?.(), DOM?.enable?.(), Page?.enable?.()].filter(Boolean));
     if (!conversationUrl) {
@@ -582,13 +656,37 @@ async function resumeBrowserSessionViaObu(
       expectedConversationUrl: conversationUrl,
     });
     const captureMarkdown = deps.captureAssistantMarkdown ?? captureAssistantMarkdown;
-    const turnBinding = storedConversationTurnBinding(runtime, deps.promptBinding);
-    const hasPromptBinding = Boolean(
-      turnBinding?.promptDigest ||
-      turnBinding?.promptTurnId ||
-      turnBinding?.promptMessageId ||
-      Number.isInteger(turnBinding?.promptTurnIndex),
-    );
+    const activePromptText = resolveReattachPromptText(runtime, deps);
+    const hasExactPromptBinding = hasExactConversationPromptBinding(turnBinding);
+    const recoveryPromptTurnIndex =
+      typeof turnBinding?.promptTurnIndex === "number" &&
+      Number.isInteger(turnBinding.promptTurnIndex) &&
+      turnBinding.promptTurnIndex >= 0
+        ? turnBinding.promptTurnIndex
+        : null;
+    if (
+      !hasExactPromptBinding &&
+      hasPotentialSubmittedPrompt(runtime) &&
+      activePromptText &&
+      recoveryPromptTurnIndex !== null
+    ) {
+      const recovered = await captureConversationUserTurnBinding(
+        Runtime,
+        activePromptText,
+        recoveryPromptTurnIndex,
+        {
+          expectedTurnIndex: recoveryPromptTurnIndex,
+          attachmentNames: runtime.submittedAttachmentNames,
+        },
+      );
+      if (recovered) {
+        turnBinding = { ...turnBinding, ...recovered };
+        logger(
+          "[browser] Recovered exact prompt turn affinity from the stored main-Chrome conversation.",
+        );
+      }
+    }
+    const hasPromptBinding = hasExactConversationPromptBinding(turnBinding);
     if (!turnBinding || !hasPromptBinding) {
       throw new BrowserAutomationError(
         "Stored main-Chrome reattach has no exact prompt turn affinity.",
@@ -605,6 +703,7 @@ async function resumeBrowserSessionViaObu(
         ...(assistant.messageId ? { assistantMessageId: assistant.messageId } : {}),
       };
       const result = await captureBoundAssistantResult(Runtime, assistant, captureMarkdown, logger);
+      assertPlannedFollowUpsComplete(runtimeForConnection(), deps);
       const warnings = await finalizeCompletedConnection();
       completed = true;
       return { ...result, runtime: runtimeForConnection(), warnings };
@@ -642,6 +741,7 @@ async function resumeBrowserSessionViaObu(
         ...(exactAssistant.messageId ? { assistantMessageId: exactAssistant.messageId } : {}),
       };
       const result = { answerText: researchResult.text, answerMarkdown: researchResult.text };
+      assertPlannedFollowUpsComplete(runtimeForConnection(), deps);
       const warnings = await finalizeCompletedConnection();
       completed = true;
       return { ...result, runtime: runtimeForConnection(), warnings };
@@ -677,6 +777,7 @@ async function resumeBrowserSessionViaObu(
       )) ?? recovered.text;
     await ensureChatGptScopeRetained(Runtime, conversationUrl);
     const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
+    assertPlannedFollowUpsComplete(runtimeForConnection(), deps);
     const warnings = await finalizeCompletedConnection();
     completed = true;
     return {
@@ -699,9 +800,11 @@ async function resumeBrowserSessionViaObu(
       }
     }
     const details = failure instanceof BrowserAutomationError ? failure.details : undefined;
+    const delayedConversationUrl =
+      details?.stage === "chatgpt-scope" && details?.code === "conversation-affinity-unavailable";
     if (
       details?.stage === "main-chrome-account-router" ||
-      details?.stage === "chatgpt-scope" ||
+      (details?.stage === "chatgpt-scope" && !delayedConversationUrl) ||
       details?.stage === "open-browser-use"
     ) {
       routeRetained = false;
@@ -861,6 +964,12 @@ async function resumeBrowserSessionViaNewChrome(
   const waitForResponse = deps.waitForAssistantResponse ?? waitForAssistantResponse;
   const captureMarkdown = deps.captureAssistantMarkdown ?? captureAssistantMarkdown;
   const turnBinding = storedConversationTurnBinding(runtime, deps.promptBinding);
+  if (turnBinding && !hasExactConversationPromptBinding(turnBinding)) {
+    throw new BrowserAutomationError("Stored Chrome reattach has no exact prompt turn affinity.", {
+      stage: "chatgpt-turn-affinity",
+      code: "turn-affinity-missing",
+    });
+  }
   const timeoutMs = resolved.timeoutMs ?? 120_000;
   const cleanup = async () => {
     if (client && typeof client.close === "function") {
@@ -889,6 +998,7 @@ async function resumeBrowserSessionViaNewChrome(
     const assistant = await waitForBoundAssistantTurn(Runtime, turnBinding, timeoutMs, logger);
     if (conversationUrl) await ensureChatGptScopeRetained(Runtime, conversationUrl);
     const result = await captureBoundAssistantResult(Runtime, assistant, captureMarkdown, logger);
+    assertPlannedFollowUpsComplete(runtime, deps);
     await cleanup();
     return result;
   }
@@ -913,6 +1023,7 @@ async function resumeBrowserSessionViaNewChrome(
     }
     if (conversationUrl) await ensureChatGptScopeRetained(Runtime, conversationUrl);
     const result = { answerText: researchResult.text, answerMarkdown: researchResult.text };
+    assertPlannedFollowUpsComplete(runtime, deps);
     await cleanup();
     return result;
   }
@@ -928,9 +1039,8 @@ async function resumeBrowserSessionViaNewChrome(
   );
   const markdown = (await captureMarkdown(Runtime, recovered.meta, logger)) ?? recovered.text;
   const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
-
+  assertPlannedFollowUpsComplete(runtime, deps);
   await cleanup();
-
   return { answerText: aligned.answerText, answerMarkdown: aligned.answerMarkdown };
 }
 
@@ -972,5 +1082,6 @@ export const __test__ = {
   buildConversationUrl,
   openConversationFromSidebar,
   readPromptPreviewTurnIndex,
+  resolveReattachPromptText,
   waitForBoundAssistantTurn,
 };

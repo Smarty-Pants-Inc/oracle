@@ -1482,6 +1482,66 @@ describe("performSessionRun", () => {
     });
   });
 
+  test("stops auto-reattach when remaining follow-ups require an explicit retry", async () => {
+    const runtime = {
+      browserTransport: "obu" as const,
+      obuSessionId: "stored-session",
+      obuTabId: 7,
+      chatGptAccountEmail: "paul@smartypants.ai",
+      chatGptWorkspaceName: "Paul Bettner",
+      chatGptAccountDigest: "a".repeat(64),
+      chatGptWorkspaceDigest: "b".repeat(64),
+      tabUrl: "https://chatgpt.com/c/obu-thread",
+      conversationId: "obu-thread",
+      promptSubmitted: true,
+      submittedPromptText: "Hello",
+      submittedPromptIndex: 0,
+    };
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(
+      new BrowserAutomationError("Open Browser Use disconnected before oracle finished.", {
+        stage: "connection-lost",
+        recoverableDisconnect: true,
+        runtime,
+      }),
+    );
+    vi.mocked(resumeBrowserSession).mockRejectedValueOnce(
+      new BrowserAutomationError("One planned browser follow-up remains.", {
+        stage: "browser-follow-ups",
+        code: "follow-ups-pending",
+        remainingFollowUps: 1,
+        runtime,
+      }),
+    );
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: { ...baseRunOptions, browserFollowUps: ["follow-up prompt"] },
+      mode: "browser",
+      browserConfig: {
+        browserTransport: "obu",
+        obuSessionId: "stored-session",
+        obuTabId: 7,
+        chatGptAccountEmail: "paul@smartypants.ai",
+        chatGptWorkspaceName: "Paul Bettner",
+        chatGptAccountDigest: "a".repeat(64),
+        chatGptWorkspaceDigest: "b".repeat(64),
+        autoReattachIntervalMs: 1,
+      },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(vi.mocked(resumeBrowserSession)).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls.map((call) => String(call[0])).join("\n")).toContain(
+      "remaining planned follow-ups require an explicit retry",
+    );
+    expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
+      error: { details: { code: "follow-ups-pending" } },
+    });
+  });
+
   test("auto-reattaches after connection loss and marks session completed", async () => {
     const automationError = new BrowserAutomationError(
       "Chrome DevTools client disconnected before oracle finished; the browser target appears still alive.",
@@ -1612,7 +1672,7 @@ describe("performSessionRun", () => {
     });
   });
 
-  test("fails closed when an OBU prompt was submitted before a stable thread existed", async () => {
+  test("auto-reattaches an OBU prompt from exact tab affinity before its URL stabilizes", async () => {
     const runtime = {
       browserTransport: "obu" as const,
       obuSessionId: "stored-session",
@@ -1622,7 +1682,21 @@ describe("performSessionRun", () => {
       chatGptAccountDigest: "a".repeat(64),
       chatGptWorkspaceDigest: "b".repeat(64),
       tabUrl: "https://chatgpt.com/",
-      promptSubmitted: true,
+      promptSubmitted: false,
+      promptTurnIndex: 0,
+      submittedPromptText: "Hello",
+      submittedPromptIndex: 0,
+    };
+    const recoveredRuntime = {
+      ...runtime,
+      tabUrl: "https://chatgpt.com/c/recovered-thread",
+      conversationId: "recovered-thread",
+      promptDigest: "c".repeat(64),
+      promptTurnId: "user-turn-0",
+      promptMessageId: "user-message-0",
+      assistantTurnIndex: 1,
+      assistantTurnId: "assistant-turn-1",
+      assistantMessageId: "assistant-message-1",
     };
     vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(
       new BrowserAutomationError("Open Browser Use disconnected before the thread stabilized.", {
@@ -1631,33 +1705,53 @@ describe("performSessionRun", () => {
         runtime,
       }),
     );
+    vi.mocked(resumeBrowserSession).mockResolvedValueOnce({
+      answerText: "recovered answer",
+      answerMarkdown: "recovered answer",
+      runtime: recoveredRuntime,
+    });
 
-    await expect(
-      performSessionRun({
-        sessionMeta: baseSessionMeta,
-        runOptions: baseRunOptions,
-        mode: "browser",
-        browserConfig: {
-          browserTransport: "obu",
-          obuSessionId: "stored-session",
-          obuTabId: 7,
-          chatGptAccountEmail: "paul@smartypants.ai",
-          chatGptWorkspaceName: "Paul Bettner",
-          chatGptAccountDigest: "a".repeat(64),
-          chatGptWorkspaceDigest: "b".repeat(64),
-        },
-        cwd: "/tmp",
-        log,
-        write,
-        version: cliVersion,
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: {
+        browserTransport: "obu",
+        obuSessionId: "stored-session",
+        obuTabId: 7,
+        chatGptAccountEmail: "paul@smartypants.ai",
+        chatGptWorkspaceName: "Paul Bettner",
+        chatGptAccountDigest: "a".repeat(64),
+        chatGptWorkspaceDigest: "b".repeat(64),
+      },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    expect(vi.mocked(resumeBrowserSession)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        obuSessionId: "stored-session",
+        obuTabId: 7,
+        submittedPromptText: "Hello",
+        promptSubmitted: false,
+        submittedPromptIndex: 0,
       }),
-    ).rejects.toThrow(/before the thread stabilized/i);
-
-    expect(vi.mocked(resumeBrowserSession)).not.toHaveBeenCalled();
+      expect.objectContaining({ browserTransport: "obu" }),
+      expect.any(Function),
+      expect.objectContaining({ promptText: "Hello" }),
+    );
     expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
-      status: "error",
-      response: { status: "error", incompleteReason: "chrome-disconnected" },
-      browser: { runtime: { promptSubmitted: true, tabUrl: "https://chatgpt.com/" } },
+      status: "completed",
+      response: { status: "completed" },
+      browser: {
+        runtime: {
+          conversationId: "recovered-thread",
+          promptTurnId: "user-turn-0",
+          assistantTurnId: "assistant-turn-1",
+        },
+      },
     });
   });
 

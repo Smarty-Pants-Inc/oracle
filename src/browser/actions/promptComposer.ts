@@ -41,6 +41,7 @@ export async function submitPrompt(
     attachmentTimeoutMs?: number | null;
     onPromptSubmitted?: () => Promise<void> | void;
     beforePromptSubmit?: () => Promise<void> | void;
+    onPromptDispatch?: () => Promise<void> | void;
   },
   prompt: string,
   logger: BrowserLogger,
@@ -221,9 +222,11 @@ export async function submitPrompt(
     deps?.attachmentNames,
     deps?.attachmentTimeoutMs,
     deps.beforePromptSubmit,
+    deps.onPromptDispatch,
   );
   if (!clicked) {
     await deps.beforePromptSubmit?.();
+    await deps.onPromptDispatch?.();
     await input.dispatchKeyEvent({
       type: "keyDown",
       ...ENTER_KEY_EVENT,
@@ -655,6 +658,7 @@ async function attemptSendButton(
   attachmentNames?: AttachmentReadyInput[],
   attachmentTimeoutMs?: number | null,
   beforeSubmit?: () => Promise<void> | void,
+  onSubmitDispatch?: () => Promise<void> | void,
 ): Promise<boolean> {
   const script = `(() => {
     const selectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
@@ -728,6 +732,7 @@ async function attemptSendButton(
           continue;
         }
       }
+      await onSubmitDispatch?.();
       await clickTrustedPoint(Runtime, Input, value.x, value.y);
       return true;
     }

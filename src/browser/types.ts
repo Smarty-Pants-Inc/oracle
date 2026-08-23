@@ -217,6 +217,9 @@ export interface BrowserRunResult {
   promptTurnIndex?: number;
   promptTurnId?: string;
   promptMessageId?: string;
+  submittedPromptText?: string;
+  submittedPromptIndex?: number;
+  submittedAttachmentNames?: string[];
   assistantTurnIndex?: number;
   assistantTurnId?: string;
   assistantMessageId?: string;

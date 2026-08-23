@@ -151,13 +151,21 @@ export async function captureConversationUserTurnBinding(
   Runtime: ChromeClient["Runtime"],
   prompt: string,
   minTurnIndex = 0,
+  options: { expectedTurnIndex?: number; attachmentNames?: string[] } = {},
 ): Promise<ConversationTurnBinding | null> {
   const expected = normalizeConversationTurnMatchText(prompt);
   if (!expected) return null;
+  const expectedTurnIndex = options.expectedTurnIndex;
+  const attachmentNames = (options.attachmentNames ?? [])
+    .map((name) => normalizeConversationTurnMatchText(name))
+    .filter(Boolean);
   const matches = (await readConversationUserTurns(Runtime)).filter((turn) => {
     if (turn.index < minTurnIndex) return false;
+    if (Number.isInteger(expectedTurnIndex) && turn.index !== expectedTurnIndex) {
+      return false;
+    }
     const observed = normalizeConversationTurnMatchText(turn.text);
-    return observed === expected || observed.endsWith(expected);
+    return matchesSubmittedPrompt(observed, expected, attachmentNames);
   });
   if (matches.length !== 1) return null;
   const user = matches[0] as ConversationUserTurn;
@@ -176,6 +184,17 @@ function normalizeConversationTurnMatchText(text: string): string {
     .replace(/`([^`]*)`/gu, "$1")
     .replace(/\s+/gu, " ")
     .trim();
+}
+
+function matchesSubmittedPrompt(
+  observed: string,
+  expected: string,
+  attachmentNames: string[],
+): boolean {
+  if (observed === expected) return true;
+  if (!observed.endsWith(expected) || attachmentNames.length === 0) return false;
+  const prefix = observed.slice(0, -expected.length).toLocaleLowerCase();
+  return attachmentNames.every((name) => prefix.includes(name.toLocaleLowerCase()));
 }
 
 export async function captureLatestConversationUserTurnBinding(
@@ -367,7 +386,7 @@ export async function readBoundConversationTurn(
         }
         return true;
       })
-    : matched.assistants.slice(-1);
+    : matched.assistants;
   if (assistantMatches.length > 1) return { status: "ambiguous" };
   if (hasAssistantBinding && assistantMatches.length === 0) return { status: "missing" };
   return {

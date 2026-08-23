@@ -327,6 +327,7 @@ describe("promptComposer", () => {
   test("marks prompt submitted before commit verification finishes", async () => {
     const onPromptSubmitted = vi.fn();
     const beforePromptSubmit = vi.fn();
+    const onPromptDispatch = vi.fn();
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
         if (expression.includes("document.readyState")) {
@@ -374,6 +375,7 @@ describe("promptComposer", () => {
         input: input as never,
         baselineTurns: 0,
         beforePromptSubmit,
+        onPromptDispatch,
         onPromptSubmitted,
       },
       "hello",
@@ -382,11 +384,50 @@ describe("promptComposer", () => {
 
     expect(onPromptSubmitted).toHaveBeenCalledTimes(1);
     expect(beforePromptSubmit).toHaveBeenCalledTimes(1);
+    expect(onPromptDispatch).toHaveBeenCalledTimes(1);
     expect(beforePromptSubmit.mock.invocationCallOrder[0]).toBeLessThan(
       onPromptSubmitted.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
     );
     expect(beforePromptSubmit.mock.invocationCallOrder[0]).toBeLessThan(
       input.dispatchMouseEvent.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
+    );
+    expect(onPromptDispatch.mock.invocationCallOrder[0]).toBeLessThan(
+      input.dispatchMouseEvent.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
+    );
+    expect(beforePromptSubmit.mock.invocationCallOrder[0]).toBeLessThan(
+      onPromptDispatch.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
+    );
+  });
+
+  test("records trusted dispatch before a mouse release error", async () => {
+    const points = [
+      { status: "point", x: 10, y: 20 },
+      { status: "point", x: 30, y: 40 },
+    ];
+    const evaluate = vi.fn(async () => ({ result: { value: points.shift() } }));
+    const beforeSubmit = vi.fn();
+    const onPromptDispatch = vi.fn();
+    const input = {
+      dispatchMouseEvent: vi.fn(async ({ type }: { type: string }) => {
+        if (type === "mouseReleased") throw new Error("release outcome unknown");
+      }),
+    };
+
+    await expect(
+      promptComposer.attemptSendButton(
+        { evaluate } as never,
+        input as never,
+        undefined,
+        undefined,
+        undefined,
+        beforeSubmit,
+        onPromptDispatch,
+      ),
+    ).rejects.toThrow("release outcome unknown");
+    expect(beforeSubmit).toHaveBeenCalledOnce();
+    expect(onPromptDispatch).toHaveBeenCalledOnce();
+    expect(onPromptDispatch.mock.invocationCallOrder[0]).toBeLessThan(
+      input.dispatchMouseEvent.mock.invocationCallOrder.at(-1) ?? Number.POSITIVE_INFINITY,
     );
   });
 

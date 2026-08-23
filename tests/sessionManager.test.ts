@@ -40,6 +40,21 @@ describe("session storage setup", () => {
   });
 });
 
+describe("session metadata redaction", () => {
+  test("redacts recovery-only submitted prompt text recursively", () => {
+    const source = {
+      browser: { runtime: { submittedPromptText: "private prompt", submittedPromptIndex: 0 } },
+      error: { details: { runtime: { submittedPromptText: "nested private prompt" } } },
+    };
+
+    expect(sessionModule.redactSubmittedPromptText(source)).toEqual({
+      browser: { runtime: { submittedPromptText: "[redacted]", submittedPromptIndex: 0 } },
+      error: { details: { runtime: { submittedPromptText: "[redacted]" } } },
+    });
+    expect(source.browser.runtime.submittedPromptText).toBe("private prompt");
+  });
+});
+
 describe("session identifiers", () => {
   test("createSessionId slugifies prompts without timestamps", () => {
     const id = sessionModule.createSessionId("  Hello, WORLD??? -- Example ");

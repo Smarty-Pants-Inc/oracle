@@ -3322,6 +3322,7 @@ async function runRemoteBrowserMode(
   let lastUrl: string | undefined;
   let pinnedChatGptScopeUrl = config.resumeConversationUrl ?? config.url;
   let promptSubmitted = false;
+  let promptDispatchStarted = false;
   let pendingConversationAffinity = false;
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
   let attachedExistingTab = false;
@@ -3335,6 +3336,10 @@ async function runRemoteBrowserMode(
   let removeObuTerminationHooks: (() => void) | null = null;
   const chromeProfileRoot = config.remoteChromeProfileRoot ?? undefined;
   let promptBinding: ConversationTurnBinding = {};
+  let submittedPromptText: string | undefined;
+  let activePromptIndex = 0;
+  let submittedPromptIndex: number | undefined;
+  let submittedAttachmentNames: string[] | undefined;
   let pendingResumeTurnBinding = config.resumeTurnBinding ?? null;
   const followUpPrompts = normalizeBrowserFollowUpPrompts(options.followUpPrompts);
   const runtimeHintCb = options.runtimeHintCb;
@@ -3359,6 +3364,9 @@ async function runRemoteBrowserMode(
       ? (config.chatGptAccountDigest ?? undefined)
       : (config.remoteChromeAccountDigest ?? undefined),
     ...promptBinding,
+    submittedPromptText,
+    submittedPromptIndex,
+    submittedAttachmentNames,
     tabUrl: lastUrl,
     conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
     promptSubmitted,
@@ -3375,6 +3383,10 @@ async function runRemoteBrowserMode(
         tabUrl: lastUrl,
       });
     });
+  };
+  const markPromptDispatchStarted = async (): Promise<void> => {
+    await emitRuntimeHint();
+    promptDispatchStarted = true;
   };
   const markPromptSubmitted = async (): Promise<void> => {
     promptSubmitted = true;
@@ -3811,6 +3823,11 @@ async function runRemoteBrowserMode(
         if (pendingResumeTurnBinding) {
           await assertResumeTurnAffinity(Runtime, pendingResumeTurnBinding, "prompt send");
         }
+        promptSubmitted = false;
+        promptDispatchStarted = false;
+        submittedPromptText = prompt;
+        submittedPromptIndex = activePromptIndex;
+        submittedAttachmentNames = attachmentNames.length > 0 ? attachmentNames : undefined;
         promptBinding =
           promptTurnBoundary == null
             ? { promptDigest: hashConversationTurnText(prompt) }
@@ -3828,6 +3845,7 @@ async function runRemoteBrowserMode(
         baselineTurns: baselineTurns ?? undefined,
         attachmentNames: attachmentExpectations,
         beforePromptSubmit: preparePromptSend,
+        onPromptDispatch: markPromptDispatchStarted,
         onPromptSubmitted: markPromptSubmitted,
       };
       const deepResearchTargetBaseline =
@@ -3850,6 +3868,10 @@ async function runRemoteBrowserMode(
         Runtime,
         prompt,
         Math.max(0, promptTurnBoundary ?? 0),
+        {
+          expectedTurnIndex: promptTurnBoundary ?? undefined,
+          attachmentNames,
+        },
       );
       if (!committedBinding) {
         throw new BrowserAutomationError(
@@ -4378,6 +4400,7 @@ async function runRemoteBrowserMode(
 
     for (let index = 0; index < followUpPrompts.length; index += 1) {
       const followUpPrompt = followUpPrompts[index];
+      activePromptIndex = index + 1;
       logger(`[browser] Sending follow-up ${index + 1}/${followUpPrompts.length}`);
       await clearPromptComposer(Runtime, logger);
       await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
@@ -4508,10 +4531,12 @@ async function runRemoteBrowserMode(
       (normalizedError.details?.stage === "main-chrome-account-router" ||
         normalizedError.details?.stage === "chatgpt-scope" ||
         normalizedError.details?.stage === "open-browser-use");
+    const promptDispatchOutcomeUnknown =
+      usingObu && promptDispatchStarted && !promptSubmitted && !routeFailure;
 
     if (!socketClosed) {
       const archive =
-        browserRuntime && !routeFailure
+        browserRuntime && !routeFailure && !promptDispatchOutcomeUnknown
           ? await maybeArchiveInterruptedConversation({
               Runtime: browserRuntime,
               logger,
@@ -4529,6 +4554,7 @@ async function runRemoteBrowserMode(
       }
       preserveBrowserOnError =
         promptSubmitted ||
+        (promptDispatchOutcomeUnknown && Boolean(obuConnection)) ||
         (!routeFailure &&
           (preservedErrorKind === "cloudflare-challenge" ||
             (preservedErrorKind === "reattachable-capture" && archive?.archived !== true)));
@@ -4536,14 +4562,26 @@ async function runRemoteBrowserMode(
       if ((config.debug || process.env.CHATGPT_DEVTOOLS_TRACE === "1") && normalizedError.stack) {
         logger(normalizedError.stack);
       }
-      const interruptedError = withInterruptedArchiveDetails(normalizedError, archive);
+      const interruptedError = promptDispatchOutcomeUnknown
+        ? new BrowserAutomationError(
+            "Main-Chrome prompt dispatch may have succeeded before browser control returned. The exact Oracle tab was preserved for affinity-safe reattach.",
+            {
+              stage: "connection-lost",
+              code: "prompt-submit-outcome-unknown",
+              recoverableDisconnect: Boolean(obuConnection),
+              disconnectCause: "obu-submit-outcome-unknown",
+              runtime: buildRuntimeMetadata(),
+            },
+            normalizedError,
+          )
+        : withInterruptedArchiveDetails(normalizedError, archive);
       if (interruptedError instanceof BrowserAutomationError) runFailure = interruptedError;
       throw interruptedError;
     }
     if (usingObu) {
       const recoveryRuntime = buildRuntimeMetadata();
       const recoverable =
-        promptSubmitted && Boolean(obuConnection) && Boolean(recoveryRuntime.conversationId);
+        Boolean(obuConnection) && (promptSubmitted || Boolean(submittedPromptText));
       preserveBrowserOnError = recoverable;
       runFailure = new BrowserAutomationError(
         recoverable

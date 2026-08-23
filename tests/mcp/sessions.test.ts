@@ -112,6 +112,19 @@ describe("sessions MCP tool", () => {
       model: "gpt-5.1",
       mode: "api",
       options: { prompt: "p", file: [], model: "gpt-5.1" },
+      browser: {
+        runtime: {
+          submittedPromptText: "private recovery prompt",
+          submittedPromptIndex: 0,
+        },
+      },
+      error: {
+        details: {
+          runtime: {
+            submittedPromptText: "nested private recovery prompt",
+          },
+        },
+      },
     };
     readSession.mockResolvedValue(meta);
     readLog.mockResolvedValue("hello log");
@@ -127,6 +140,18 @@ describe("sessions MCP tool", () => {
     expect(readLog).toHaveBeenCalledWith("detail");
     expect(readRequest).toHaveBeenCalledWith("detail");
     expect(result.structuredContent.session.metadata.id).toBe("detail");
+    expect(result.structuredContent.session.metadata.browser?.runtime).toMatchObject({
+      submittedPromptText: "[redacted]",
+      submittedPromptIndex: 0,
+    });
+    expect(
+      (
+        result.structuredContent.session.metadata.error?.details?.runtime as
+          | { submittedPromptText?: string }
+          | undefined
+      )?.submittedPromptText,
+    ).toBe("[redacted]");
+    expect(meta.browser?.runtime?.submittedPromptText).toBe("private recovery prompt");
     expect(result.structuredContent.session.log).toContain("hello log");
     expect(result.structuredContent.session.request).toEqual(
       expect.objectContaining({ prompt: "hi" }),
