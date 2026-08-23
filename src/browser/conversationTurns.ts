@@ -83,13 +83,16 @@ export async function readConversationUserTurns(
         node?.matches?.('[data-message-id]')
           ? node
           : node?.querySelector?.('[data-message-id]');
+      const userTextRoot = (node) =>
+        node?.querySelector?.('[data-testid="collapsible-user-message-content"]') || node;
       const turns = ${buildConversationTurnListExpression()};
       return turns.flatMap((node, index) => {
         if (!isUser(node)) return [];
         const message = messageRoot(node);
+        const content = userTextRoot(node);
         return [{
           index,
-          text: normalize(node?.innerText || node?.textContent || ''),
+          text: normalize(content?.innerText || content?.textContent || ''),
           turnId: node?.getAttribute?.('data-testid') || message?.getAttribute?.('data-testid') || null,
           messageId: message?.getAttribute?.('data-message-id') || node?.getAttribute?.('data-message-id') || null,
         }];
@@ -241,12 +244,15 @@ export async function readBoundConversationTurn(
         node?.matches?.('[data-message-id]')
           ? node
           : node?.querySelector?.('[data-message-id]');
+      const userTextRoot = (node) =>
+        node?.querySelector?.('[data-testid="collapsible-user-message-content"]') || node;
       const turns = ${buildConversationTurnListExpression()};
       const candidates = [];
       for (let userIndex = 0; userIndex < turns.length; userIndex += 1) {
         const userNode = turns[userIndex];
         if (!isUser(userNode)) continue;
         const userMessage = messageRoot(userNode);
+        const userContent = userTextRoot(userNode);
         const assistants = [];
         let hasLaterUserTurn = false;
         for (let index = userIndex + 1; index < turns.length; index += 1) {
@@ -275,7 +281,7 @@ export async function readBoundConversationTurn(
         candidates.push({
           user: {
             index: userIndex,
-            text: normalize(userNode?.innerText || userNode?.textContent || ''),
+            text: normalize(userContent?.innerText || userContent?.textContent || ''),
             turnId: userNode?.getAttribute?.('data-testid') || userMessage?.getAttribute?.('data-testid') || null,
             messageId: userMessage?.getAttribute?.('data-message-id') || userNode?.getAttribute?.('data-message-id') || null,
           },

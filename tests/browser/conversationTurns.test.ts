@@ -3,6 +3,7 @@ import {
   captureConversationUserTurnBinding,
   captureLatestConversationUserTurnBinding,
   hashConversationTurnText,
+  readConversationUserTurns,
   readBoundConversationTurn,
   resolveConversationUserTurnBinding,
 } from "../../src/browser/conversationTurns.js";
@@ -60,6 +61,24 @@ describe("conversation turn affinity", () => {
       promptTurnId: "turn-3",
       promptMessageId: "message-3",
     });
+  });
+
+  test("reads user text from the collapsible message body instead of turn controls", async () => {
+    const Runtime = {
+      evaluate: vi.fn(async () => ({ result: { value: [] } })),
+    } as unknown as ChromeClient["Runtime"];
+
+    await readConversationUserTurns(Runtime);
+    await readBoundConversationTurn(Runtime, { promptTurnIndex: 0 });
+
+    const expressions = (Runtime.evaluate as ReturnType<typeof vi.fn>).mock.calls.map(
+      ([options]) => options.expression as string,
+    );
+    expect(expressions).toHaveLength(2);
+    for (const expression of expressions) {
+      expect(expression).toContain('[data-testid="collapsible-user-message-content"]');
+      expect(expression).toContain("userTextRoot");
+    }
   });
 
   test("captures the only new user turn that contains the exact submitted prompt", async () => {
