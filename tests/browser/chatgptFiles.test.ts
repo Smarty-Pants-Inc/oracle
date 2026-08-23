@@ -912,6 +912,9 @@ describe("collectChatGptFileArtifacts", () => {
   test("keeps browser download staging when restoring default behavior fails", async () => {
     const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-file-reset-"));
     setOracleHomeDirOverrideForTest(tmpHome);
+    const browserId = `reset-${path.basename(tmpHome)}`;
+    const lockScope = { browserId };
+    const lockPath = resolveBrowserDownloadBehaviorLockPath(lockScope);
     let browserDownloadDir = "";
     const logger = vi.fn();
     const runtime = {
@@ -943,6 +946,7 @@ describe("collectChatGptFileArtifacts", () => {
         Page: page,
         Runtime: runtime,
         logger,
+        downloadBehaviorLockScope: lockScope,
         sessionId: "collect-session",
         files: [
           {
@@ -955,10 +959,22 @@ describe("collectChatGptFileArtifacts", () => {
 
       expect(savedFiles).toHaveLength(1);
       await expect(fs.stat(browserDownloadDir)).resolves.toMatchObject({});
+      await expect(fs.stat(lockPath)).resolves.toMatchObject({});
+      await expect(fs.stat(`${lockPath}.poison`)).resolves.toMatchObject({});
+      await expect(
+        acquireBrowserDownloadBehaviorLock(lockScope, { timeoutMs: 50, pollMs: 5 }),
+      ).rejects.toThrow(/restart Chrome/i);
+      const restartedBrowserLock = await acquireBrowserDownloadBehaviorLock(
+        { browserId: `${browserId}-replacement` },
+        { timeoutMs: 50, pollMs: 5 },
+      );
+      await restartedBrowserLock.release();
       expect(logger).toHaveBeenCalledWith(
         "[browser] Preserved browser download staging after reset failure.",
       );
     } finally {
+      await fs.rm(lockPath, { force: true });
+      await fs.rm(`${lockPath}.poison`, { force: true });
       await fs.rm(tmpHome, { recursive: true, force: true });
     }
   });
@@ -967,7 +983,6 @@ describe("collectChatGptFileArtifacts", () => {
     const firstDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-download-first-"));
     const secondDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-download-second-"));
     const events: string[] = [];
-    let resetCount = 0;
     let releaseFirstClick!: () => void;
     let signalFirstClick!: () => void;
     const firstClickGate = new Promise<void>((resolve) => {
@@ -983,9 +998,6 @@ describe("collectChatGptFileArtifacts", () => {
           { behavior }: { behavior: "allow" | "default"; downloadPath?: string },
         ) => {
           events.push(behavior);
-          if (behavior === "default" && ++resetCount === 1) {
-            throw new Error("reset failed");
-          }
         },
       ),
     } as unknown as ChromeClient;
@@ -1030,9 +1042,9 @@ describe("collectChatGptFileArtifacts", () => {
         "second-click",
         "default",
       ]);
-      expect(firstResult.retainedStagingDir).toBeDefined();
-      await expect(fs.stat(firstResult.retainedStagingDir as string)).resolves.toMatchObject({});
+      expect(firstResult.retainedStagingDir).toBeUndefined();
       expect(secondResult.retainedStagingDir).toBeUndefined();
+      await expect(fs.readdir(firstDir)).resolves.toEqual([]);
       await expect(fs.readdir(secondDir)).resolves.toEqual([]);
     } finally {
       releaseFirstClick();
@@ -1106,19 +1118,28 @@ describe("collectChatGptFileArtifacts", () => {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
-  test("keys shared Chrome locks by endpoint rather than profile metadata", () => {
-    const browserWSEndpoint = "ws://127.0.0.1:9222/devtools/browser/shared";
+  test("keys shared Chrome locks by canonical browser identity across aliases and routes", () => {
+    const canonicalPath = resolveBrowserDownloadBehaviorLockPath({
+      browserId: "shared",
+      profileDir: "/local-controller-profile",
+    });
+    for (const browserWSEndpoint of [
+      "ws://localhost:9222/devtools/browser/shared",
+      "ws://127.0.0.1:9222/devtools/browser/shared",
+      "ws://[::1]:9222/devtools/browser/shared",
+    ]) {
+      expect(resolveBrowserDownloadBehaviorLockPath({ browserWSEndpoint })).toBe(canonicalPath);
+    }
     expect(
+      resolveBrowserDownloadBehaviorLockPath({ browserId: "shared", profileDir: "/other-profile" }),
+    ).toBe(canonicalPath);
+    expect(resolveBrowserDownloadBehaviorLockPath({ browserId: "other" })).not.toBe(canonicalPath);
+    expect(() =>
       resolveBrowserDownloadBehaviorLockPath({
-        browserWSEndpoint,
-        profileDir: "/different-controller-profile",
-      }),
-    ).toBe(resolveBrowserDownloadBehaviorLockPath({ browserWSEndpoint }));
-    expect(resolveBrowserDownloadBehaviorLockPath({ browserWSEndpoint })).not.toBe(
-      resolveBrowserDownloadBehaviorLockPath({
+        browserId: "shared",
         browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/other",
       }),
-    );
+    ).toThrow(/does not match its WebSocket/i);
   });
 
   test("blocks a separate Oracle process on the same profile lock", async () => {

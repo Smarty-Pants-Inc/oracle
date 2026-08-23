@@ -414,6 +414,9 @@ export async function handleChatGptExportCommand(options: ChatGptExportCliOption
     console.log(JSON.stringify(result, null, 2));
     return;
   }
+  for (const warning of result.cleanupWarnings ?? []) {
+    console.error(chalk.yellow(`Warning: ${warning}`));
+  }
 
   console.log(chalk.bold("ChatGPT conversation export complete"));
   console.log(`Target: ${result.targetUrl}`);

@@ -108,6 +108,7 @@ import {
   assertChatGptTabOrigin,
   connectToExistingChatGptTab,
   expectedConversationIdForRef,
+  isChatGptUrl,
 } from "./liveTabs.js";
 import { captureBrowserDiagnostics } from "./domDebug.js";
 import {
@@ -981,8 +982,8 @@ function conversationCookieIdsToPreserve(
 
 function extractExactChatGptConversationId(url: string): string | undefined {
   try {
+    if (!isChatGptUrl(url)) return undefined;
     const parsed = new URL(url);
-    if (parsed.origin !== "https://chatgpt.com") return undefined;
     return /^(?:\/c|\/g\/[^/?#]+\/(?:project\/)?c)\/([a-zA-Z0-9-]+)\/?$/.exec(parsed.pathname)?.[1];
   } catch {
     return undefined;
@@ -2616,6 +2617,10 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       // Bail out on mid-run disconnects so the session stays reattachable.
       throw new Error("Chrome disconnected before completion");
     }
+    const localDownloadBehaviorLockScope = {
+      browserId: (await resolveRemoteChromeBrowserIdentity({ host: chromeHost, port: chrome.port }))
+        .browserId,
+    };
     const imageArtifacts = await collectGeneratedImageArtifacts({
       Browser: client.Browser,
       Client: client,
@@ -2632,7 +2637,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       expectedConversationId: runConversationId,
       assertPageAffinity,
       expectedAccountDigest: chatGptAccountDigest ?? undefined,
-      downloadBehaviorLockScope: { profileDir: userDataDir },
+      downloadBehaviorLockScope: localDownloadBehaviorLockScope,
       checkBlockingUiWarning: () =>
         throwChatGptUiWarningIfPresent({
           Runtime,
@@ -2670,7 +2675,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       expectedConversationId: runConversationId,
       assertPageAffinity,
       expectedAccountDigest: chatGptAccountDigest ?? undefined,
-      downloadBehaviorLockScope: { profileDir: userDataDir },
+      downloadBehaviorLockScope: localDownloadBehaviorLockScope,
     });
     const savedImageArtifacts = appendArtifacts(undefined, imageArtifacts.savedImages);
     const savedBrowserArtifacts = appendArtifacts(savedImageArtifacts, fileArtifacts.savedFiles);
@@ -4532,7 +4537,7 @@ async function runRemoteBrowserMode(
       expectedConversationId: runConversationId,
       assertPageAffinity,
       expectedAccountDigest: config.remoteChromeAccountDigest ?? undefined,
-      downloadBehaviorLockScope: { browserWSEndpoint },
+      downloadBehaviorLockScope: { browserId: expectedBrowserId, browserWSEndpoint },
       checkBlockingUiWarning: () =>
         throwChatGptUiWarningIfPresent({
           Runtime,
@@ -4570,7 +4575,7 @@ async function runRemoteBrowserMode(
       expectedConversationId: runConversationId,
       assertPageAffinity,
       expectedAccountDigest: config.remoteChromeAccountDigest ?? undefined,
-      downloadBehaviorLockScope: { browserWSEndpoint },
+      downloadBehaviorLockScope: { browserId: expectedBrowserId, browserWSEndpoint },
     });
     const savedImageArtifacts = appendArtifacts(undefined, imageArtifacts.savedImages);
     const savedBrowserArtifacts = appendArtifacts(savedImageArtifacts, fileArtifacts.savedFiles);

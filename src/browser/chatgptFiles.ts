@@ -1269,9 +1269,13 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
           params.logger?.(`[browser] Failed to restore browser download behavior: ${message}`);
         }
       }
+      if (resetSucceeded) {
+        await browserDownloadBehaviorLock.release();
+      } else {
+        await browserDownloadBehaviorLock.poison();
+      }
     } finally {
       downloadBehaviorFinalized = true;
-      await browserDownloadBehaviorLock.release();
     }
   };
   const stagedDownloads: Array<{ path: string; filename: string }> = [];

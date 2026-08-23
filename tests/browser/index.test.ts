@@ -67,6 +67,16 @@ describe("conversation cookie cleanup", () => {
       ),
     ).toBe("resumed-thread");
   });
+  test("accepts exact conversation affinity on the supported legacy ChatGPT host", () => {
+    expect(
+      __test__.extractExactChatGptConversationId("https://chat.openai.com/c/legacy-thread"),
+    ).toBe("legacy-thread");
+    expect(
+      __test__.extractExactChatGptConversationId(
+        "https://chat.openai.com/g/project/project/c/legacy-thread",
+      ),
+    ).toBe("legacy-thread");
+  });
 
   test("does not read conversation affinity from query strings or fragments", () => {
     expect(

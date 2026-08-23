@@ -231,13 +231,26 @@ export async function submitPrompt(
     typeof baselineResult.result?.value === "number"
       ? baselineResult.result.value
       : Number(baselineResult.result?.value);
-  if (!Number.isFinite(rawBaseline) || rawBaseline < 0) {
+  const measuredBaselineTurns =
+    Number.isFinite(rawBaseline) && rawBaseline >= 0 ? Math.floor(rawBaseline) : undefined;
+  const callerBaselineTurns =
+    typeof deps.baselineTurns === "number" &&
+    Number.isFinite(deps.baselineTurns) &&
+    deps.baselineTurns >= 0
+      ? Math.floor(deps.baselineTurns)
+      : undefined;
+  const commitBaselineTurns =
+    measuredBaselineTurns === undefined
+      ? callerBaselineTurns
+      : callerBaselineTurns === undefined
+        ? measuredBaselineTurns
+        : Math.max(callerBaselineTurns, measuredBaselineTurns);
+  if (commitBaselineTurns === undefined) {
     throw new BrowserAutomationError("Could not establish a conversation baseline before send.", {
       stage: "submit-prompt",
       code: "prompt-baseline-unavailable",
     });
   }
-  const commitBaselineTurns = Math.floor(rawBaseline);
 
   const clicked = await attemptSendButton(
     runtime,

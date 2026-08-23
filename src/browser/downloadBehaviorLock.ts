@@ -3,18 +3,24 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { BrowserLogger } from "./types.js";
-import { isProcessAlive } from "./profileState.js";
+import { browserIdFromWebSocketEndpoint, isProcessAlive } from "./profileState.js";
 import { delay } from "./utils.js";
 
 const LOCK_FILENAME = "oracle-download-behavior.lock";
 const RECOVERY_SUFFIX = ".recovery";
+const POISON_SUFFIX = ".poison";
+const POISONED_ERROR_MESSAGE =
+  "Browser download behavior reset failed for this Chrome instance; restart Chrome before collecting browser downloads again.";
 const DEFAULT_TIMEOUT_MS = 300_000;
 const DEFAULT_POLL_MS = 100;
+
 export interface BrowserDownloadBehaviorLockScope {
-  /** Persistent profile directory for local manual-login Chrome. */
-  profileDir?: string;
-  /** Exact DevTools browser endpoint for attached/shared Chrome. */
+  /** Canonical DevTools browser id for the actual Chrome instance. */
+  browserId?: string;
+  /** Exact DevTools browser endpoint, used only to derive its canonical browser id. */
   browserWSEndpoint?: string;
+  /** Persistent profile directory fallback when no browser identity is available. */
+  profileDir?: string;
 }
 
 export interface BrowserDownloadBehaviorLockOptions {
@@ -33,6 +39,7 @@ interface BrowserDownloadBehaviorLockRecord {
 export interface BrowserDownloadBehaviorLock {
   path: string;
   lockId: string;
+  poison: () => Promise<void>;
   release: () => Promise<void>;
 }
 
@@ -40,8 +47,18 @@ export function resolveBrowserDownloadBehaviorLockPath(
   scope: BrowserDownloadBehaviorLockScope | undefined,
 ): string {
   const browserWSEndpoint = scope?.browserWSEndpoint?.trim();
-  if (browserWSEndpoint) {
-    return hashedBrowserLockPath(browserWSEndpoint);
+  const configuredBrowserId = scope?.browserId?.trim();
+  const endpointBrowserId = browserWSEndpoint
+    ? browserIdFromWebSocketEndpoint(browserWSEndpoint)
+    : undefined;
+  if (configuredBrowserId && endpointBrowserId && configuredBrowserId !== endpointBrowserId) {
+    throw new Error(
+      "Browser download behavior lock browser identity does not match its WebSocket.",
+    );
+  }
+  const browserId = configuredBrowserId || endpointBrowserId;
+  if (browserId) {
+    return hashedBrowserLockPath(`browser:${browserId}`);
   }
 
   const profileDir = scope?.profileDir?.trim();
@@ -94,9 +111,11 @@ export async function acquireBrowserDownloadBehaviorLock(
   };
 
   await fs.mkdir(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+  await throwIfBrowserDownloadBehaviorPoisoned(lockPath);
   await fs.writeFile(candidatePath, payload, { encoding: "utf8", mode: 0o600, flag: "wx" });
   try {
     for (;;) {
+      await throwIfBrowserDownloadBehaviorPoisoned(lockPath);
       if (await hasLiveRecoveryMarker(lockPath, isOwnerAlive)) {
         await waitForNextAttempt("recovery to finish");
         continue;
@@ -139,9 +158,50 @@ export async function acquireBrowserDownloadBehaviorLock(
       return {
         path: lockPath,
         lockId,
+        poison: async () => poisonBrowserDownloadBehaviorLock(lockPath, lockId, options.logger),
         release: async () => releaseBrowserDownloadBehaviorLock(lockPath, lockId, options.logger),
       };
     }
+  } finally {
+    await fs.unlink(candidatePath).catch(() => undefined);
+  }
+}
+
+async function throwIfBrowserDownloadBehaviorPoisoned(lockPath: string): Promise<void> {
+  try {
+    await fs.stat(`${lockPath}${POISON_SUFFIX}`);
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return;
+    throw error;
+  }
+  throw new Error(POISONED_ERROR_MESSAGE);
+}
+
+async function poisonBrowserDownloadBehaviorLock(
+  lockPath: string,
+  lockId: string,
+  logger?: BrowserLogger,
+): Promise<void> {
+  const owned = await readLockRecord(lockPath);
+  if (!owned || owned.lockId !== lockId) {
+    throw new Error("Cannot mark browser download behavior unsafe because lock ownership changed.");
+  }
+  const poisonPath = `${lockPath}${POISON_SUFFIX}`;
+  const candidatePath = `${poisonPath}.${process.pid}.${randomUUID()}.candidate`;
+  await fs.writeFile(candidatePath, JSON.stringify(createLockRecord(lockId)), {
+    encoding: "utf8",
+    mode: 0o600,
+    flag: "wx",
+  });
+  try {
+    try {
+      await fs.link(candidatePath, poisonPath);
+    } catch (error) {
+      if (!error || typeof error !== "object" || !("code" in error) || error.code !== "EEXIST") {
+        throw error;
+      }
+    }
+    logger?.(`[browser] ${POISONED_ERROR_MESSAGE}`);
   } finally {
     await fs.unlink(candidatePath).catch(() => undefined);
   }

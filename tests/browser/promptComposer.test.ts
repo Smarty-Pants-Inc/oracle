@@ -522,7 +522,7 @@ describe("promptComposer", () => {
     expect(promptComposer.sendButtonTimeoutMs(["oracle-attach-verify.txt"], 120_000)).toBe(120_000);
   });
 
-  test("marks prompt submitted before commit verification finishes", async () => {
+  test("keeps the caller-hydrated baseline when the post-typing turn count drops", async () => {
     const onPromptSubmitted = vi.fn();
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
@@ -590,7 +590,7 @@ describe("promptComposer", () => {
     expect(
       vi
         .mocked(runtime.evaluate)
-        .mock.calls.some(([{ expression }]) => String(expression).includes("const baseline = 0;")),
+        .mock.calls.some(([{ expression }]) => String(expression).includes("const baseline = 7;")),
     ).toBe(true);
     expect(assertPageAffinity.mock.calls.map(([action]) => action)).toEqual([
       "prompt composer focus",

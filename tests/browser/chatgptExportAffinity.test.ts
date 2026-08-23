@@ -72,7 +72,7 @@ describe("ChatGPT export account receipt", () => {
   });
   const test = process.platform === "win32" ? it.skip : it;
 
-  test("keeps the verified account digest internal and honors explicit post-export archiving", async () => {
+  test("preserves export and archive receipts while warning on final target cleanup failure", async () => {
     const outDir = await freshOutputDir("oracle-chatgpt-export-affinity-");
     const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
     const accountDigest = "a".repeat(64);
@@ -130,7 +130,7 @@ describe("ChatGPT export account receipt", () => {
         throw new Error(`Unexpected Runtime.evaluate expression: ${expression.slice(0, 80)}`);
       }),
     } as unknown as ChromeClient["Runtime"];
-    const close = vi.fn(async () => undefined);
+    const close = vi.fn().mockRejectedValue(new Error("detach failed for private-target-id"));
     const removeScriptToEvaluateOnNewDocument = vi.fn(async () => {
       cleanupOrder.push("remove-script");
     });
@@ -169,9 +169,12 @@ describe("ChatGPT export account receipt", () => {
       conversationId: "conv-1",
       archiveRecovery: { attempted: false, recovered: false, status: "not-needed" },
       postExportArchive: { attempted: true, archived: true },
+      cleanupWarnings: ["ChatGPT export target cleanup could not be confirmed."],
     });
     expect(result).not.toHaveProperty("accountDigest");
     expect(close).toHaveBeenCalledOnce();
+    await expect(fs.stat(result.rawBackendPath)).resolves.toMatchObject({});
+    expect(JSON.stringify(result.cleanupWarnings)).not.toContain("private-target-id");
     expect(removeScriptToEvaluateOnNewDocument).toHaveBeenCalledWith({
       identifier: "capture-hook",
     });

@@ -133,6 +133,7 @@ export interface ChatGptConversationExportResult {
   stats: Record<string, unknown>;
   archiveRecovery: ChatGptArchiveRecoveryResult;
   postExportArchive?: BrowserArchiveResult;
+  cleanupWarnings?: string[];
 }
 
 export interface ChatGptArchiveRecoveryResult {
@@ -2406,6 +2407,7 @@ export async function captureApprovedChatGptConversationBackend(
   }
   const cleanupDeadline = Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS;
   const cleanupErrors: unknown[] = [];
+  const cleanupWarnings: string[] = [];
   if (captureScriptIdentifier) {
     try {
       await runCleanupBeforeDeadline(
@@ -2416,6 +2418,7 @@ export async function captureApprovedChatGptConversationBackend(
       captureScriptIdentifier = undefined;
     } catch (error) {
       cleanupErrors.push(error);
+      cleanupWarnings.push("ChatGPT export capture-hook cleanup could not be confirmed.");
     }
   }
   if (rawCapturePending) {
@@ -2432,19 +2435,24 @@ export async function captureApprovedChatGptConversationBackend(
       rawCapturePending = false;
     } catch (error) {
       cleanupErrors.push(error);
+      cleanupWarnings.push("ChatGPT export in-page capture cleanup could not be confirmed.");
     }
   }
   try {
     await disposeChatGptExportConnection(client, cleanupDeadline);
   } catch (error) {
     cleanupErrors.push(error);
+    cleanupWarnings.push("ChatGPT export target cleanup could not be confirmed.");
   }
   const errors = operationError ? [operationError, ...cleanupErrors] : cleanupErrors;
-  if (errors.length > 1) {
-    throw new AggregateError(errors, "ChatGPT export and target cleanup failed.");
+  if (operationError || !completedResult) {
+    if (errors.length > 1) {
+      throw new AggregateError(errors, "ChatGPT export and target cleanup failed.");
+    }
+    if (errors.length === 1) throw errors[0];
   }
-  if (errors.length === 1) throw errors[0];
   if (!completedResult) throw new Error("ChatGPT export did not produce a result.");
+  if (cleanupWarnings.length > 0) completedResult.cleanupWarnings = cleanupWarnings;
   return completedResult;
 }
 

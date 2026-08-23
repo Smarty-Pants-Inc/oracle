@@ -8,6 +8,7 @@ import {
   resolveGeneratedImageWaitTimeoutMsForTest,
   saveChatGptGeneratedImages,
 } from "../../src/browser/chatgptImages.js";
+import { resolveBrowserDownloadBehaviorLockPath } from "../../src/browser/downloadBehaviorLock.js";
 import type { ChromeClient } from "../../src/browser/types.js";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
 
@@ -594,6 +595,8 @@ describe("collectGeneratedImageArtifacts", () => {
   test("preserves outer image staging when its nested download reset fails", async () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-image-nested-reset-"));
     const outputPath = path.join(tmpDir, "generated.png");
+    const downloadBehaviorLockScope = { browserId: `nested-reset-${path.basename(tmpDir)}` };
+    const lockPath = resolveBrowserDownloadBehaviorLockPath(downloadBehaviorLockScope);
     const png = Buffer.from([
       0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x00,
     ]);
@@ -632,6 +635,7 @@ describe("collectGeneratedImageArtifacts", () => {
         minTurnIndex: 0,
         generateImagePath: outputPath,
         answerText: "Here you go.",
+        downloadBehaviorLockScope,
       });
 
       await expect(fs.readFile(outputPath)).resolves.toEqual(png);
@@ -640,6 +644,8 @@ describe("collectGeneratedImageArtifacts", () => {
       expect(path.dirname(path.dirname(browserDownloadDir))).toBe(tmpDir);
       expect(result.savedImages[0]?.path).toBe(outputPath);
     } finally {
+      await fs.rm(lockPath, { force: true });
+      await fs.rm(`${lockPath}.poison`, { force: true });
       await fs.rm(tmpDir, { recursive: true, force: true });
     }
   });
