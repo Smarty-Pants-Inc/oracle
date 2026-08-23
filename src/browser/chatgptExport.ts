@@ -250,6 +250,60 @@ async function runCleanupBeforeDeadline<T>(
     .catch(() => undefined);
   throw new Error(timeoutMessage);
 }
+
+async function registerCaptureHookBeforeDeadline<T>(
+  register: () => Promise<T>,
+  remove: (registration: T) => Promise<void>,
+  deadline: number,
+  timeoutMessage: string,
+): Promise<T> {
+  const remaining = remainingMs(deadline);
+  if (remaining <= 0) throw new Error(timeoutMessage);
+  let timedOut = false;
+  let timer: NodeJS.Timeout | undefined;
+  const registration = Promise.resolve().then(register);
+  try {
+    return await Promise.race([
+      registration,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          reject(new Error(timeoutMessage));
+        }, remaining);
+        timer.unref?.();
+      }),
+    ]);
+  } catch (error) {
+    if (!timedOut) throw error;
+    const cleanupDeadline = Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS;
+    try {
+      const lateRegistration = await runCleanupBeforeDeadline(
+        () => registration,
+        cleanupDeadline,
+        "Timed out waiting for the late ChatGPT export capture hook registration.",
+        (lateResult) =>
+          runCleanupBeforeDeadline(
+            () => remove(lateResult),
+            Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS,
+            "Timed out removing a late ChatGPT export capture hook.",
+          ),
+      );
+      await runCleanupBeforeDeadline(
+        () => remove(lateRegistration),
+        cleanupDeadline,
+        "Timed out removing a late ChatGPT export capture hook.",
+      );
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "ChatGPT export capture hook registration and cleanup failed.",
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 export function runBeforeExportDeadlineForTest<T>(
   operation: () => Promise<T>,
   deadline: number,
@@ -886,6 +940,7 @@ async function runObuCdp(
   params: JsonRecord,
   deadline: number,
   cleanup = false,
+  enforceDeadline = true,
 ): Promise<JsonRecord> {
   const timeout = `${Math.max(1, Math.ceil(remainingMs(deadline) / 1_000))}s`;
   const run = () =>
@@ -906,9 +961,11 @@ async function runObuCdp(
       ],
       { maxBuffer: 64 * 1024 * 1024 },
     );
-  const { stdout, stderr } = cleanup
-    ? await runCleanupBeforeDeadline(run, deadline, `Timed out waiting for obu cdp ${method}.`)
-    : await runBeforeDeadline(run, deadline, `Timed out waiting for obu cdp ${method}.`);
+  const { stdout, stderr } = await (cleanup
+    ? runCleanupBeforeDeadline(run, deadline, `Timed out waiting for obu cdp ${method}.`)
+    : enforceDeadline
+      ? runBeforeDeadline(run, deadline, `Timed out waiting for obu cdp ${method}.`)
+      : run());
   let envelope: JsonRecord;
   try {
     envelope = JSON.parse(stdout) as JsonRecord;
@@ -2224,22 +2281,17 @@ export async function captureApprovedChatGptConversationBackend(
       expectedEmail,
       deadline,
     );
-    const registration = await runBeforeDeadline(
+    const registration = await registerCaptureHookBeforeDeadline(
       () =>
         Page.addScriptToEvaluateOnNewDocument({
           source: buildScopedBackendCaptureHook(targetApiUrl),
         }),
+      (lateRegistration) =>
+        Page.removeScriptToEvaluateOnNewDocument({
+          identifier: lateRegistration.identifier,
+        }),
       deadline,
       "Timed out registering the ChatGPT export capture hook.",
-      (lateRegistration) =>
-        runCleanupBeforeDeadline(
-          () =>
-            Page.removeScriptToEvaluateOnNewDocument({
-              identifier: lateRegistration.identifier,
-            }),
-          Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS,
-          "Timed out removing a late ChatGPT export capture hook.",
-        ),
     );
     captureScriptIdentifier = registration.identifier;
     rawCapturePending = true;
@@ -2427,12 +2479,34 @@ export async function captureApprovedChatGptConversationBackendViaObu(
   let captureScriptIdentifier: string | undefined;
   let rawCapturePending = false;
   try {
-    const registration = await runObuCdp(
-      sessionId,
-      options.tabId,
-      "Page.addScriptToEvaluateOnNewDocument",
-      { source: buildScopedBackendCaptureHook(targetApiUrl) },
+    const registration = await registerCaptureHookBeforeDeadline(
+      () =>
+        runObuCdp(
+          sessionId,
+          options.tabId,
+          "Page.addScriptToEvaluateOnNewDocument",
+          { source: buildScopedBackendCaptureHook(targetApiUrl) },
+          deadline,
+          false,
+          false,
+        ),
+      async (lateRegistration) => {
+        const lateIdentifier =
+          typeof lateRegistration.identifier === "string" ? lateRegistration.identifier : undefined;
+        if (!lateIdentifier) {
+          throw new Error("OBU capture hook registration did not return an identifier.");
+        }
+        await runObuCdp(
+          sessionId,
+          options.tabId,
+          "Page.removeScriptToEvaluateOnNewDocument",
+          { identifier: lateIdentifier },
+          Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS,
+          true,
+        );
+      },
       deadline,
+      "Timed out registering the OBU ChatGPT export capture hook.",
     );
     captureScriptIdentifier =
       typeof registration.identifier === "string" ? registration.identifier : undefined;

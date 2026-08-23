@@ -887,11 +887,38 @@ async function verifyPromptCommitted(
       .filter((node) => Boolean(node));
     const visibleInputs = inputs.filter((node) => isVisible(node));
     const activeInputs = visibleInputs.length > 0 ? visibleInputs : inputs;
-    const userMatched =
-      normalizedPrompt.length > 0 && normalizedTurns.some((text) => text.includes(normalizedPrompt));
-    const prefixMatched =
-      normalizedPromptPrefix.length > 30 &&
-      normalizedTurns.some((text) => text.includes(normalizedPromptPrefix));
+    const readIdentityPart = (value) => {
+      const raw = String(value ?? '').trim();
+      return raw.length > 0 &&
+        raw.length <= 200 &&
+        /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(raw)
+        ? raw
+        : '';
+    };
+    const identityNodesFor = (node) => {
+      const nodes = [node];
+      const candidates = [
+        node?.querySelector?.('[data-message-author-role="user"], [data-turn="user"]'),
+        node?.querySelector?.('[data-message-id]'),
+        node?.querySelector?.('[data-testid^="conversation-turn"]'),
+      ];
+      for (const candidate of candidates) {
+        if (candidate && !nodes.includes(candidate)) nodes.push(candidate);
+      }
+      return nodes;
+    };
+    const readTurnIdentity = (node) => {
+      const identityNodes = identityNodesFor(node);
+      for (const identityNode of identityNodes) {
+        const messageId = readIdentityPart(identityNode?.getAttribute?.('data-message-id'));
+        if (messageId) return 'message:' + messageId;
+      }
+      for (const identityNode of identityNodes) {
+        const testId = readIdentityPart(identityNode?.getAttribute?.('data-testid'));
+        if (testId) return 'testid:' + testId;
+      }
+      return null;
+    };
     const baseline = ${baselineLiteral};
     const lastTurn = normalizedTurns[normalizedTurns.length - 1] ?? '';
     const lastMatched = matchesPromptText(lastTurn);
@@ -904,10 +931,25 @@ async function verifyPromptCommitted(
         break;
       }
     }
+    let submittedTurnIdentity =
+      submittedTurnIndex >= 0 ? readTurnIdentity(articles[submittedTurnIndex]) : null;
+    if (submittedTurnIdentity) {
+      const identityCounts = new Map();
+      for (const article of articles) {
+        const identity = readTurnIdentity(article);
+        if (identity) identityCounts.set(identity, (identityCounts.get(identity) || 0) + 1);
+      }
+      if (identityCounts.get(submittedTurnIdentity) !== 1) submittedTurnIdentity = null;
+    }
     const submittedTurnMatched =
       submittedTurnIndex >= 0 &&
       isUserTurn(articles[submittedTurnIndex]) &&
       matchesPromptText(normalizedTurns[submittedTurnIndex] ?? '');
+    const userMatched =
+      normalizedPrompt.length > 0 && normalizedTurns.some((text) => text.includes(normalizedPrompt));
+    const prefixMatched =
+      normalizedPromptPrefix.length > 30 &&
+      normalizedTurns.some((text) => text.includes(normalizedPromptPrefix));
     const stopVisible = Boolean(document.querySelector(${stopSelectorLiteral}));
     const assistantVisible = Boolean(
       document.querySelector(${assistantSelectorLiteral}) ||
@@ -930,6 +972,7 @@ async function verifyPromptCommitted(
       userMatched,
       prefixMatched,
       submittedTurnIndex,
+      submittedTurnIdentity,
       lastMatched,
       submittedTurnMatched,
       hasNewTurn,
@@ -946,7 +989,9 @@ async function verifyPromptCommitted(
     };
   })()`;
 
-  const unclearedSubmittedTurnIndexes = new Set<number>();
+  const unclearedSubmittedTurnIdentities = new Set<string>();
+  let observedSubmittedTurnIdentity: string | undefined;
+  let submittedTurnIdentityAmbiguous = false;
   let lastProbe: CommitProbeState | undefined;
   while (Date.now() < deadline) {
     const { result } = await Runtime.evaluate({ expression: script, returnByValue: true });
@@ -955,6 +1000,19 @@ async function verifyPromptCommitted(
       lastProbe = info;
     }
     const turnsCount = (result.value as { turnsCount?: number } | undefined)?.turnsCount;
+    const currentSubmittedTurnIdentity = sanitizeCommitProbeIdentity(info?.submittedTurnIdentity);
+    if (info?.submittedTurnMatched === true) {
+      if (!currentSubmittedTurnIdentity) {
+        submittedTurnIdentityAmbiguous = true;
+      } else if (
+        observedSubmittedTurnIdentity &&
+        observedSubmittedTurnIdentity !== currentSubmittedTurnIdentity
+      ) {
+        submittedTurnIdentityAmbiguous = true;
+      } else if (!observedSubmittedTurnIdentity) {
+        observedSubmittedTurnIdentity = currentSubmittedTurnIdentity;
+      }
+    }
     const baselineKnown =
       typeof info?.baseline === "number" ? info.baseline >= 0 : baselineLiteral >= 0;
     const parsedConversationUrl =
@@ -963,14 +1021,14 @@ async function verifyPromptCommitted(
       parsedConversationUrl && extractStableConversationIdFromUrl(parsedConversationUrl.pathname)
         ? info?.href
         : null;
-    const submittedTurnIndex = info?.submittedTurnIndex;
     const submittedTurnIsFresh =
       info?.submittedTurnMatched === true &&
       info.composerKnown === true &&
       info.composerCleared === true &&
-      typeof submittedTurnIndex === "number" &&
-      submittedTurnIndex >= 0 &&
-      !unclearedSubmittedTurnIndexes.has(submittedTurnIndex);
+      currentSubmittedTurnIdentity !== null &&
+      submittedTurnIdentityAmbiguous === false &&
+      observedSubmittedTurnIdentity === currentSubmittedTurnIdentity &&
+      !unclearedSubmittedTurnIdentities.has(currentSubmittedTurnIdentity);
     if (baselineKnown && info?.hasNewTurn && submittedTurnIsFresh && conversationUrl) {
       return {
         turnsCount:
@@ -982,11 +1040,12 @@ async function verifyPromptCommitted(
       baselineKnown &&
       info?.hasNewTurn === true &&
       info.submittedTurnMatched === true &&
-      typeof submittedTurnIndex === "number" &&
-      submittedTurnIndex >= 0 &&
-      info.composerCleared !== true
+      currentSubmittedTurnIdentity !== null &&
+      info.composerCleared !== true &&
+      // A visible stop control binds this identity to the active send before React clears the composer.
+      info.stopVisible !== true
     ) {
-      unclearedSubmittedTurnIndexes.add(submittedTurnIndex);
+      unclearedSubmittedTurnIdentities.add(currentSubmittedTurnIdentity);
     }
     await delay(100);
   }
@@ -996,7 +1055,7 @@ async function verifyPromptCommitted(
   const probe = finalProbe && typeof finalProbe === "object" ? finalProbe : lastProbe;
   if (logger) {
     logger(
-      `Prompt commit check failed; latest state: ${probe ? JSON.stringify(probe) : "unavailable"}`,
+      `Prompt commit check failed; latest state: ${probe ? JSON.stringify(summarizeCommitProbe(probe)) : "unavailable"}`,
     );
     await logDomFailure(Runtime, logger, "prompt-commit");
   }
@@ -1028,6 +1087,7 @@ interface CommitProbeState {
   submittedTurnIndex?: number;
   userMatched?: boolean;
   prefixMatched?: boolean;
+  submittedTurnIdentity?: string | null;
   lastMatched?: boolean;
   submittedTurnMatched?: boolean;
   hasNewTurn?: boolean;
@@ -1044,6 +1104,12 @@ interface CommitProbeState {
 }
 
 // Keep booleans/counts but replace free text with lengths so session metadata stays lean.
+
+function sanitizeCommitProbeIdentity(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(normalized) ? normalized : null;
+}
 function summarizeCommitProbe(probe: CommitProbeState): Record<string, unknown> {
   return {
     baseline: probe.baseline,
@@ -1052,6 +1118,7 @@ function summarizeCommitProbe(probe: CommitProbeState): Record<string, unknown> 
     userMatched: probe.userMatched,
     prefixMatched: probe.prefixMatched,
     lastMatched: probe.lastMatched,
+    submittedTurnIdentityPresent: typeof probe.submittedTurnIdentity === "string",
     submittedTurnMatched: probe.submittedTurnMatched,
     hasNewTurn: probe.hasNewTurn,
     stopVisible: probe.stopVisible,

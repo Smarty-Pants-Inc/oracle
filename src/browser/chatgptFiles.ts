@@ -17,6 +17,10 @@ import {
   writeBinaryBrowserArtifact,
 } from "./artifacts.js";
 import { buildEvaluatedChatGptPageAffinityGuard } from "./chatgptAccount.js";
+import {
+  acquireBrowserDownloadBehaviorLock,
+  type BrowserDownloadBehaviorLockScope,
+} from "./downloadBehaviorLock.js";
 
 const CHATGPT_DOWNLOAD_BASE_URL = "https://chatgpt.com/";
 const DOWNLOAD_BUTTON_WAIT_MS = 15_000;
@@ -27,19 +31,6 @@ export type SavedAssistantDownloadButtonArtifacts = SavedBrowserFile[] & {
   readonly retainedStagingDir?: string;
 };
 
-// ponytail: one process-wide queue because Browser.setDownloadBehavior has no tab scope.
-let browserDownloadBehaviorQueue: Promise<void> = Promise.resolve();
-
-async function acquireBrowserDownloadBehaviorLock(): Promise<() => void> {
-  let release!: () => void;
-  const pending = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const previous = browserDownloadBehaviorQueue;
-  browserDownloadBehaviorQueue = pending;
-  await previous;
-  return release;
-}
 type DownloadSourceKind = "sandbox" | "chatgpt-file-endpoint" | "browser-download";
 type DirectDownloadStrategy = "browser-fetch" | "node-fetch";
 
@@ -1233,6 +1224,7 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
   buttonWaitMs?: number;
   downloadPath?: string;
   downloadWaitMs?: number;
+  downloadBehaviorLockScope?: BrowserDownloadBehaviorLockScope;
   minTurnIndex?: number | null;
   sessionId?: string;
   assertPageAffinity?: (action: string) => Promise<void>;
@@ -1251,9 +1243,38 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
     params.downloadPath ?? resolveSessionArtifactsDir(params.sessionId as string);
   await fs.mkdir(artifactsDir, { recursive: true });
   await params.assertPageAffinity?.("browser download artifact collection");
-  const stagingDir = await fs.mkdtemp(path.join(artifactsDir, ".oracle-download-"));
-  const releaseBrowserDownloadBehavior = await acquireBrowserDownloadBehaviorLock();
+  const browserDownloadBehaviorLock = await acquireBrowserDownloadBehaviorLock(
+    params.downloadBehaviorLockScope,
+    { logger: params.logger },
+  );
+  let stagingDir: string;
+  try {
+    stagingDir = await fs.mkdtemp(path.join(artifactsDir, ".oracle-download-"));
+  } catch (error) {
+    await browserDownloadBehaviorLock.release();
+    throw error;
+  }
   let restoreDownloadBehavior: (() => Promise<void>) | null = null;
+  let resetSucceeded = true;
+  let downloadBehaviorFinalized = false;
+  const finalizeBrowserDownloadBehavior = async () => {
+    if (downloadBehaviorFinalized) return;
+    try {
+      if (restoreDownloadBehavior) {
+        try {
+          await restoreDownloadBehavior();
+        } catch (error) {
+          resetSucceeded = false;
+          const message = error instanceof Error ? error.message : String(error);
+          params.logger?.(`[browser] Failed to restore browser download behavior: ${message}`);
+        }
+      }
+    } finally {
+      downloadBehaviorFinalized = true;
+      await browserDownloadBehaviorLock.release();
+    }
+  };
+  const stagedDownloads: Array<{ path: string; filename: string }> = [];
   try {
     restoreDownloadBehavior = await configureBrowserDownloadPath({
       Browser: params.Browser,
@@ -1277,7 +1298,6 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
     const buttonWaitMs = params.buttonWaitMs ?? DOWNLOAD_BUTTON_WAIT_MS;
     const downloadWaitMs = params.downloadWaitMs ?? DOWNLOAD_BUTTON_WAIT_MS;
     const expectedFiles = params.files ?? [];
-    const stagedDownloads: Array<{ path: string; filename: string }> = [];
 
     if (expectedFiles.length === 0) {
       const clickedResult = await clickAssistantDownloadButtons({
@@ -1417,6 +1437,7 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
     }
 
     await params.assertPageAffinity?.("browser download artifact final return");
+    await finalizeBrowserDownloadBehavior();
     const publishedPaths = new Set<string>();
     for (const staged of stagedDownloads) {
       if (publishedPaths.has(staged.path)) {
@@ -1432,26 +1453,13 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
     }
     return savedFiles;
   } finally {
-    try {
-      let resetSucceeded = true;
-      if (restoreDownloadBehavior) {
-        try {
-          await restoreDownloadBehavior();
-        } catch (error) {
-          resetSucceeded = false;
-          const message = error instanceof Error ? error.message : String(error);
-          params.logger?.(`[browser] Failed to restore browser download behavior: ${message}`);
-        }
-      }
-      if (resetSucceeded) {
-        await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
-      } else {
-        Object.defineProperty(savedFiles, "retainedStagingDir", { value: stagingDir });
-        params.onStagingRetained?.(stagingDir);
-        params.logger?.("[browser] Preserved browser download staging after reset failure.");
-      }
-    } finally {
-      releaseBrowserDownloadBehavior();
+    await finalizeBrowserDownloadBehavior();
+    if (resetSucceeded) {
+      await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
+    } else {
+      Object.defineProperty(savedFiles, "retainedStagingDir", { value: stagingDir });
+      params.onStagingRetained?.(stagingDir);
+      params.logger?.("[browser] Preserved browser download staging after reset failure.");
     }
   }
 }
@@ -1780,6 +1788,7 @@ export async function collectChatGptFileArtifacts(params: {
   assertPageAffinity?: (action: string) => Promise<void>;
   expectedAccountDigest?: string;
   sessionId?: string;
+  downloadBehaviorLockScope?: BrowserDownloadBehaviorLockScope;
 }): Promise<{
   files: BrowserDownloadableFile[];
   savedFiles: SavedBrowserFile[];
@@ -1846,6 +1855,7 @@ export async function collectChatGptFileArtifacts(params: {
           assertPageAffinity: params.assertPageAffinity,
           expectedConversationId: params.expectedConversationId,
           expectedAccountDigest: params.expectedAccountDigest,
+          downloadBehaviorLockScope: params.downloadBehaviorLockScope,
         })
       : [];
   const savedFiles = [...saved.savedFiles, ...buttonSavedFiles];

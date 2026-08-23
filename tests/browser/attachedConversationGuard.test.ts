@@ -65,11 +65,17 @@ vi.mock("../../src/browser/providerDomFlow.js", async (importOriginal) => ({
 }));
 
 import { runBrowserMode } from "../../src/browser/index.js";
+import { BrowserAutomationError } from "../../src/oracle/errors.js";
 
 type Transport = "local" | "remote";
 type RetargetPoint = "before-clear" | "before-upload";
 type FirstConversationRetargetPoint = "before-pin" | "before-follow-up";
 const transports = ["local", "remote"] as const;
+type RuntimeHint = {
+  tabUrl?: string;
+  conversationId?: string;
+  promptSubmitted?: boolean;
+};
 
 function resetMocks(): void {
   chromeMocks.launchChrome.mockReset();
@@ -274,7 +280,10 @@ async function runUnpinnedAttachmentRetarget(
   }).catch((error: unknown) => error);
 }
 
-async function runAttachedWorkConversationReset(transport: Transport): Promise<unknown> {
+async function runAttachedWorkConversationReset(
+  transport: Transport,
+  options: { failCommitVerification?: boolean; runtimeHints?: RuntimeHint[] } = {},
+): Promise<unknown> {
   const workUrl = "https://chatgpt.com/c/work-thread";
   const createdUrl = "https://chatgpt.com/c/created-after-reset";
   const answer = "a".repeat(100);
@@ -338,6 +347,13 @@ async function runAttachedWorkConversationReset(transport: Transport): Promise<u
       if (!context.state) return;
       context.state.baselineTurns = 0;
       await (context.state.onPromptSubmitted as (() => Promise<void>) | undefined)?.();
+      if (options.failCommitVerification) {
+        await Promise.resolve();
+        throw new BrowserAutomationError("Prompt commit verification failed.", {
+          stage: "submit-prompt",
+          code: "prompt-commit-timeout",
+        });
+      }
       context.state.committedConversationUrl = createdUrl;
     },
   );
@@ -361,6 +377,11 @@ async function runAttachedWorkConversationReset(transport: Transport): Promise<u
       modelStrategy: "ignore",
       ...(transport === "remote" ? { remoteChrome: { host: "127.0.0.1", port: 9223 } } : {}),
     },
+    runtimeHintCb: options.runtimeHints
+      ? (hint) => {
+          options.runtimeHints?.push(hint);
+        }
+      : undefined,
   });
 }
 
@@ -463,6 +484,27 @@ describe("attached conversation mutation guards", () => {
       });
       expect(pageActionMocks.navigateToChatGPT).toHaveBeenCalledOnce();
       expect(providerFlowMocks.runProviderSubmissionFlow).toHaveBeenCalledOnce();
+    },
+  );
+  test.each(transports)(
+    "keeps a reset-created %s Chat recoverable when commit verification fails",
+    async (transport) => {
+      const runtimeHints: RuntimeHint[] = [];
+
+      await expect(
+        runAttachedWorkConversationReset(transport, {
+          failCommitVerification: true,
+          runtimeHints,
+        }),
+      ).rejects.toMatchObject({ details: { code: "prompt-commit-timeout" } });
+
+      expect(runtimeHints).toContainEqual(
+        expect.objectContaining({
+          tabUrl: "https://chatgpt.com/c/created-after-reset",
+          conversationId: "created-after-reset",
+          promptSubmitted: true,
+        }),
+      );
     },
   );
 });

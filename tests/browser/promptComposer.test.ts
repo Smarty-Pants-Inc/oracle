@@ -113,17 +113,21 @@ describe("promptComposer", () => {
     }
   });
   test("accepts a fresh submitted prompt followed by an assistant turn before the first probe", async () => {
-    const turn = (role: "user" | "assistant", innerText: string) => ({
+    const turn = (role: "user" | "assistant", innerText: string, id: string) => ({
       innerText,
-      getAttribute: (name: string) => (name === "data-message-author-role" ? role : null),
+      getAttribute: (name: string) => {
+        if (name === "data-message-author-role") return role;
+        if (name === "data-testid") return id;
+        return null;
+      },
       querySelector: () => null,
     });
     const topLevelTurns = [
-      turn("user", "old prompt"),
-      turn("assistant", "old answer"),
-      turn("assistant", "late hydrated answer"),
-      turn("user", "new prompt"),
-      turn("assistant", "Thinking"),
+      turn("user", "old prompt", "conversation-turn-old-user"),
+      turn("assistant", "old answer", "conversation-turn-old-assistant"),
+      turn("assistant", "late hydrated answer", "conversation-turn-late-assistant"),
+      turn("user", "new prompt", "conversation-turn-new-user"),
+      turn("assistant", "Thinking", "conversation-turn-new-assistant"),
     ];
     const composer = {
       innerText: "",
@@ -165,6 +169,58 @@ describe("promptComposer", () => {
     });
   });
 
+  test("accepts a submitted turn with stop evidence when composer clears on a later poll", async () => {
+    vi.useFakeTimers();
+    try {
+      const firstProbe = {
+        baseline: 2,
+        turnsCount: 3,
+        submittedTurnIndex: 2,
+        submittedTurnIdentity: "testid:conversation-turn-new-user",
+        submittedTurnMatched: true,
+        hasNewTurn: true,
+        lastMatched: true,
+        stopVisible: true,
+        composerKnown: true,
+        composerCleared: false,
+        inConversation: true,
+        href: "https://chatgpt.com/c/reused",
+      };
+      const laterProbe = {
+        ...firstProbe,
+        turnsCount: 4,
+        lastMatched: false,
+        stopVisible: false,
+        composerCleared: true,
+        assistantVisible: true,
+      };
+      const runtime = {
+        evaluate: vi
+          .fn()
+          .mockResolvedValueOnce({ result: { value: firstProbe } })
+          .mockResolvedValue({ result: { value: laterProbe } }),
+      } as unknown as {
+        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+      };
+
+      const promise = promptComposer.verifyPromptCommitted(
+        runtime as never,
+        "new prompt",
+        150,
+        undefined,
+        2,
+      );
+      const assertion = expect(promise).resolves.toEqual({
+        turnsCount: 4,
+        conversationUrl: "https://chatgpt.com/c/reused",
+      });
+      await vi.advanceTimersByTimeAsync(250);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("does not accept a stale matching tail after later hydration clears the composer", async () => {
     vi.useFakeTimers();
     try {
@@ -172,9 +228,11 @@ describe("promptComposer", () => {
         baseline: 2,
         turnsCount: 3,
         submittedTurnIndex: 2,
+        submittedTurnIdentity: "testid:conversation-turn-stale-user",
         submittedTurnMatched: true,
         hasNewTurn: true,
         lastMatched: true,
+        stopVisible: false,
         composerKnown: true,
         composerCleared: false,
         inConversation: true,
@@ -192,6 +250,96 @@ describe("promptComposer", () => {
           .fn()
           .mockResolvedValueOnce({ result: { value: firstProbe } })
           .mockResolvedValue({ result: { value: laterProbe } }),
+      } as unknown as {
+        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+      };
+
+      const promise = promptComposer.verifyPromptCommitted(
+        runtime as never,
+        "new prompt",
+        150,
+        undefined,
+        2,
+      );
+      const assertion = expect(promise).rejects.toMatchObject({
+        details: expect.objectContaining({ code: "prompt-commit-timeout" }),
+      });
+      await vi.advanceTimersByTimeAsync(250);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not accept a stale matching turn reindexed when the composer clears", async () => {
+    vi.useFakeTimers();
+    try {
+      const firstProbe = {
+        baseline: 2,
+        turnsCount: 3,
+        submittedTurnIndex: 2,
+        submittedTurnIdentity: "testid:conversation-turn-stale-user",
+        submittedTurnMatched: true,
+        hasNewTurn: true,
+        stopVisible: false,
+        composerKnown: true,
+        composerCleared: false,
+        href: "https://chatgpt.com/c/reused",
+      };
+      const runtime = {
+        evaluate: vi
+          .fn()
+          .mockResolvedValueOnce({ result: { value: firstProbe } })
+          .mockResolvedValue({
+            result: {
+              value: {
+                ...firstProbe,
+                turnsCount: 4,
+                submittedTurnIndex: 3,
+                composerCleared: true,
+              },
+            },
+          }),
+      } as unknown as {
+        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+      };
+
+      const promise = promptComposer.verifyPromptCommitted(
+        runtime as never,
+        "new prompt",
+        150,
+        undefined,
+        2,
+      );
+      const assertion = expect(promise).rejects.toMatchObject({
+        details: expect.objectContaining({ code: "prompt-commit-timeout" }),
+      });
+      await vi.advanceTimersByTimeAsync(250);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("fails closed when a matched turn has no stable identity", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: {
+            value: {
+              baseline: 2,
+              turnsCount: 3,
+              submittedTurnIndex: 2,
+              submittedTurnMatched: true,
+              hasNewTurn: true,
+              stopVisible: true,
+              composerKnown: true,
+              composerCleared: true,
+              href: "https://chatgpt.com/c/reused",
+            },
+          },
+        }),
       } as unknown as {
         evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
       };
@@ -293,6 +441,7 @@ describe("promptComposer", () => {
               composerCleared: true,
               inConversation: true,
               href: "https://chatgpt.com/c/created-for-prompt",
+              submittedTurnIdentity: "testid:conversation-turn-new-user",
             },
           },
         }),
@@ -403,6 +552,7 @@ describe("promptComposer", () => {
               prefixMatched: false,
               lastMatched: true,
               submittedTurnIndex: 0,
+              submittedTurnIdentity: "testid:conversation-turn-new-user",
               submittedTurnMatched: true,
               hasNewTurn: true,
               stopVisible: true,

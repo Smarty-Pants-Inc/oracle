@@ -14,6 +14,7 @@ import { readAssistantSnapshot } from "./pageActions.js";
 import { getOracleHomeDir } from "../oracleHome.js";
 import { resolveSessionArtifactsDir } from "./artifacts.js";
 import { saveAssistantDownloadButtonArtifacts } from "./chatgptFiles.js";
+import type { BrowserDownloadBehaviorLockScope } from "./downloadBehaviorLock.js";
 import { buildEvaluatedChatGptPageAffinityGuard } from "./chatgptAccount.js";
 function buildAssistantImageExpression(
   minTurnIndex?: number,
@@ -580,6 +581,7 @@ async function saveGeneratedImageButtonArtifacts(params: {
   assertPageAffinity?: (action: string) => Promise<void>;
   expectedConversationId?: string;
   expectedAccountDigest?: string;
+  downloadBehaviorLockScope?: BrowserDownloadBehaviorLockScope;
 }): Promise<SavedBrowserImage[]> {
   await params.assertPageAffinity?.("generated image download button fallback");
   const targetPath = path.resolve(params.targetPath);
@@ -599,6 +601,7 @@ async function saveGeneratedImageButtonArtifacts(params: {
       assertPageAffinity: params.assertPageAffinity,
       expectedConversationId: params.expectedConversationId,
       expectedAccountDigest: params.expectedAccountDigest,
+      downloadBehaviorLockScope: params.downloadBehaviorLockScope,
       onStagingRetained: () => {
         preserveStagingDir = true;
       },
@@ -687,6 +690,7 @@ export async function collectGeneratedImageArtifacts(params: {
   answerText: string;
   waitTimeoutMs?: number;
   checkBlockingUiWarning?: () => Promise<void>;
+  downloadBehaviorLockScope?: BrowserDownloadBehaviorLockScope;
 }): Promise<{
   generatedImages: BrowserGeneratedImage[];
   savedImages: SavedBrowserImage[];
@@ -720,6 +724,7 @@ export async function collectGeneratedImageArtifacts(params: {
       assertPageAffinity: params.assertPageAffinity,
       expectedConversationId: params.expectedConversationId,
       expectedAccountDigest: params.expectedAccountDigest,
+      downloadBehaviorLockScope: params.downloadBehaviorLockScope,
     });
     if (buttonImages.length > 0) {
       return formatButtonImageArtifacts(buttonImages, latestAnswerText);
@@ -772,6 +777,7 @@ export async function collectGeneratedImageArtifacts(params: {
         assertPageAffinity: params.assertPageAffinity,
         expectedConversationId: params.expectedConversationId,
         expectedAccountDigest: params.expectedAccountDigest,
+        downloadBehaviorLockScope: params.downloadBehaviorLockScope,
       });
       if (delayedButtonImages.length > 0) {
         return formatButtonImageArtifacts(delayedButtonImages, latestAnswerText);
@@ -825,6 +831,7 @@ export async function collectGeneratedImageArtifacts(params: {
         expectedConversationId: params.expectedConversationId,
         expectedAccountDigest: params.expectedAccountDigest,
         targetPath: path.resolve(explicitTargetPath),
+        downloadBehaviorLockScope: params.downloadBehaviorLockScope,
       });
       if (buttonImages.length > 0) {
         return formatButtonImageArtifacts(buttonImages, latestAnswerText);

@@ -1,6 +1,9 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
+import { once } from "node:events";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   collectChatGptFileArtifacts,
@@ -9,8 +12,26 @@ import {
   saveChatGptDownloadableFiles,
   __test__,
 } from "../../src/browser/chatgptFiles.js";
+import {
+  acquireBrowserDownloadBehaviorLock,
+  resolveBrowserDownloadBehaviorLockPath,
+} from "../../src/browser/downloadBehaviorLock.js";
 import type { ChromeClient } from "../../src/browser/types.js";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
+
+function createDeferredPromise<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 class FakeElement {
   clickCount = 0;
@@ -820,7 +841,7 @@ describe("collectChatGptFileArtifacts", () => {
     }
   });
 
-  test("restores browser download behavior and publishes without hard links or clobbering", async () => {
+  test("restores browser download behavior and publishes by exclusive copy without clobbering", async () => {
     const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-file-publish-"));
     setOracleHomeDirOverrideForTest(tmpHome);
     const sessionId = "collect-session";
@@ -855,9 +876,7 @@ describe("collectChatGptFileArtifacts", () => {
         },
       ),
     } as unknown as ChromeClient["Page"];
-    const linkSpy = vi
-      .spyOn(fs, "link")
-      .mockRejectedValue(Object.assign(new Error("hard links unavailable"), { code: "EPERM" }));
+    const linkSpy = vi.spyOn(fs, "link");
 
     const savedFiles = await saveAssistantDownloadButtonArtifacts({
       Page: page,
@@ -877,7 +896,10 @@ describe("collectChatGptFileArtifacts", () => {
       "existing",
     );
     await expect(fs.readFile(path.join(artifactsDir, "report-2.csv"), "utf8")).resolves.toBe("new");
-    expect(linkSpy).not.toHaveBeenCalled();
+    expect(linkSpy).not.toHaveBeenCalledWith(
+      expect.any(String),
+      path.join(artifactsDir, "report-2.csv"),
+    );
     expect(page.setDownloadBehavior).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({ behavior: "allow", downloadPath: browserDownloadDir }),
@@ -1017,6 +1039,163 @@ describe("collectChatGptFileArtifacts", () => {
       await Promise.allSettled([first, second]);
       await fs.rm(firstDir, { recursive: true, force: true });
       await fs.rm(secondDir, { recursive: true, force: true });
+    }
+  });
+  test("reclaims a crashed process lock without deleting that run's staging", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-download-lock-recovery-"));
+    try {
+      const profileDir = path.join(root, "shared-profile");
+      const artifactsDir = path.join(root, "artifacts");
+      await fs.mkdir(profileDir, { recursive: true });
+      await fs.mkdir(artifactsDir, { recursive: true });
+      const crashedStagingDir = await fs.mkdtemp(path.join(artifactsDir, ".oracle-download-"));
+      const crashedStagingFile = path.join(crashedStagingDir, "orphan.txt");
+      await fs.writeFile(crashedStagingFile, "preserve", "utf8");
+
+      const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+      await once(child, "exit");
+      if (!child.pid) throw new Error("Missing crashed lock owner pid");
+      const lockPath = path.join(profileDir, "oracle-download-behavior.lock");
+      await fs.writeFile(
+        lockPath,
+        JSON.stringify({
+          pid: child.pid,
+          lockId: "crashed-owner",
+          createdAt: new Date().toISOString(),
+        }),
+      );
+
+      let browserDownloadDir = "";
+      const page = {
+        setDownloadBehavior: vi.fn(
+          async ({
+            behavior,
+            downloadPath,
+          }: {
+            behavior: "allow" | "default";
+            downloadPath?: string;
+          }) => {
+            if (behavior === "allow") browserDownloadDir = downloadPath ?? "";
+          },
+        ),
+      } as unknown as ChromeClient["Page"];
+      const runtime = {
+        evaluate: vi.fn(async () => {
+          await fs.writeFile(path.join(browserDownloadDir, "replacement.txt"), "new", "utf8");
+          return { result: { value: [{ text: "Download", ariaLabel: "", testId: "" }] } };
+        }),
+      } as unknown as ChromeClient["Runtime"];
+
+      await expect(
+        saveAssistantDownloadButtonArtifacts({
+          Page: page,
+          Runtime: runtime,
+          downloadPath: artifactsDir,
+          downloadWaitMs: 0,
+          downloadBehaviorLockScope: { profileDir },
+        }),
+      ).resolves.toEqual([]);
+      expect(page.setDownloadBehavior).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ behavior: "allow" }),
+      );
+      expect(page.setDownloadBehavior).toHaveBeenNthCalledWith(2, { behavior: "default" });
+      await expect(fs.readFile(crashedStagingFile, "utf8")).resolves.toBe("preserve");
+      await expect(fs.stat(lockPath)).rejects.toThrow();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+  test("keys shared Chrome locks by endpoint rather than profile metadata", () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9222/devtools/browser/shared";
+    expect(
+      resolveBrowserDownloadBehaviorLockPath({
+        browserWSEndpoint,
+        profileDir: "/different-controller-profile",
+      }),
+    ).toBe(resolveBrowserDownloadBehaviorLockPath({ browserWSEndpoint }));
+    expect(resolveBrowserDownloadBehaviorLockPath({ browserWSEndpoint })).not.toBe(
+      resolveBrowserDownloadBehaviorLockPath({
+        browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/other",
+      }),
+    );
+  });
+
+  test("blocks a separate Oracle process on the same profile lock", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-download-lock-contention-"));
+    const profileDir = path.join(root, "shared-profile");
+    await fs.mkdir(profileDir, { recursive: true });
+    const lockModule = pathToFileURL(
+      path.resolve(process.cwd(), "src/browser/downloadBehaviorLock.ts"),
+    ).href;
+    const childScript = `
+      import { acquireBrowserDownloadBehaviorLock } from ${JSON.stringify(lockModule)};
+      const lock = await acquireBrowserDownloadBehaviorLock(
+        { profileDir: ${JSON.stringify(profileDir)} },
+        { timeoutMs: 3000, pollMs: 20 },
+      );
+      process.stdout.write("ready\\n");
+      process.stdin.once("data", async () => {
+        await lock.release();
+        process.exit(0);
+      });
+    `;
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "-e", childScript],
+      { cwd: process.cwd(), stdio: ["pipe", "pipe", "inherit"] },
+    );
+    if (!child.stdout || !child.stdin) throw new Error("Missing child stdio for lock contention");
+    const childExited = once(child, "exit");
+    let childOutput = "";
+    const childReady = createDeferredPromise<void>();
+    child.stdout.on("data", (chunk: Buffer) => {
+      childOutput += chunk.toString();
+      if (childOutput.includes("ready")) childReady.resolve();
+    });
+    child.once("error", childReady.reject);
+    child.once("exit", (code) => {
+      if (code !== null && !childOutput.includes("ready")) {
+        childReady.reject(new Error(`lock owner exited before readiness (${code})`));
+      }
+    });
+    try {
+      await childReady.promise;
+      const contenderWaiting = createDeferredPromise<void>();
+      const contender = acquireBrowserDownloadBehaviorLock(
+        { profileDir },
+        {
+          timeoutMs: 2000,
+          pollMs: 20,
+          logger: (message) => {
+            if (message.includes("Waiting for browser-wide download capture lock")) {
+              contenderWaiting.resolve();
+            }
+          },
+        },
+      );
+      void contender.catch(contenderWaiting.reject);
+      await contenderWaiting.promise;
+      let contenderSettled = false;
+      void contender.then(
+        () => {
+          contenderSettled = true;
+        },
+        () => {
+          contenderSettled = true;
+        },
+      );
+      expect(contenderSettled).toBe(false);
+      child.stdin.write("release\n");
+      const acquired = await contender;
+      await acquired.release();
+      await childExited;
+    } finally {
+      if (child.exitCode === null) {
+        child.kill("SIGKILL");
+        await childExited.catch(() => undefined);
+      }
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 

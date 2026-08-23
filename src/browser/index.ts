@@ -1242,10 +1242,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     }
     promptSubmitted = true;
     await emitRuntimeHint();
-    if (runConversationId) {
-      postSubmitConversationUrlPromise =
-        conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000) ?? null;
-    }
+    postSubmitConversationUrlPromise =
+      conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000) ?? null;
   };
   if (config.debug || process.env.CHATGPT_DEVTOOLS_TRACE === "1") {
     logger(
@@ -2634,6 +2632,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       expectedConversationId: runConversationId,
       assertPageAffinity,
       expectedAccountDigest: chatGptAccountDigest ?? undefined,
+      downloadBehaviorLockScope: { profileDir: userDataDir },
       checkBlockingUiWarning: () =>
         throwChatGptUiWarningIfPresent({
           Runtime,
@@ -2671,6 +2670,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       expectedConversationId: runConversationId,
       assertPageAffinity,
       expectedAccountDigest: chatGptAccountDigest ?? undefined,
+      downloadBehaviorLockScope: { profileDir: userDataDir },
     });
     const savedImageArtifacts = appendArtifacts(undefined, imageArtifacts.savedImages);
     const savedBrowserArtifacts = appendArtifacts(savedImageArtifacts, fileArtifacts.savedFiles);
@@ -3539,10 +3539,8 @@ async function runRemoteBrowserMode(
     }
     promptSubmitted = true;
     await emitRuntimeHint();
-    if (runConversationId) {
-      postSubmitConversationUrlPromise =
-        conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000) ?? null;
-    }
+    postSubmitConversationUrlPromise =
+      conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000) ?? null;
   };
   const accountAffinityProbeTimeoutMs = () =>
     resolveAccountAffinityProbeTimeoutMs(config.inputTimeoutMs);
@@ -4534,6 +4532,7 @@ async function runRemoteBrowserMode(
       expectedConversationId: runConversationId,
       assertPageAffinity,
       expectedAccountDigest: config.remoteChromeAccountDigest ?? undefined,
+      downloadBehaviorLockScope: { browserWSEndpoint },
       checkBlockingUiWarning: () =>
         throwChatGptUiWarningIfPresent({
           Runtime,
@@ -4571,6 +4570,7 @@ async function runRemoteBrowserMode(
       expectedConversationId: runConversationId,
       assertPageAffinity,
       expectedAccountDigest: config.remoteChromeAccountDigest ?? undefined,
+      downloadBehaviorLockScope: { browserWSEndpoint },
     });
     const savedImageArtifacts = appendArtifacts(undefined, imageArtifacts.savedImages);
     const savedBrowserArtifacts = appendArtifacts(savedImageArtifacts, fileArtifacts.savedFiles);
