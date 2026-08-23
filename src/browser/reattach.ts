@@ -2,7 +2,7 @@ import CDP from "chrome-remote-interface";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
-import { BrowserAutomationError } from "../oracle/errors.js";
+import { BrowserAutomationError, sanitizeErrorForPersistence } from "../oracle/errors.js";
 import type {
   BrowserRunWarning,
   BrowserRuntimeMetadata,
@@ -613,13 +613,15 @@ async function resumeBrowserSessionViaObu(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const details = error instanceof BrowserAutomationError ? error.details : undefined;
-      logger(`[browser] Reattached answer captured, but task-tab finalization failed: ${message}`);
+      const warning = sanitizeErrorForPersistence(message, details);
+      logger(
+        `[browser] Reattached answer captured, but task-tab finalization failed: ${warning.message}`,
+      );
       return [
         {
           code: "obu-tab-finalize-failed",
           severity: "warning",
-          message,
-          ...(details ? { details: { ...details } } : {}),
+          ...warning,
         },
       ];
     }

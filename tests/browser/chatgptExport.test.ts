@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import {
@@ -10,6 +13,8 @@ import {
   buildApprovedBackendFetchExpression,
   captureApprovedChatGptConversationBackend,
   buildScopedBackendCaptureHook,
+  cleanupArchivedConversationRecoveryForTest,
+  cleanupScopedBackendCaptureForTest,
   finalizeCompletedOpenBrowserUseExport,
   contentToText,
   conversationIdFromChatGptUrl,
@@ -20,6 +25,7 @@ import {
   runBeforeCaptureDeadlineForTest,
   retrieveCapturedTextWithEvaluator,
   scanTextForSecretLikeMarkers,
+  writeChatGptExportBundleForTest,
   type CapturePollResult,
 } from "../../src/browser/chatgptExport.js";
 
@@ -99,6 +105,92 @@ describe("ChatGPT conversation export helpers", () => {
     expect(finalize).toHaveBeenCalledWith(false);
   });
 
+  test("redacts URLs from persisted OBU finalization warnings", async () => {
+    const finalize = vi.fn().mockRejectedValue(
+      new BrowserAutomationError("Could not finalize https://chatgpt.com/c/private-conversation", {
+        actualUrl: "https://chatgpt.com/c/private-conversation",
+        endpoint: "https://chatgpt.com/backend-api/conversation/private-conversation",
+      }),
+    );
+
+    const warnings = await finalizeCompletedOpenBrowserUseExport({ finalize });
+
+    expect(JSON.stringify(warnings)).not.toContain("private-conversation");
+    expect(warnings).toEqual([
+      expect.objectContaining({
+        message: expect.stringContaining("[redacted-url]"),
+        details: { endpoint: "[redacted-url]" },
+      }),
+    ]);
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "writes export bundles with private modes, including overwritten files",
+    async () => {
+      const parentDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-export-private-mode-"));
+      const outDir = path.join(parentDir, "bundle");
+      const files = [
+        "backend-conversation.json",
+        "backend-capture-info.json",
+        "conversation.json",
+        "payload.json",
+        "conversation.md",
+        "manifest.json",
+        "redaction-report.json",
+        "SHA256SUMS.txt",
+      ];
+      const rawText = JSON.stringify({ conversation_id: "conv-1", title: "private export" });
+      try {
+        await fs.mkdir(outDir, { mode: 0o755 });
+        await fs.chmod(outDir, 0o755);
+        await Promise.all(
+          files.map(async (file) => {
+            const output = path.join(outDir, file);
+            await fs.writeFile(output, "permissive stale content", { mode: 0o644 });
+            await fs.chmod(output, 0o644);
+          }),
+        );
+
+        await writeChatGptExportBundleForTest({
+          outDir,
+          rawText,
+          payload: {
+            target_url: "https://chatgpt.com/c/conv-1",
+            final_url: "https://chatgpt.com/c/conv-1",
+            conversation_id: "conv-1",
+            expected_conversation_id: "conv-1",
+            scope_ok: true,
+            title: "private export",
+            extraction_method: "test",
+            exported_at: "2026-08-23T00:00:00.000Z",
+            backend_probe: {},
+            stats: {
+              turn_count: 0,
+              user_turns: 0,
+              assistant_turns: 0,
+              tool_turns: 0,
+              system_turns: 0,
+            },
+            turns: [],
+          },
+          captureInfo: { captured_at: "2026-08-23T00:00:00.000Z" },
+        });
+
+        expect((await fs.stat(outDir)).mode & 0o777).toBe(0o700);
+        await Promise.all(
+          files.map(async (file) => {
+            expect((await fs.stat(path.join(outDir, file))).mode & 0o777).toBe(0o600);
+          }),
+        );
+        expect(await fs.readFile(path.join(outDir, "backend-conversation.json"), "utf8")).toBe(
+          rawText,
+        );
+      } finally {
+        await fs.rm(parentDir, { recursive: true, force: true });
+      }
+    },
+  );
+
   test("derives exact backend conversation URL and project-aware scope check", () => {
     const rootUrl = "https://chatgpt.com/c/conv-1";
     const projectUrl = "https://chatgpt.com/g/project/c/conv-1";
@@ -173,6 +265,11 @@ describe("ChatGPT conversation export helpers", () => {
     expect(hook).toContain("EXPECTED_WORKSPACE_DIGEST");
     expect(hook).toContain("requestWorkspaceDigest");
     expect(hook).toContain("identityMatches");
+    expect(hook).toContain("routeMatches() &&");
+    expect(hook).toContain('const SETTINGS_HASH = "#settings/DataControls/ArchivedChats"');
+    expect(hook).toContain('current.search !== ""');
+    expect(hook).toContain("current.hash !== SETTINGS_HASH");
+    expect(hook.lastIndexOf("if (!routeMatches())")).toBeLessThan(hook.indexOf("const patch"));
   });
 
   test("refuses archived-list authorization captured before the expected account is active", async () => {
@@ -343,6 +440,114 @@ describe("ChatGPT conversation export helpers", () => {
     });
     expect(patchHeaders).toEqual([`Bearer ${freshToken}`, workspaceId]);
   });
+  test("refuses archive recovery when a deferred archived list returns after settings drift", async () => {
+    const expectedUserId = "account-a";
+    const workspaceId = "workspace-a";
+    const freshToken = "fresh-account-a-token";
+    const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const archivedListUrl = "https://chatgpt.com/backend-api/conversations?is_archived=true";
+    const settingsUrl = "https://chatgpt.com/#settings/DataControls/ArchivedChats";
+    const install = new Function(
+      "window",
+      "document",
+      "location",
+      "Request",
+      "Headers",
+      "URL",
+      "crypto",
+      "TextEncoder",
+      "globalThis",
+      buildArchivedConversationRecoveryHookForTest("conv-1", {
+        targetUrl: "https://chatgpt.com/c/conv-1",
+        accountDigest: digest(expectedUserId),
+        workspaceDigest: digest(workspaceId),
+      }),
+    ) as (...args: unknown[]) => void;
+
+    for (const driftUrl of [
+      "https://chatgpt.com/?drift=1#settings/DataControls/ArchivedChats",
+      "https://chatgpt.com/#settings/DataControls/Other",
+    ]) {
+      let listRequested = false;
+      let resolveList: (response: Response) => void = () => {};
+      const patch = vi.fn();
+      const pageFetch = vi.fn((input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        if (url === "/api/auth/session") {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({ user: { id: expectedUserId }, account: { id: workspaceId } }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            ),
+          );
+        }
+        if (url === archivedListUrl) {
+          listRequested = true;
+          return new Promise<Response>((resolve) => {
+            resolveList = resolve;
+          });
+        }
+        if (url === targetApiUrl && init?.method === "PATCH") {
+          patch();
+          return Promise.resolve(new Response("{}", { status: 200 }));
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      });
+      const page = {
+        fetch: pageFetch as unknown as typeof fetch,
+        document: {
+          getElementById: () => ({
+            textContent: JSON.stringify({
+              session: {
+                user: { id: expectedUserId },
+                account: { id: workspaceId },
+                accessToken: freshToken,
+              },
+            }),
+          }),
+        },
+      } as {
+        fetch: typeof fetch;
+        document: { getElementById: () => { textContent: string } };
+        __oracleArchivedConversationRecovery?: Record<string, unknown>;
+      };
+      const location = { href: settingsUrl };
+      install(
+        page,
+        page.document,
+        location,
+        Request,
+        Headers,
+        URL,
+        globalThis.crypto,
+        TextEncoder,
+        { crypto: globalThis.crypto },
+      );
+
+      const list = page.fetch(
+        new Request(archivedListUrl, {
+          headers: {
+            Authorization: "Bearer stale-account-token",
+            "ChatGPT-Account-Id": workspaceId,
+          },
+        }),
+      );
+      await vi.waitFor(() => {
+        expect(listRequested).toBe(true);
+      });
+      location.href = driftUrl;
+      resolveList(new Response("{}", { status: 200 }));
+      await list;
+
+      expect(patch).not.toHaveBeenCalled();
+      expect(page.__oracleArchivedConversationRecovery).toMatchObject({
+        status: "failed",
+        recovered: false,
+      });
+    }
+  });
 
   test("capture hook scopes recording and marks exact GETs before dispatch", () => {
     const hook = buildScopedBackendCaptureHook(
@@ -351,17 +556,175 @@ describe("ChatGPT conversation export helpers", () => {
     expect(hook).toContain('const TARGET = "https://chatgpt.com/backend-api/conversation/conv-1"');
     expect(hook).toContain("url !== TARGET");
     expect(hook).toContain("window.fetch");
-    expect(hook).toContain("XMLHttpRequest");
     expect(hook).toContain("requests: { started: 0, pending: 0, completed: 0 }");
     expect(hook.indexOf("state.requests.started += 1")).toBeLessThan(
       hook.indexOf("originalFetch.apply"),
     );
     expect(hook).toContain('request = begin("xhr", requestUrl, requestMethod, requestHeaders)');
-    expect(hook).toContain(
-      'sessionStorage.setItem("__oracleChatGptBackendCapture:" + TARGET, capturedText)',
-    );
+    expect(hook).toContain("sessionStorage.setItem(STORAGE_KEY, capturedText)");
+    expect(hook).toContain("state.cleanup");
     expect(hook).not.toContain("localStorage");
     expect(hook).not.toContain("cookie");
+  });
+
+  test("cleans scoped capture state, removes its registration, and disarms delayed responses", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const storageValues = new Map<string, string>();
+    const storage = {
+      getItem: vi.fn((key: string) => storageValues.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storageValues.set(key, value)),
+      removeItem: vi.fn((key: string) => storageValues.delete(key)),
+    };
+    let resolveResponse: ((response: Response) => void) | undefined;
+    const originalFetch = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveResponse = resolve;
+        }),
+    ) as unknown as typeof fetch;
+    class OriginalXhr {}
+    const page = {
+      fetch: originalFetch,
+      XMLHttpRequest: OriginalXhr,
+      __oracleChatGptBackendCaptureSelection: { target: targetApiUrl },
+    } as {
+      fetch: typeof fetch;
+      XMLHttpRequest: typeof OriginalXhr;
+      __oracleChatGptBackendCapture?: unknown;
+      __oracleChatGptBackendCaptureSelection?: { target: string };
+    };
+    const install = new Function(
+      "window",
+      "location",
+      "sessionStorage",
+      buildScopedBackendCaptureHook(targetApiUrl),
+    ) as (window: typeof page, location: { href: string }, sessionStorage: typeof storage) => void;
+    install(page, { href: "https://chatgpt.com/c/conv-1" }, storage);
+
+    const pendingResponse = page.fetch(targetApiUrl);
+    const Runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: new Function("window", "sessionStorage", `return (${expression});`)(page, storage),
+        },
+      })),
+    };
+    const Page = { removeScriptToEvaluateOnNewDocument: vi.fn(async () => undefined) };
+
+    await cleanupScopedBackendCaptureForTest(
+      Runtime as never,
+      Page as never,
+      targetApiUrl,
+      "scoped-capture-script",
+    );
+
+    expect(page.fetch).toBe(originalFetch);
+    expect(page.XMLHttpRequest).toBe(OriginalXhr);
+    expect(page.__oracleChatGptBackendCapture).toBeUndefined();
+    expect(page.__oracleChatGptBackendCaptureSelection).toBeUndefined();
+    expect(storage.removeItem).toHaveBeenCalledWith(
+      `__oracleChatGptBackendCapture:${targetApiUrl}`,
+    );
+    expect(Page.removeScriptToEvaluateOnNewDocument).toHaveBeenCalledWith({
+      identifier: "scoped-capture-script",
+    });
+
+    expect(resolveResponse).toBeTypeOf("function");
+    resolveResponse!(
+      new Response(JSON.stringify({ conversation_id: "conv-1", title: "delayed private body" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    await pendingResponse;
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(storage.setItem).not.toHaveBeenCalled();
+  });
+
+  test("cleans archived recovery state and removes its registration", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const originalFetch = vi.fn(async () => new Response("{}")) as unknown as typeof fetch;
+    const storage = { getItem: () => null };
+    const page = {
+      fetch: originalFetch,
+      document: { getElementById: () => ({ textContent: "{}" }) },
+    } as {
+      fetch: typeof fetch;
+      document: { getElementById: () => { textContent: string } };
+      __oracleArchivedConversationRecovery?: unknown;
+    };
+    const install = new Function(
+      "window",
+      "document",
+      "location",
+      "Request",
+      "Headers",
+      "URL",
+      "crypto",
+      "TextEncoder",
+      "globalThis",
+      "sessionStorage",
+      buildArchivedConversationRecoveryHookForTest("conv-1"),
+    ) as (...args: unknown[]) => void;
+    install(
+      page,
+      page.document,
+      { href: "https://chatgpt.com/#settings/DataControls/ArchivedChats" },
+      Request,
+      Headers,
+      URL,
+      globalThis.crypto,
+      TextEncoder,
+      { crypto: globalThis.crypto },
+      storage,
+    );
+    const Runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: { value: new Function("window", `return (${expression});`)(page) },
+      })),
+    };
+    const Page = { removeScriptToEvaluateOnNewDocument: vi.fn(async () => undefined) };
+
+    await cleanupArchivedConversationRecoveryForTest(
+      Runtime as never,
+      Page as never,
+      targetApiUrl,
+      "archive-recovery-script",
+    );
+
+    expect(page.fetch).toBe(originalFetch);
+    expect(page.__oracleArchivedConversationRecovery).toBeUndefined();
+    expect(Page.removeScriptToEvaluateOnNewDocument).toHaveBeenCalledWith({
+      identifier: "archive-recovery-script",
+    });
+  });
+
+  test("reports page and registration teardown failures after attempting both", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const Runtime = { evaluate: vi.fn().mockRejectedValue(new Error("page disconnected")) };
+    const Page = {
+      removeScriptToEvaluateOnNewDocument: vi.fn().mockRejectedValue(new Error("remove failed")),
+    };
+
+    await expect(
+      cleanupScopedBackendCaptureForTest(
+        Runtime as never,
+        Page as never,
+        targetApiUrl,
+        "script-id",
+      ),
+    ).rejects.toMatchObject({
+      name: "BrowserAutomationError",
+      details: {
+        code: "capture-cleanup-failed",
+        cleanup: expect.arrayContaining(["page cleanup", "script removal", "fail-closed marker"]),
+      },
+    });
+    expect(Page.removeScriptToEvaluateOnNewDocument).toHaveBeenCalledWith({
+      identifier: "script-id",
+    });
+    expect(Runtime.evaluate).toHaveBeenCalledTimes(2);
   });
 
   test("captures approved JSON XHR responses without reading responseText", async () => {
@@ -426,6 +789,106 @@ describe("ChatGPT conversation export helpers", () => {
       `__oracleChatGptBackendCapture:${targetApiUrl}`,
       text,
     );
+  });
+  test("resets tracked headers when a reused XHR opens a new request", async () => {
+    const targetUrl = "https://chatgpt.com/c/conv-1";
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const userId = "account-a";
+    const workspaceId = "workspace-a";
+    const payload = JSON.stringify({ conversation_id: "conv-1", title: "approved" });
+    const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+    class FakeXhr {
+      responseType = "";
+      responseText = payload;
+      status = 200;
+      private readonly listeners = new Map<string, () => void>();
+
+      open(_method: string, _url: string): void {}
+      setRequestHeader(_name: string, _value: string): void {}
+      send(): void {
+        this.listeners.get("loadend")?.();
+      }
+      addEventListener(name: string, listener: () => void): void {
+        this.listeners.set(name, listener);
+      }
+      getResponseHeader(name: string): string | null {
+        return name.toLowerCase() === "content-type" ? "application/json" : null;
+      }
+    }
+    const pageFetch = vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url === "/api/auth/session") {
+        return new Response(
+          JSON.stringify({ user: { id: userId }, account: { id: workspaceId } }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    const page = {
+      fetch: pageFetch as unknown as typeof fetch,
+      XMLHttpRequest: FakeXhr,
+      document: {
+        getElementById: () => ({
+          textContent: JSON.stringify({
+            session: {
+              user: { id: userId },
+              account: { id: workspaceId },
+              accessToken: "fresh-account-a-token",
+            },
+          }),
+        }),
+      },
+    } as {
+      fetch: typeof fetch;
+      XMLHttpRequest: new () => FakeXhr;
+      document: { getElementById: () => { textContent: string } };
+      __oracleChatGptBackendCapture?: {
+        hits: Array<{ text?: string; affinityMatched?: boolean }>;
+        requests: { started: number; pending: number; completed: number };
+      };
+    };
+    const storage = { setItem: vi.fn() };
+    const install = new Function(
+      "window",
+      "location",
+      "sessionStorage",
+      "document",
+      "crypto",
+      "TextEncoder",
+      "globalThis",
+      "URL",
+      buildScopedBackendCaptureHook(targetApiUrl, {
+        targetUrl,
+        accountDigest: digest(userId),
+        workspaceDigest: digest(workspaceId),
+      }),
+    ) as (...args: unknown[]) => void;
+    install(
+      page,
+      { href: targetUrl },
+      storage,
+      page.document,
+      globalThis.crypto,
+      TextEncoder,
+      { crypto: globalThis.crypto },
+      URL,
+    );
+
+    const xhr = new page.XMLHttpRequest();
+    xhr.open("GET", "https://chatgpt.com/backend-api/conversation/other");
+    xhr.setRequestHeader("Authorization", "Bearer stale-token");
+    xhr.setRequestHeader("ChatGPT-Account-Id", "stale-workspace");
+    xhr.send();
+    xhr.open("GET", targetApiUrl);
+    xhr.send();
+    await vi.waitFor(() => {
+      expect(page.__oracleChatGptBackendCapture?.requests.completed).toBe(1);
+    });
+
+    expect(page.__oracleChatGptBackendCapture?.hits).toEqual([
+      expect.objectContaining({ text: payload, affinityMatched: true }),
+    ]);
   });
 
   test.each([
@@ -661,7 +1124,7 @@ describe("ChatGPT conversation export helpers", () => {
         workspaceDigest: "b".repeat(64),
         timeoutMs: 1_000,
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(false);
   });
 
   test("does not actively fetch while an exact passive request is pending", async () => {
@@ -669,7 +1132,7 @@ describe("ChatGPT conversation export helpers", () => {
     try {
       vi.setSystemTime(new Date("2026-08-23T00:00:00.000Z"));
       const startedAt = Date.now();
-      const fallback = vi.fn(async () => {});
+      const fallback = vi.fn(async () => true);
       const result = pollCaptureWithPassiveFallbackForTest(
         async () => {
           const completed = Date.now() - startedAt >= 3_000;
@@ -711,6 +1174,7 @@ describe("ChatGPT conversation export helpers", () => {
       let fallbackRequested = false;
       const fallback = vi.fn(async () => {
         fallbackRequested = true;
+        return true;
       });
       const result = pollCaptureWithPassiveFallbackForTest(
         async () => ({
@@ -746,6 +1210,7 @@ describe("ChatGPT conversation export helpers", () => {
       const fallback = vi.fn(async (remainingMs: number) => {
         expect(remainingMs).toBeGreaterThan(0);
         passiveStartedAt = Date.now();
+        return true;
       });
       const result = pollCaptureWithPassiveFallbackForTest(
         async () => {
@@ -782,6 +1247,7 @@ describe("ChatGPT conversation export helpers", () => {
     let fallbackRequested = false;
     const fallback = vi.fn(async () => {
       fallbackRequested = true;
+      return true;
     });
     const result = pollCaptureWithPassiveFallbackForTest(
       async () => ({
@@ -805,11 +1271,59 @@ describe("ChatGPT conversation export helpers", () => {
     expect(fallback).toHaveBeenCalledTimes(1);
   });
 
+  test("does not consume active fallback when pending passive handoff completes without a hit", async () => {
+    vi.useFakeTimers();
+    try {
+      let passiveState: "idle" | "pending" | "completed" = "idle";
+      let fallbackCalls = 0;
+      const fallback = vi.fn(async () => {
+        fallbackCalls += 1;
+        if (fallbackCalls === 1) {
+          passiveState = "pending";
+          return false;
+        }
+        return true;
+      });
+      const result = pollCaptureWithPassiveFallbackForTest(
+        async () => {
+          const observedState = passiveState;
+          if (observedState === "pending") passiveState = "completed";
+          return {
+            hit:
+              fallbackCalls >= 2 && observedState === "completed"
+                ? {
+                    kind: "fetch",
+                    url: "https://chatgpt.com/backend-api/conversation/conv-1",
+                    status: 200,
+                    chars: 2,
+                  }
+                : null,
+            requests: {
+              started: observedState === "idle" ? 0 : 1,
+              pending: observedState === "pending" ? 1 : 0,
+              completed: observedState === "completed" ? 1 : 0,
+            },
+          };
+        },
+        "https://chatgpt.com/backend-api/conversation/conv-1",
+        5_000,
+        0,
+        fallback,
+      );
+
+      await vi.runAllTimersAsync();
+      await expect(result).resolves.toMatchObject({ hit: { status: 200, chars: 2 } });
+      expect(fallback).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("rejects at the capture deadline when the fallback never settles", async () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date("2026-08-23T00:00:00.000Z"));
-      const fallback = vi.fn(() => new Promise<void>(() => {}));
+      const fallback = vi.fn(() => new Promise<boolean>(() => {}));
       const result = pollCaptureWithPassiveFallbackForTest(
         async () => ({
           hit: null,
@@ -857,7 +1371,7 @@ describe("ChatGPT conversation export helpers", () => {
         "https://chatgpt.com/backend-api/conversation/conv-1",
         1_000,
         500,
-        vi.fn(async () => {}),
+        vi.fn(async () => true),
       );
       const rejection = expect(result).rejects.toThrow(
         /Timed out waiting for backend conversation capture/,
@@ -891,7 +1405,7 @@ describe("ChatGPT conversation export helpers", () => {
       targetApiUrl,
       1_000,
       500,
-      vi.fn(async () => {}),
+      vi.fn(async () => true),
     );
 
     expect(expression).not.toContain("location.href");
@@ -944,6 +1458,33 @@ describe("ChatGPT conversation export helpers", () => {
     }
   });
 
+  test("bounds post-poll scope evaluation by the capture deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-23T00:00:00.000Z"));
+      const deadline = Date.now() + 1_000;
+      const runtime = {
+        evaluate: vi.fn(() => new Promise<never>(() => {})),
+      };
+      const result = assertChatGptExportMutationAffinityForTest(
+        runtime as never,
+        undefined,
+        "https://chatgpt.com/c/conv-1",
+        "export capture",
+        undefined,
+        deadline,
+      );
+      const rejection = expect(result).rejects.toThrow(
+        /Timed out waiting for backend conversation capture/,
+      );
+      await vi.advanceTimersByTimeAsync(1_000);
+      await rejection;
+      expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("retrieves persisted capture text after a transient miss", async () => {
     const payload = '{"conversation_id":"conv-1","title":"persisted"}';
     let attempts = 0;
@@ -989,6 +1530,33 @@ describe("ChatGPT conversation export helpers", () => {
     );
 
     expect(result).toBe(approved);
+  });
+
+  test("validates and selects capture text once for chunked retrieval", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const approved = JSON.stringify({ conversation_id: "conv-1", title: "approved" });
+    const parse = vi.fn((value: string) => JSON.parse(value));
+    const sessionStorage = { getItem: vi.fn(() => null) };
+    const page = {
+      __oracleChatGptBackendCapture: {
+        hits: [{ url: targetApiUrl, status: 200, text: approved }],
+      },
+    };
+    const result = await retrieveCapturedTextWithEvaluator(
+      async (expression) =>
+        new Function("window", "sessionStorage", "JSON", `return (${expression})`)(
+          page,
+          sessionStorage,
+          { parse },
+        ) as never,
+      targetApiUrl,
+      approved.length,
+      1,
+    );
+
+    expect(result).toBe(approved);
+    expect(parse).toHaveBeenCalledTimes(1);
+    expect(sessionStorage.getItem).toHaveBeenCalledTimes(1);
   });
 
   test("bounds capture text retrieval by the shared absolute deadline", async () => {

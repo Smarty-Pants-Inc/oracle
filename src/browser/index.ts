@@ -63,7 +63,7 @@ import { formatElapsed } from "../oracle/format.js";
 import type { BrowserModelSelectionEvidence, BrowserRuntimeMetadata } from "../sessionStore.js";
 import { CHATGPT_URL, DEFAULT_MODEL_STRATEGY } from "./constants.js";
 import type { LaunchedChrome } from "chrome-launcher";
-import { BrowserAutomationError } from "../oracle/errors.js";
+import { BrowserAutomationError, sanitizeErrorForPersistence } from "../oracle/errors.js";
 import { alignPromptEchoPair, buildPromptEchoMatcher } from "./reattachHelpers.js";
 import {
   buildConversationTurnCountExpression,
@@ -3332,7 +3332,9 @@ async function runRemoteBrowserMode(
   let browserRuntime: ChromeClient["Runtime"] | null = null;
   let remoteTargetId: string | null = null;
   let tabLease: BrowserTabLease | null = null;
-  let lastUrl: string | undefined;
+  let lastUrl: string | undefined = usingObu
+    ? (config.resumeConversationUrl ?? undefined)
+    : undefined;
   let pinnedChatGptScopeUrl = config.resumeConversationUrl ?? config.url;
   let promptSubmitted = false;
   let promptDispatchStarted = false;
@@ -3438,13 +3440,15 @@ async function runRemoteBrowserMode(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const details = error instanceof BrowserAutomationError ? error.details : undefined;
-      logger(`[browser] Completed answer captured, but task-tab finalization failed: ${message}`);
+      const warning = sanitizeErrorForPersistence(message, details);
+      logger(
+        `[browser] Completed answer captured, but task-tab finalization failed: ${warning.message}`,
+      );
       return [
         {
           code: "obu-tab-finalize-failed",
           severity: "warning",
-          message,
-          ...(details ? { details: { ...details } } : {}),
+          ...warning,
         },
       ];
     }
@@ -3483,7 +3487,6 @@ async function runRemoteBrowserMode(
       client = obuConnection.client;
       config.obuSessionId = obuConnection.sessionId;
       config.obuTabId = obuConnection.tabId;
-      lastUrl = obuConnection.tabUrl || lastUrl;
       attachedExistingTab = !obuConnection.created;
       ownsTarget = true;
       attachedTabDescription = `${attachedExistingTab ? "Reclaimed" : "Opened"} main-Chrome Oracle tab ${obuConnection.sessionId}:${obuConnection.tabId}`;

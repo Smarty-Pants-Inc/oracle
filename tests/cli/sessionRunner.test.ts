@@ -1201,9 +1201,22 @@ describe("performSessionRun", () => {
     expect(result).toBe(expected);
   });
 
-  test("records metadata when browser automation fails", async () => {
-    const automationError = new BrowserAutomationError("automation failed", {
+  test("redacts nested browser errors in terminal session metadata without changing the thrown error", async () => {
+    const signedUrl = "https://chatgpt.com/c/private?signature=runner-secret#fragment";
+    const automationError = new BrowserAutomationError(`automation failed at ${signedUrl}`, {
       stage: "execute-browser",
+      code: "scope-mismatch",
+      actualUrl: signedUrl,
+      recoveryHandle: {
+        transport: "obu",
+        sessionId: "oracle-main",
+        tabId: 7,
+        conversationUrl: signedUrl,
+      },
+      cleanupFailure: {
+        message: `cleanup failed at ${signedUrl}`,
+        details: { actualUrl: signedUrl },
+      },
     });
     vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(automationError);
     const staleSessionMeta = {
@@ -1234,16 +1247,36 @@ describe("performSessionRun", () => {
         write,
         version: cliVersion,
       }),
-    ).rejects.toThrow("automation failed");
+    ).rejects.toBe(automationError);
 
     const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
     expect(finalUpdate).toMatchObject({
       status: "error",
-      errorMessage: "automation failed",
+      errorMessage: "automation failed at [redacted-url]",
       browser: expect.objectContaining({ config: expect.any(Object) }),
+      error: {
+        category: "browser-automation",
+        message: "automation failed at [redacted-url]",
+        details: {
+          stage: "execute-browser",
+          code: "scope-mismatch",
+          recoveryHandle: {
+            transport: "obu",
+            sessionId: "oracle-main",
+            tabId: 7,
+            conversationUrl: "[redacted-url]",
+          },
+          cleanupFailure: {
+            message: "cleanup failed at [redacted-url]",
+          },
+        },
+      },
     });
     expect(finalUpdate?.browser?.runtime).toBeUndefined();
     expect(finalUpdate?.browser).not.toHaveProperty("modelSelection");
+    expect(finalUpdate?.error?.details).not.toHaveProperty("actualUrl");
+    expect(JSON.stringify(finalUpdate)).not.toContain(signedUrl);
+    expect(JSON.stringify(finalUpdate)).not.toContain("runner-secret");
     expect(sessionStoreMock.updateModelRun).toHaveBeenCalledWith(
       baseSessionMeta.id,
       "gpt-5.2-pro",
@@ -1483,6 +1516,7 @@ describe("performSessionRun", () => {
   });
 
   test("stops auto-reattach when remaining follow-ups require an explicit retry", async () => {
+    const signedUrl = "https://chatgpt.com/c/private?signature=reattach-secret#fragment";
     const runtime = {
       browserTransport: "obu" as const,
       obuSessionId: "stored-session",
@@ -1505,10 +1539,17 @@ describe("performSessionRun", () => {
       }),
     );
     vi.mocked(resumeBrowserSession).mockRejectedValueOnce(
-      new BrowserAutomationError("One planned browser follow-up remains.", {
+      new BrowserAutomationError(`One planned browser follow-up remains at ${signedUrl}`, {
         stage: "browser-follow-ups",
         code: "follow-ups-pending",
         remainingFollowUps: 1,
+        actualUrl: signedUrl,
+        recoveryHandle: {
+          transport: "obu",
+          sessionId: "stored-session",
+          tabId: 7,
+          conversationUrl: signedUrl,
+        },
         runtime,
       }),
     );
@@ -1537,9 +1578,26 @@ describe("performSessionRun", () => {
     expect(log.mock.calls.map((call) => String(call[0])).join("\n")).toContain(
       "remaining planned follow-ups require an explicit retry",
     );
-    expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
-      error: { details: { code: "follow-ups-pending" } },
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate).toMatchObject({
+      errorMessage: "One planned browser follow-up remains at [redacted-url]",
+      error: {
+        message: "One planned browser follow-up remains at [redacted-url]",
+        details: {
+          code: "follow-ups-pending",
+          recoveryHandle: {
+            transport: "obu",
+            sessionId: "stored-session",
+            tabId: 7,
+            conversationUrl: "[redacted-url]",
+          },
+          runtime: expect.objectContaining({ tabUrl: "[redacted-url]" }),
+        },
+      },
     });
+    expect(finalUpdate?.error?.details).not.toHaveProperty("actualUrl");
+    expect(JSON.stringify(finalUpdate)).not.toContain(signedUrl);
+    expect(JSON.stringify(finalUpdate)).not.toContain("reattach-secret");
   });
 
   test("auto-reattaches after connection loss and marks session completed", async () => {

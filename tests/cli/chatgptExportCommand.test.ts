@@ -70,13 +70,21 @@ describe("ChatGPT export operation errors", () => {
     const meta = obuSession();
     meta.errorMessage = "primary run failed";
     meta.error = { category: "browser-automation", message: "primary run failed" };
+    const signedUrl = "https://chatgpt.com/c/private-other-thread?signature=export-secret#x";
     mocks.readSession.mockResolvedValue(meta);
     mocks.captureViaObu
       .mockRejectedValueOnce(
-        new BrowserAutomationError("Export tab lost its routed account.", {
+        new BrowserAutomationError(`Export tab lost its routed account at ${signedUrl}`, {
           stage: "main-chrome-account-router",
           code: "account-identity-mismatch",
-          actualUrl: "https://chatgpt.com/c/private-other-thread",
+          actualUrl: signedUrl,
+          recoveryHandle: {
+            transport: "obu",
+            sessionId: "oracle-main",
+            tabId: 7,
+            conversationUrl: signedUrl,
+          },
+          sessionStatus: "needs_login",
         }),
       )
       .mockResolvedValueOnce({ targetUrl, conversationId: "export-thread" });
@@ -92,12 +100,25 @@ describe("ChatGPT export operation errors", () => {
     const failedUpdate = mocks.updateSession.mock.calls.at(-1)?.[1] as
       | Partial<SessionMetadata>
       | undefined;
-    expect(failedUpdate?.browser?.operationErrors?.["chatgpt-export"]?.details).toMatchObject({
-      oracleOperation: "chatgpt-export",
+    const operationError = failedUpdate?.browser?.operationErrors?.["chatgpt-export"];
+    expect(operationError).toMatchObject({
+      message: "Export tab lost its routed account at [redacted-url]",
+      details: {
+        oracleOperation: "chatgpt-export",
+        stage: "main-chrome-account-router",
+        code: "account-identity-mismatch",
+        sessionStatus: "needs_login",
+        recoveryHandle: {
+          transport: "obu",
+          sessionId: "oracle-main",
+          tabId: 7,
+          conversationUrl: "[redacted-url]",
+        },
+      },
     });
-    expect(failedUpdate?.browser?.operationErrors?.["chatgpt-export"]?.details).not.toHaveProperty(
-      "actualUrl",
-    );
+    expect(operationError?.details).not.toHaveProperty("actualUrl");
+    expect(JSON.stringify(operationError)).not.toContain(signedUrl);
+    expect(JSON.stringify(operationError)).not.toContain("export-secret");
     expect(failedUpdate).not.toHaveProperty("error");
     meta.browser = failedUpdate?.browser;
     expect(meta.error?.message).toBe("primary run failed");

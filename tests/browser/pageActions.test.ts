@@ -122,7 +122,9 @@ describe("navigateToPromptReadyWithFallback", () => {
       .fn()
       .mockRejectedValueOnce(new Error("Prompt textarea did not appear before timeout"))
       .mockResolvedValueOnce(undefined);
-    const runtime = {} as unknown as ChromeClient["Runtime"];
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({ result: { value: "https://chatgpt.com/" } }),
+    } as unknown as ChromeClient["Runtime"];
     const page = {} as unknown as ChromeClient["Page"];
 
     await expect(
@@ -231,15 +233,40 @@ describe("navigateToPromptReadyWithFallback", () => {
 });
 
 describe("ensureChatGptScopeRetained", () => {
-  test("is a no-op for unpinned root ChatGPT URLs", async () => {
+  test.each(["https://chatgpt.com/", "https://chatgpt.com/c/abc"])(
+    "accepts canonical actual URL %s for an unpinned root",
+    async (actualUrl) => {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({ result: { value: actualUrl } }),
+      } as unknown as ChromeClient["Runtime"];
+
+      await expect(
+        ensureChatGptScopeRetained(runtime, "https://chatgpt.com/"),
+      ).resolves.toBeUndefined();
+      expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test.each([
+    "https://example.com/c/abc",
+    "https://user:password@chatgpt.com/c/abc",
+    "https://chatgpt.com/%63/abc",
+  ])("rejects noncanonical actual URL %s for an unpinned root", async (actualUrl) => {
     const runtime = {
-      evaluate: vi.fn().mockResolvedValue({ result: { value: "https://chatgpt.com/" } }),
+      evaluate: vi.fn().mockResolvedValue({ result: { value: actualUrl } }),
     } as unknown as ChromeClient["Runtime"];
 
-    await expect(
-      ensureChatGptScopeRetained(runtime, "https://chatgpt.com/"),
-    ).resolves.toBeUndefined();
-    expect(runtime.evaluate).not.toHaveBeenCalled();
+    await expect(ensureChatGptScopeRetained(runtime, "https://chatgpt.com/")).rejects.toMatchObject(
+      {
+        details: {
+          stage: "chatgpt-scope",
+          code: "scope-mismatch",
+          expectedUrl: "https://chatgpt.com/",
+          actualUrl,
+        },
+      },
+    );
+    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
   });
 
   test("accepts an active tab that remains in the requested project", async () => {

@@ -60,6 +60,82 @@ export function asOracleUserError(error: unknown): OracleUserError | null {
   return null;
 }
 
+const PERSISTED_ERROR_URL_KEY = /(?:url|uri|href|endpoint)s?$/iu;
+
+function redactPersistedErrorText(value: string): string {
+  return value.replace(/\b[a-z][a-z\d+.-]*:\/\/[^\s<>"']+/giu, "[redacted-url]");
+}
+
+function sanitizePersistedErrorValue(
+  value: unknown,
+  seen: WeakSet<object>,
+  urlKey = false,
+): unknown {
+  if (typeof value === "string") {
+    const redacted = redactPersistedErrorText(value);
+    return urlKey ? "[redacted-url]" : redacted;
+  }
+  if (value === undefined) return undefined;
+  if (urlKey) return "[redacted-url]";
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value === "boolean" || value === null) return value;
+  if (typeof value !== "object") return undefined;
+  if (seen.has(value)) return undefined;
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const sanitized: unknown[] = [];
+      for (const nested of value) {
+        const sanitizedValue = sanitizePersistedErrorValue(nested, seen);
+        if (sanitizedValue !== undefined) sanitized.push(sanitizedValue);
+      }
+      return sanitized.length > 0 ? sanitized : undefined;
+    }
+    const sanitized: OracleUserErrorDetails = {};
+    for (const key of Object.keys(value)) {
+      if (key.toLowerCase() === "actualurl") continue;
+      let nested: unknown;
+      try {
+        nested = (value as Record<string, unknown>)[key];
+      } catch {
+        continue;
+      }
+      const sanitizedValue = sanitizePersistedErrorValue(
+        nested,
+        seen,
+        PERSISTED_ERROR_URL_KEY.test(key),
+      );
+      if (sanitizedValue !== undefined) sanitized[key] = sanitizedValue;
+    }
+    return Object.keys(sanitized).length > 0 ? sanitized : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    seen.delete(value);
+  }
+}
+
+export function sanitizeErrorForPersistence(
+  message: string,
+  details?: OracleUserErrorDetails,
+  oracleOperation?: string,
+): { message: string; details?: OracleUserErrorDetails } {
+  const sanitizedDetails = sanitizePersistedErrorValue(details, new WeakSet()) as
+    | OracleUserErrorDetails
+    | undefined;
+  const persistedDetails =
+    oracleOperation === undefined
+      ? sanitizedDetails
+      : {
+          ...(sanitizedDetails ?? {}),
+          oracleOperation: redactPersistedErrorText(oracleOperation),
+        };
+  return {
+    message: redactPersistedErrorText(message),
+    ...(persistedDetails ? { details: persistedDetails } : {}),
+  };
+}
+
 export class OracleTransportError extends Error {
   readonly reason: TransportFailureReason;
 

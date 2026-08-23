@@ -20,6 +20,7 @@ import {
   extractTextOutput,
   classifyProviderFailure,
 } from "../oracle.js";
+import { sanitizeErrorForPersistence } from "../oracle/errors.js";
 import {
   ensureSessionArtifacts,
   runBrowserSessionExecution,
@@ -521,6 +522,13 @@ export async function performSessionRun({
     log(`ERROR: ${message}`);
     markErrorLogged(error);
     const userError = asOracleUserError(error);
+    const persistedMessage = sanitizeErrorForPersistence(message).message;
+    const persistedUserError = userError
+      ? {
+          category: userError.category,
+          ...sanitizeErrorForPersistence(userError.message, userError.details),
+        }
+      : undefined;
     const connectionLost =
       userError?.category === "browser-automation" &&
       (userError.details as { stage?: string } | undefined)?.stage === "connection-lost";
@@ -570,17 +578,13 @@ export async function performSessionRun({
             status: "error",
             completedAt: new Date().toISOString(),
             response: { status: "error", incompleteReason: "chrome-disconnected" },
-            error: {
-              category: userError.category,
-              message: userError.message,
-              details: userError.details,
-            },
+            error: persistedUserError,
           });
         }
         await sessionStore.updateSession(sessionMeta.id, {
           status: "error",
           completedAt: new Date().toISOString(),
-          errorMessage: message,
+          errorMessage: persistedMessage,
           mode,
           browser: {
             ...currentBrowser,
@@ -591,11 +595,7 @@ export async function performSessionRun({
             ? { options: optionsWithBrowserConfig(sessionMeta, browserConfig) }
             : {}),
           response: { status: "error", incompleteReason: "chrome-disconnected" },
-          error: {
-            category: userError.category,
-            message: userError.message,
-            details: userError.details,
-          },
+          error: persistedUserError,
         });
         throw error;
       }
@@ -608,7 +608,7 @@ export async function performSessionRun({
       }
       await sessionStore.updateSession(sessionMeta.id, {
         status: "running",
-        errorMessage: message,
+        errorMessage: persistedMessage,
         mode,
         browser: {
           ...currentBrowser,
@@ -668,10 +668,9 @@ export async function performSessionRun({
         status: "incomplete",
         incompleteReason: "incomplete-capture",
       } as const;
-      const timeoutError = {
-        category: userError.category,
-        message: userError.message,
-        details: userError.details,
+      const timeoutError = persistedUserError ?? {
+        category: "browser-automation",
+        message: persistedMessage,
       };
       const autoReattachIntervalMs = browserConfig?.autoReattachIntervalMs ?? 0;
       const autoRuntime = runtime ?? currentBrowser?.runtime;
@@ -688,7 +687,7 @@ export async function performSessionRun({
         await sessionStore.updateSession(sessionMeta.id, {
           status: "running",
           completedAt: undefined,
-          errorMessage: message,
+          errorMessage: persistedMessage,
           mode,
           browser: {
             ...currentBrowser,
@@ -726,7 +725,7 @@ export async function performSessionRun({
       await sessionStore.updateSession(sessionMeta.id, {
         status: "error",
         completedAt: new Date().toISOString(),
-        errorMessage: message,
+        errorMessage: persistedMessage,
         mode,
         browser: {
           ...currentBrowser,
@@ -778,7 +777,7 @@ export async function performSessionRun({
     await sessionStore.updateSession(sessionMeta.id, {
       status: "error",
       completedAt: new Date().toISOString(),
-      errorMessage: message,
+      errorMessage: persistedMessage,
       mode,
       browser: browserConfig
         ? {
@@ -790,13 +789,7 @@ export async function performSessionRun({
       ...(browserConfig ? { options: optionsWithBrowserConfig(sessionMeta, browserConfig) } : {}),
       response: responseMetadata,
       transport: transportMetadata,
-      error: userError
-        ? {
-            category: userError.category,
-            message: userError.message,
-            details: userError.details,
-          }
-        : undefined,
+      error: persistedUserError,
     });
     if (modelForStatus) {
       await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
@@ -1350,12 +1343,20 @@ async function autoReattachUntilComplete({
       return true;
     } catch (error) {
       const userError = asOracleUserError(error);
+      const message = error instanceof Error ? error.message : String(error);
+      const persistedMessage = sanitizeErrorForPersistence(message).message;
+      const persistedFormattedMessage = sanitizeErrorForPersistence(formatError(error)).message;
+      const persistedUserError = userError
+        ? {
+            category: userError.category,
+            ...sanitizeErrorForPersistence(userError.message, userError.details),
+          }
+        : undefined;
       const recoveredRuntime = (
         userError?.details as { runtime?: BrowserRuntimeMetadata } | undefined
       )?.runtime;
       if (recoveredRuntime) applyOpenBrowserUseRuntime(currentBrowserConfig, recoveredRuntime);
       if (captureSucceeded) {
-        const message = formatError(error);
         if (modelForStatus) {
           await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
             status: "error",
@@ -1365,7 +1366,7 @@ async function autoReattachUntilComplete({
         await sessionStore.updateSession(sessionMeta.id, {
           status: "error",
           completedAt: new Date().toISOString(),
-          errorMessage: message,
+          errorMessage: persistedFormattedMessage,
           browser: {
             ...browserMetadata,
             config: currentBrowserConfig,
@@ -1375,7 +1376,7 @@ async function autoReattachUntilComplete({
           response: { status: "error", incompleteReason: "incomplete-capture" },
           error: {
             category: "internal",
-            message,
+            message: persistedFormattedMessage,
           },
         });
         throw error;
@@ -1392,15 +1393,10 @@ async function autoReattachUntilComplete({
           options: optionsWithBrowserConfig(sessionMeta, currentBrowserConfig),
         });
       }
-      const message = error instanceof Error ? error.message : String(error);
-      if (userError) {
+      if (persistedUserError) {
         await sessionStore.updateSession(sessionMeta.id, {
-          errorMessage: userError.message,
-          error: {
-            category: userError.category,
-            message: userError.message,
-            details: userError.details,
-          },
+          errorMessage: persistedMessage,
+          error: persistedUserError,
         });
       }
       log(dim(`Auto-reattach attempt ${attempt} failed: ${message}`));

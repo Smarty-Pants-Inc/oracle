@@ -144,7 +144,7 @@ export function isChatGptScopePinned(url: string): boolean {
 }
 
 export function isChatGptScopeRetained(actualUrl: string, expectedUrl: string): boolean {
-  if (isUnpinnedChatGptRoot(expectedUrl)) return true;
+  if (isUnpinnedChatGptRoot(expectedUrl)) return parseChatGptUrl(actualUrl) !== null;
   const expectedScope = normalizePinnedChatGptScope(expectedUrl);
   if (!expectedScope) return false;
   const actualScope = normalizePinnedChatGptScope(actualUrl);
@@ -162,8 +162,7 @@ export async function ensureChatGptScopeRetained(
   expectedUrl: string,
 ) {
   const expectedScope = normalizePinnedChatGptScope(expectedUrl);
-  if (!expectedScope) {
-    if (isUnpinnedChatGptRoot(expectedUrl)) return;
+  if (!expectedScope && !isUnpinnedChatGptRoot(expectedUrl)) {
     throw new BrowserAutomationError(
       "ChatGPT scope URL is not a supported root, project, or conversation route.",
       {

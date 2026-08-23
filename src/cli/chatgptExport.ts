@@ -17,7 +17,7 @@ import {
   resolveStoredOpenBrowserUseAffinity,
   type StoredOpenBrowserUseAffinity,
 } from "../browser/openBrowserUse.js";
-import { asOracleUserError } from "../oracle/errors.js";
+import { asOracleUserError, sanitizeErrorForPersistence } from "../oracle/errors.js";
 
 export interface ChatGptExportCliOptions {
   targetUrl?: string;
@@ -455,18 +455,22 @@ export async function handleChatGptExportCommand(options: ChatGptExportCliOption
       if (options.sessionId) {
         const metadata = await sessionStore.readSession(options.sessionId);
         const userError = asOracleUserError(error);
-        const safeDetails = { ...(userError?.details ?? {}) };
-        delete safeDetails.actualUrl;
         const operationError = userError
           ? {
               category: userError.category,
-              message: userError.message,
-              details: { ...safeDetails, oracleOperation: "chatgpt-export" },
+              ...sanitizeErrorForPersistence(
+                userError.message,
+                userError.details,
+                "chatgpt-export",
+              ),
             }
           : {
               category: "browser-automation",
-              message: "ChatGPT export failed. Rerun the export to see the current error.",
-              details: { oracleOperation: "chatgpt-export" },
+              ...sanitizeErrorForPersistence(
+                "ChatGPT export failed. Rerun the export to see the current error.",
+                undefined,
+                "chatgpt-export",
+              ),
             };
         const browser = {
           ...(metadata?.browser ?? {}),

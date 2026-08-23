@@ -37,7 +37,11 @@ import {
   hashConversationTurnText,
   type ConversationTurnBinding,
 } from "../browser/conversationTurns.js";
-import { asOracleUserError, BrowserAutomationError } from "../oracle/errors.js";
+import {
+  asOracleUserError,
+  BrowserAutomationError,
+  sanitizeErrorForPersistence,
+} from "../oracle/errors.js";
 
 const LIVE_POLL_MS = 2000;
 const DEFAULT_STALL_THRESHOLD_MS = 60_000;
@@ -509,17 +513,14 @@ async function withPersistedOpenBrowserUseOperationError<T>(
   } catch (error) {
     const userError = asOracleUserError(error);
     const message = error instanceof Error ? error.message : String(error);
-    const operationError = userError
-      ? {
-          category: userError.category,
-          message: userError.message,
-          details: { ...userError.details, oracleOperation: operationName },
-        }
-      : {
-          category: "browser-automation",
-          message,
-          details: { oracleOperation: operationName },
-        };
+    const operationError = {
+      category: userError?.category ?? "browser-automation",
+      ...sanitizeErrorForPersistence(
+        userError?.message ?? message,
+        userError?.details,
+        operationName,
+      ),
+    };
     const currentMeta = (await sessionStore.readSession(meta.id)) ?? meta;
     const browser = {
       ...(currentMeta.browser ?? {}),
@@ -543,8 +544,7 @@ async function appendBrowserWarning(
   const warning = {
     code,
     severity: "warning" as const,
-    message,
-    ...(details ? { details: { ...details } } : {}),
+    ...sanitizeErrorForPersistence(message, details),
   };
   const browser = {
     ...(meta.browser ?? {}),

@@ -310,6 +310,90 @@ describe("main-Chrome harvest recovery", () => {
     expect(finalize).toHaveBeenCalledWith(true);
   });
 
+  test("redacts nested persisted recovery details without changing the immediate error", async () => {
+    const meta = obuSession();
+    const signedUrl =
+      "https://chatgpt.com/c/private-thread?signature=secret&expires=9999999999#private";
+    const finalize = vi.fn(async () => {
+      throw new BrowserAutomationError(`Cleanup failed at ${signedUrl}`, {
+        stage: "open-browser-use",
+        code: "tab-finalize-failed",
+        recoveryHandle: {
+          transport: "obu",
+          sessionId: "cleanup-session",
+          tabId: 9,
+          conversationUrl: signedUrl,
+        },
+      });
+    });
+    const primaryError = new BrowserAutomationError(`Scope changed at ${signedUrl}`, {
+      stage: "chatgpt-scope",
+      code: "scope-mismatch",
+      actualUrl: signedUrl,
+      recoveryHandle: {
+        transport: "obu",
+        sessionId: "recovered-session",
+        tabId: 8,
+        conversationUrl: signedUrl,
+      },
+      sessionStatus: "needs_login",
+    });
+    mocks.readSession.mockResolvedValue(meta);
+    mocks.connectOpenBrowserUseTab.mockResolvedValue({
+      client: {},
+      obuClient: {},
+      sessionId: "recovered-session",
+      tabId: 8,
+      tabUrl: conversationUrl,
+      created: true,
+      finalize,
+    } as unknown as OpenBrowserUseConnection);
+    mocks.prepareOpenBrowserUseConversationRoute.mockRejectedValueOnce(primaryError);
+
+    await expect(harvestSessionBrowserOutput(meta.id, { quietOutput: true })).rejects.toBe(
+      primaryError,
+    );
+    expect(primaryError.message).toContain(signedUrl);
+    expect(primaryError.details).toHaveProperty("actualUrl", signedUrl);
+    const failedUpdate = mocks.updateSession.mock.calls.at(-1)?.[1] as
+      | Partial<SessionMetadata>
+      | undefined;
+    const operationError = failedUpdate?.browser?.operationErrors?.harvest;
+    expect(operationError).toMatchObject({
+      message: "Scope changed at [redacted-url]",
+      details: {
+        stage: "chatgpt-scope",
+        code: "scope-mismatch",
+        sessionStatus: "needs_login",
+        recoveryHandle: {
+          transport: "obu",
+          sessionId: "recovered-session",
+          tabId: 8,
+          conversationUrl: "[redacted-url]",
+        },
+        cleanupFailure: {
+          message: "Cleanup failed at [redacted-url]",
+          details: {
+            stage: "open-browser-use",
+            code: "tab-finalize-failed",
+            recoveryHandle: {
+              transport: "obu",
+              sessionId: "cleanup-session",
+              tabId: 9,
+              conversationUrl: "[redacted-url]",
+            },
+          },
+        },
+        oracleOperation: "harvest",
+      },
+    });
+    expect(operationError?.details).not.toHaveProperty("actualUrl");
+    const persistedPatch = JSON.stringify(operationError);
+    expect(persistedPatch).not.toContain(signedUrl);
+    expect(persistedPatch).not.toContain("signature=secret");
+    expect(finalize).toHaveBeenCalledWith(false);
+  });
+
   test("accepts a canonical project slug suffix change during harvest", async () => {
     const meta = obuSession();
     const expectedUrl = "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef/c/obu-thread";
@@ -537,11 +621,21 @@ describe("main-Chrome harvest recovery", () => {
     expect(finalize).toHaveBeenCalledWith(true);
   });
 
-  test("preserves the primary harvest error when tab finalization also fails", async () => {
+  test("preserves the primary harvest error and redacts finalization warning details", async () => {
     const meta = obuSession();
     meta.promptPreview = "parent prompt";
+    const signedUrl = "https://chatgpt.com/c/cleanup-thread?sig=warning-secret#done";
     const finalize = vi.fn(async () => {
-      throw new Error("finalize failed");
+      throw new BrowserAutomationError(`Finalize failed at ${signedUrl}`, {
+        stage: "open-browser-use",
+        code: "tab-finalize-failed",
+        recoveryHandle: {
+          transport: "obu",
+          sessionId: "stored-session",
+          tabId: 7,
+          conversationUrl: signedUrl,
+        },
+      });
     });
     mocks.readSession.mockResolvedValue(meta);
     mocks.connectOpenBrowserUseTab.mockResolvedValue({
@@ -566,8 +660,24 @@ describe("main-Chrome harvest recovery", () => {
     );
     expect(finalize).toHaveBeenCalledWith(true);
     expect(meta.browser?.warnings).toEqual([
-      expect.objectContaining({ code: "obu-tab-finalize-failed", message: "finalize failed" }),
+      {
+        code: "obu-tab-finalize-failed",
+        severity: "warning",
+        message: "Finalize failed at [redacted-url]",
+        details: {
+          stage: "open-browser-use",
+          code: "tab-finalize-failed",
+          recoveryHandle: {
+            transport: "obu",
+            sessionId: "stored-session",
+            tabId: 7,
+            conversationUrl: "[redacted-url]",
+          },
+        },
+      },
     ]);
+    expect(JSON.stringify(meta.browser?.warnings)).not.toContain(signedUrl);
+    expect(JSON.stringify(meta.browser?.warnings)).not.toContain("warning-secret");
     expect(meta.browser?.operationErrors?.harvest?.details).toMatchObject({
       oracleOperation: "harvest",
     });

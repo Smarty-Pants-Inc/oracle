@@ -519,6 +519,106 @@ describe("archiveChatGptConversation", () => {
     expect(menuButton.dispatchEvent).not.toHaveBeenCalled();
   });
 
+  test("compares full canonical affinity for ancestor conversation links", async () => {
+    const evaluateCandidate = async (expectedRoute: string, href: string) => {
+      const expression = buildArchiveConversationExpressionForTest({ expectedRoute });
+      class FakeElement {
+        tagName: string;
+        parentElement: FakeElement | null;
+        href?: string;
+        textContent = "More";
+        dispatchEvent = vi.fn();
+
+        constructor(tagName: string, parentElement: FakeElement | null = null, href?: string) {
+          this.tagName = tagName;
+          this.parentElement = parentElement;
+          this.href = href;
+        }
+
+        getAttribute(name: string) {
+          if (name === "aria-label") return "More";
+          return name === "href" ? (this.href ?? null) : null;
+        }
+
+        getBoundingClientRect() {
+          return { left: 1160, right: 1180, top: 10, width: 20, height: 20 };
+        }
+      }
+      const body = new FakeElement("BODY");
+      const linkedConversation = new FakeElement("A", body, href);
+      const menuButton = new FakeElement("BUTTON", linkedConversation);
+      const document = {
+        body,
+        dispatchEvent: vi.fn(),
+        querySelectorAll: vi.fn((selector: string) =>
+          selector === 'button,[role="button"]' ? [menuButton] : [],
+        ),
+      };
+      const EventStub = class {};
+      const evaluate = new Function(
+        "location",
+        "document",
+        "HTMLElement",
+        "getComputedStyle",
+        "window",
+        "PointerEvent",
+        "MouseEvent",
+        "KeyboardEvent",
+        "setTimeout",
+        `return ${expression};`,
+      ) as (
+        location: { href: string },
+        document: object,
+        HTMLElement: typeof FakeElement,
+        getComputedStyle: () => {
+          visibility: string;
+          display: string;
+          opacity: string;
+          pointerEvents: string;
+        },
+        window: { innerWidth: number },
+        PointerEvent: typeof EventStub,
+        MouseEvent: typeof EventStub,
+        KeyboardEvent: typeof EventStub,
+        setTimeout: (callback: () => void) => number,
+      ) => Promise<{ status: string; reason?: string }>;
+
+      const result = await evaluate(
+        { href: `https://chatgpt.com${expectedRoute}` },
+        document,
+        FakeElement,
+        () => ({ visibility: "visible", display: "block", opacity: "1", pointerEvents: "auto" }),
+        { innerWidth: 1200 },
+        EventStub,
+        EventStub,
+        EventStub,
+        (callback) => {
+          callback();
+          return 0;
+        },
+      );
+      return { result, menuButton };
+    };
+
+    const differentProject = await evaluateCandidate("/g/project-A/c/abc", "/g/project-B/c/abc");
+    expect(differentProject.result).toMatchObject({
+      status: "skipped",
+      reason: "conversation-menu-not-found",
+    });
+    expect(differentProject.menuButton.dispatchEvent).not.toHaveBeenCalled();
+
+    const stableProjectId = "g-p-0123456789abcdef0123456789abcdef";
+    const stableSuffixVariant = await evaluateCandidate(
+      `/g/${stableProjectId}-project-a/c/abc`,
+      `/g/${stableProjectId}-project-b/c/abc`,
+    );
+    expect(stableSuffixVariant.result).toMatchObject({
+      status: "skipped",
+      reason: "conversation-menu-not-owned",
+    });
+    expect(stableSuffixVariant.menuButton.dispatchEvent).toHaveBeenCalled();
+  });
+
   test("keeps the archive expression scoped to Archive actions", () => {
     const expression = buildArchiveConversationExpressionForTest();
     expect(expression).toContain("findConversationMenuButton");

@@ -9,6 +9,7 @@ import type {
   SessionUserErrorMetadata,
 } from "../sessionStore.js";
 import { asOracleUserError, type OracleResponseMetadata } from "../oracle.js";
+import { sanitizeErrorForPersistence } from "../oracle/errors.js";
 import { renderMarkdownAnsi } from "./markdownRenderer.js";
 import { formatFinishLine } from "../oracle/finishLine.js";
 import { redactSubmittedPromptText, sessionStore, wait } from "../sessionStore.js";
@@ -460,12 +461,14 @@ export async function attachSession(
       const errorMetadata = userError
         ? {
             category: userError.category,
-            message: userError.message,
-            details: userError.details,
+            ...sanitizeErrorForPersistence(userError.message, userError.details),
           }
-        : { category: "browser-automation", message };
+        : {
+            category: "browser-automation",
+            ...sanitizeErrorForPersistence(message),
+          };
       await sessionStore.updateSession(sessionId, {
-        errorMessage: message,
+        errorMessage: sanitizeErrorForPersistence(message).message,
         error: errorMetadata,
         ...(recoveredRuntime && recoveredConfig
           ? {
@@ -489,7 +492,7 @@ export async function attachSession(
         }
         await sessionStore.updateSession(sessionId, {
           status: "error",
-          errorMessage: `Deep Research capture incomplete: ${message}`,
+          errorMessage: `Deep Research capture incomplete: ${sanitizeErrorForPersistence(message).message}`,
           response: { status: "incomplete", incompleteReason: "incomplete-capture" },
           error: errorMetadata,
         });
@@ -748,9 +751,10 @@ export async function attachSession(
         settled.status === "error"
           ? (settled.errorMessage ?? "Detached worker failed.")
           : "Detached worker exited before the session reached a terminal state.";
+      const persistedMessage = sanitizeErrorForPersistence(message).message;
       const failure = {
         category: "internal",
-        message,
+        message: persistedMessage,
       } as const;
       if (settled.model) {
         await sessionStore.updateModelRun(settled.id, settled.model, {
@@ -763,7 +767,7 @@ export async function attachSession(
       await sessionStore.updateSession(settled.id, {
         status: "error",
         completedAt: new Date().toISOString(),
-        errorMessage: message,
+        errorMessage: persistedMessage,
         response: { status: "incomplete", incompleteReason: "incomplete-capture" },
         error: failure,
       });

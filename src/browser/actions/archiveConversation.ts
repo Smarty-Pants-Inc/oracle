@@ -300,7 +300,13 @@ function buildArchiveConversationExpression({
             const linkedProject = new RegExp('^/g/([^/?#]+)/c/([^/?#]+)/?$').exec(linked.pathname);
             const linkedRoot = new RegExp('^/c/([^/?#]+)/?$').exec(linked.pathname);
             const linkedConversationId = linkedProject?.[2] || linkedRoot?.[1];
-            if (linkedConversationId && linkedConversationId !== expectedConversationId) return true;
+            const linkedProjectKey = linkedProject?.[1] ? stableProjectKey(linkedProject[1]) : null;
+            if (
+              linkedConversationId &&
+              (linked.origin !== expectedOrigin ||
+                linkedConversationId !== expectedConversationId ||
+                linkedProjectKey !== expectedProjectKey)
+            ) return true;
           } catch {}
         }
         current = current.parentElement;

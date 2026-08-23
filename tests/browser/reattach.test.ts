@@ -1598,70 +1598,81 @@ describe("resumeBrowserSession", () => {
     expect(captureAssistantMarkdown).not.toHaveBeenCalled();
   });
 
-  test("returns the recovered affinity and a warning when reattach tab cleanup fails", async () => {
+  test("returns the recovered affinity with redacted finalization warning details", async () => {
     const { connection } = createObuConnection("recovered-session", 8);
+    const signedUrl = "https://chatgpt.com/c/recovered-thread?sig=reattach-secret#done";
     const finalize = vi.fn().mockRejectedValueOnce(
-      new BrowserAutomationError("Failed to finalize the task-owned main-Chrome Oracle tab.", {
+      new BrowserAutomationError(`Failed to finalize at ${signedUrl}`, {
         stage: "open-browser-use",
         code: "tab-finalize-failed",
         recoveryHandle: {
           transport: "obu",
           sessionId: "recovered-session",
           tabId: 8,
-          conversationUrl: obuConversationUrl,
+          conversationUrl: signedUrl,
         },
       }),
     );
     connection.finalize = finalize;
 
-    await expect(
-      resumeBrowserSession(
-        obuRuntime,
-        {
-          browserTransport: "obu",
-          obuSessionId: "stored-session",
-          obuTabId: 7,
-          chatGptAccountEmail: "paul@smartypants.ai",
-          chatGptWorkspaceName: "Paul Bettner",
-          chatGptAccountDigest: obuAccountDigest,
-          chatGptWorkspaceDigest: obuWorkspaceDigest,
-          url: obuConversationUrl,
-          timeoutMs: 2_000,
-        },
-        vi.fn() as BrowserLogger,
-        {
-          acquireOpenBrowserUseRunLock: vi.fn(async () => ({
-            path: "/tmp/oracle.lock",
-            lockId: "lock-1",
-            release: vi.fn(async () => {}),
-          })),
-          connectOpenBrowserUseTab: vi.fn(async () => connection),
-          prepareOpenBrowserUseChatGptRoute: vi.fn(async () => ({
-            email: "paul@smartypants.ai",
-            workspaceName: "Paul Bettner",
-            accountDigest: obuAccountDigest,
-            workspaceDigest: obuWorkspaceDigest,
-          })),
-          waitForConversationHydration: vi.fn(async () => 2),
-          waitForAssistantResponse: vi.fn(async () => ({
-            text: "exact answer",
-            html: "",
-            meta: { messageId: "m1", turnId: "turn-1" },
-          })),
-          captureAssistantMarkdown: vi.fn(async () => "exact answer"),
-        },
-      ),
-    ).resolves.toMatchObject({
+    const result = await resumeBrowserSession(
+      obuRuntime,
+      {
+        browserTransport: "obu",
+        obuSessionId: "stored-session",
+        obuTabId: 7,
+        chatGptAccountEmail: "paul@smartypants.ai",
+        chatGptWorkspaceName: "Paul Bettner",
+        chatGptAccountDigest: obuAccountDigest,
+        chatGptWorkspaceDigest: obuWorkspaceDigest,
+        url: obuConversationUrl,
+        timeoutMs: 2_000,
+      },
+      vi.fn() as BrowserLogger,
+      {
+        acquireOpenBrowserUseRunLock: vi.fn(async () => ({
+          path: "/tmp/oracle.lock",
+          lockId: "lock-1",
+          release: vi.fn(async () => {}),
+        })),
+        connectOpenBrowserUseTab: vi.fn(async () => connection),
+        prepareOpenBrowserUseChatGptRoute: vi.fn(async () => ({
+          email: "paul@smartypants.ai",
+          workspaceName: "Paul Bettner",
+          accountDigest: obuAccountDigest,
+          workspaceDigest: obuWorkspaceDigest,
+        })),
+        waitForConversationHydration: vi.fn(async () => 2),
+        waitForAssistantResponse: vi.fn(async () => ({
+          text: "exact answer",
+          html: "",
+          meta: { messageId: "m1", turnId: "turn-1" },
+        })),
+        captureAssistantMarkdown: vi.fn(async () => "exact answer"),
+      },
+    );
+
+    expect(result).toMatchObject({
       runtime: { obuSessionId: "recovered-session", obuTabId: 8 },
       warnings: [
         {
           code: "obu-tab-finalize-failed",
+          message: "Failed to finalize at [redacted-url]",
           details: {
-            recoveryHandle: { sessionId: "recovered-session", tabId: 8 },
+            stage: "open-browser-use",
+            code: "tab-finalize-failed",
+            recoveryHandle: {
+              transport: "obu",
+              sessionId: "recovered-session",
+              tabId: 8,
+              conversationUrl: "[redacted-url]",
+            },
           },
         },
       ],
     });
+    expect(JSON.stringify(result.warnings)).not.toContain(signedUrl);
+    expect(JSON.stringify(result.warnings)).not.toContain("reattach-secret");
     expect(finalize).toHaveBeenCalledWith(false);
   });
 

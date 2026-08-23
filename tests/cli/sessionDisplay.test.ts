@@ -11,7 +11,9 @@ import {
   attachSession,
 } from "../../src/cli/sessionDisplay.ts";
 import chalk from "chalk";
+import { BrowserAutomationError } from "../../src/oracle/errors.js";
 
+const resumeBrowserSessionMock = vi.hoisted(() => vi.fn());
 const waitMock = vi.hoisted(() => vi.fn());
 const sessionStoreMock = vi.hoisted(() => ({
   readSession: vi.fn(),
@@ -38,6 +40,9 @@ vi.mock("../../src/sessionStore.ts", () => ({
 vi.mock("../../src/sessionManager.ts", () => ({
   wait: vi.fn(),
 }));
+vi.mock("../../src/browser/reattach.ts", () => ({
+  resumeBrowserSession: resumeBrowserSessionMock,
+}));
 
 vi.mock("../../src/cli/markdownRenderer.ts", () => {
   return {
@@ -61,6 +66,7 @@ beforeEach(() => {
   process.exitCode = undefined;
   waitMock.mockClear();
   Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+  resumeBrowserSessionMock.mockReset();
   chalk.level = 1;
   vi.spyOn(process.stdout, "write").mockImplementation(() => true);
   Object.values(sessionStoreMock).forEach((fn) => {
@@ -449,6 +455,89 @@ describe("attachSession rendering", () => {
     expect(logSpy).not.toHaveBeenCalledWith(
       expect.stringContaining("Attempting to reattach to the existing Chrome session"),
     );
+  });
+
+  test("redacts reattach errors in session metadata while preserving verified runtime affinity", async () => {
+    const signedUrl = "https://chatgpt.com/c/private?signature=display-secret#fragment";
+    const verifiedUrl = "https://chatgpt.com/c/verified-thread";
+    const runtime = {
+      browserTransport: "obu" as const,
+      obuSessionId: "oracle-main",
+      obuTabId: 7,
+      chatGptAccountEmail: "paul@smartypants.ai",
+      chatGptWorkspaceName: "Paul Bettner",
+      chatGptAccountDigest: "a".repeat(64),
+      chatGptWorkspaceDigest: "b".repeat(64),
+      tabUrl: verifiedUrl,
+      conversationId: "verified-thread",
+      promptSubmitted: true,
+      controllerPid: 2_147_483_647,
+    };
+    const runningMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "running",
+      mode: "browser",
+      response: { status: "running", incompleteReason: "chrome-disconnected" },
+      options: {
+        browserConfig: {
+          browserTransport: "obu",
+          obuSessionId: "oracle-main",
+          obuTabId: 7,
+          chatGptAccountEmail: "paul@smartypants.ai",
+          chatGptWorkspaceName: "Paul Bettner",
+          chatGptAccountDigest: "a".repeat(64),
+          chatGptWorkspaceDigest: "b".repeat(64),
+        },
+      },
+      browser: { runtime },
+    };
+    const settledMeta = { ...runningMeta, status: "error" } as SessionMetadata;
+    readSessionMetadataMock.mockResolvedValueOnce(runningMeta).mockResolvedValue(settledMeta);
+    readSessionLogMock.mockResolvedValue("");
+    readSessionRequestMock.mockResolvedValue({ prompt: "Prompt here" });
+    const reattachError = new BrowserAutomationError(`Reattach failed at ${signedUrl}`, {
+      stage: "chatgpt-scope",
+      code: "scope-mismatch",
+      actualUrl: signedUrl,
+      recoveryHandle: {
+        transport: "obu",
+        sessionId: "oracle-main",
+        tabId: 7,
+        conversationUrl: signedUrl,
+      },
+      runtime,
+    });
+    resumeBrowserSessionMock.mockRejectedValueOnce(reattachError);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await attachSession("sess", { renderMarkdown: false, suppressMetadata: true });
+
+    const persisted = sessionStoreMock.updateSession.mock.calls.find(
+      ([, patch]) => patch.error?.message === "Reattach failed at [redacted-url]",
+    )?.[1];
+    expect(persisted).toMatchObject({
+      errorMessage: "Reattach failed at [redacted-url]",
+      error: {
+        category: "browser-automation",
+        message: "Reattach failed at [redacted-url]",
+        details: {
+          stage: "chatgpt-scope",
+          code: "scope-mismatch",
+          recoveryHandle: {
+            transport: "obu",
+            sessionId: "oracle-main",
+            tabId: 7,
+            conversationUrl: "[redacted-url]",
+          },
+          runtime: expect.objectContaining({ tabUrl: "[redacted-url]" }),
+        },
+      },
+      browser: { runtime: expect.objectContaining({ tabUrl: verifiedUrl }) },
+    });
+    expect(persisted?.error?.details).not.toHaveProperty("actualUrl");
+    expect(JSON.stringify(persisted)).not.toContain(signedUrl);
+    expect(JSON.stringify(persisted)).not.toContain("display-secret");
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining(signedUrl));
   });
 
   test("stops an ordinary attachment when its detached worker exits", async () => {
