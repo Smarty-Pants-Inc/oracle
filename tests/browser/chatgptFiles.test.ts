@@ -703,9 +703,17 @@ describe("collectChatGptFileArtifacts", () => {
       }),
     } as unknown as ChromeClient["Network"];
     const page = {
-      setDownloadBehavior: vi.fn(async ({ downloadPath }: { downloadPath: string }) => {
-        browserDownloadDir = downloadPath;
-      }),
+      setDownloadBehavior: vi.fn(
+        async ({
+          behavior,
+          downloadPath,
+        }: {
+          behavior: "allow" | "default";
+          downloadPath?: string;
+        }) => {
+          if (behavior === "allow") browserDownloadDir = downloadPath ?? "";
+        },
+      ),
     } as unknown as ChromeClient["Page"];
 
     const result = await collectChatGptFileArtifacts({
@@ -772,9 +780,17 @@ describe("collectChatGptFileArtifacts", () => {
       }),
     } as unknown as ChromeClient["Runtime"];
     const page = {
-      setDownloadBehavior: vi.fn(async ({ downloadPath }: { downloadPath: string }) => {
-        browserDownloadDir = downloadPath;
-      }),
+      setDownloadBehavior: vi.fn(
+        async ({
+          behavior,
+          downloadPath,
+        }: {
+          behavior: "allow" | "default";
+          downloadPath?: string;
+        }) => {
+          if (behavior === "allow") browserDownloadDir = downloadPath ?? "";
+        },
+      ),
     } as unknown as ChromeClient["Page"];
 
     const savedFiles = await saveAssistantDownloadButtonArtifacts({
@@ -804,6 +820,127 @@ describe("collectChatGptFileArtifacts", () => {
     }
   });
 
+  test("restores browser download behavior and publishes without hard links or clobbering", async () => {
+    const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-file-publish-"));
+    setOracleHomeDirOverrideForTest(tmpHome);
+    const sessionId = "collect-session";
+    const artifactsDir = path.join(tmpHome, "sessions", sessionId, "artifacts");
+    await fs.mkdir(artifactsDir, { recursive: true });
+    await fs.writeFile(path.join(artifactsDir, "report.csv"), "existing", "utf8");
+    let browserDownloadDir = "";
+    let restoredWhileStagingExisted = false;
+    const runtime = {
+      evaluate: vi.fn(async () => {
+        await fs.writeFile(path.join(browserDownloadDir, "report.csv"), "new", "utf8");
+        return { result: { value: [{ text: "Download report.csv", ariaLabel: "", testId: "" }] } };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    const page = {
+      setDownloadBehavior: vi.fn(
+        async ({
+          behavior,
+          downloadPath,
+        }: {
+          behavior: "allow" | "default";
+          downloadPath?: string;
+        }) => {
+          if (behavior === "allow") {
+            browserDownloadDir = downloadPath ?? "";
+            return;
+          }
+          restoredWhileStagingExisted = await fs
+            .stat(browserDownloadDir)
+            .then(() => true)
+            .catch(() => false);
+        },
+      ),
+    } as unknown as ChromeClient["Page"];
+    const linkSpy = vi
+      .spyOn(fs, "link")
+      .mockRejectedValue(Object.assign(new Error("hard links unavailable"), { code: "EPERM" }));
+
+    const savedFiles = await saveAssistantDownloadButtonArtifacts({
+      Page: page,
+      Runtime: runtime,
+      sessionId,
+      files: [
+        {
+          url: "sandbox:/mnt/data/report.csv",
+          sandboxUrl: "sandbox:/mnt/data/report.csv",
+          filename: "report.csv",
+        },
+      ],
+    });
+
+    expect(savedFiles.map((file) => file.filename)).toEqual(["report-2.csv"]);
+    await expect(fs.readFile(path.join(artifactsDir, "report.csv"), "utf8")).resolves.toBe(
+      "existing",
+    );
+    await expect(fs.readFile(path.join(artifactsDir, "report-2.csv"), "utf8")).resolves.toBe("new");
+    expect(linkSpy).not.toHaveBeenCalled();
+    expect(page.setDownloadBehavior).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ behavior: "allow", downloadPath: browserDownloadDir }),
+    );
+    expect(page.setDownloadBehavior).toHaveBeenNthCalledWith(2, { behavior: "default" });
+    expect(restoredWhileStagingExisted).toBe(true);
+    await expect(fs.stat(browserDownloadDir)).rejects.toThrow();
+  });
+
+  test("keeps browser download staging when restoring default behavior fails", async () => {
+    const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-file-reset-"));
+    setOracleHomeDirOverrideForTest(tmpHome);
+    let browserDownloadDir = "";
+    const logger = vi.fn();
+    const runtime = {
+      evaluate: vi.fn(async () => {
+        await fs.writeFile(path.join(browserDownloadDir, "report.csv"), "new", "utf8");
+        return { result: { value: [{ text: "Download report.csv", ariaLabel: "", testId: "" }] } };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    const page = {
+      setDownloadBehavior: vi.fn(
+        async ({
+          behavior,
+          downloadPath,
+        }: {
+          behavior: "allow" | "default";
+          downloadPath?: string;
+        }) => {
+          if (behavior === "allow") {
+            browserDownloadDir = downloadPath ?? "";
+            return;
+          }
+          throw new Error("reset failed");
+        },
+      ),
+    } as unknown as ChromeClient["Page"];
+
+    try {
+      const savedFiles = await saveAssistantDownloadButtonArtifacts({
+        Page: page,
+        Runtime: runtime,
+        logger,
+        sessionId: "collect-session",
+        files: [
+          {
+            url: "sandbox:/mnt/data/report.csv",
+            sandboxUrl: "sandbox:/mnt/data/report.csv",
+            filename: "report.csv",
+          },
+        ],
+      });
+
+      expect(savedFiles).toHaveLength(1);
+      await expect(fs.stat(browserDownloadDir)).resolves.toMatchObject({});
+      expect(logger).toHaveBeenCalledWith(
+        "[browser] Preserved browser download staging after reset failure.",
+      );
+    } finally {
+      await fs.rm(tmpHome, { recursive: true, force: true });
+    }
+  });
+
   test("preserves a browser-provided filename for a generic download endpoint", async () => {
     const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-file-filename-"));
     setOracleHomeDirOverrideForTest(tmpHome);
@@ -817,9 +954,17 @@ describe("collectChatGptFileArtifacts", () => {
       }),
     } as unknown as ChromeClient["Runtime"];
     const page = {
-      setDownloadBehavior: vi.fn(async ({ downloadPath }: { downloadPath: string }) => {
-        browserDownloadDir = downloadPath;
-      }),
+      setDownloadBehavior: vi.fn(
+        async ({
+          behavior,
+          downloadPath,
+        }: {
+          behavior: "allow" | "default";
+          downloadPath?: string;
+        }) => {
+          if (behavior === "allow") browserDownloadDir = downloadPath ?? "";
+        },
+      ),
     } as unknown as ChromeClient["Page"];
 
     const savedFiles = await saveAssistantDownloadButtonArtifacts({
@@ -882,9 +1027,17 @@ describe("collectChatGptFileArtifacts", () => {
       }),
     } as unknown as ChromeClient["Runtime"];
     const page = {
-      setDownloadBehavior: vi.fn(async ({ downloadPath }: { downloadPath: string }) => {
-        browserDownloadDir = downloadPath;
-      }),
+      setDownloadBehavior: vi.fn(
+        async ({
+          behavior,
+          downloadPath,
+        }: {
+          behavior: "allow" | "default";
+          downloadPath?: string;
+        }) => {
+          if (behavior === "allow") browserDownloadDir = downloadPath ?? "";
+        },
+      ),
     } as unknown as ChromeClient["Page"];
 
     const savedFiles = await saveAssistantDownloadButtonArtifacts({
@@ -1017,9 +1170,17 @@ describe("collectChatGptFileArtifacts", () => {
       }),
     } as unknown as ChromeClient["Network"];
     const page = {
-      setDownloadBehavior: vi.fn(async ({ downloadPath }: { downloadPath: string }) => {
-        browserDownloadDir = downloadPath;
-      }),
+      setDownloadBehavior: vi.fn(
+        async ({
+          behavior,
+          downloadPath,
+        }: {
+          behavior: "allow" | "default";
+          downloadPath?: string;
+        }) => {
+          if (behavior === "allow") browserDownloadDir = downloadPath ?? "";
+        },
+      ),
     } as unknown as ChromeClient["Page"];
     globalThis.fetch = vi.fn().mockImplementation(async (url: URL | string) => {
       const missing = String(url).includes("file_missing");

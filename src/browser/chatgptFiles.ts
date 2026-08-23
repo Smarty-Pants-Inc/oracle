@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import path from "node:path";
 import type {
   BrowserDownloadableFile,
@@ -706,7 +707,7 @@ async function configureBrowserDownloadPath(params: {
   logger?: BrowserLogger;
   downloadPath: string;
   assertPageAffinity?: (action: string) => Promise<void>;
-}): Promise<boolean> {
+}): Promise<(() => Promise<void>) | null> {
   await params.assertPageAffinity?.("browser download configuration");
   if (params.Client?.send) {
     try {
@@ -715,41 +716,43 @@ async function configureBrowserDownloadPath(params: {
         downloadPath: params.downloadPath,
         eventsEnabled: true,
       });
-      return true;
+      return async () => {
+        await params.Client?.send("Browser.setDownloadBehavior", { behavior: "default" });
+      };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       params.logger?.(`[browser] Browser.setDownloadBehavior unavailable: ${message}`);
     }
   }
+  type DownloadBehaviorController = {
+    setDownloadBehavior?: (options: {
+      behavior: "allow" | "default";
+      downloadPath?: string;
+    }) => Promise<unknown>;
+  };
   const BrowserWithDownloads = params.Browser as
-    | (ChromeClient["Browser"] & {
-        setDownloadBehavior?: (options: {
-          behavior: "allow";
-          downloadPath: string;
-        }) => Promise<unknown>;
-      })
+    | (ChromeClient["Browser"] & DownloadBehaviorController)
     | undefined;
   if (BrowserWithDownloads?.setDownloadBehavior) {
     await BrowserWithDownloads.setDownloadBehavior({
       behavior: "allow",
       downloadPath: params.downloadPath,
     });
-    return true;
+    return async () => {
+      await BrowserWithDownloads.setDownloadBehavior?.({ behavior: "default" });
+    };
   }
-  const PageWithDownloads = params.Page as ChromeClient["Page"] & {
-    setDownloadBehavior?: (options: {
-      behavior: "allow";
-      downloadPath: string;
-    }) => Promise<unknown>;
-  };
+  const PageWithDownloads = params.Page as ChromeClient["Page"] & DownloadBehaviorController;
   if (PageWithDownloads?.setDownloadBehavior) {
     await PageWithDownloads.setDownloadBehavior({
       behavior: "allow",
       downloadPath: params.downloadPath,
     });
-    return true;
+    return async () => {
+      await PageWithDownloads.setDownloadBehavior?.({ behavior: "default" });
+    };
   }
-  return false;
+  return null;
 }
 
 function buildClickAssistantDownloadButtonsExpression(
@@ -1021,8 +1024,7 @@ async function publishStagedDownloadFile(params: {
       suffix === 1 ? filename : `${parsed.name || "download"}-${suffix}${parsed.ext}`;
     const candidatePath = path.join(params.destinationDir, candidateFilename);
     try {
-      // A hard link provides a no-replace, atomic publish from the private staging directory.
-      await fs.link(params.stagedPath, candidatePath);
+      await fs.copyFile(params.stagedPath, candidatePath, fsConstants.COPYFILE_EXCL);
       await fs.unlink(params.stagedPath).catch(() => undefined);
       return candidatePath;
     } catch (error) {
@@ -1231,8 +1233,9 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
   await fs.mkdir(artifactsDir, { recursive: true });
   await params.assertPageAffinity?.("browser download artifact collection");
   const stagingDir = await fs.mkdtemp(path.join(artifactsDir, ".oracle-download-"));
+  let restoreDownloadBehavior: (() => Promise<void>) | null = null;
   try {
-    const configured = await configureBrowserDownloadPath({
+    restoreDownloadBehavior = await configureBrowserDownloadPath({
       Browser: params.Browser,
       Client: params.Client,
       Page: params.Page,
@@ -1242,9 +1245,9 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
     }).catch((error) => {
       const message = error instanceof Error ? error.message : String(error);
       params.logger?.(`[browser] Failed to configure browser download path: ${message}`);
-      return false;
+      return null;
     });
-    if (!configured) {
+    if (!restoreDownloadBehavior) {
       params.logger?.(
         "[browser] Browser download path could not be configured; skipping button fallback.",
       );
@@ -1410,7 +1413,21 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
     }
     return savedFiles;
   } finally {
-    await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
+    let resetSucceeded = true;
+    if (restoreDownloadBehavior) {
+      try {
+        await restoreDownloadBehavior();
+      } catch (error) {
+        resetSucceeded = false;
+        const message = error instanceof Error ? error.message : String(error);
+        params.logger?.(`[browser] Failed to restore browser download behavior: ${message}`);
+      }
+    }
+    if (resetSucceeded) {
+      await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
+    } else {
+      params.logger?.("[browser] Preserved browser download staging after reset failure.");
+    }
   }
 }
 

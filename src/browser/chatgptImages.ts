@@ -412,15 +412,23 @@ async function createGeneratedImageStagingDir(targetPath: string): Promise<strin
 async function publishStagedGeneratedImages(
   stagedImages: StagedGeneratedImage[],
   assertPageAffinity?: (action: string) => Promise<void>,
-): Promise<SavedBrowserImage[]> {
+  logger?: BrowserLogger,
+): Promise<{ savedImages: SavedBrowserImage[]; errors: string[] }> {
   await assertPageAffinity?.("generated image artifact final return");
   const savedImages: SavedBrowserImage[] = [];
+  const errors: string[] = [];
   for (const stagedImage of stagedImages) {
-    await fs.rename(stagedImage.stagingPath, stagedImage.targetPath);
-    const { stagingPath: _stagingPath, targetPath, ...image } = stagedImage;
-    savedImages.push({ ...image, path: targetPath });
+    try {
+      await fs.rename(stagedImage.stagingPath, stagedImage.targetPath);
+      const { stagingPath: _stagingPath, targetPath, ...image } = stagedImage;
+      savedImages.push({ ...image, path: targetPath });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      errors.push(`${stagedImage.fileId ?? stagedImage.url}: ${message}`);
+      logger?.(`[browser] Failed to publish generated image: ${message}`);
+    }
   }
-  return savedImages;
+  return { savedImages, errors };
 }
 
 export async function saveChatGptGeneratedImages(params: {
@@ -545,12 +553,16 @@ export async function saveChatGptGeneratedImages(params: {
       }
     }
 
-    const savedImages = await publishStagedGeneratedImages(stagedImages, params.assertPageAffinity);
+    const publication = await publishStagedGeneratedImages(
+      stagedImages,
+      params.assertPageAffinity,
+      logger,
+    );
     return {
-      saved: savedImages.length > 0,
+      saved: publication.savedImages.length > 0,
       imageCount: images.length,
-      savedImages,
-      errors,
+      savedImages: publication.savedImages,
+      errors: [...errors, ...publication.errors],
     };
   } finally {
     await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
@@ -613,12 +625,13 @@ async function saveGeneratedImageButtonArtifacts(params: {
     if (stagedImages.length === 0) {
       return [];
     }
-    const buttonImages = await publishStagedGeneratedImages(
+    const { savedImages } = await publishStagedGeneratedImages(
       stagedImages,
       params.assertPageAffinity,
+      params.logger,
     );
-    params.logger?.(`[browser] Saved ${buttonImages.length} generated image download artifact(s).`);
-    return buttonImages;
+    params.logger?.(`[browser] Saved ${savedImages.length} generated image download artifact(s).`);
+    return savedImages;
   } finally {
     await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
   }

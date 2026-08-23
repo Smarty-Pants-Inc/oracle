@@ -223,6 +223,21 @@ export async function submitPrompt(
       },
     );
   }
+  const baselineResult = await runtime.evaluate({
+    expression: buildConversationTurnCountExpression(),
+    returnByValue: true,
+  });
+  const rawBaseline =
+    typeof baselineResult.result?.value === "number"
+      ? baselineResult.result.value
+      : Number(baselineResult.result?.value);
+  if (!Number.isFinite(rawBaseline) || rawBaseline < 0) {
+    throw new BrowserAutomationError("Could not establish a conversation baseline before send.", {
+      stage: "submit-prompt",
+      code: "prompt-baseline-unavailable",
+    });
+  }
+  const commitBaselineTurns = Math.floor(rawBaseline);
 
   const clicked = await attemptSendButton(
     runtime,
@@ -252,13 +267,7 @@ export async function submitPrompt(
 
   const commitTimeoutMs = Math.max(60_000, deps.inputTimeoutMs ?? 0);
   // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
-  return await verifyPromptCommitted(
-    runtime,
-    prompt,
-    commitTimeoutMs,
-    logger,
-    deps.baselineTurns ?? undefined,
-  );
+  return await verifyPromptCommitted(runtime, prompt, commitTimeoutMs, logger, commitBaselineTurns);
 }
 
 export async function clearPromptComposer(
@@ -825,25 +834,11 @@ async function verifyPromptCommitted(
   const inputSelectorsLiteral = JSON.stringify(INPUT_SELECTORS);
   const stopSelectorLiteral = JSON.stringify(STOP_BUTTON_SELECTOR);
   const assistantSelectorLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
-  let baseline: number | null =
+  const baseline =
     typeof baselineTurns === "number" && Number.isFinite(baselineTurns) && baselineTurns >= 0
       ? Math.floor(baselineTurns)
-      : null;
-  if (baseline === null) {
-    try {
-      const { result } = await Runtime.evaluate({
-        expression: buildConversationTurnCountExpression(),
-        returnByValue: true,
-      });
-      const raw = typeof result?.value === "number" ? result.value : Number(result?.value);
-      if (Number.isFinite(raw)) {
-        baseline = Math.max(0, Math.floor(raw));
-      }
-    } catch {
-      // ignore; baseline stays unknown
-    }
-  }
-  const baselineLiteral = baseline ?? -1;
+      : -1;
+  const baselineLiteral = baseline;
   // Learned: ChatGPT can echo/format text; normalize markdown and use prefix matches to detect the sent prompt.
   const script = `(() => {
     const editor = document.querySelector(${primarySelectorLiteral});
@@ -924,8 +919,10 @@ async function verifyPromptCommitted(
       activeInputs.length === 0
         ? null
         : activeInputs.every((node) => !String(readValue(node)).trim());
+    const composerKnown = activeInputs.length > 0 || Boolean(editor || fallback);
     const composerCleared =
-      activeEmpty ?? !(String(editorValue).trim() || String(fallbackValue).trim());
+      composerKnown &&
+      (activeEmpty ?? !(String(editorValue).trim() || String(fallbackValue).trim()));
     const href = typeof location === 'object' && location.href ? location.href : '';
     const inConversation = /\\/c\\//.test(href);
     return {
@@ -938,6 +935,7 @@ async function verifyPromptCommitted(
       hasNewTurn,
       stopVisible,
       assistantVisible,
+      composerKnown,
       composerCleared,
       inConversation,
       href,
@@ -956,15 +954,22 @@ async function verifyPromptCommitted(
       lastProbe = info;
     }
     const turnsCount = (result.value as { turnsCount?: number } | undefined)?.turnsCount;
-    const baselineUnknown =
-      typeof info?.baseline === "number" ? info.baseline < 0 : baselineLiteral < 0;
+    const baselineKnown =
+      typeof info?.baseline === "number" ? info.baseline >= 0 : baselineLiteral >= 0;
     const parsedConversationUrl =
       typeof info?.href === "string" && isChatGptUrl(info.href) ? new URL(info.href) : null;
     const conversationUrl =
       parsedConversationUrl && extractStableConversationIdFromUrl(parsedConversationUrl.pathname)
         ? info?.href
         : null;
-    if (info?.submittedTurnMatched && (baselineUnknown || info.hasNewTurn) && conversationUrl) {
+    const submittedTurnIsCurrentTail =
+      info?.submittedTurnMatched === true &&
+      info.composerKnown === true &&
+      info.composerCleared === true &&
+      typeof info.submittedTurnIndex === "number" &&
+      typeof turnsCount === "number" &&
+      info.submittedTurnIndex === turnsCount - 1;
+    if (baselineKnown && info?.hasNewTurn && submittedTurnIsCurrentTail && conversationUrl) {
       return {
         turnsCount:
           typeof turnsCount === "number" && Number.isFinite(turnsCount) ? turnsCount : null,
@@ -1016,6 +1021,7 @@ interface CommitProbeState {
   hasNewTurn?: boolean;
   stopVisible?: boolean;
   assistantVisible?: boolean;
+  composerKnown?: boolean;
   composerCleared?: boolean;
   inConversation?: boolean;
   turnsCount?: number;
@@ -1038,6 +1044,7 @@ function summarizeCommitProbe(probe: CommitProbeState): Record<string, unknown> 
     hasNewTurn: probe.hasNewTurn,
     stopVisible: probe.stopVisible,
     assistantVisible: probe.assistantVisible,
+    composerKnown: probe.composerKnown,
     composerCleared: probe.composerCleared,
     inConversation: probe.inConversation,
     editorLength: typeof probe.editorValue === "string" ? probe.editorValue.length : undefined,

@@ -7,6 +7,7 @@ import {
 import {
   CONVERSATION_TURN_CONTAINER_SELECTOR,
   CONVERSATION_TURN_SELECTOR,
+  PROMPT_PRIMARY_SELECTOR,
 } from "../../src/browser/constants.js";
 
 describe("promptComposer", () => {
@@ -111,7 +112,7 @@ describe("promptComposer", () => {
       vi.useRealTimers();
     }
   });
-  test("finds the submitted prompt after late prior-turn hydration shifts its index", async () => {
+  test("finds the submitted prompt at a refreshed baseline after prior-turn hydration", async () => {
     const turn = (role: "user" | "assistant", innerText: string) => ({
       innerText,
       getAttribute: (name: string) => (name === "data-message-author-role" ? role : null),
@@ -123,8 +124,12 @@ describe("promptComposer", () => {
       turn("assistant", "late hydrated answer"),
       turn("user", "new prompt"),
     ];
+    const composer = {
+      innerText: "",
+      getBoundingClientRect: () => ({ width: 100, height: 40 }),
+    };
     const document = {
-      querySelector: () => null,
+      querySelector: (selector: string) => (selector === PROMPT_PRIMARY_SELECTOR ? composer : null),
       querySelectorAll: (selector: string) => {
         if (
           selector === CONVERSATION_TURN_CONTAINER_SELECTOR ||
@@ -159,6 +164,54 @@ describe("promptComposer", () => {
     });
   });
 
+  test("does not combine a stale tail match with later composer clearance", async () => {
+    vi.useFakeTimers();
+    try {
+      const firstProbe = {
+        baseline: 2,
+        turnsCount: 3,
+        submittedTurnIndex: 2,
+        submittedTurnMatched: true,
+        hasNewTurn: true,
+        lastMatched: true,
+        composerKnown: true,
+        composerCleared: false,
+        inConversation: true,
+        href: "https://chatgpt.com/c/reused",
+      };
+      const laterProbe = {
+        ...firstProbe,
+        turnsCount: 4,
+        lastMatched: false,
+        composerCleared: true,
+        assistantVisible: true,
+      };
+      const runtime = {
+        evaluate: vi
+          .fn()
+          .mockResolvedValueOnce({ result: { value: firstProbe } })
+          .mockResolvedValue({ result: { value: laterProbe } }),
+      } as unknown as {
+        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+      };
+
+      const promise = promptComposer.verifyPromptCommitted(
+        runtime as never,
+        "new prompt",
+        150,
+        undefined,
+        2,
+      );
+      const assertion = expect(promise).rejects.toMatchObject({
+        details: expect.objectContaining({ code: "prompt-commit-timeout" }),
+      });
+      await vi.advanceTimersByTimeAsync(250);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("commit timeout throws a structured error with probe diagnostics", async () => {
     vi.useFakeTimers();
     try {
@@ -177,17 +230,18 @@ describe("promptComposer", () => {
         lastTurn: "previous turn text",
       };
       const runtime = {
-        evaluate: vi
-          .fn()
-          // Baseline read (turn count)
-          .mockResolvedValueOnce({ result: { value: 10 } })
-          // Polls + final diagnostic probe
-          .mockResolvedValue({ result: { value: probe } }),
+        evaluate: vi.fn().mockResolvedValue({ result: { value: probe } }),
       } as unknown as {
         evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
       };
 
-      const promise = promptComposer.verifyPromptCommitted(runtime as never, "hello", 150);
+      const promise = promptComposer.verifyPromptCommitted(
+        runtime as never,
+        "hello",
+        150,
+        undefined,
+        10,
+      );
       const assertion = promise.then(
         () => {
           throw new Error("expected verifyPromptCommitted to reject");
@@ -221,41 +275,39 @@ describe("promptComposer", () => {
     }
   });
 
-  test("allows prompt match even if baseline turn count cannot be read", async () => {
-    const runtime = {
-      evaluate: vi
-        .fn()
-        // Baseline read fails
-        .mockRejectedValueOnce(new Error("turn read failed"))
-        // First poll shows prompt match (baseline unknown)
-        .mockResolvedValueOnce({
+  test("fails closed when no pre-send baseline is available", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
           result: {
             value: {
               baseline: -1,
               turnsCount: 1,
-              userMatched: true,
-              prefixMatched: false,
-              lastMatched: true,
+              submittedTurnIndex: 0,
               submittedTurnMatched: true,
               hasNewTurn: false,
-              stopVisible: false,
-              assistantVisible: false,
-              composerCleared: false,
+              lastMatched: true,
+              composerKnown: true,
+              composerCleared: true,
               inConversation: true,
               href: "https://chatgpt.com/c/created-for-prompt",
             },
           },
         }),
-    } as unknown as {
-      evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
-    };
+      } as unknown as {
+        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+      };
 
-    await expect(
-      promptComposer.verifyPromptCommitted(runtime as never, "hello", 150),
-    ).resolves.toEqual({
-      turnsCount: 1,
-      conversationUrl: "https://chatgpt.com/c/created-for-prompt",
-    });
+      const promise = promptComposer.verifyPromptCommitted(runtime as never, "hello", 150);
+      const assertion = expect(promise).rejects.toMatchObject({
+        details: expect.objectContaining({ code: "prompt-commit-timeout" }),
+      });
+      await vi.advanceTimersByTimeAsync(250);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("attachment sends time out instead of allowing Enter fallback", async () => {
@@ -335,6 +387,9 @@ describe("promptComposer", () => {
             result: { value: { editorText: "hello", fallbackValue: "", activeValue: "hello" } },
           };
         }
+        if (expression.trim().endsWith(").length")) {
+          return { result: { value: 0 } };
+        }
         if (expression.includes("button.scrollIntoView")) {
           return { result: { value: { status: "point", x: 1, y: 1 } } };
         }
@@ -346,10 +401,12 @@ describe("promptComposer", () => {
               userMatched: true,
               prefixMatched: false,
               lastMatched: true,
+              submittedTurnIndex: 0,
               submittedTurnMatched: true,
               hasNewTurn: true,
               stopVisible: true,
               assistantVisible: false,
+              composerKnown: true,
               composerCleared: true,
               inConversation: true,
               href: "https://chatgpt.com/c/created-for-prompt",
@@ -370,7 +427,7 @@ describe("promptComposer", () => {
       {
         runtime: runtime as never,
         input: input as never,
-        baselineTurns: 0,
+        baselineTurns: 7,
         onPromptSubmitted,
         assertPageAffinity,
       },
@@ -379,6 +436,11 @@ describe("promptComposer", () => {
     );
 
     expect(onPromptSubmitted).toHaveBeenCalledTimes(1);
+    expect(
+      vi
+        .mocked(runtime.evaluate)
+        .mock.calls.some(([{ expression }]) => String(expression).includes("const baseline = 0;")),
+    ).toBe(true);
     expect(assertPageAffinity.mock.calls.map(([action]) => action)).toEqual([
       "prompt composer focus",
       "prompt text insertion",

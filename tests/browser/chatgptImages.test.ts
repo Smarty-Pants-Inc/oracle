@@ -305,6 +305,56 @@ describe("saveChatGptGeneratedImages", () => {
     );
   });
 
+  test("returns published images when a later image target cannot be replaced", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-images-partial-"));
+    const outputPath = path.join(tmpDir, "generated.png");
+    const blockedPath = path.join(tmpDir, "generated.2.png");
+    await fs.mkdir(blockedPath);
+    const network = {
+      getCookies: vi.fn().mockResolvedValue({
+        cookies: [{ name: "__Secure-next-auth.session-token", value: "abc" }],
+      }),
+    } as unknown as ChromeClient["Network"];
+    globalThis.fetch = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        url: "https://files.local/1",
+        headers: { get: () => "image/png" },
+        arrayBuffer: async () => Uint8Array.from([1, 2, 3, 4]).buffer,
+      } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        url: "https://files.local/2",
+        headers: { get: () => "image/png" },
+        arrayBuffer: async () => Uint8Array.from([5, 6, 7, 8]).buffer,
+      } as unknown as Response);
+
+    try {
+      const result = await saveChatGptGeneratedImages({
+        Network: network,
+        images: [
+          { url: "https://chatgpt.com/backend-api/estuary/content?id=file_1", fileId: "file_1" },
+          { url: "https://chatgpt.com/backend-api/estuary/content?id=file_2", fileId: "file_2" },
+        ],
+        outputPath,
+      });
+
+      expect(result.saved).toBe(true);
+      expect(result.savedImages.map((image) => image.path)).toEqual([outputPath]);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0]).toContain("file_2");
+      await expect(fs.readFile(outputPath)).resolves.toEqual(Buffer.from([1, 2, 3, 4]));
+      await expect(fs.stat(blockedPath)).resolves.toMatchObject({});
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   test("falls back to browser-context fetch when Node fetch cannot download the image", async () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-images-"));
     const network = {
@@ -470,6 +520,7 @@ describe("collectGeneratedImageArtifacts", () => {
       0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x00,
     ]);
     let browserDownloadDir = "";
+    let resetWhileStagingExisted = false;
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
         if (expression.includes("behavior-btn")) {
@@ -490,9 +541,21 @@ describe("collectGeneratedImageArtifacts", () => {
       }),
     } as unknown as ChromeClient["Runtime"];
     const client = {
-      send: vi.fn(async (_method: string, { downloadPath }: { downloadPath: string }) => {
-        browserDownloadDir = downloadPath;
-      }),
+      send: vi.fn(
+        async (
+          _method: string,
+          { behavior, downloadPath }: { behavior: "allow" | "default"; downloadPath?: string },
+        ) => {
+          if (behavior === "allow") {
+            browserDownloadDir = downloadPath ?? "";
+            return;
+          }
+          resetWhileStagingExisted = await fs
+            .stat(browserDownloadDir)
+            .then(() => true)
+            .catch(() => false);
+        },
+      ),
     } as unknown as ChromeClient;
 
     try {
@@ -514,10 +577,15 @@ describe("collectGeneratedImageArtifacts", () => {
         sourceUrl: "browser-download",
       });
       await expect(fs.readFile(outputPath)).resolves.toEqual(png);
-      expect(client.send).toHaveBeenCalledWith(
+      expect(client.send).toHaveBeenNthCalledWith(
+        1,
         "Browser.setDownloadBehavior",
         expect.objectContaining({ behavior: "allow", downloadPath: browserDownloadDir }),
       );
+      expect(client.send).toHaveBeenNthCalledWith(2, "Browser.setDownloadBehavior", {
+        behavior: "default",
+      });
+      expect(resetWhileStagingExisted).toBe(true);
       expect(path.dirname(path.dirname(browserDownloadDir))).toBe(tmpDir);
     } finally {
       await fs.rm(tmpDir, { recursive: true, force: true });
@@ -534,9 +602,14 @@ describe("collectGeneratedImageArtifacts", () => {
     await fs.writeFile(outputPath, "existing");
     let browserDownloadDir = "";
     const client = {
-      send: vi.fn(async (_method: string, { downloadPath }: { downloadPath: string }) => {
-        browserDownloadDir = downloadPath;
-      }),
+      send: vi.fn(
+        async (
+          _method: string,
+          { behavior, downloadPath }: { behavior: "allow" | "default"; downloadPath?: string },
+        ) => {
+          if (behavior === "allow") browserDownloadDir = downloadPath ?? "";
+        },
+      ),
     } as unknown as ChromeClient;
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
@@ -628,9 +701,14 @@ describe("collectGeneratedImageArtifacts", () => {
       }),
     } as unknown as ChromeClient["Runtime"];
     const client = {
-      send: vi.fn(async (_method: string, { downloadPath }: { downloadPath: string }) => {
-        browserDownloadDir = downloadPath;
-      }),
+      send: vi.fn(
+        async (
+          _method: string,
+          { behavior, downloadPath }: { behavior: "allow" | "default"; downloadPath?: string },
+        ) => {
+          if (behavior === "allow") browserDownloadDir = downloadPath ?? "";
+        },
+      ),
     } as unknown as ChromeClient;
 
     try {
@@ -711,9 +789,14 @@ describe("collectGeneratedImageArtifacts", () => {
       }),
     } as unknown as ChromeClient["Network"];
     const client = {
-      send: vi.fn(async (_method: string, { downloadPath }: { downloadPath: string }) => {
-        browserDownloadDir = downloadPath;
-      }),
+      send: vi.fn(
+        async (
+          _method: string,
+          { behavior, downloadPath }: { behavior: "allow" | "default"; downloadPath?: string },
+        ) => {
+          if (behavior === "allow") browserDownloadDir = downloadPath ?? "";
+        },
+      ),
     } as unknown as ChromeClient;
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: false,
