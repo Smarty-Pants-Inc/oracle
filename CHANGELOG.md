@@ -7,7 +7,7 @@
 - Browser: wait for copied-profile Chrome processes to exit before deleting the throwaway profile, preventing Chrome from recreating profile residue during shutdown.
 - Browser: close owned run and Project Sources tabs after non-recoverable failures while preserving explicit keep-browser and reattach recovery cases.
 - Browser: fail closed before sending uploaded prompts unless ChatGPT confirms the attachment, preserve submitted tabs for Cloudflare and attachment-verification recovery, and recover named sessions from their saved conversation URL before probing a default target.
-- Browser: keep long ChatGPT prompts bound to their exact user turn by ignoring collapsible-message controls such as “Show more” during submit, reattach, harvest, and follow-up affinity checks.
+- Browser: keep long ChatGPT prompts bound to their exact user turn by ignoring collapsible-message controls such as “Show more” during submit, reattach, harvest, and follow-up affinity checks; retry transient bound-turn misses only within an absolute recovery deadline while the canonical exact conversation hydrates; recover server-rendered exports with a capture-deadline-bounded, content-free poll and exact-route/account/workspace-verified in-page request that yields to any passive request observed before credential use; require complete route and identity affinity for archived recovery; and bind archive clicks to the unique current-thread menu while rechecking canonical route plus user/workspace digests.
 
 ## 0.17.0 — 2026-08-02
 

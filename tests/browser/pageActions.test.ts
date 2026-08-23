@@ -278,6 +278,99 @@ describe("ensureChatGptScopeRetained", () => {
     ).resolves.toBeUndefined();
   });
 
+  test("accepts a canonical project slug suffix change for the same stable project", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: {
+          value: "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef-oracle/c/abc",
+        },
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      ensureChatGptScopeRetained(
+        runtime,
+        "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef/c/abc",
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  test("rejects a non-delimited project slug suffix", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: {
+          value: "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdefZ/c/abc",
+        },
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      ensureChatGptScopeRetained(
+        runtime,
+        "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef/c/abc",
+      ),
+    ).rejects.toMatchObject({ details: { code: "scope-mismatch" } });
+  });
+
+  test("rejects the same conversation id on a ChatGPT subdomain", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: { value: "https://preview.chatgpt.com/c/abc" },
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      ensureChatGptScopeRetained(runtime, "https://chatgpt.com/c/abc"),
+    ).rejects.toMatchObject({ details: { code: "scope-mismatch" } });
+  });
+
+  test("rejects distinct malformed project slugs with one hex prefix", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: { value: "https://chatgpt.com/g/g-p-a-two/c/abc" },
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      ensureChatGptScopeRetained(runtime, "https://chatgpt.com/g/g-p-a-one/c/abc"),
+    ).rejects.toMatchObject({ details: { code: "scope-mismatch" } });
+  });
+
+  test("rejects a malformed conversation-like expected route before probing the tab", async () => {
+    const runtime = { evaluate: vi.fn() } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      ensureChatGptScopeRetained(runtime, "https://chatgpt.com/c/abc/extra"),
+    ).rejects.toMatchObject({
+      details: {
+        stage: "chatgpt-scope",
+        code: "scope-mismatch",
+        expectedUrl: "https://chatgpt.com/c/abc/extra",
+      },
+    });
+    expect(runtime.evaluate).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["https://chatgpt.com/g/project-a/c/abc", "https://chatgpt.com/c/abc"],
+    ["https://chatgpt.com/g/project-a/c/abc", "https://chatgpt.com/g/project-b/c/abc"],
+    ["https://chatgpt.com/c/abc", "https://chatgpt.com/g/project-a/c/abc"],
+    ["https://chatgpt.com/c/abc", "https://chatgpt.com/c/abc/extra"],
+  ])("rejects conversation route drift from %s to %s", async (expectedUrl, actualUrl) => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({ result: { value: actualUrl } }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(ensureChatGptScopeRetained(runtime, expectedUrl)).rejects.toMatchObject({
+      details: {
+        stage: "chatgpt-scope",
+        code: "scope-mismatch",
+        expectedUrl,
+        actualUrl,
+      },
+    });
+  });
+
   test("rejects same-project but wrong-conversation targets", async () => {
     const runtime = {
       evaluate: vi.fn().mockResolvedValue({

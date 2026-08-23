@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   prepareOpenBrowserUseConversationRoute: vi.fn(),
   waitForOpenBrowserUseConversationUrl: vi.fn(),
   harvestConnectedChatGptTab: vi.fn(),
+  ensureChatGptScopeRetained: vi.fn(),
 }));
 
 vi.mock("../../src/sessionStore.ts", () => ({
@@ -38,6 +39,11 @@ vi.mock("../../src/browser/liveTabs.ts", async (importOriginal) => {
     ...actual,
     harvestConnectedChatGptTab: mocks.harvestConnectedChatGptTab,
   };
+});
+
+vi.mock("../../src/browser/pageActions.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/browser/pageActions.js")>();
+  return { ...actual, ensureChatGptScopeRetained: mocks.ensureChatGptScopeRetained };
 });
 
 import { harvestSessionBrowserOutput } from "../../src/cli/browserTabs.js";
@@ -98,7 +104,7 @@ const harvested: ChatGptTabSummary = {
 
 describe("main-Chrome harvest recovery", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
     mocks.updateSession.mockResolvedValue(undefined);
     mocks.acquireOpenBrowserUseRunLock.mockResolvedValue({
       path: "/tmp/oracle.lock",
@@ -106,6 +112,7 @@ describe("main-Chrome harvest recovery", () => {
       release: vi.fn(async () => {}),
     });
     mocks.harvestConnectedChatGptTab.mockResolvedValue(harvested);
+    mocks.ensureChatGptScopeRetained.mockResolvedValue(undefined);
     mocks.prepareOpenBrowserUseConversationRoute.mockResolvedValue({
       email: "paul@smartypants.ai",
       workspaceName: "Paul Bettner",
@@ -212,6 +219,250 @@ describe("main-Chrome harvest recovery", () => {
       await expect(result).resolves.toMatchObject({ conversationId: "obu-thread" });
       expect(mocks.harvestConnectedChatGptTab).toHaveBeenCalledTimes(2);
       expect(finalize).toHaveBeenCalledWith(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("retries missing stored turn affinity while the conversation hydrates", async () => {
+    vi.useFakeTimers();
+    try {
+      const meta = obuSession();
+      const finalize = vi.fn(async (_keepTab: boolean) => {});
+      mocks.readSession.mockResolvedValue(meta);
+      mocks.connectOpenBrowserUseTab.mockResolvedValue({
+        client: {},
+        obuClient: {},
+        sessionId: "recovered-session",
+        tabId: 8,
+        tabUrl: conversationUrl,
+        created: true,
+        finalize,
+      } as unknown as OpenBrowserUseConnection);
+      mocks.harvestConnectedChatGptTab
+        .mockRejectedValueOnce(
+          new BrowserAutomationError("Stored turn is not hydrated yet.", {
+            stage: "chatgpt-turn-affinity",
+            code: "turn-affinity-missing",
+          }),
+        )
+        .mockResolvedValueOnce(harvested);
+
+      const result = harvestSessionBrowserOutput(meta.id, { quietOutput: true });
+      await vi.runAllTimersAsync();
+      await expect(result).resolves.toMatchObject({ conversationId: "obu-thread" });
+      expect(mocks.harvestConnectedChatGptTab).toHaveBeenCalledTimes(2);
+      expect(finalize).toHaveBeenCalledWith(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("rejects a scope change before retrying missing turn affinity", async () => {
+    const meta = obuSession();
+    const finalize = vi.fn(async (_keepTab: boolean) => {});
+    mocks.readSession.mockResolvedValue(meta);
+    mocks.connectOpenBrowserUseTab.mockResolvedValue({
+      client: {},
+      obuClient: {},
+      sessionId: "recovered-session",
+      tabId: 8,
+      tabUrl: conversationUrl,
+      created: true,
+      finalize,
+    } as unknown as OpenBrowserUseConnection);
+    mocks.ensureChatGptScopeRetained.mockRejectedValueOnce(
+      new BrowserAutomationError("ChatGPT left the stored thread.", {
+        stage: "chatgpt-scope",
+        code: "scope-mismatch",
+      }),
+    );
+
+    await expect(harvestSessionBrowserOutput(meta.id, { quietOutput: true })).rejects.toMatchObject(
+      { details: { stage: "chatgpt-scope", code: "scope-mismatch" } },
+    );
+    expect(mocks.harvestConnectedChatGptTab).not.toHaveBeenCalled();
+    expect(finalize).toHaveBeenCalledWith(true);
+  });
+
+  test("rejects a harvested root/project route change with the same conversation id", async () => {
+    const meta = obuSession();
+    const projectUrl = "https://chatgpt.com/g/project-a/c/obu-thread";
+    meta.browser!.runtime!.tabUrl = projectUrl;
+    const finalize = vi.fn(async (_keepTab: boolean) => {});
+    mocks.readSession.mockResolvedValue(meta);
+    mocks.connectOpenBrowserUseTab.mockResolvedValue({
+      client: {},
+      obuClient: {},
+      sessionId: "recovered-session",
+      tabId: 8,
+      tabUrl: projectUrl,
+      created: true,
+      finalize,
+    } as unknown as OpenBrowserUseConnection);
+
+    await expect(harvestSessionBrowserOutput(meta.id, { quietOutput: true })).rejects.toMatchObject(
+      {
+        details: { stage: "chatgpt-scope", code: "scope-mismatch" },
+      },
+    );
+    expect(mocks.harvestConnectedChatGptTab).toHaveBeenCalledTimes(1);
+    expect(finalize).toHaveBeenCalledWith(true);
+  });
+
+  test("accepts a canonical project slug suffix change during harvest", async () => {
+    const meta = obuSession();
+    const expectedUrl = "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef/c/obu-thread";
+    meta.browser!.runtime!.tabUrl = expectedUrl;
+    const finalize = vi.fn(async (_keepTab: boolean) => {});
+    mocks.readSession.mockResolvedValue(meta);
+    mocks.connectOpenBrowserUseTab.mockResolvedValue({
+      client: {},
+      obuClient: {},
+      sessionId: "recovered-session",
+      tabId: 8,
+      tabUrl: expectedUrl,
+      created: true,
+      finalize,
+    } as unknown as OpenBrowserUseConnection);
+    mocks.harvestConnectedChatGptTab.mockResolvedValueOnce({
+      ...harvested,
+      url: "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef-oracle/c/obu-thread",
+    });
+
+    await expect(
+      harvestSessionBrowserOutput(meta.id, { quietOutput: true }),
+    ).resolves.toMatchObject({ conversationId: "obu-thread" });
+    expect(finalize).toHaveBeenCalledWith(false);
+  });
+
+  test("rejects a non-delimited project slug suffix during harvest", async () => {
+    const meta = obuSession();
+    const expectedUrl = "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef/c/obu-thread";
+    meta.browser!.runtime!.tabUrl = expectedUrl;
+    const finalize = vi.fn(async (_keepTab: boolean) => {});
+    mocks.readSession.mockResolvedValue(meta);
+    mocks.connectOpenBrowserUseTab.mockResolvedValue({
+      client: {},
+      obuClient: {},
+      sessionId: "recovered-session",
+      tabId: 8,
+      tabUrl: expectedUrl,
+      created: true,
+      finalize,
+    } as unknown as OpenBrowserUseConnection);
+    mocks.harvestConnectedChatGptTab.mockResolvedValueOnce({
+      ...harvested,
+      url: "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdefZ/c/obu-thread",
+    });
+
+    await expect(harvestSessionBrowserOutput(meta.id, { quietOutput: true })).rejects.toMatchObject(
+      { details: { stage: "chatgpt-scope", code: "scope-mismatch" } },
+    );
+    expect(finalize).toHaveBeenCalledWith(true);
+  });
+
+  test("does not start another affinity harvest after the recovery deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const meta = obuSession();
+      meta.browser!.config = { ...meta.browser!.config!, inputTimeoutMs: 1 };
+      meta.options.browserConfig = { ...meta.options.browserConfig!, inputTimeoutMs: 1 };
+      const finalize = vi.fn(async (_keepTab: boolean) => {});
+      mocks.readSession.mockResolvedValue(meta);
+      mocks.connectOpenBrowserUseTab.mockResolvedValue({
+        client: {},
+        obuClient: {},
+        sessionId: "recovered-session",
+        tabId: 8,
+        tabUrl: conversationUrl,
+        created: true,
+        finalize,
+      } as unknown as OpenBrowserUseConnection);
+      const missing = new BrowserAutomationError("Stored turn is not hydrated yet.", {
+        stage: "chatgpt-turn-affinity",
+        code: "turn-affinity-missing",
+      });
+      mocks.harvestConnectedChatGptTab
+        .mockRejectedValueOnce(missing)
+        .mockResolvedValueOnce(harvested);
+
+      const result = harvestSessionBrowserOutput(meta.id, { quietOutput: true });
+      const rejection = expect(result).rejects.toBe(missing);
+      await vi.runAllTimersAsync();
+      await rejection;
+      expect(mocks.harvestConnectedChatGptTab).toHaveBeenCalledTimes(1);
+      expect(finalize).toHaveBeenCalledWith(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("bounds an in-flight affinity harvest by the recovery deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const meta = obuSession();
+      meta.browser!.config = { ...meta.browser!.config!, inputTimeoutMs: 1_000 };
+      meta.options.browserConfig = { ...meta.options.browserConfig!, inputTimeoutMs: 1_000 };
+      const finalize = vi.fn(async (_keepTab: boolean) => {});
+      mocks.readSession.mockResolvedValue(meta);
+      mocks.connectOpenBrowserUseTab.mockResolvedValue({
+        client: {},
+        obuClient: {},
+        sessionId: "recovered-session",
+        tabId: 8,
+        tabUrl: conversationUrl,
+        created: true,
+        finalize,
+      } as unknown as OpenBrowserUseConnection);
+      mocks.harvestConnectedChatGptTab.mockImplementationOnce(
+        () => new Promise<ChatGptTabSummary>(() => {}),
+      );
+
+      const result = harvestSessionBrowserOutput(meta.id, { quietOutput: true });
+      const rejection = expect(result).rejects.toMatchObject({
+        details: { stage: "assistant-timeout", code: "recovered-content-unavailable" },
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      await rejection;
+      expect(mocks.harvestConnectedChatGptTab).toHaveBeenCalledTimes(1);
+      expect(finalize).toHaveBeenCalledWith(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("rejects a ready harvest that settles at the recovery deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const meta = obuSession();
+      meta.browser!.config = { ...meta.browser!.config!, inputTimeoutMs: 1_000 };
+      meta.options.browserConfig = { ...meta.options.browserConfig!, inputTimeoutMs: 1_000 };
+      const finalize = vi.fn(async (_keepTab: boolean) => {});
+      mocks.readSession.mockResolvedValue(meta);
+      mocks.connectOpenBrowserUseTab.mockResolvedValue({
+        client: {},
+        obuClient: {},
+        sessionId: "recovered-session",
+        tabId: 8,
+        tabUrl: conversationUrl,
+        created: true,
+        finalize,
+      } as unknown as OpenBrowserUseConnection);
+      mocks.harvestConnectedChatGptTab.mockImplementationOnce(
+        () =>
+          new Promise<ChatGptTabSummary>((resolve) => {
+            setTimeout(() => resolve(harvested), 1_000);
+          }),
+      );
+
+      const result = harvestSessionBrowserOutput(meta.id, { quietOutput: true });
+      const rejection = expect(result).rejects.toMatchObject({
+        details: { stage: "assistant-timeout", code: "recovered-content-unavailable" },
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      await rejection;
+      expect(finalize).toHaveBeenCalledWith(true);
     } finally {
       vi.useRealTimers();
     }

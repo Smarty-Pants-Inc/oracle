@@ -76,6 +76,7 @@ describe("ChatGPT export operation errors", () => {
         new BrowserAutomationError("Export tab lost its routed account.", {
           stage: "main-chrome-account-router",
           code: "account-identity-mismatch",
+          actualUrl: "https://chatgpt.com/c/private-other-thread",
         }),
       )
       .mockResolvedValueOnce({ targetUrl, conversationId: "export-thread" });
@@ -94,6 +95,9 @@ describe("ChatGPT export operation errors", () => {
     expect(failedUpdate?.browser?.operationErrors?.["chatgpt-export"]?.details).toMatchObject({
       oracleOperation: "chatgpt-export",
     });
+    expect(failedUpdate?.browser?.operationErrors?.["chatgpt-export"]?.details).not.toHaveProperty(
+      "actualUrl",
+    );
     expect(failedUpdate).not.toHaveProperty("error");
     meta.browser = failedUpdate?.browser;
     expect(meta.error?.message).toBe("primary run failed");
@@ -118,6 +122,26 @@ describe("ChatGPT export operation errors", () => {
       browser: expect.objectContaining({ operationErrors: undefined }),
     });
     expect(meta.error?.message).toBe("primary run failed");
+  });
+
+  test("does not persist arbitrary generic export error text", async () => {
+    const meta = obuSession();
+    const privateUrl = "https://chatgpt.com/c/private-other-thread";
+    mocks.readSession.mockResolvedValue(meta);
+    mocks.captureViaObu.mockRejectedValue(new Error(`Export failed at ${privateUrl}`));
+
+    await expect(
+      handleChatGptExportCommand({ targetUrl, sessionId: meta.id, json: true }),
+    ).rejects.toThrow(privateUrl);
+
+    const failedUpdate = mocks.updateSession.mock.calls.at(-1)?.[1] as
+      | Partial<SessionMetadata>
+      | undefined;
+    const operationError = failedUpdate?.browser?.operationErrors?.["chatgpt-export"];
+    expect(operationError?.message).toBe(
+      "ChatGPT export failed. Rerun the export to see the current error.",
+    );
+    expect(JSON.stringify(operationError)).not.toContain(privateUrl);
   });
 
   test("passes exact post-export archive cleanup to the main-Chrome exporter", async () => {

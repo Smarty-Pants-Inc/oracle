@@ -238,6 +238,69 @@ describe("archiveChatGptConversation", () => {
     expect(domAccess).not.toHaveBeenCalled();
   });
 
+  test("checks workspace affinity inside the evaluator before DOM mutation", async () => {
+    const expectedAccountDigest = createHash("sha256").update("account-a").digest("hex");
+    const expectedWorkspaceDigest = createHash("sha256").update("workspace-a").digest("hex");
+    const expression = buildArchiveConversationExpressionForTest({
+      expectedRoute: "/g/project-a/c/abc",
+      expectedAccountDigest,
+      expectedWorkspaceDigest,
+    });
+    const domAccess = vi.fn();
+    const document = new Proxy(
+      {},
+      {
+        get() {
+          domAccess();
+          throw new Error("DOM mutation path reached");
+        },
+      },
+    );
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        user: { id: "account-a" },
+        account: { id: "workspace-b" },
+      }),
+    });
+    const evaluate = new Function("location", "document", "fetch", `return ${expression};`) as (
+      location: { href: string },
+      document: object,
+      fetch: typeof globalThis.fetch,
+    ) => Promise<{ status: string; reason?: string }>;
+
+    await expect(
+      evaluate({ href: "https://chatgpt.com/g/project-a/c/abc" }, document, fetch as never),
+    ).resolves.toMatchObject({ status: "skipped", reason: "affinity-mismatch" });
+    expect(domAccess).not.toHaveBeenCalled();
+  });
+
+  test("checks the exact root or project route inside the evaluator before DOM mutation", async () => {
+    const expression = buildArchiveConversationExpressionForTest({
+      expectedRoute: "/g/project-a/c/abc",
+    });
+    const domAccess = vi.fn();
+    const document = new Proxy(
+      {},
+      {
+        get() {
+          domAccess();
+          throw new Error("DOM mutation path reached");
+        },
+      },
+    );
+    const evaluate = new Function("location", "document", `return ${expression};`) as (
+      location: { href: string },
+      document: object,
+    ) => Promise<{ status: string; reason?: string }>;
+
+    await expect(evaluate({ href: "https://chatgpt.com/c/abc" }, document)).resolves.toMatchObject({
+      status: "skipped",
+      reason: "affinity-mismatch",
+    });
+    expect(domAccess).not.toHaveBeenCalled();
+  });
+
   test("checks exact ChatGPT origin inside the evaluator before DOM mutation", async () => {
     const expectedAccountDigest = createHash("sha256").update("account-a").digest("hex");
     const expression = buildArchiveConversationExpressionForTest({
@@ -304,11 +367,13 @@ describe("archiveChatGptConversation", () => {
     expect(domAccess).not.toHaveBeenCalled();
   });
 
-  test("rechecks account affinity after opening the menu and before archive mutation", async () => {
+  test("rechecks workspace affinity after opening the menu and before archive mutation", async () => {
     const expectedAccountDigest = createHash("sha256").update("account-a").digest("hex");
+    const expectedWorkspaceDigest = createHash("sha256").update("workspace-a").digest("hex");
     const expression = buildArchiveConversationExpressionForTest({
       expectedConversationId: "abc",
       expectedAccountDigest,
+      expectedWorkspaceDigest,
     });
     class FakeElement {
       textContent = "More";
@@ -326,14 +391,17 @@ describe("archiveChatGptConversation", () => {
         selector === 'button,[role="button"]' ? [menuButton] : [],
       ),
     };
-    const response = (userId: string) => ({
+    const response = (workspaceId: string) => ({
       ok: true,
-      json: async () => ({ user: { id: userId } }),
+      json: async () => ({
+        user: { id: "account-a" },
+        account: { id: workspaceId },
+      }),
     });
     const fetch = vi
       .fn()
-      .mockResolvedValueOnce(response("account-a"))
-      .mockResolvedValueOnce(response("account-b"));
+      .mockResolvedValueOnce(response("workspace-a"))
+      .mockResolvedValueOnce(response("workspace-b"));
     const EventStub = class {};
     const evaluate = new Function(
       "location",
@@ -376,18 +444,100 @@ describe("archiveChatGptConversation", () => {
     ).resolves.toMatchObject({ status: "skipped", reason: "affinity-mismatch" });
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(menuButton.dispatchEvent).toHaveBeenCalled();
-    expect(document.querySelectorAll).toHaveBeenCalledTimes(1);
+    expect(document.querySelectorAll).toHaveBeenCalledTimes(2);
+  });
+
+  test("does not select sidebar history controls as the conversation menu", async () => {
+    const expression = buildArchiveConversationExpressionForTest();
+    class FakeElement {
+      tagName: string;
+      parentElement: FakeElement | null;
+      textContent = "More";
+      dispatchEvent = vi.fn();
+
+      constructor(tagName: string, parentElement: FakeElement | null = null) {
+        this.tagName = tagName;
+        this.parentElement = parentElement;
+      }
+
+      getAttribute(name: string) {
+        return name === "aria-label" ? "More" : null;
+      }
+
+      getBoundingClientRect() {
+        return { left: 1160, right: 1180, top: 10, width: 20, height: 20 };
+      }
+    }
+    const body = new FakeElement("BODY");
+    const sidebar = new FakeElement("NAV", body);
+    const menuButton = new FakeElement("BUTTON", sidebar);
+    const document = {
+      body,
+      querySelectorAll: vi.fn((selector: string) =>
+        selector === 'button,[role="button"]' ? [menuButton] : [],
+      ),
+    };
+    const EventStub = class {};
+    const evaluate = new Function(
+      "location",
+      "document",
+      "HTMLElement",
+      "getComputedStyle",
+      "window",
+      "PointerEvent",
+      "MouseEvent",
+      "setTimeout",
+      `return ${expression};`,
+    ) as (
+      location: { href: string },
+      document: object,
+      HTMLElement: typeof FakeElement,
+      getComputedStyle: () => {
+        visibility: string;
+        display: string;
+        opacity: string;
+        pointerEvents: string;
+      },
+      window: { innerWidth: number },
+      PointerEvent: typeof EventStub,
+      MouseEvent: typeof EventStub,
+      setTimeout: (callback: () => void) => number,
+    ) => Promise<{ status: string; reason?: string }>;
+
+    await expect(
+      evaluate(
+        { href: "https://chatgpt.com/c/abc" },
+        document,
+        FakeElement,
+        () => ({ visibility: "visible", display: "block", opacity: "1", pointerEvents: "auto" }),
+        { innerWidth: 1200 },
+        EventStub,
+        EventStub,
+        () => 0,
+      ),
+    ).resolves.toMatchObject({ status: "skipped", reason: "conversation-menu-not-found" });
+    expect(menuButton.dispatchEvent).not.toHaveBeenCalled();
   });
 
   test("keeps the archive expression scoped to Archive actions", () => {
     const expression = buildArchiveConversationExpressionForTest();
     expect(expression).toContain("findConversationMenuButton");
+    expect(expression).toContain("belongsToOtherConversation");
+    expect(expression).toContain("visibleDialogRoots");
+    expect(expression).toContain("openedDialogs.length !== 1");
     expect(expression).toContain("visibleMenuCandidates");
     expect(expression).toContain("findArchiveMenuItem");
     expect(expression).toContain("findArchiveConfirmationButton");
-    expect(expression).toContain("hasUnarchiveMenuItem");
     expect(expression).toContain("PointerEvent");
     expect(expression).toContain("waitForArchiveConfirmation");
+    expect(expression).toContain("headerCandidates.length === 1");
+    expect(expression).toContain("resolveOwnedMenuRoot");
+    expect(expression).toContain("conversation-menu-not-owned");
+    expect(expression).toContain("style.opacity");
+    expect(expression).toContain("style.pointerEvents");
+    expect(expression).toContain("(?=-|$)");
+    expect(expression).not.toContain("?? labelled[0]");
+    expect(expression).not.toContain("menuRoots.length > 0 ? menuRoots : [document]");
     expect(expression).toContain("Date.now() + 10_000");
     expect(expression).toContain("archive-not-confirmed");
     expect(expression).toContain("archive");

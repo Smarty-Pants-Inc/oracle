@@ -737,6 +737,7 @@ async function maybeArchiveCompletedConversation({
     Runtime,
     logger,
     accountDigest,
+    workspaceDigest: config.chatGptWorkspaceDigest,
     mode: decision.mode,
     conversationUrl,
   });
@@ -782,6 +783,7 @@ async function maybeArchiveInterruptedConversation({
     Runtime,
     logger,
     accountDigest,
+    workspaceDigest: config.chatGptWorkspaceDigest,
     mode: decision.mode,
     conversationUrl,
   });
@@ -791,18 +793,28 @@ async function runChatGptArchive({
   Runtime,
   logger,
   accountDigest,
+  workspaceDigest,
   mode,
   conversationUrl,
 }: {
   Runtime: ChromeClient["Runtime"];
   logger: BrowserLogger;
   accountDigest?: string | null;
+  workspaceDigest?: string | null;
   mode: BrowserArchiveResult["mode"];
   conversationUrl?: string | null;
 }): Promise<BrowserArchiveResult> {
   const expectedAccountDigest = accountDigest?.trim();
-  if (!expectedAccountDigest || !/^[a-f0-9]{64}$/.test(expectedAccountDigest)) {
-    const error = "originating account identity is unavailable";
+  const expectedWorkspaceDigest = workspaceDigest?.trim();
+  const affinityError =
+    !expectedAccountDigest || !/^[a-f0-9]{64}$/.test(expectedAccountDigest)
+      ? "originating account identity is unavailable"
+      : workspaceDigest != null &&
+          (!expectedWorkspaceDigest || !/^[a-f0-9]{64}$/.test(expectedWorkspaceDigest))
+        ? "originating workspace identity is unavailable"
+        : null;
+  if (affinityError) {
+    const error = affinityError;
     logger(`[browser] ChatGPT archive skipped (${error}).`);
     return {
       mode,
@@ -817,6 +829,7 @@ async function runChatGptArchive({
     mode,
     conversationUrl,
     expectedAccountDigest,
+    expectedWorkspaceDigest,
   }).catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
     logger(`[browser] ChatGPT archive failed (${message}).`);

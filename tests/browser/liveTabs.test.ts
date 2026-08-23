@@ -286,6 +286,51 @@ describe("liveTabs helpers", () => {
     expect(resolveChatGptTabFromSummariesForTest(tabs, "b").targetId).toBe("target-2");
     expect(resolveChatGptTabFromSummariesForTest(tabs, "Review B").targetId).toBe("target-2");
   });
+  test("does not retain an unrelated tab for unpinned root or temporary URL refs", () => {
+    const tabs = [
+      makeTab({
+        targetId: "conversation",
+        url: "https://chatgpt.com/c/unrelated",
+        conversationId: "unrelated",
+      }),
+    ];
+    expect(() => resolveChatGptTabFromSummariesForTest(tabs, "https://chatgpt.com/")).toThrow(
+      /no ChatGPT tab matched/i,
+    );
+    expect(() =>
+      resolveChatGptTabFromSummariesForTest(tabs, "https://chatgpt.com/?temporary-chat=true"),
+    ).toThrow(/no ChatGPT tab matched/i);
+
+    const targets: ChromeTarget[] = [
+      { id: "conversation", type: "page", url: "https://chatgpt.com/c/unrelated" },
+    ];
+    expect(resolveExactChatGptTargetForTest(targets, "https://chatgpt.com/")).toBeNull();
+    expect(
+      resolveExactChatGptTargetForTest(targets, "https://chatgpt.com/?temporary-chat=true"),
+    ).toBeNull();
+  });
+
+  test("prefers the canonical project scope when duplicate tabs share a conversation id", () => {
+    const tabs = [
+      makeTab({
+        targetId: "root",
+        url: "https://chatgpt.com/c/shared",
+        conversationId: "shared",
+      }),
+      makeTab({
+        targetId: "project",
+        url: "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef-oracle/c/shared",
+        conversationId: "shared",
+      }),
+    ];
+
+    expect(
+      resolveChatGptTabFromSummariesForTest(
+        tabs,
+        "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef/c/shared",
+      ).targetId,
+    ).toBe("project");
+  });
 
   test("resolves exact target ids and urls from target list before inspecting tabs", () => {
     const targets: ChromeTarget[] = [
@@ -301,6 +346,24 @@ describe("liveTabs helpers", () => {
     ).toBe("target-1");
     expect(resolveExactChatGptTargetForTest(targets, "current")).toBeNull();
     expect(resolveExactChatGptTargetForTest(targets, "Review B")).toBeNull();
+  });
+
+  test("prefers the canonical project target when duplicate targets share a conversation id", () => {
+    const targets: ChromeTarget[] = [
+      { id: "root", type: "page", url: "https://chatgpt.com/c/shared" },
+      {
+        id: "project",
+        type: "page",
+        url: "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef-oracle/c/shared",
+      },
+    ];
+
+    expect(
+      resolveExactChatGptTargetForTest(
+        targets,
+        "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef/c/shared",
+      )?.id,
+    ).toBe("project");
   });
   test.each([
     { ref: "current", expectedTargetId: "target-2" },

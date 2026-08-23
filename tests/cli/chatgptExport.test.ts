@@ -162,6 +162,28 @@ describe("ChatGPT export endpoint affinity", () => {
     ).toEqual(affinity("127.0.0.1", 9224, "browser-a"));
   });
 
+  test("rejects the same browser and account with conflicting stored workspaces", () => {
+    const targetUrl = "https://chatgpt.com/c/thread-workspace-conflict";
+    const browserConfig = config("127.0.0.1", 9224, "browser-a");
+    const sessions = [
+      session("workspace-a", {
+        harvest: { conversationId: "thread-workspace-conflict" },
+        config: { ...browserConfig, chatGptWorkspaceDigest: "b".repeat(64) },
+      }),
+      session("workspace-b", {
+        harvest: { conversationId: "thread-workspace-conflict" },
+        config: { ...browserConfig, chatGptWorkspaceDigest: "c".repeat(64) },
+      }),
+    ];
+
+    expect(() => resolveChatGptExportBrowserTarget(targetUrl, sessions)).toThrow(
+      /conflicting stored browser affinities/i,
+    );
+    expect(() => resolveChatGptExportRemoteChrome(targetUrl, sessions)).toThrow(
+      /conflicting stored remote Chrome browser affinities/i,
+    );
+  });
+
   test("deduplicates equivalent endpoint hostnames case-insensitively", () => {
     expect(
       resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-host-case", [

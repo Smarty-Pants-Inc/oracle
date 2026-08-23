@@ -95,13 +95,23 @@ paired assistant message. Export selects the backend path that ends at that
 assistant message and verifies the prompt is its user ancestor; it does not
 follow a later child branch merely because ChatGPT marks it current. Capture
 uses a fresh task-owned OBU tab so it cannot close or mutate the originating
-handoff tab. Caller-supplied unbound OBU tab IDs are refused. For remote CDP
-sessions, stored affinity includes the browser UUID, refreshed WebSocket, and
-authenticated account digest. Raw IDs and session payloads never leave the page
-context. Omit `--session-id` only when the conversation has one globally unique
-stored affinity. The command does not read cookies, local storage, browser
-profiles, or unrelated history. Archived-target recovery and post-export
-archiving remain available only on the legacy CDP path.
+handoff tab. Caller-supplied unbound OBU tab IDs are refused. After route
+verification, Oracle first watches for ChatGPT's exact page-load request. The
+poll returns only request counters and an opaque exact-response length; page
+titles, URLs, response previews, and backend IDs remain in page context until
+Oracle revalidates the exact route and account/workspace. If a server-rendered
+page issues no request, the task-owned page makes one exact backend request only
+after atomically rechecking its project-aware conversation route and
+account/workspace digests. Credential values never leave page context. For
+remote CDP sessions, stored affinity includes the browser UUID, refreshed
+WebSocket, authenticated account digest, and workspace digest when available.
+Archived-target recovery additionally requires both identity digests and
+rechecks the exact root/project settings route in page context immediately
+before its PATCH. Raw IDs and session payloads never leave page context.
+Omit `--session-id` only when the conversation has one globally unique stored
+affinity. The command does not read cookies, local storage, browser profiles,
+or unrelated history. Archived-target recovery remains available only on the
+legacy CDP path and fails closed when its workspace affinity is unavailable.
 
 ## Current Pipeline
 
@@ -112,7 +122,8 @@ archiving remain available only on the legacy CDP path.
    - Open Browser Use mode connects through `open-browser-use-sdk`, scopes every CDP call/event to one task-owned tab, and serializes account switching through one durable main-Chrome lock.
    - Launcher mode can optionally copy cookies from the requested browser profile via Oracle’s built-in cookie reader (Keychain/DPAPI aware) so you stay signed in.
    - Navigates to `chatgpt.com`, switches the model, optionally activates Deep Research, pastes the prompt, waits for completion, and copies the assistant Markdown.
-   - Open Browser Use routes fetch `/api/auth/session` only in page context, persist email/workspace route labels plus SHA-256 user/workspace digests, and fail closed if any identity changes before a send, follow-up, harvest, export, or archive mutation.
+   - Open Browser Use routes fetch `/api/auth/session` only in page context, persist email/workspace route labels plus SHA-256 user/workspace digests, and fail closed if any identity or exact root/project route changes before a send, follow-up, harvest, export, or archive mutation.
+   - Archive mutations recheck the canonical root/project route plus user/workspace digests in page context immediately before each click, require one unique current-thread header control, and accept only a menu structurally owned by that control.
    - When `--file` inputs would push the pasted composer content over ~60k characters, Oracle switches to uploads and waits for ChatGPT to re-enable Send.
    - Launcher mode cleans up the temporary profile unless `--browser-keep-browser` is passed.
 3. **Session integration** – browser sessions use the normal log writer and persist transport-specific affinity. Open Browser Use sessions record only their task-owned tab lineage, exact account/workspace route plus digests, full prompt digest, committed user-turn index/IDs, paired assistant-turn index/IDs, and exact conversation. New sends, follow-ups, reattach, named harvest/live inspection, and exports all revalidate this affinity; answer capture and export stay on the bound branch instead of trusting the latest visible or backend-current turn.

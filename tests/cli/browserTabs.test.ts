@@ -162,7 +162,7 @@ describe("browser tab CLI helpers", () => {
   const harvested = (overrides: Partial<ChatGptTabSummary> = {}): ChatGptTabSummary => ({
     targetId: "ABCDEF12",
     title: "Oracle review",
-    url: "https://chatgpt.com/g/g-p-1234abcd-oracle/c/conversation-123",
+    url: "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef-oracle/c/conversation-123",
     currentModelLabel: "Pro",
     stopExists: false,
     sendExists: false,
@@ -195,16 +195,18 @@ describe("browser tab CLI helpers", () => {
       options: { writeOutputPath: "/tmp/oracle-output.md" },
       mode: "browser",
       browser: {
-        config: { url: "https://chatgpt.com/g/g-p-1234abcd/project" },
+        config: {
+          url: "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef/project",
+        },
         runtime: {
           chromeTargetId: "OLD00000",
-          tabUrl: "https://chatgpt.com/g/g-p-1234abcd/project",
+          tabUrl: "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef/project",
         },
         archive: {
           mode: "never",
           attempted: false,
           archived: false,
-          conversationUrl: "https://chatgpt.com/g/g-p-1234abcd/project",
+          conversationUrl: "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef/project",
         },
       },
     }) as SessionMetadata;
@@ -225,11 +227,12 @@ describe("browser tab CLI helpers", () => {
 
     expect(browser.runtime).toMatchObject({
       chromeTargetId: "ABCDEF12",
-      tabUrl: "https://chatgpt.com/g/g-p-1234abcd-oracle/c/conversation-123",
+      tabUrl:
+        "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef-oracle/c/conversation-123",
       conversationId: "conversation-123",
     });
     expect(browser.archive?.conversationUrl).toBe(
-      "https://chatgpt.com/g/g-p-1234abcd-oracle/c/conversation-123",
+      "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef-oracle/c/conversation-123",
     );
     expect(browser.harvest).toMatchObject({
       outputMatched: true,
@@ -237,13 +240,29 @@ describe("browser tab CLI helpers", () => {
       runtimeRepaired: true,
     });
   });
+
+  test("does not repair across a non-delimited project slug suffix", () => {
+    const browser = recoverBrowserMetadataFromHarvestForTest(
+      staleSession(),
+      harvested({
+        url: "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdefZ/c/conversation-123",
+      }),
+      '{"outcome":"clean_for_closeout","clean":true,"summary":"ready "}',
+    );
+
+    expect(browser.runtime?.tabUrl).toBe(
+      "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef/project",
+    );
+    expect(browser.harvest?.runtimeRepaired).toBe(false);
+  });
   test("repairs an OBU runtime without inventing a CDP target id", () => {
     const meta = staleSession();
     meta.browser!.runtime = {
       browserTransport: "obu",
       obuSessionId: "oracle-main",
       obuTabId: 7,
-      tabUrl: "https://chatgpt.com/g/g-p-1234abcd-oracle/c/conversation-123",
+      tabUrl:
+        "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef-oracle/c/conversation-123",
       conversationId: "conversation-123",
     };
     const browser = recoverBrowserMetadataFromHarvestForTest(
@@ -270,7 +289,9 @@ describe("browser tab CLI helpers", () => {
       '{"outcome":"implementation_repair_required","clean":false}',
     );
 
-    expect(browser.runtime?.tabUrl).toBe("https://chatgpt.com/g/g-p-1234abcd/project");
+    expect(browser.runtime?.tabUrl).toBe(
+      "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef/project",
+    );
     expect(browser.harvest?.runtimeRepaired).toBe(false);
     expect(browser.harvest?.outputMatched).toBe(false);
     expect(browser.runtime).toMatchObject({
@@ -284,7 +305,7 @@ describe("browser tab CLI helpers", () => {
     const meta = staleSession();
     meta.browser!.runtime = {
       chromeTargetId: "OLD00000",
-      tabUrl: "https://chatgpt.com/g/g-p-1234abcd/c/different-conversation",
+      tabUrl: "https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef/c/different-conversation",
       conversationId: "different-conversation",
     };
     const browser = recoverBrowserMetadataFromHarvestForTest(

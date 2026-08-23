@@ -31,6 +31,7 @@ import {
   waitForOpenBrowserUseConversationUrl,
   type StoredOpenBrowserUseTabAffinity,
 } from "../browser/openBrowserUse.js";
+import { ensureChatGptScopeRetained, isChatGptScopeRetained } from "../browser/pageActions.js";
 import { delay } from "../browser/utils.js";
 import {
   hashConversationTurnText,
@@ -321,7 +322,7 @@ function stableProjectKey(value: string | undefined): string | null {
   try {
     const segment = new URL(value).pathname.match(/^\/g\/([^/]+)/u)?.[1];
     if (!segment) return null;
-    return (segment.match(/^(g-p-[0-9a-f]+)/iu)?.[1] ?? segment).toLowerCase();
+    return (segment.match(/^(g-p-[0-9a-f]{32})(?=-|$)/iu)?.[1] ?? segment).toLowerCase();
   } catch {
     return null;
   }
@@ -740,17 +741,78 @@ async function harvestOpenBrowserUseContext(
   };
   const expectedConversationId = extractConversationIdFromUrl(context.affinity.conversationUrl);
   const recoveryDeadline = Date.now() + context.recoveryTimeoutMs;
-  for (;;) {
-    const harvested = await harvestConnectedChatGptTab({
-      client: context.connection.client,
-      targetId: String(context.connection.tabId),
-      title: "Oracle main-Chrome tab",
-      url: context.affinity.conversationUrl,
-      identity,
-      stallWindowMs,
-      turnBinding: storedConversationTurnBinding(context.meta),
+  const hydrationUnavailable = () =>
+    new BrowserAutomationError("Main-Chrome conversation did not hydrate before harvest.", {
+      stage: "assistant-timeout",
+      code: "recovered-content-unavailable",
+      recoveryHandle: {
+        transport: "obu",
+        sessionId: context.connection.sessionId,
+        tabId: context.connection.tabId,
+        conversationUrl: context.affinity.conversationUrl,
+      },
     });
-    if (!expectedConversationId || harvested.conversationId !== expectedConversationId) {
+  let lastAffinityError: BrowserAutomationError | null = null;
+  const deadlineError = () => lastAffinityError ?? hydrationUnavailable();
+  const runBeforeDeadline = async <T>(
+    operation: (remainingMs: number) => Promise<T>,
+  ): Promise<T> => {
+    const remainingMs = recoveryDeadline - Date.now();
+    if (remainingMs <= 0) throw deadlineError();
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timeoutId = setTimeout(() => reject(deadlineError()), remainingMs);
+      });
+      const result = await Promise.race([timeout, operation(remainingMs)]);
+      if (Date.now() >= recoveryDeadline) throw deadlineError();
+      return result;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  };
+  const waitForRetry = async () => {
+    const remainingMs = recoveryDeadline - Date.now();
+    if (remainingMs <= 0) throw deadlineError();
+    await delay(Math.min(LIVE_POLL_MS, remainingMs));
+  };
+  for (;;) {
+    await runBeforeDeadline(() =>
+      ensureChatGptScopeRetained(
+        context.connection.client.Runtime,
+        context.affinity.conversationUrl,
+      ),
+    );
+    let harvested: ChatGptTabSummary;
+    try {
+      harvested = await runBeforeDeadline((remainingMs) =>
+        harvestConnectedChatGptTab({
+          client: context.connection.client,
+          targetId: String(context.connection.tabId),
+          title: "Oracle main-Chrome tab",
+          url: context.affinity.conversationUrl,
+          identity,
+          stallWindowMs:
+            stallWindowMs === undefined ? undefined : Math.min(stallWindowMs, remainingMs),
+          turnBinding: storedConversationTurnBinding(context.meta),
+        }),
+      );
+    } catch (error) {
+      const affinityStillHydrating =
+        error instanceof BrowserAutomationError &&
+        error.details?.stage === "chatgpt-turn-affinity" &&
+        error.details?.code === "turn-affinity-missing";
+      if (!affinityStillHydrating) throw error;
+      lastAffinityError = error;
+      await waitForRetry();
+      continue;
+    }
+    lastAffinityError = null;
+    if (
+      !expectedConversationId ||
+      harvested.conversationId !== expectedConversationId ||
+      !isChatGptScopeRetained(harvested.url, context.affinity.conversationUrl)
+    ) {
       throw new BrowserAutomationError(
         "Main-Chrome tab left the stored ChatGPT conversation during harvest.",
         {
@@ -762,19 +824,7 @@ async function harvestOpenBrowserUseContext(
       );
     }
     if (isRecoveredConversationHarvestReady(harvested)) return harvested;
-    if (Date.now() >= recoveryDeadline) {
-      throw new BrowserAutomationError("Main-Chrome conversation did not hydrate before harvest.", {
-        stage: "assistant-timeout",
-        code: "recovered-content-unavailable",
-        recoveryHandle: {
-          transport: "obu",
-          sessionId: context.connection.sessionId,
-          tabId: context.connection.tabId,
-          conversationUrl: context.affinity.conversationUrl,
-        },
-      });
-    }
-    await delay(LIVE_POLL_MS);
+    await waitForRetry();
   }
 }
 

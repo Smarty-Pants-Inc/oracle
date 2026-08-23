@@ -77,15 +77,6 @@ export interface PromptReadyNavigationDeps {
   ensurePromptReady?: typeof ensurePromptReady;
 }
 
-function hasUnsafeChatGptPathEncoding(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    return /(^|\.)chatgpt\.com$/i.test(parsed.hostname) && parsed.pathname.includes("%");
-  } catch {
-    return false;
-  }
-}
-
 function shouldFailClosedWithoutFallback(url: string): boolean {
   try {
     const parsed = new URL(url);
@@ -107,34 +98,74 @@ interface PinnedChatGptScope {
   projectId?: string;
 }
 
-function normalizePinnedChatGptScope(url: string): PinnedChatGptScope | null {
+function stableChatGptProjectKey(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  return (value.match(/^(g-p-[0-9a-f]{32})(?=-|$)/iu)?.[1] ?? value).toLowerCase();
+}
+
+function parseChatGptUrl(url: string): URL | null {
   try {
     const parsed = new URL(url);
-    if (!/(^|\.)chatgpt\.com$/i.test(parsed.hostname)) {
+    if (
+      parsed.origin !== "https://chatgpt.com" ||
+      parsed.username ||
+      parsed.password ||
+      parsed.pathname.includes("%")
+    ) {
       return null;
     }
-    if (parsed.pathname.includes("%")) {
-      return null;
-    }
-    const conversationId = parsed.pathname.match(/\/c\/([^/?#]+)/)?.[1];
-    const projectId = parsed.pathname.match(/^\/g\/([^/?#]+)\/(?:project|c\/[^/?#]+)\/?$/)?.[1];
-    if (!conversationId && !projectId) return null;
-    return {
-      ...(conversationId ? { conversationId } : {}),
-      ...(projectId ? { projectId } : {}),
-    };
+    return parsed;
   } catch {
     return null;
   }
+}
+
+function normalizePinnedChatGptScope(url: string): PinnedChatGptScope | null {
+  const parsed = parseChatGptUrl(url);
+  if (!parsed) return null;
+  const projectConversation = /^\/g\/([^/?#]+)\/c\/([^/?#]+)\/?$/.exec(parsed.pathname);
+  if (projectConversation?.[1] && projectConversation[2]) {
+    return {
+      projectId: stableChatGptProjectKey(projectConversation[1]),
+      conversationId: projectConversation[2],
+    };
+  }
+  const rootConversation = /^\/c\/([^/?#]+)\/?$/.exec(parsed.pathname);
+  if (rootConversation?.[1]) return { conversationId: rootConversation[1] };
+  const project = /^\/g\/([^/?#]+)\/project\/?$/.exec(parsed.pathname);
+  return project?.[1] ? { projectId: stableChatGptProjectKey(project[1]) } : null;
+}
+
+function isUnpinnedChatGptRoot(url: string): boolean {
+  return parseChatGptUrl(url)?.pathname === "/";
+}
+export function isChatGptScopePinned(url: string): boolean {
+  return normalizePinnedChatGptScope(url) !== null;
+}
+
+export function isChatGptScopeRetained(actualUrl: string, expectedUrl: string): boolean {
+  if (isUnpinnedChatGptRoot(expectedUrl)) return true;
+  const expectedScope = normalizePinnedChatGptScope(expectedUrl);
+  if (!expectedScope) return false;
+  const actualScope = normalizePinnedChatGptScope(actualUrl);
+  if (expectedScope.conversationId) {
+    return (
+      actualScope?.conversationId === expectedScope.conversationId &&
+      actualScope.projectId === expectedScope.projectId
+    );
+  }
+  return actualScope?.projectId === expectedScope.projectId;
 }
 
 export async function ensureChatGptScopeRetained(
   Runtime: ChromeClient["Runtime"],
   expectedUrl: string,
 ) {
-  if (hasUnsafeChatGptPathEncoding(expectedUrl)) {
+  const expectedScope = normalizePinnedChatGptScope(expectedUrl);
+  if (!expectedScope) {
+    if (isUnpinnedChatGptRoot(expectedUrl)) return;
     throw new BrowserAutomationError(
-      "ChatGPT scope URL contains an encoded path; refusing ambiguous route affinity.",
+      "ChatGPT scope URL is not a supported root, project, or conversation route.",
       {
         stage: "chatgpt-scope",
         code: "scope-mismatch",
@@ -143,18 +174,9 @@ export async function ensureChatGptScopeRetained(
       },
     );
   }
-  const expectedScope = normalizePinnedChatGptScope(expectedUrl);
-  if (!expectedScope) {
-    return;
-  }
   const actualUrl = (await currentUrl(Runtime)) ?? "";
-  const actualScope = normalizePinnedChatGptScope(actualUrl);
-  const retained = expectedScope.conversationId
-    ? actualScope?.conversationId === expectedScope.conversationId
-    : actualScope?.projectId === expectedScope.projectId;
-  if (retained) {
-    return;
-  }
+  const retained = isChatGptScopeRetained(actualUrl, expectedUrl);
+  if (retained) return;
   throw new BrowserAutomationError(
     "ChatGPT did not stay on the requested project/thread URL; refusing to fall back to root chat.",
     {
@@ -631,6 +653,54 @@ export async function assertWrapperExpectedChatGptAccount(
     stage: "remote-browser-account-email",
     code,
   });
+}
+
+/** Returns only SHA-256 digests of ChatGPT's authenticated user and workspace ids. */
+export async function readChatGptIdentityDigests(
+  Runtime: ChromeClient["Runtime"],
+): Promise<{ accountDigest: string; workspaceDigest: string }> {
+  const outcome = await Runtime.evaluate({
+    expression: `(() => (async () => {
+      try {
+        const response = await fetch('/api/auth/session', {
+          cache: 'no-store', credentials: 'include',
+        });
+        if (!response.ok) return null;
+        const body = await response.json();
+        const digest = async (value) => {
+          if (typeof value !== 'string' || !value.trim() || !globalThis.crypto?.subtle) return null;
+          const bytes = new Uint8Array(await crypto.subtle.digest(
+            'SHA-256', new TextEncoder().encode(value.trim()),
+          ));
+          return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+        };
+        return {
+          accountDigest: await digest(body?.user?.id),
+          workspaceDigest: await digest(body?.account?.id),
+        };
+      } catch {
+        return null;
+      }
+    })())()`,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  const digests = outcome.result?.value as
+    | { accountDigest?: unknown; workspaceDigest?: unknown }
+    | null
+    | undefined;
+  if (
+    typeof digests?.accountDigest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(digests.accountDigest) ||
+    typeof digests.workspaceDigest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(digests.workspaceDigest)
+  ) {
+    throw new Error("Authenticated ChatGPT account or workspace identity is unavailable.");
+  }
+  return {
+    accountDigest: digests.accountDigest,
+    workspaceDigest: digests.workspaceDigest,
+  };
 }
 
 /** Returns only the SHA-256 digest of ChatGPT's authenticated user id. */

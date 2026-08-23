@@ -4,11 +4,14 @@ export {
   ensureNotBlocked,
   ensureLoggedIn,
   readChatGptAccountDigest,
+  readChatGptIdentityDigests,
   assertWrapperExpectedChatGptAccount,
   ensurePromptReady,
   ensureChatMode,
   waitForResumedConversationHydration,
   ensureChatGptScopeRetained,
+  isChatGptScopePinned,
+  isChatGptScopeRetained,
   installJavaScriptDialogAutoDismissal,
 } from "./actions/navigation.js";
 export { ensureModelSelection } from "./actions/modelSelection.js";

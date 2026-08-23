@@ -20,7 +20,11 @@ import { extractStableConversationIdFromUrl } from "./conversationUrl.js";
 import { delay } from "./utils.js";
 import { connectToRemoteChromeTarget, listRemoteChromeTargets } from "./chromeLifecycle.js";
 import { resolveRemoteChromeBrowserIdentity } from "./profileState.js";
-import { readChatGptAccountDigest } from "./pageActions.js";
+import {
+  isChatGptScopePinned,
+  isChatGptScopeRetained,
+  readChatGptAccountDigest,
+} from "./pageActions.js";
 import { assertChatGptIdentity } from "./chatgptAccountRouter.js";
 import type { ChromeClient } from "./types.js";
 
@@ -703,6 +707,12 @@ function resolveChatGptTabFromSummaries(
   if (exactUrl) {
     return exactUrl;
   }
+  const retainedScope = isChatGptScopePinned(trimmedRef)
+    ? summaries.find((tab) => isChatGptScopeRetained(tab.url, trimmedRef))
+    : undefined;
+  if (retainedScope) {
+    return retainedScope;
+  }
   const refConversationId = extractConversationIdFromUrl(trimmedRef) ?? trimmedRef;
   const exactConversation = summaries.find((tab) => tab.conversationId === refConversationId);
   if (exactConversation) {
@@ -740,6 +750,9 @@ function resolveExactChatGptTarget(targets: ChromeTarget[], ref?: string): Chrom
   return (
     targets.find((target) => extractTargetId(target) === trimmedRef) ??
     targets.find((target) => normalizeUrl(target.url ?? "") === trimmedRef) ??
+    (isChatGptScopePinned(trimmedRef)
+      ? targets.find((target) => isChatGptScopeRetained(normalizeUrl(target.url ?? ""), trimmedRef))
+      : undefined) ??
     (refConversationId
       ? targets.find(
           (target) => extractConversationIdFromUrl(target.url ?? "") === refConversationId,

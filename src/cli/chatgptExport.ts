@@ -38,6 +38,7 @@ export interface ChatGptExportRemoteChromeAffinity {
   browserId: string;
   browserWSEndpoint: string;
   accountDigest: string;
+  workspaceDigest?: string;
 }
 
 export type ChatGptExportRemoteChromeTarget =
@@ -99,12 +100,22 @@ function storedRemoteChromeAffinities(
     const configuredAccountDigest = config?.remoteChromeAccountDigest?.trim();
     const runtimeAccountDigest = metadata.browser?.runtime?.chatGptAccountDigest?.trim();
     const accountDigest = runtimeAccountDigest ?? configuredAccountDigest;
+    const configuredWorkspaceDigest = config?.chatGptWorkspaceDigest?.trim();
+    const runtimeWorkspaceDigest = metadata.browser?.runtime?.chatGptWorkspaceDigest?.trim();
+    const workspaceDigest = runtimeWorkspaceDigest ?? configuredWorkspaceDigest;
     if (
       configuredAccountDigest &&
       runtimeAccountDigest &&
       configuredAccountDigest !== runtimeAccountDigest
     ) {
       throw new Error("Stored remote Chrome account identity is conflicting.");
+    }
+    if (
+      configuredWorkspaceDigest &&
+      runtimeWorkspaceDigest &&
+      configuredWorkspaceDigest !== runtimeWorkspaceDigest
+    ) {
+      throw new Error("Stored remote Chrome workspace identity is conflicting.");
     }
     const browserWSEndpoint = runtimeBrowserWSEndpoint ?? configuredBrowserWSEndpoint;
     if (!browserWSEndpoint || !accountDigest) {
@@ -123,8 +134,21 @@ function storedRemoteChromeAffinities(
     if (!/^[a-f0-9]{64}$/.test(accountDigest)) {
       throw new Error("Stored remote Chrome account identity is invalid.");
     }
-    const affinity = { host, port, browserId, browserWSEndpoint, accountDigest };
-    affinities.set(`${host.toLowerCase()}:${port}\t${browserId}\t${accountDigest}`, affinity);
+    if (workspaceDigest && !/^[a-f0-9]{64}$/.test(workspaceDigest)) {
+      throw new Error("Stored remote Chrome workspace identity is invalid.");
+    }
+    const affinity = {
+      host,
+      port,
+      browserId,
+      browserWSEndpoint,
+      accountDigest,
+      ...(workspaceDigest ? { workspaceDigest } : {}),
+    };
+    affinities.set(
+      `${host.toLowerCase()}:${port}\t${browserId}\t${accountDigest}\t${workspaceDigest ?? ""}`,
+      affinity,
+    );
   }
   return [...affinities.values()];
 }
@@ -181,11 +205,12 @@ function resolveStoredChatGptExportTarget(
     for (const affinity of storedRemoteChromeAffinities(metadata)) {
       const browserId = "browserId" in affinity ? affinity.browserId : "";
       const accountDigest = "accountDigest" in affinity ? affinity.accountDigest : "";
+      const workspaceDigest = "workspaceDigest" in affinity ? affinity.workspaceDigest : "";
       const branchKey = turnAffinity
         ? `${turnAffinity.promptMessageId}\t${turnAffinity.assistantMessageId}`
         : "";
       targets.set(
-        `cdp\t${affinity.host}:${affinity.port}\t${browserId}\t${accountDigest}\t${branchKey}`,
+        `cdp\t${affinity.host}:${affinity.port}\t${browserId}\t${accountDigest}\t${workspaceDigest}\t${branchKey}`,
         { transport: "cdp", affinity, ...(turnAffinity ? { turnAffinity } : {}) },
       );
     }
@@ -245,8 +270,9 @@ export function resolveChatGptExportRemoteChrome(
     for (const affinity of storedAffinities) {
       const browserId = "browserId" in affinity ? affinity.browserId : "";
       const accountDigest = "accountDigest" in affinity ? affinity.accountDigest : "";
+      const workspaceDigest = "workspaceDigest" in affinity ? affinity.workspaceDigest : "";
       affinities.set(
-        `${affinity.host.toLowerCase()}:${affinity.port}\t${browserId}\t${accountDigest}`,
+        `${affinity.host.toLowerCase()}:${affinity.port}\t${browserId}\t${accountDigest}\t${workspaceDigest}`,
         affinity,
       );
     }
@@ -418,6 +444,7 @@ export async function handleChatGptExportCommand(options: ChatGptExportCliOption
             browserId: remoteChromeIdentity?.browserId,
             browserWSEndpoint: remoteChromeIdentity?.browserWSEndpoint,
             accountDigest: remoteChromeIdentity?.accountDigest,
+            workspaceDigest: remoteChromeIdentity?.workspaceDigest,
             timeoutMs,
             chunkSize,
             turnAffinity: browserTarget.turnAffinity,
@@ -428,16 +455,17 @@ export async function handleChatGptExportCommand(options: ChatGptExportCliOption
       if (options.sessionId) {
         const metadata = await sessionStore.readSession(options.sessionId);
         const userError = asOracleUserError(error);
-        const message = error instanceof Error ? error.message : String(error);
+        const safeDetails = { ...(userError?.details ?? {}) };
+        delete safeDetails.actualUrl;
         const operationError = userError
           ? {
               category: userError.category,
               message: userError.message,
-              details: { ...userError.details, oracleOperation: "chatgpt-export" },
+              details: { ...safeDetails, oracleOperation: "chatgpt-export" },
             }
           : {
               category: "browser-automation",
-              message,
+              message: "ChatGPT export failed. Rerun the export to see the current error.",
               details: { oracleOperation: "chatgpt-export" },
             };
         const browser = {
