@@ -87,17 +87,14 @@ export interface BrowserLiveTailOptions {
 }
 
 function hasRemoteAffinityMarker(meta: SessionMetadata | null | undefined): boolean {
-  const config = meta?.browser?.config;
-  const runtime = meta?.browser?.runtime;
+  const config = meta?.browser?.config ?? meta?.options?.browserConfig;
   return (
     process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" ||
     Boolean(
       config?.remoteChrome ||
       config?.remoteChromeBrowserId?.trim() ||
       config?.remoteChromeBrowserWSEndpoint?.trim() ||
-      config?.remoteChromeAccountDigest?.trim() ||
-      (runtime?.chromeBrowserWSEndpoint?.trim() &&
-        normalizeChatGptAccountDigest(runtime.chatGptAccountDigest)),
+      config?.remoteChromeAccountDigest?.trim(),
     )
   );
 }
@@ -106,39 +103,55 @@ function sessionBrowserEndpoint(
   meta: SessionMetadata | null | undefined,
 ): { host: string; port: number; browserId?: string; accountDigest?: string } | null {
   const runtime = meta?.browser?.runtime ?? {};
-  const config = meta?.browser?.config;
+  const config = meta?.browser?.config ?? meta?.options?.browserConfig;
   const remote = config?.remoteChrome;
   const host = runtime.chromeHost ?? remote?.host;
   const port = runtime.chromePort ?? remote?.port;
-  const rawConfiguredAccountDigest = config?.remoteChromeAccountDigest;
-  const configuredAccountDigest = normalizeChatGptAccountDigest(rawConfiguredAccountDigest);
-  if (rawConfiguredAccountDigest !== undefined && !configuredAccountDigest) {
+  const rawExpectedAccountDigest = config?.expectedAccountDigest;
+  const expectedAccountDigest = normalizeChatGptAccountDigest(rawExpectedAccountDigest);
+  if (rawExpectedAccountDigest != null && !expectedAccountDigest) {
+    throw new Error("Stored ChatGPT account identity is invalid.");
+  }
+  const rawConfiguredRemoteAccountDigest = config?.remoteChromeAccountDigest;
+  const configuredRemoteAccountDigest = normalizeChatGptAccountDigest(
+    rawConfiguredRemoteAccountDigest,
+  );
+  if (rawConfiguredRemoteAccountDigest != null && !configuredRemoteAccountDigest) {
     throw new Error("Stored remote Chrome account identity is invalid.");
   }
   const rawRuntimeAccountDigest = runtime.chatGptAccountDigest;
   const runtimeAccountDigest = normalizeChatGptAccountDigest(rawRuntimeAccountDigest);
-  if (rawRuntimeAccountDigest !== undefined && !runtimeAccountDigest) {
+  if (rawRuntimeAccountDigest != null && !runtimeAccountDigest) {
     throw new Error("Stored ChatGPT account identity is invalid.");
   }
-  const requiresAffinity = hasRemoteAffinityMarker(meta);
+  if (
+    (expectedAccountDigest &&
+      configuredRemoteAccountDigest &&
+      expectedAccountDigest !== configuredRemoteAccountDigest) ||
+    (expectedAccountDigest &&
+      runtimeAccountDigest &&
+      expectedAccountDigest !== runtimeAccountDigest) ||
+    (configuredRemoteAccountDigest &&
+      runtimeAccountDigest &&
+      configuredRemoteAccountDigest !== runtimeAccountDigest)
+  ) {
+    throw new Error("Stored ChatGPT account identity is conflicting.");
+  }
+  const accountDigest =
+    runtimeAccountDigest ?? expectedAccountDigest ?? configuredRemoteAccountDigest;
+  const requiresRemoteAffinity = hasRemoteAffinityMarker(meta);
   if (!host || !port) {
-    if (requiresAffinity) {
+    if (requiresRemoteAffinity) {
       throw new Error("Stored remote Chrome browser and account identity is incomplete.");
     }
     return null;
   }
-  if (!requiresAffinity) return { host, port };
+  if (!requiresRemoteAffinity) {
+    return { host, port, ...(accountDigest ? { accountDigest } : {}) };
+  }
   const configuredBrowserWSEndpoint = config?.remoteChromeBrowserWSEndpoint?.trim();
   const runtimeBrowserWSEndpoint = runtime.chromeBrowserWSEndpoint?.trim();
-  if (
-    configuredAccountDigest &&
-    runtimeAccountDigest &&
-    configuredAccountDigest !== runtimeAccountDigest
-  ) {
-    throw new Error("Stored remote Chrome account identity is conflicting.");
-  }
   const browserWSEndpoint = runtimeBrowserWSEndpoint ?? configuredBrowserWSEndpoint;
-  const accountDigest = runtimeAccountDigest ?? configuredAccountDigest;
   if (!browserWSEndpoint || !accountDigest) {
     throw new Error("Stored remote Chrome browser and account identity is incomplete.");
   }

@@ -15,6 +15,7 @@ import {
   validateArtifactFile,
   writeBinaryBrowserArtifact,
 } from "./artifacts.js";
+import { buildEvaluatedChatGptPageAffinityGuard } from "./chatgptAccount.js";
 
 const CHATGPT_DOWNLOAD_BASE_URL = "https://chatgpt.com/";
 const DOWNLOAD_BUTTON_WAIT_MS = 15_000;
@@ -322,13 +323,19 @@ function readTextDownloadableFiles(value?: string | null): BrowserDownloadableFi
   return dedupeFiles(files);
 }
 
-function buildAssistantDownloadableFilesExpression(minTurnIndex?: number): string {
+function buildAssistantDownloadableFilesExpression(
+  minTurnIndex?: number,
+  affinity: { expectedConversationId?: string; expectedAccountDigest?: string } = {},
+): string {
   const minTurnLiteral =
     typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex) && minTurnIndex >= 0
       ? Math.floor(minTurnIndex)
       : -1;
+  const affinityGuard = buildEvaluatedChatGptPageAffinityGuard(affinity);
   const assistantLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
-  return `(() => {
+  return `${affinityGuard ? "(async () => {" : "(() => {"}
+    ${affinityGuard}
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     const MIN_TURN_INDEX = ${minTurnLiteral};
     const ASSISTANT_SELECTOR = ${assistantLiteral};
     const isAssistantTurn = (node) => {
@@ -447,6 +454,7 @@ function buildAssistantDownloadableFilesExpression(minTurnIndex?: number): strin
       const messageRoot = turn.querySelector(ASSISTANT_SELECTOR) || turn;
       files.push(...serializeFiles(messageRoot));
     }
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     return files;
   })()`;
 }
@@ -455,12 +463,22 @@ export async function readAssistantDownloadableFiles(
   Runtime: ChromeClient["Runtime"],
   minTurnIndex?: number,
   assertPageAffinity?: (action: string) => Promise<void>,
+  expectedConversationId?: string,
+  expectedAccountDigest?: string,
 ): Promise<BrowserDownloadableFile[]> {
   await assertPageAffinity?.("downloadable file DOM read");
-  const { result } = await Runtime.evaluate({
-    expression: buildAssistantDownloadableFilesExpression(minTurnIndex),
+  const { result, exceptionDetails } = await Runtime.evaluate({
+    expression: buildAssistantDownloadableFilesExpression(minTurnIndex, {
+      expectedConversationId,
+      expectedAccountDigest,
+    }),
+    awaitPromise: true,
     returnByValue: true,
   });
+  if (exceptionDetails) {
+    throw new Error("Downloadable file DOM read failed its in-page affinity guard.");
+  }
+  await assertPageAffinity?.("downloadable file DOM read completion");
   const raw = Array.isArray(result?.value) ? result.value : [];
   const normalized: BrowserDownloadableFile[] = [];
   for (const item of raw) {
@@ -664,6 +682,22 @@ async function waitForCompletedDownloadFiles(
   }
   return latest;
 }
+async function removeOwnedFiles(paths: Iterable<string>): Promise<void> {
+  await Promise.all([...paths].map((filePath) => fs.unlink(filePath).catch(() => undefined)));
+}
+
+async function assertPageAffinityOrRemoveOwnedFiles(params: {
+  assertPageAffinity?: (action: string) => Promise<void>;
+  action: string;
+  paths: Iterable<string>;
+}): Promise<void> {
+  try {
+    await params.assertPageAffinity?.(params.action);
+  } catch (error) {
+    await removeOwnedFiles(params.paths);
+    throw error;
+  }
+}
 
 async function configureBrowserDownloadPath(params: {
   Browser?: ChromeClient["Browser"];
@@ -723,6 +757,7 @@ function buildClickAssistantDownloadButtonsExpression(
   expectedLabels: string[] = [],
   allowGenericDownloadLabels = true,
   options: { markClicked?: boolean; maxClicks?: number; returnDiagnostics?: boolean } = {},
+  affinity: { expectedConversationId?: string; expectedAccountDigest?: string } = {},
 ): string {
   const minTurnLiteral =
     typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex) && minTurnIndex >= 0
@@ -739,7 +774,10 @@ function buildClickAssistantDownloadButtonsExpression(
     options.maxClicks > 0
       ? Math.floor(options.maxClicks)
       : 0;
-  return `(() => {
+  const affinityGuard = buildEvaluatedChatGptPageAffinityGuard(affinity);
+  return `${affinityGuard ? "(async () => {" : "(() => {"}
+    ${affinityGuard}
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     const MIN_TURN_INDEX = ${minTurnLiteral};
     const ASSISTANT_SELECTOR = ${assistantLiteral};
     const EXPECTED_LABELS = ${expectedLabelsLiteral};
@@ -913,10 +951,11 @@ function buildClickAssistantDownloadButtonsExpression(
           : genericFallbackMatches
         : genericAllMatches;
     const selectedControls = Array.from(selected).slice(0, MAX_CLICKS > 0 ? MAX_CLICKS : undefined);
-    selectedControls.forEach((info) => {
+    for (const info of selectedControls) {
+      ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
       if (MARK_CLICKED) info.control.setAttribute(CLICKED_ATTRIBUTE, 'true');
       info.control.click();
-    });
+    }
     const clickedDiagnostics = selectedControls.map((info) => ({
       text: info.text,
       ariaLabel: info.ariaLabel,
@@ -928,6 +967,7 @@ function buildClickAssistantDownloadButtonsExpression(
       category: selectedCategory,
     }));
     const clicked = clickedDiagnostics.map(({ text, ariaLabel, testId }) => ({ text, ariaLabel, testId }));
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     return RETURN_DIAGNOSTICS ? { inspectedCount, selectedCategory, clicked: clickedDiagnostics } : clicked;
   })()`;
 }
@@ -955,35 +995,43 @@ function expectedDownloadedFilename(file: BrowserDownloadableFile): string | und
   return basename && basename !== "." ? basename : undefined;
 }
 
-async function moveDownloadedFileToExpectedName(
-  filePath: string,
-  file: BrowserDownloadableFile,
-): Promise<string> {
-  const filename = expectedDownloadedFilename(file);
-  if (!filename) {
-    return filePath;
+function preferredDownloadedFilename(filePath: string, file?: BrowserDownloadableFile): string {
+  const actualFilename = path.basename(filePath);
+  const expectedFilename = file ? expectedDownloadedFilename(file) : undefined;
+  if (!expectedFilename || actualFilename === expectedFilename) {
+    return actualFilename;
   }
-  const targetPath = path.join(path.dirname(filePath), filename);
-  if (path.resolve(targetPath) === path.resolve(filePath)) {
-    return filePath;
-  }
-  const expected = path.parse(filename);
+  const expected = path.parse(expectedFilename);
   const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const duplicatePattern = new RegExp(
     `^${escapeRegExp(expected.name)} ?\\(\\d+\\)${escapeRegExp(expected.ext)}$`,
   );
-  if (!duplicatePattern.test(path.basename(filePath))) {
-    return filePath;
+  return duplicatePattern.test(actualFilename) ? expectedFilename : actualFilename;
+}
+
+async function publishStagedDownloadFile(params: {
+  stagedPath: string;
+  destinationDir: string;
+  filename: string;
+}): Promise<string> {
+  const filename = path.basename(params.filename) || "download";
+  const parsed = path.parse(filename);
+  for (let suffix = 1; ; suffix += 1) {
+    const candidateFilename =
+      suffix === 1 ? filename : `${parsed.name || "download"}-${suffix}${parsed.ext}`;
+    const candidatePath = path.join(params.destinationDir, candidateFilename);
+    try {
+      // A hard link provides a no-replace, atomic publish from the private staging directory.
+      await fs.link(params.stagedPath, candidatePath);
+      await fs.unlink(params.stagedPath).catch(() => undefined);
+      return candidatePath;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        continue;
+      }
+      throw error;
+    }
   }
-  const targetExists = await fs
-    .stat(targetPath)
-    .then((stat) => stat.isFile())
-    .catch(() => false);
-  if (targetExists) {
-    return filePath;
-  }
-  await fs.rename(filePath, targetPath);
-  return targetPath;
 }
 
 async function clickAssistantDownloadButtons(params: {
@@ -996,22 +1044,33 @@ async function clickAssistantDownloadButtons(params: {
   timeoutMs?: number;
   logger?: BrowserLogger;
   assertPageAffinity?: (action: string) => Promise<void>;
+  expectedConversationId?: string;
+  expectedAccountDigest?: string;
 }): Promise<ClickDownloadControlsResult> {
   const expression = buildClickAssistantDownloadButtonsExpression(
     params.minTurnIndex,
     params.expectedLabels ?? [],
     params.allowGenericDownloadLabels,
     { markClicked: params.markClicked, maxClicks: params.maxClicks, returnDiagnostics: true },
+    {
+      expectedConversationId: params.expectedConversationId,
+      expectedAccountDigest: params.expectedAccountDigest,
+    },
   );
   const deadline = Date.now() + (params.timeoutMs ?? DOWNLOAD_BUTTON_WAIT_MS);
   let lastInspectedCount = 0;
   let lastSelectedCategory: string | undefined;
   while (Date.now() < deadline) {
     await params.assertPageAffinity?.("assistant download button DOM read and click");
-    const { result } = await params.Runtime.evaluate({
+    const { result, exceptionDetails } = await params.Runtime.evaluate({
       expression,
+      awaitPromise: true,
       returnByValue: true,
     });
+    if (exceptionDetails) {
+      throw new Error("Assistant download button action failed its in-page affinity guard.");
+    }
+    await params.assertPageAffinity?.("assistant download button DOM read and click completion");
     const value = result?.value as unknown;
     const diagnosticValue =
       value && typeof value === "object" && !Array.isArray(value)
@@ -1067,10 +1126,18 @@ async function clickGeneratedDownloadUrl(params: {
   downloadUrl: string;
   logger?: BrowserLogger;
   assertPageAffinity?: (action: string) => Promise<void>;
+  expectedConversationId?: string;
+  expectedAccountDigest?: string;
 }): Promise<ClickDownloadControlsResult> {
   await params.assertPageAffinity?.("generated file download click");
   const filename = expectedDownloadedFilename(params.file) ?? "download";
-  const expression = `(() => {
+  const affinityGuard = buildEvaluatedChatGptPageAffinityGuard({
+    expectedConversationId: params.expectedConversationId,
+    expectedAccountDigest: params.expectedAccountDigest,
+  });
+  const expression = `${affinityGuard ? "(async () => {" : "(() => {"}
+    ${affinityGuard}
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     const anchor = document.createElement('a');
     anchor.href = ${JSON.stringify(params.downloadUrl)};
     anchor.download = ${JSON.stringify(filename)};
@@ -1078,8 +1145,10 @@ async function clickGeneratedDownloadUrl(params: {
     anchor.style.display = 'none';
     anchor.setAttribute('data-oracle-generated-download-anchor', 'true');
     document.body.appendChild(anchor);
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     anchor.click();
     setTimeout(() => anchor.remove(), 0);
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     return {
       inspectedCount: 1,
       selectedCategory: 'generated-download-url',
@@ -1095,7 +1164,15 @@ async function clickGeneratedDownloadUrl(params: {
       }],
     };
   })()`;
-  const { result } = await params.Runtime.evaluate({ expression, returnByValue: true });
+  const { result, exceptionDetails } = await params.Runtime.evaluate({
+    expression,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  if (exceptionDetails) {
+    throw new Error("Generated file download click failed its in-page affinity guard.");
+  }
+  await params.assertPageAffinity?.("generated file download click completion");
   const value = result?.value as ClickDownloadControlsResult | undefined;
   return {
     clicked: Array.isArray(value?.clicked) ? value.clicked : [],
@@ -1104,11 +1181,7 @@ async function clickGeneratedDownloadUrl(params: {
   };
 }
 
-async function savedBrowserFileFromPath(
-  filePath: string,
-  assertPageAffinity?: (action: string) => Promise<void>,
-): Promise<SavedBrowserFile> {
-  await assertPageAffinity?.("browser download artifact save");
+async function savedBrowserFileFromPath(filePath: string): Promise<SavedBrowserFile> {
   const filename = path.basename(filePath);
   const stat = await fs.stat(filePath);
   const mimeType = mimeTypeFromFilename(filename);
@@ -1144,6 +1217,8 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
   minTurnIndex?: number | null;
   sessionId?: string;
   assertPageAffinity?: (action: string) => Promise<void>;
+  expectedConversationId?: string;
+  expectedAccountDigest?: string;
 }): Promise<SavedBrowserFile[]> {
   if (
     (!params.sessionId && !params.downloadPath) ||
@@ -1155,164 +1230,188 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
     params.downloadPath ?? resolveSessionArtifactsDir(params.sessionId as string);
   await fs.mkdir(artifactsDir, { recursive: true });
   await params.assertPageAffinity?.("browser download artifact collection");
-  const before = new Set(await fs.readdir(artifactsDir).catch(() => []));
-  const configured = await configureBrowserDownloadPath({
-    Browser: params.Browser,
-    Client: params.Client,
-    Page: params.Page,
-    logger: params.logger,
-    downloadPath: artifactsDir,
-    assertPageAffinity: params.assertPageAffinity,
-  }).catch((error) => {
-    const message = error instanceof Error ? error.message : String(error);
-    params.logger?.(`[browser] Failed to configure browser download path: ${message}`);
-    return false;
-  });
-  if (!configured) {
-    params.logger?.(
-      "[browser] Browser download path could not be configured; skipping button fallback.",
-    );
-    return [];
-  }
-
-  const buttonWaitMs = params.buttonWaitMs ?? DOWNLOAD_BUTTON_WAIT_MS;
-  const downloadWaitMs = params.downloadWaitMs ?? DOWNLOAD_BUTTON_WAIT_MS;
-  const expectedFiles = params.files ?? [];
-
-  if (expectedFiles.length === 0) {
-    const clickedResult = await clickAssistantDownloadButtons({
-      Runtime: params.Runtime,
-      minTurnIndex: params.minTurnIndex,
-      expectedLabels: [],
-      allowGenericDownloadLabels: params.allowGenericDownloadLabels,
-      timeoutMs: buttonWaitMs,
+  const stagingDir = await fs.mkdtemp(path.join(artifactsDir, ".oracle-download-"));
+  try {
+    const configured = await configureBrowserDownloadPath({
+      Browser: params.Browser,
+      Client: params.Client,
+      Page: params.Page,
       logger: params.logger,
+      downloadPath: stagingDir,
       assertPageAffinity: params.assertPageAffinity,
+    }).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      params.logger?.(`[browser] Failed to configure browser download path: ${message}`);
+      return false;
     });
-    if (clickedResult.clicked.length === 0) {
+    if (!configured) {
       params.logger?.(
-        `[browser] No assistant download controls found for button fallback (inspected ${clickedResult.inspectedCount} control(s); category=${clickedResult.selectedCategory ?? "none"}).`,
+        "[browser] Browser download path could not be configured; skipping button fallback.",
       );
       return [];
     }
-    params.logger?.(
-      `[browser] Clicked ${clickedResult.clicked.length} assistant download control(s) ` +
-        `(inspected ${clickedResult.inspectedCount}; category=${clickedResult.selectedCategory ?? "unknown"}; ` +
-        `details=${summarizeClickedControls(clickedResult.clicked)}).`,
-    );
-    const downloaded = await waitForCompletedDownloadFiles(
-      artifactsDir,
-      before,
-      clickedResult.clicked.length,
-      downloadWaitMs,
-    );
-    return Promise.all(
-      downloaded.map((filePath) => savedBrowserFileFromPath(filePath, params.assertPageAffinity)),
-    );
-  }
 
-  let clickedCount = 0;
-  let knownEntries = before;
-  const downloadedPaths: string[] = [];
-  const missingFiles: string[] = [];
+    const buttonWaitMs = params.buttonWaitMs ?? DOWNLOAD_BUTTON_WAIT_MS;
+    const downloadWaitMs = params.downloadWaitMs ?? DOWNLOAD_BUTTON_WAIT_MS;
+    const expectedFiles = params.files ?? [];
+    const stagedDownloads: Array<{ path: string; filename: string }> = [];
 
-  const unattemptedFiles: string[] = [];
-  for (const [fileIndex, file] of expectedFiles.entries()) {
-    const expectedLabels = resolveDownloadButtonLabels([file]);
-    const displayName = describeDownloadableFile(file);
-    let clickResult = await clickAssistantDownloadButtons({
-      Runtime: params.Runtime,
-      minTurnIndex: params.minTurnIndex,
-      expectedLabels,
-      allowGenericDownloadLabels: params.allowGenericDownloadLabels === true,
-      markClicked: true,
-      maxClicks: 1,
-      timeoutMs: buttonWaitMs,
-      logger: params.logger,
-      assertPageAffinity: params.assertPageAffinity,
-    });
-    params.logger?.(
-      `[browser] Button fallback inspected ${clickResult.inspectedCount} control(s) for ${sanitizeCandidateFilename(
-        displayName,
-      )}; category=${clickResult.selectedCategory ?? "none"}; clicked=${clickResult.clicked.length}.`,
-    );
-    if (clickResult.clicked.length > 0) {
+    if (expectedFiles.length === 0) {
+      const clickedResult = await clickAssistantDownloadButtons({
+        Runtime: params.Runtime,
+        minTurnIndex: params.minTurnIndex,
+        expectedLabels: [],
+        allowGenericDownloadLabels: params.allowGenericDownloadLabels,
+        timeoutMs: buttonWaitMs,
+        logger: params.logger,
+        assertPageAffinity: params.assertPageAffinity,
+        expectedConversationId: params.expectedConversationId,
+        expectedAccountDigest: params.expectedAccountDigest,
+      });
+      if (clickedResult.clicked.length === 0) {
+        params.logger?.(
+          `[browser] No assistant download controls found for button fallback (inspected ${clickedResult.inspectedCount} control(s); category=${clickedResult.selectedCategory ?? "none"}).`,
+        );
+        return [];
+      }
       params.logger?.(
-        `[browser] Button fallback clicked control detail(s): ${summarizeClickedControls(
-          clickResult.clicked,
-        )}`,
+        `[browser] Clicked ${clickedResult.clicked.length} assistant download control(s) ` +
+          `(inspected ${clickedResult.inspectedCount}; category=${clickedResult.selectedCategory ?? "unknown"}; ` +
+          `details=${summarizeClickedControls(clickedResult.clicked)}).`,
+      );
+      const downloaded = await waitForCompletedDownloadFiles(
+        stagingDir,
+        new Set(),
+        clickedResult.clicked.length,
+        downloadWaitMs,
+      );
+      await params.assertPageAffinity?.("browser download completion wait");
+      stagedDownloads.push(
+        ...downloaded.map((filePath) => ({ path: filePath, filename: path.basename(filePath) })),
       );
     } else {
-      const explicitDownloadUrl = normalizeChatGptDownloadUrl(file.downloadUrl ?? file.url);
-      const sandboxDownloadUrl = downloadUrlFromSandboxUrl(file.sandboxUrl ?? file.url);
-      const downloadUrl = explicitDownloadUrl ?? sandboxDownloadUrl;
-      if (downloadUrl) {
-        params.logger?.(
-          `[browser] No matching assistant control for ${sanitizeCandidateFilename(
-            displayName,
-          )}; trying scoped generated browser download for urlKind=${classifyUrlKind(downloadUrl)}.`,
-        );
-        clickResult = await clickGeneratedDownloadUrl({
+      let clickedCount = 0;
+      let knownEntries = new Set<string>();
+      const missingFiles: string[] = [];
+      const unattemptedFiles: string[] = [];
+      for (const [fileIndex, file] of expectedFiles.entries()) {
+        const expectedLabels = resolveDownloadButtonLabels([file]);
+        const displayName = describeDownloadableFile(file);
+        let clickResult = await clickAssistantDownloadButtons({
           Runtime: params.Runtime,
-          file,
-          downloadUrl,
+          minTurnIndex: params.minTurnIndex,
+          expectedLabels,
+          allowGenericDownloadLabels: params.allowGenericDownloadLabels === true,
+          markClicked: true,
+          maxClicks: 1,
+          timeoutMs: buttonWaitMs,
           logger: params.logger,
           assertPageAffinity: params.assertPageAffinity,
+          expectedConversationId: params.expectedConversationId,
+          expectedAccountDigest: params.expectedAccountDigest,
         });
+        params.logger?.(
+          `[browser] Button fallback inspected ${clickResult.inspectedCount} control(s) for ${sanitizeCandidateFilename(
+            displayName,
+          )}; category=${clickResult.selectedCategory ?? "none"}; clicked=${clickResult.clicked.length}.`,
+        );
+        if (clickResult.clicked.length > 0) {
+          params.logger?.(
+            `[browser] Button fallback clicked control detail(s): ${summarizeClickedControls(
+              clickResult.clicked,
+            )}`,
+          );
+        } else {
+          const explicitDownloadUrl = normalizeChatGptDownloadUrl(file.downloadUrl ?? file.url);
+          const sandboxDownloadUrl = downloadUrlFromSandboxUrl(file.sandboxUrl ?? file.url);
+          const downloadUrl = explicitDownloadUrl ?? sandboxDownloadUrl;
+          if (downloadUrl) {
+            params.logger?.(
+              `[browser] No matching assistant control for ${sanitizeCandidateFilename(
+                displayName,
+              )}; trying scoped generated browser download for urlKind=${classifyUrlKind(downloadUrl)}.`,
+            );
+            clickResult = await clickGeneratedDownloadUrl({
+              Runtime: params.Runtime,
+              file,
+              downloadUrl,
+              logger: params.logger,
+              assertPageAffinity: params.assertPageAffinity,
+              expectedConversationId: params.expectedConversationId,
+              expectedAccountDigest: params.expectedAccountDigest,
+            });
+          }
+        }
+        if (clickResult.clicked.length === 0) {
+          missingFiles.push(displayName);
+          knownEntries = new Set(await fs.readdir(stagingDir).catch(() => []));
+          continue;
+        }
+
+        clickedCount += clickResult.clicked.length;
+        const downloaded = await waitForCompletedDownloadFiles(
+          stagingDir,
+          knownEntries,
+          1,
+          downloadWaitMs,
+        );
+        await params.assertPageAffinity?.("browser download completion wait");
+        if (downloaded.length === 0) {
+          missingFiles.push(displayName);
+          unattemptedFiles.push(
+            ...expectedFiles.slice(fileIndex + 1).map(describeDownloadableFile),
+          );
+          missingFiles.push(...unattemptedFiles);
+          params.logger?.(
+            `[browser] Download timed out for ${displayName}${
+              unattemptedFiles.length > 0
+                ? `; skipped remaining expected file(s) to avoid misassigning a late completion: ${unattemptedFiles.join(", ")}`
+                : ""
+            }`,
+          );
+          break;
+        }
+
+        stagedDownloads.push(
+          ...downloaded.map((filePath, index) => ({
+            path: filePath,
+            filename: preferredDownloadedFilename(filePath, index === 0 ? file : undefined),
+          })),
+        );
+        knownEntries = new Set(await fs.readdir(stagingDir).catch(() => []));
+      }
+
+      if (clickedCount === 0) {
+        params.logger?.("[browser] No assistant download controls found for button fallback.");
+      } else {
+        params.logger?.(`[browser] Clicked ${clickedCount} assistant download control(s).`);
+      }
+      if (missingFiles.length > 0) {
+        params.logger?.(
+          `[browser] Download button fallback did not save expected file(s): ${missingFiles.join(", ")}`,
+        );
       }
     }
-    if (clickResult.clicked.length === 0) {
-      missingFiles.push(displayName);
-      knownEntries = new Set(await fs.readdir(artifactsDir).catch(() => []));
-      continue;
+
+    await params.assertPageAffinity?.("browser download artifact final return");
+    const savedFiles: SavedBrowserFile[] = [];
+    const publishedPaths = new Set<string>();
+    for (const staged of stagedDownloads) {
+      if (publishedPaths.has(staged.path)) {
+        continue;
+      }
+      publishedPaths.add(staged.path);
+      const publishedPath = await publishStagedDownloadFile({
+        stagedPath: staged.path,
+        destinationDir: artifactsDir,
+        filename: staged.filename,
+      });
+      savedFiles.push(await savedBrowserFileFromPath(publishedPath));
     }
-
-    clickedCount += clickResult.clicked.length;
-    const downloaded = await waitForCompletedDownloadFiles(
-      artifactsDir,
-      knownEntries,
-      1,
-      downloadWaitMs,
-    );
-    if (downloaded.length === 0) {
-      missingFiles.push(displayName);
-      unattemptedFiles.push(...expectedFiles.slice(fileIndex + 1).map(describeDownloadableFile));
-      missingFiles.push(...unattemptedFiles);
-      params.logger?.(
-        `[browser] Download timed out for ${displayName}${
-          unattemptedFiles.length > 0
-            ? `; skipped remaining expected file(s) to avoid misassigning a late completion: ${unattemptedFiles.join(", ")}`
-            : ""
-        }`,
-      );
-      break;
-    }
-
-    const normalizedDownloads = await Promise.all(
-      downloaded.map((filePath, index) =>
-        index === 0 ? moveDownloadedFileToExpectedName(filePath, file) : filePath,
-      ),
-    );
-    downloadedPaths.push(...normalizedDownloads);
-    knownEntries = new Set(await fs.readdir(artifactsDir).catch(() => []));
+    return savedFiles;
+  } finally {
+    await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
   }
-
-  if (clickedCount === 0) {
-    params.logger?.("[browser] No assistant download controls found for button fallback.");
-  } else {
-    params.logger?.(`[browser] Clicked ${clickedCount} assistant download control(s).`);
-  }
-  if (missingFiles.length > 0) {
-    params.logger?.(
-      `[browser] Download button fallback did not save expected file(s): ${missingFiles.join(", ")}`,
-    );
-  }
-
-  return Promise.all(
-    [...new Set(downloadedPaths)].map((filePath) =>
-      savedBrowserFileFromPath(filePath, params.assertPageAffinity),
-    ),
-  );
 }
 
 interface DownloadedFilePayload {
@@ -1409,9 +1508,17 @@ async function fetchDownloadWithBrowser(
   Runtime: ChromeClient["Runtime"],
   downloadUrl: string,
   assertPageAffinity?: (action: string) => Promise<void>,
+  expectedConversationId?: string,
+  expectedAccountDigest?: string,
 ): Promise<DownloadedFilePayload> {
   await assertPageAffinity?.("downloadable file browser download");
-  const expression = `(() => {
+  const affinityGuard = buildEvaluatedChatGptPageAffinityGuard({
+    expectedConversationId,
+    expectedAccountDigest,
+  });
+  const expression = `${affinityGuard ? "(async () => {" : "(() => {"}
+    ${affinityGuard}
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     const downloadUrl = ${JSON.stringify(downloadUrl)};
     const encodeBase64 = (bytes) => {
       let binary = '';
@@ -1421,24 +1528,28 @@ async function fetchDownloadWithBrowser(
       }
       return btoa(binary);
     };
-    return fetch(downloadUrl, { credentials: 'include' }).then(async (response) => {
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      return {
-        ok: response.ok,
-        status: response.status,
-        statusText: response.statusText,
-        url: response.url,
-        contentDisposition: response.headers.get('content-disposition'),
-        contentType: response.headers.get('content-type'),
-        base64: encodeBase64(bytes),
-      };
-    });
+    const response = await fetch(downloadUrl, { credentials: 'include' });
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
+    return {
+      ok: response.ok,
+      status: response.status,
+      statusText: response.statusText,
+      url: response.url,
+      contentDisposition: response.headers.get('content-disposition'),
+      contentType: response.headers.get('content-type'),
+      base64: encodeBase64(bytes),
+    };
   })()`;
   const evaluated = await Runtime.evaluate({
     expression,
     awaitPromise: true,
     returnByValue: true,
   });
+  if (evaluated.exceptionDetails) {
+    throw new Error("Browser file download failed its in-page affinity guard.");
+  }
+  await assertPageAffinity?.("downloadable file browser download completion");
   const value = evaluated.result?.value as
     | {
         base64?: string;
@@ -1485,6 +1596,8 @@ export async function saveChatGptDownloadableFiles(params: {
   sessionId?: string;
   logger?: BrowserLogger;
   assertPageAffinity?: (action: string) => Promise<void>;
+  expectedConversationId?: string;
+  expectedAccountDigest?: string;
 }): Promise<{
   saved: boolean;
   fileCount: number;
@@ -1512,6 +1625,7 @@ export async function saveChatGptDownloadableFiles(params: {
   const savedFiles: SavedBrowserFile[] = [];
   const failedFiles: BrowserDownloadableFile[] = [];
   const errors: string[] = [];
+  const ownedArtifactPaths = new Set<string>();
   for (let index = 0; index < files.length; index += 1) {
     const file = files[index];
     await params.assertPageAffinity?.("downloadable file download");
@@ -1541,6 +1655,8 @@ export async function saveChatGptDownloadableFiles(params: {
               params.Runtime as ChromeClient["Runtime"],
               downloadUrl,
               params.assertPageAffinity,
+              params.expectedConversationId,
+              params.expectedAccountDigest,
             )
           : await fetchDownloadWithNode(downloadUrl, getCookieHeader, params.assertPageAffinity);
       const contentType = downloaded.contentType;
@@ -1562,14 +1678,16 @@ export async function saveChatGptDownloadableFiles(params: {
         logger,
       });
       if (artifact) {
-        savedFiles.push({
+        const savedFile: SavedBrowserFile = {
           ...artifact,
           kind: "file",
           url: downloadUrl,
           finalUrl: downloaded.finalUrl,
           sandboxUrl: file.sandboxUrl,
           filename,
-        });
+        };
+        savedFiles.push(savedFile);
+        ownedArtifactPaths.add(savedFile.path);
       } else {
         failedFiles.push(file);
       }
@@ -1592,7 +1710,11 @@ export async function saveChatGptDownloadableFiles(params: {
       );
     }
   }
-  await params.assertPageAffinity?.("downloadable file artifact final return");
+  await assertPageAffinityOrRemoveOwnedFiles({
+    assertPageAffinity: params.assertPageAffinity,
+    action: "downloadable file artifact final return",
+    paths: ownedArtifactPaths,
+  });
 
   return {
     saved: savedFiles.length > 0,
@@ -1614,6 +1736,7 @@ export async function collectChatGptFileArtifacts(params: {
   minTurnIndex?: number | null;
   expectedConversationId?: string;
   assertPageAffinity?: (action: string) => Promise<void>;
+  expectedAccountDigest?: string;
   sessionId?: string;
 }): Promise<{
   files: BrowserDownloadableFile[];
@@ -1625,6 +1748,8 @@ export async function collectChatGptFileArtifacts(params: {
     params.Runtime,
     params.minTurnIndex ?? undefined,
     params.assertPageAffinity,
+    params.expectedConversationId,
+    params.expectedAccountDigest,
   ).catch(async (error) => {
     await params.assertPageAffinity?.("downloadable file DOM read failure");
     const message = error instanceof Error ? error.message : String(error);
@@ -1661,6 +1786,8 @@ export async function collectChatGptFileArtifacts(params: {
     sessionId: params.sessionId,
     logger: params.logger,
     assertPageAffinity: params.assertPageAffinity,
+    expectedConversationId: params.expectedConversationId,
+    expectedAccountDigest: params.expectedAccountDigest,
   });
   const buttonSavedFiles =
     saved.failedFiles.length > 0
@@ -1675,6 +1802,8 @@ export async function collectChatGptFileArtifacts(params: {
           minTurnIndex: params.minTurnIndex,
           sessionId: params.sessionId,
           assertPageAffinity: params.assertPageAffinity,
+          expectedConversationId: params.expectedConversationId,
+          expectedAccountDigest: params.expectedAccountDigest,
         })
       : [];
   const savedFiles = [...saved.savedFiles, ...buttonSavedFiles];

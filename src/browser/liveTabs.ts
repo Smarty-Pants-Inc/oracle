@@ -122,12 +122,10 @@ async function refreshBoundBrowserEndpoint(options: HostPort): Promise<string | 
   const expectedBrowserId = options.browserId?.trim();
   const expectedAccountDigest = options.accountDigest?.trim();
   if (!expectedBrowserId && !expectedAccountDigest) return options.browserWSEndpoint;
-  if (
-    !expectedBrowserId ||
-    (expectedAccountDigest && !/^[a-f0-9]{64}$/.test(expectedAccountDigest))
-  ) {
-    throw new Error("Stored remote Chrome browser and account identity is incomplete.");
+  if (expectedAccountDigest && !/^[a-f0-9]{64}$/.test(expectedAccountDigest)) {
+    throw new Error("Stored ChatGPT account identity is invalid.");
   }
+  if (!expectedBrowserId) return options.browserWSEndpoint;
   const { host, port } = normalizeHostPort(options);
   const liveIdentity = await resolveRemoteChromeBrowserIdentity({ host, port });
   if (liveIdentity.browserId !== expectedBrowserId) {
@@ -402,12 +400,31 @@ export async function openChatGptTarget(
       targetUrl: url,
       closeTargetOnDispose: false,
     });
-    if (!connection.targetId) {
+    const targetId = connection.targetId;
+    if (!targetId) {
       await connection.close();
       throw new Error("Remote Chrome did not return a target id.");
     }
-    const targetId = connection.targetId;
-    await connection.close();
+    try {
+      await connection.close();
+    } catch (closeError) {
+      const cleanupErrors: unknown[] = [];
+      try {
+        const closed = await closeTab(port, targetId, noopLogger, host);
+        if (!closed) {
+          cleanupErrors.push(new Error("Remote Chrome target cleanup was not confirmed."));
+        }
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [closeError, ...cleanupErrors],
+          "Remote Chrome target handoff and cleanup failed.",
+        );
+      }
+      throw closeError;
+    }
     return targetId;
   }
   const target = await CDP.New({ host, port, url });

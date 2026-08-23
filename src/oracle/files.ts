@@ -195,7 +195,9 @@ async function partitionFileInputs(
 async function expandWithNativeGlob(partitioned: PartitionedFiles, cwd: string): Promise<string[]> {
   const patterns = [
     ...partitioned.globPatterns,
-    ...partitioned.literalFiles.map((absPath) => toPosixRelativeOrBasename(absPath, cwd)),
+    ...partitioned.literalFiles.map((absPath) =>
+      fg.posix.escapePath(toPosixRelativeOrBasename(absPath, cwd)),
+    ),
     ...partitioned.literalDirectories.map((absDir) =>
       makeDirectoryPattern(toPosixRelative(absDir, cwd)),
     ),
@@ -402,7 +404,7 @@ function makeDirectoryPattern(relative: string): string {
   if (relative === "." || relative === "") {
     return "**/*";
   }
-  return `${stripTrailingSlashes(relative)}/**/*`;
+  return `${fg.posix.escapePath(stripTrailingSlashes(relative))}/**/*`;
 }
 
 function isNativeFsModule(fsModule: MinimalFsModule): boolean {

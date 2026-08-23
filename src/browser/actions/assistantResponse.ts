@@ -16,6 +16,7 @@ import {
   buildConversationDebugExpression,
 } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
+import { buildEvaluatedChatGptPageAffinityGuard } from "../chatgptAccount.js";
 
 const ASSISTANT_POLL_TIMEOUT_ERROR = "assistant-response-watchdog-timeout";
 const STOP_CONTROL_SELECTOR = STOP_BUTTON_SELECTORS.join(", ");
@@ -367,11 +368,21 @@ export async function readAssistantSnapshot(
   Runtime: ChromeClient["Runtime"],
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedAccountDigest?: string,
 ): Promise<AssistantSnapshot | null> {
-  const { result } = await Runtime.evaluate({
-    expression: buildAssistantSnapshotExpression(minTurnIndex, expectedConversationId),
+  const requiresAsyncAffinity = Boolean(expectedAccountDigest?.trim());
+  const { result, exceptionDetails } = await Runtime.evaluate({
+    expression: buildAssistantSnapshotExpression(
+      minTurnIndex,
+      expectedConversationId,
+      expectedAccountDigest,
+    ),
+    ...(requiresAsyncAffinity ? { awaitPromise: true } : {}),
     returnByValue: true,
   });
+  if (exceptionDetails) {
+    throw new Error("Assistant snapshot read failed its in-page affinity guard.");
+  }
   const value = result?.value;
   if (value && typeof value === "object") {
     const snapshot = value as AssistantSnapshot;
@@ -424,8 +435,13 @@ export function buildAssistantExtractorForTest(name: string): string {
 export function buildAssistantSnapshotExpressionForTest(
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedAccountDigest?: string,
 ): string {
-  return buildAssistantSnapshotExpression(minTurnIndex, expectedConversationId);
+  return buildAssistantSnapshotExpression(
+    minTurnIndex,
+    expectedConversationId,
+    expectedAccountDigest,
+  );
 }
 
 export function buildConversationDebugExpressionForTest(): string {
@@ -861,6 +877,7 @@ async function waitForCondition<T>(
 function buildAssistantSnapshotExpression(
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedAccountDigest?: string,
 ): string {
   const minTurnLiteral =
     typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex) && minTurnIndex >= 0
@@ -870,15 +887,25 @@ function buildAssistantSnapshotExpression(
     typeof expectedConversationId === "string" && expectedConversationId.trim().length > 0
       ? JSON.stringify(expectedConversationId.trim())
       : "null";
-  return `(() => {
+  const affinityGuard = expectedAccountDigest
+    ? buildEvaluatedChatGptPageAffinityGuard({
+        expectedConversationId,
+        expectedAccountDigest,
+      })
+    : "";
+  return `${affinityGuard ? "(async () => {" : "(() => {"}
+    ${affinityGuard}
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     const MIN_TURN_INDEX = ${minTurnLiteral};
     const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
-    const currentHref = typeof location === 'object' && location.href ? location.href : '';
-    const currentConversationId = currentHref.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] ?? null;
-    if (
-      EXPECTED_CONVERSATION_ID &&
-      currentConversationId !== EXPECTED_CONVERSATION_ID
-    ) {
+    let currentPageUrl = null;
+    try {
+      currentPageUrl = new URL(typeof location === 'object' && location.href ? location.href : '');
+    } catch {}
+    const currentConversationId = currentPageUrl?.origin === 'https://chatgpt.com'
+      ? /^(?:[/]c|[/]g[/][^/?#]+[/](?:project[/])?c)[/]([a-zA-Z0-9-]+)[/]?$/.exec(currentPageUrl.pathname)?.[1] ?? null
+      : null;
+    if (EXPECTED_CONVERSATION_ID && currentConversationId !== EXPECTED_CONVERSATION_ID) {
       return null;
     }
     // Learned: the default turn DOM misses project view; keep a fallback extractor.
@@ -900,14 +927,17 @@ function buildAssistantSnapshotExpression(
       !isPlaceholder(extracted) &&
       !isActiveThinkingStatus(extracted)
     ) {
+      ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
       return extracted;
     }
     // Fallback for ChatGPT project view: answers can live outside conversation turns.
     const extractFallback = ${buildMarkdownFallbackExtractor("MIN_TURN_INDEX")};
     const fallback = extractFallback();
     if (fallback && !isPlaceholder(fallback) && !isActiveThinkingStatus(fallback)) {
+      ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
       return fallback;
     }
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     return null;
   })()`;
 }

@@ -123,6 +123,28 @@ describe("readAssistantDownloadableFiles", () => {
       filename: "source.tar.gz",
     });
   });
+
+  test("embeds exact conversation and account checks in the DOM read", async () => {
+    let expression = "";
+    const runtime = {
+      evaluate: vi.fn(async (options: { expression: string }) => {
+        expression = options.expression;
+        return { result: { value: [] } };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    await readAssistantDownloadableFiles(
+      runtime,
+      undefined,
+      undefined,
+      "expected-thread",
+      "a".repeat(64),
+    );
+    expect(expression).toContain('const expectedConversationId = "expected-thread"');
+    expect(expression).toContain("pageUrl.pathname");
+    expect(
+      expression.match(/await assertOracleChatGptPageAffinity\(\);/g)?.length,
+    ).toBeGreaterThanOrEqual(2);
+  });
 });
 
 describe("saveChatGptDownloadableFiles", () => {
@@ -186,6 +208,47 @@ describe("saveChatGptDownloadableFiles", () => {
       path.join(tmpHome, "sessions", "file-session", "artifacts", "package.zip"),
     );
     await expect(fs.readFile(result.savedFiles[0]!.path)).resolves.toEqual(Buffer.from([9, 8, 7]));
+  });
+
+  test("removes only owned artifacts when final page affinity fails", async () => {
+    const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-files-affinity-"));
+    setOracleHomeDirOverrideForTest(tmpHome);
+    const network = {
+      getCookies: vi.fn().mockResolvedValue({
+        cookies: [{ name: "__Secure-next-auth.session-token", value: "abc" }],
+      }),
+    } as unknown as ChromeClient["Network"];
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      url: "https://chatgpt.com/backend-api/files/file_package/download",
+      headers: { get: () => null },
+      arrayBuffer: async () => Uint8Array.from([1, 2, 3]).buffer,
+    } as unknown as Response);
+    const artifactDir = path.join(tmpHome, "sessions", "affinity-session", "artifacts");
+    const concurrentPath = path.join(artifactDir, "concurrent.bin");
+    const assertPageAffinity = vi.fn(async (action: string) => {
+      if (action === "downloadable file artifact final return") {
+        await fs.writeFile(concurrentPath, "concurrent");
+        throw new Error("conversation changed");
+      }
+    });
+    await expect(
+      saveChatGptDownloadableFiles({
+        Network: network,
+        sessionId: "affinity-session",
+        assertPageAffinity,
+        files: [
+          {
+            url: "https://chatgpt.com/backend-api/files/file_package/download",
+            filename: "package.bin",
+          },
+        ],
+      }),
+    ).rejects.toThrow(/conversation changed/i);
+    await expect(fs.readdir(artifactDir)).resolves.toEqual(["concurrent.bin"]);
+    await expect(fs.readFile(concurrentPath, "utf8")).resolves.toBe("concurrent");
   });
 
   test("saves sandbox-only references through the ChatGPT sandbox download endpoint", async () => {
@@ -435,6 +498,38 @@ describe("collectChatGptFileArtifacts", () => {
       expect.stringContaining("Auto-save for downloadable files failed"),
     );
   });
+  test("cleans private browser downloads after an in-page affinity exception", async () => {
+    const destinationDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-download-staging-"));
+    const concurrentPath = path.join(destinationDir, "concurrent.txt");
+    await fs.writeFile(concurrentPath, "keep");
+    let browserDownloadDir = "";
+    const client = {
+      send: vi.fn(async (_method: string, { downloadPath }: { downloadPath: string }) => {
+        browserDownloadDir = downloadPath;
+      }),
+    } as unknown as ChromeClient;
+    const runtime = {
+      evaluate: vi.fn(async () => {
+        await fs.writeFile(path.join(browserDownloadDir, "download.csv"), "new");
+        return { result: { value: [] }, exceptionDetails: { text: "affinity changed" } };
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    try {
+      await expect(
+        saveAssistantDownloadButtonArtifacts({
+          Client: client,
+          Runtime: runtime,
+          downloadPath: destinationDir,
+          files: [],
+        }),
+      ).rejects.toThrow(/in-page affinity guard/i);
+      await expect(fs.readFile(concurrentPath, "utf8")).resolves.toBe("keep");
+      await expect(fs.readdir(destinationDir)).resolves.toEqual(["concurrent.txt"]);
+    } finally {
+      await fs.rm(destinationDir, { recursive: true, force: true });
+    }
+  });
 
   test("discovers sandbox links from captured answer markdown when DOM anchors are absent", async () => {
     const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-file-text-"));
@@ -565,6 +660,7 @@ describe("collectChatGptFileArtifacts", () => {
     const artifactsDir = path.join(tmpHome, "sessions", sessionId, "artifacts");
     const filename = "oracle_pr245_file_artifact_smoke_out.csv";
     const csv = "name,value\nalpha,1\nbeta,2\n";
+    let browserDownloadDir = "";
     const runtime = {
       evaluate: vi
         .fn()
@@ -587,8 +683,7 @@ describe("collectChatGptFileArtifacts", () => {
           if (!fallbackExpression.includes("const ALLOW_GENERIC_DOWNLOAD_LABELS = true")) {
             return { result: { value: [] } };
           }
-          await fs.mkdir(artifactsDir, { recursive: true });
-          await fs.writeFile(path.join(artifactsDir, filename), csv, "utf8");
+          await fs.writeFile(path.join(browserDownloadDir, filename), csv, "utf8");
           return {
             result: {
               value: [
@@ -608,7 +703,9 @@ describe("collectChatGptFileArtifacts", () => {
       }),
     } as unknown as ChromeClient["Network"];
     const page = {
-      setDownloadBehavior: vi.fn().mockResolvedValue({}),
+      setDownloadBehavior: vi.fn(async ({ downloadPath }: { downloadPath: string }) => {
+        browserDownloadDir = downloadPath;
+      }),
     } as unknown as ChromeClient["Page"];
 
     const result = await collectChatGptFileArtifacts({
@@ -628,10 +725,10 @@ describe("collectChatGptFileArtifacts", () => {
       mimeType: "text/csv",
       path: path.join(artifactsDir, filename),
     });
-    expect(page.setDownloadBehavior).toHaveBeenCalledWith({
-      behavior: "allow",
-      downloadPath: artifactsDir,
-    });
+    expect(page.setDownloadBehavior).toHaveBeenCalledWith(
+      expect.objectContaining({ behavior: "allow", downloadPath: browserDownloadDir }),
+    );
+    expect(path.dirname(browserDownloadDir)).toBe(artifactsDir);
     const fallbackExpression = String(vi.mocked(runtime.evaluate).mock.calls[2]?.[0]?.expression);
     expect(fallbackExpression).toContain("const ALLOW_GENERIC_DOWNLOAD_LABELS = true");
     expect(fallbackExpression).toContain("const MAX_CLICKS = 1");
@@ -642,7 +739,7 @@ describe("collectChatGptFileArtifacts", () => {
     const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-file-sequential-"));
     setOracleHomeDirOverrideForTest(tmpHome);
     const sessionId = "collect-session";
-    const artifactsDir = path.join(tmpHome, "sessions", sessionId, "artifacts");
+    let browserDownloadDir = "";
     const runtime = {
       evaluate: vi.fn().mockImplementation(async ({ expression }: { expression?: string }) => {
         const clicked: Array<{ text: string; ariaLabel: string; testId: string }> = [];
@@ -651,7 +748,6 @@ describe("collectChatGptFileArtifacts", () => {
         const hasA = text.includes('"a.txt"');
         const hasB = text.includes('"b.md"');
         const hasC = text.includes('"c.zip"');
-        await fs.mkdir(artifactsDir, { recursive: true });
         if (hasA && hasB && hasC) {
           writes.push("A.txt", "C.zip");
           clicked.push(
@@ -670,13 +766,15 @@ describe("collectChatGptFileArtifacts", () => {
           clicked.push({ text: "Download C.zip", ariaLabel: "", testId: "" });
         }
         await Promise.all(
-          writes.map((filename) => fs.writeFile(path.join(artifactsDir, filename), filename)),
+          writes.map((filename) => fs.writeFile(path.join(browserDownloadDir, filename), filename)),
         );
         return { result: { value: clicked } };
       }),
     } as unknown as ChromeClient["Runtime"];
     const page = {
-      setDownloadBehavior: vi.fn().mockResolvedValue({}),
+      setDownloadBehavior: vi.fn(async ({ downloadPath }: { downloadPath: string }) => {
+        browserDownloadDir = downloadPath;
+      }),
     } as unknown as ChromeClient["Page"];
 
     const savedFiles = await saveAssistantDownloadButtonArtifacts({
@@ -711,15 +809,17 @@ describe("collectChatGptFileArtifacts", () => {
     setOracleHomeDirOverrideForTest(tmpHome);
     const sessionId = "collect-session";
     const artifactsDir = path.join(tmpHome, "sessions", sessionId, "artifacts");
+    let browserDownloadDir = "";
     const runtime = {
       evaluate: vi.fn().mockImplementation(async () => {
-        await fs.mkdir(artifactsDir, { recursive: true });
-        await fs.writeFile(path.join(artifactsDir, "report.csv"), "a,b\n1,2\n", "utf8");
+        await fs.writeFile(path.join(browserDownloadDir, "report.csv"), "a,b\n1,2\n", "utf8");
         return { result: { value: [{ text: "Download", ariaLabel: "", testId: "" }] } };
       }),
     } as unknown as ChromeClient["Runtime"];
     const page = {
-      setDownloadBehavior: vi.fn().mockResolvedValue({}),
+      setDownloadBehavior: vi.fn(async ({ downloadPath }: { downloadPath: string }) => {
+        browserDownloadDir = downloadPath;
+      }),
     } as unknown as ChromeClient["Page"];
 
     const savedFiles = await saveAssistantDownloadButtonArtifacts({
@@ -754,20 +854,23 @@ describe("collectChatGptFileArtifacts", () => {
     const artifactsDir = path.join(tmpHome, "sessions", sessionId, "artifacts");
     const logger = vi.fn();
     let lateCompletion: Promise<void> | undefined;
+    let browserDownloadDir = "";
     const runtime = {
       evaluate: vi.fn().mockImplementation(async ({ expression }: { expression?: string }) => {
         const text = String(expression ?? "");
-        await fs.mkdir(artifactsDir, { recursive: true });
         if (text.includes('"a.txt"')) {
-          await fs.writeFile(path.join(artifactsDir, "A(1).txt"), "A");
+          await fs.writeFile(path.join(browserDownloadDir, "A(1).txt"), "A");
           return { result: { value: [{ text: "Download A.txt", ariaLabel: "", testId: "" }] } };
         }
         if (text.includes('"b.md"')) {
-          const partialPath = path.join(artifactsDir, "B.md.crdownload");
+          const partialPath = path.join(browserDownloadDir, "B.md.crdownload");
           await fs.writeFile(partialPath, "B");
-          lateCompletion = new Promise<void>((resolve, reject) => {
+          lateCompletion = new Promise<void>((resolve) => {
             setTimeout(() => {
-              void fs.rename(partialPath, path.join(artifactsDir, "B.md")).then(resolve, reject);
+              void fs
+                .rename(partialPath, path.join(browserDownloadDir, "B.md"))
+                .catch(() => undefined)
+                .then(resolve);
             }, 275);
           });
           return { result: { value: [{ text: "Download B.md", ariaLabel: "", testId: "" }] } };
@@ -779,7 +882,9 @@ describe("collectChatGptFileArtifacts", () => {
       }),
     } as unknown as ChromeClient["Runtime"];
     const page = {
-      setDownloadBehavior: vi.fn().mockResolvedValue({}),
+      setDownloadBehavior: vi.fn(async ({ downloadPath }: { downloadPath: string }) => {
+        browserDownloadDir = downloadPath;
+      }),
     } as unknown as ChromeClient["Page"];
 
     const savedFiles = await saveAssistantDownloadButtonArtifacts({
@@ -810,7 +915,7 @@ describe("collectChatGptFileArtifacts", () => {
         .mocked(runtime.evaluate)
         .mock.calls.some(([options]) => String(options?.expression ?? "").includes('"c.zip"')),
     ).toBe(false);
-    await expect(fs.readFile(path.join(artifactsDir, "B.md"), "utf8")).resolves.toBe("B");
+    await expect(fs.stat(path.join(artifactsDir, "B.md"))).rejects.toThrow();
     await expect(fs.stat(path.join(artifactsDir, "C.zip"))).rejects.toThrow();
     expect(logger).toHaveBeenCalledWith(
       expect.stringContaining(
@@ -877,6 +982,7 @@ describe("collectChatGptFileArtifacts", () => {
     setOracleHomeDirOverrideForTest(tmpHome);
     const sessionId = "collect-session";
     const artifactsDir = path.join(tmpHome, "sessions", sessionId, "artifacts");
+    let browserDownloadDir = "";
     const runtime = {
       evaluate: vi
         .fn()
@@ -897,9 +1003,8 @@ describe("collectChatGptFileArtifacts", () => {
           },
         })
         .mockImplementationOnce(async () => {
-          await fs.mkdir(artifactsDir, { recursive: true });
           await fs.writeFile(
-            path.join(artifactsDir, "missing.csv"),
+            path.join(browserDownloadDir, "missing.csv"),
             "missing,value\nrow,2\n",
             "utf8",
           );
@@ -912,7 +1017,9 @@ describe("collectChatGptFileArtifacts", () => {
       }),
     } as unknown as ChromeClient["Network"];
     const page = {
-      setDownloadBehavior: vi.fn().mockResolvedValue({}),
+      setDownloadBehavior: vi.fn(async ({ downloadPath }: { downloadPath: string }) => {
+        browserDownloadDir = downloadPath;
+      }),
     } as unknown as ChromeClient["Page"];
     globalThis.fetch = vi.fn().mockImplementation(async (url: URL | string) => {
       const missing = String(url).includes("file_missing");
@@ -938,10 +1045,10 @@ describe("collectChatGptFileArtifacts", () => {
     expect(result.savedFiles.map((file) => file.filename)).toEqual(
       expect.arrayContaining(["ok.csv", "missing.csv"]),
     );
-    expect(page.setDownloadBehavior).toHaveBeenCalledWith({
-      behavior: "allow",
-      downloadPath: artifactsDir,
-    });
+    expect(page.setDownloadBehavior).toHaveBeenCalledWith(
+      expect.objectContaining({ behavior: "allow", downloadPath: browserDownloadDir }),
+    );
+    expect(path.dirname(browserDownloadDir)).toBe(artifactsDir);
     expect(runtime.evaluate).toHaveBeenCalledTimes(2);
     const fallbackExpression = vi.mocked(runtime.evaluate).mock.calls[1]?.[0]?.expression;
     expect(fallbackExpression).toContain('"missing.csv"');

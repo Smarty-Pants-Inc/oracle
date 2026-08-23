@@ -167,6 +167,7 @@ describe("browser follow-up resolution", () => {
     expect(result?.browserConfig).toMatchObject({
       url: "https://chatgpt.com/",
       resumeConversationUrl: "https://chatgpt.com/c/runtime-only-thread",
+      expectedAccountDigest: "a".repeat(64),
     });
     expect(result?.browserConfig).not.toHaveProperty("remoteChrome");
     expect(result?.browserConfig).not.toHaveProperty("remoteChromeAccountDigest");

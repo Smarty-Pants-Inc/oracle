@@ -78,15 +78,22 @@ export async function resolveBrowserFollowupReference(
       `Session ${trimmed} is a browser session but does not contain a ChatGPT conversation URL. Run "oracle status --hours 72 --limit 20" to list recent sessions.`,
     );
   }
-  const parentBrowserConfig = metadata.options?.browserConfig ?? metadata.browser?.config;
+  const parentBrowserConfig = metadata.browser?.config ?? metadata.options?.browserConfig;
   if (!parentBrowserConfig) {
     throw new Error(`Session ${trimmed} is missing its stored browser configuration.`);
   }
   const configuredBrowserId = parentBrowserConfig.remoteChromeBrowserId?.trim();
   const configuredBrowserWSEndpoint = parentBrowserConfig.remoteChromeBrowserWSEndpoint?.trim();
-  const rawConfiguredAccountDigest = parentBrowserConfig.remoteChromeAccountDigest;
-  const configuredAccountDigest = normalizeChatGptAccountDigest(rawConfiguredAccountDigest);
-  if (rawConfiguredAccountDigest !== undefined && !configuredAccountDigest) {
+  const rawExpectedAccountDigest = parentBrowserConfig.expectedAccountDigest;
+  const expectedAccountDigest = normalizeChatGptAccountDigest(rawExpectedAccountDigest);
+  if (rawExpectedAccountDigest != null && !expectedAccountDigest) {
+    throw new Error(`Session ${trimmed} has invalid stored account identity metadata.`);
+  }
+  const rawConfiguredRemoteAccountDigest = parentBrowserConfig.remoteChromeAccountDigest;
+  const configuredRemoteAccountDigest = normalizeChatGptAccountDigest(
+    rawConfiguredRemoteAccountDigest,
+  );
+  if (rawConfiguredRemoteAccountDigest != null && !configuredRemoteAccountDigest) {
     throw new Error(`Session ${trimmed} has invalid stored account identity metadata.`);
   }
   const rawRuntimeAccountDigest = metadata.browser?.runtime?.chatGptAccountDigest;
@@ -94,22 +101,25 @@ export async function resolveBrowserFollowupReference(
   if (rawRuntimeAccountDigest !== undefined && !runtimeAccountDigest) {
     throw new Error(`Session ${trimmed} has invalid stored account identity metadata.`);
   }
-  if (
-    configuredAccountDigest &&
-    runtimeAccountDigest &&
-    configuredAccountDigest !== runtimeAccountDigest
-  ) {
+  const accountDigests = [
+    expectedAccountDigest,
+    configuredRemoteAccountDigest,
+    runtimeAccountDigest,
+  ].filter((digest): digest is string => Boolean(digest));
+  if (new Set(accountDigests).size > 1) {
     throw new Error(`Session ${trimmed} has conflicting stored account identity metadata.`);
   }
+  const childExpectedAccountDigest =
+    runtimeAccountDigest ?? expectedAccountDigest ?? configuredRemoteAccountDigest;
   const hasRemoteAffinityMarker = Boolean(
     process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" ||
     parentBrowserConfig.remoteChrome ||
     configuredBrowserId ||
     configuredBrowserWSEndpoint ||
-    configuredAccountDigest,
+    configuredRemoteAccountDigest,
   );
   const remoteChromeAccountDigest = hasRemoteAffinityMarker
-    ? (runtimeAccountDigest ?? configuredAccountDigest)
+    ? (runtimeAccountDigest ?? configuredRemoteAccountDigest ?? expectedAccountDigest)
     : undefined;
   const runtimeBrowserWSEndpoint = metadata.browser?.runtime?.chromeBrowserWSEndpoint?.trim();
   let remoteChromeBrowserId = configuredBrowserId;
@@ -153,6 +163,7 @@ export async function resolveBrowserFollowupReference(
     model,
     browserConfig: {
       ...parentBrowserConfig,
+      expectedAccountDigest: childExpectedAccountDigest,
       ...(remoteChromeBrowserId && remoteChromeBrowserWSEndpoint && remoteChromeAccountDigest
         ? { remoteChromeBrowserId, remoteChromeBrowserWSEndpoint, remoteChromeAccountDigest }
         : {}),

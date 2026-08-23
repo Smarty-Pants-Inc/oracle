@@ -7,6 +7,7 @@ import {
   expectedConversationIdForRef,
   formatBrowserTabState,
   isChatGptUrl,
+  openChatGptTarget,
   resolveChatGptTab,
   resolveExactChatGptTargetForTest,
   resolveChatGptTabFromSummariesForTest,
@@ -18,6 +19,7 @@ import {
 import type { SessionMetadata } from "../../src/sessionStore.js";
 
 const remoteChromeMocks = vi.hoisted(() => ({
+  closeTab: vi.fn(),
   connectToRemoteChromeTarget: vi.fn(),
   listRemoteChromeTargets: vi.fn(),
 }));
@@ -26,7 +28,31 @@ vi.mock("../../src/browser/chromeLifecycle.js", () => remoteChromeMocks);
 
 beforeEach(() => {
   remoteChromeMocks.connectToRemoteChromeTarget.mockReset();
+  remoteChromeMocks.closeTab.mockReset();
   remoteChromeMocks.listRemoteChromeTargets.mockReset();
+});
+
+test("fallback-closes a structured target when handoff detach fails", async () => {
+  const closeError = new Error("detach failed");
+  remoteChromeMocks.connectToRemoteChromeTarget.mockResolvedValue({
+    targetId: "target-new",
+    close: vi.fn().mockRejectedValue(closeError),
+  });
+  remoteChromeMocks.closeTab.mockResolvedValue(true);
+
+  await expect(
+    openChatGptTarget({
+      host: "127.0.0.1",
+      port: 9223,
+      browserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+    }),
+  ).rejects.toBe(closeError);
+  expect(remoteChromeMocks.closeTab).toHaveBeenCalledWith(
+    9223,
+    "target-new",
+    expect.any(Function),
+    "127.0.0.1",
+  );
 });
 
 function makeTab(overrides: Partial<ChatGptTabSummary> = {}): ChatGptTabSummary {

@@ -10,11 +10,13 @@ import {
   buildChatGptCaptureCleanupExpressionForTest,
   buildReadOnlyConversationGetExpressionForTest,
   captureApprovedChatGptConversationBackend,
+  evaluateReadOnlyConversationGetForTest,
   buildScopedBackendCaptureHook,
   contentToText,
   conversationIdFromChatGptUrl,
   isSameConversationUrl,
   retrieveCapturedTextWithEvaluator,
+  runBeforeExportDeadlineForTest,
   formatChatGptCaptureTimeoutForTest,
   scanTextForSecretLikeMarkers,
   writeChatGptExportBundleForTest,
@@ -41,6 +43,45 @@ describe("ChatGPT conversation export helpers", () => {
     expect(() => conversationIdFromChatGptUrl("https://chatgpt.com/g/example/project")).toThrow(
       /specific/i,
     );
+  });
+
+  test("disposes a capture-hook registration that arrives after the export deadline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    let resolveLate!: (value: { identifier: string }) => void;
+    const dispose = vi.fn(async () => undefined);
+    try {
+      const result = runBeforeExportDeadlineForTest(
+        () => new Promise<{ identifier: string }>((resolve) => (resolveLate = resolve)),
+        10,
+        "registration timed out",
+        dispose,
+      ).catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(10);
+      await expect(result).resolves.toMatchObject({ message: "registration timed out" });
+      resolveLate({ identifier: "late-hook" });
+      await vi.waitFor(() => expect(dispose).toHaveBeenCalledWith({ identifier: "late-hook" }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not serialize CDP exception details from exact GET failures", async () => {
+    const secret = "https://chatgpt.com/c/private-thread?token=secret";
+    const runtime = {
+      evaluate: vi.fn(async () => ({ exceptionDetails: { text: secret, url: secret } })),
+    };
+    const error = await evaluateReadOnlyConversationGetForTest(
+      runtime as never,
+      "https://chatgpt.com/backend-api/conversation/conv-1",
+      "conv-1",
+      "a".repeat(64),
+      "owner@example.test",
+      Date.now() + 1_000,
+    ).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe("Read-only conversation GET failed in the page context.");
+    expect((error as Error).message).not.toContain(secret);
   });
 
   testNonWindows("rejects a browser swap before exact export attachment", async () => {

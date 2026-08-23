@@ -24,6 +24,7 @@ import { delay } from "./utils.js";
 const DEFAULT_READY_TIMEOUT_MS = 30_000;
 const READY_POLL_MS = 1_000;
 const RECOVERY_CLEANUP_ALLOWANCE_MS = 1_000;
+class RecoveryAffinityError extends Error {}
 
 function remainingRecoveryOperationMs(deadline: number): number {
   return Math.max(0, deadline - Date.now());
@@ -235,26 +236,31 @@ async function openRecoveryTarget(
     );
   }
   if (
-    !expectedBrowserId ||
-    !expectedAccountDigest ||
-    !/^[a-f0-9]{64}$/.test(expectedAccountDigest)
+    (expectedBrowserId && !expectedAccountDigest) ||
+    (expectedAccountDigest && !/^[a-f0-9]{64}$/.test(expectedAccountDigest))
   ) {
-    throw new Error("Stored remote Chrome browser and account identity is incomplete.");
+    throw new Error("Stored Chrome account affinity is incomplete or invalid.");
   }
-  const liveIdentity = await runBeforeRecoveryDeadline(
-    () => resolveRemoteChromeBrowserIdentity(endpoint),
-    deadline,
-    "resolving the remote Chrome browser identity for conversation recovery",
-  );
-  if (liveIdentity.browserId !== expectedBrowserId) {
-    throw new Error("Remote Chrome browser identity changed before conversation recovery.");
+  let browserWSEndpoint: string | undefined;
+  if (expectedBrowserId) {
+    const liveIdentity = await runBeforeRecoveryDeadline(
+      () => resolveRemoteChromeBrowserIdentity(endpoint),
+      deadline,
+      "resolving the remote Chrome browser identity for conversation recovery",
+    );
+    if (liveIdentity.browserId !== expectedBrowserId) {
+      throw new RecoveryAffinityError(
+        "Remote Chrome browser identity changed before conversation recovery.",
+      );
+    }
+    browserWSEndpoint = liveIdentity.browserWSEndpoint;
   }
   const targetId = await runBeforeRecoveryDeadline(
     () =>
       openChatGptTarget({
         host: endpoint.host,
         port: endpoint.port,
-        browserWSEndpoint: liveIdentity.browserWSEndpoint,
+        browserWSEndpoint,
         url: CHATGPT_URL,
       }),
     deadline,
@@ -269,7 +275,7 @@ async function openRecoveryTarget(
     connection = await runBeforeRecoveryDeadline(
       () =>
         connectToRemoteChromeTarget(endpoint.host, endpoint.port, logger, {
-          browserWSEndpoint: liveIdentity.browserWSEndpoint,
+          browserWSEndpoint,
           targetId,
           closeTargetOnDispose: false,
         }),
@@ -300,7 +306,9 @@ async function openRecoveryTarget(
           remainingRecoveryOperationMs(deadline),
         );
         if (observedAccountDigest !== expectedAccountDigest) {
-          throw new Error("Remote Chrome account identity changed before conversation recovery.");
+          throw new RecoveryAffinityError(
+            "Chrome account identity changed before conversation recovery.",
+          );
         }
         await runBeforeRecoveryDeadline(
           () => Page.navigate({ url }),
@@ -310,7 +318,7 @@ async function openRecoveryTarget(
         ready = true;
         break;
       } catch (error) {
-        if (error instanceof Error && /identity changed/i.test(error.message)) {
+        if (error instanceof RecoveryAffinityError) {
           throw error;
         }
         lastError = error;
@@ -418,7 +426,7 @@ export async function recoverConversationTab(
       logger("[browser] Recovery: existing Chrome could not reopen the saved conversation.");
       if (
         options.existingEndpoint.browserId ||
-        options.existingEndpoint.accountDigest ||
+        error instanceof RecoveryAffinityError ||
         remainingRecoveryOperationMs(deadline) <= 0
       ) {
         throw error;
@@ -442,20 +450,19 @@ export async function recoverConversationTab(
   const host = chrome.host ?? "127.0.0.1";
   const port = chrome.port;
 
+  const freshEndpoint: RecoveryEndpoint = {
+    host,
+    port,
+    accountDigest: options.existingEndpoint?.accountDigest,
+  };
   let targetId: string | undefined;
   try {
-    targetId = await runBeforeRecoveryDeadline(
-      () => openChatGptTarget({ host, port, url }),
-      deadline,
-      "opening the recovery target",
-      (lateTargetId) =>
-        closeRecoveryTarget({ host, port }, lateTargetId, logger, deadline).catch(() => undefined),
-    );
-    await waitForRecoveredConversationReady({ host, port }, targetId, url, deadline, waitForReady);
+    targetId = await openRecoveryTarget(freshEndpoint, url, logger, deadline);
+    await waitForRecoveredConversationReady(freshEndpoint, targetId, url, deadline, waitForReady);
 
     logger(`[browser] Recovery: Chrome listening on ${host}:${port}; tab loaded.`);
 
-    return { host, port, url, ref: targetId, chrome };
+    return { ...freshEndpoint, url, ref: targetId, chrome };
   } catch (error) {
     const cleanupErrors: unknown[] = [];
     if (targetId) {

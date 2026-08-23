@@ -15,6 +15,8 @@ export async function uploadAttachmentViaDataTransfer(
     runtime: ChromeClient["Runtime"];
     dom?: ChromeClient["DOM"];
     assertPageAffinity?: (action: string) => Promise<void>;
+    expectedConversationId?: string;
+    expectedAccountDigest?: string;
   },
   attachment: BrowserAttachment,
   logger: BrowserLogger,
@@ -48,6 +50,8 @@ export async function uploadAttachmentViaDataTransfer(
     attachment,
     fileInputSelector,
     deps.assertPageAffinity,
+    deps.expectedConversationId,
+    deps.expectedAccountDigest,
   );
 
   logger(`File transferred: ${transferResult.fileName} (${transferResult.size} bytes)`);
@@ -55,6 +59,7 @@ export async function uploadAttachmentViaDataTransfer(
   // Give ChatGPT a moment to process the file
   await delay(500);
   await waitForAttachmentVisible(runtime, transferResult.fileName, 10_000, logger);
+  await deps.assertPageAffinity?.("attachment visibility confirmation");
 
   logger("Attachment queued");
 }

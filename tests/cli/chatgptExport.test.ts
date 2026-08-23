@@ -39,6 +39,18 @@ describe("ChatGPT export endpoint affinity", () => {
     accountDigest,
   });
 
+  test.each([
+    { sessionId: "   ", label: "--session-id" },
+    { obuTabId: "", label: "--obu-tab-id" },
+  ])("rejects an explicitly empty $label selector", async ({ label, ...selector }) => {
+    await expect(
+      handleChatGptExportCommand({
+        targetUrl: "https://chatgpt.com/c/thread-empty-selector",
+        ...selector,
+      }),
+    ).rejects.toThrow(new RegExp(`${label} cannot be empty`, "i"));
+  });
+
   test("matches a root target URL to project conversation evidence", () => {
     expect(
       resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-1", [

@@ -979,13 +979,29 @@ function conversationCookieIdsToPreserve(
     .filter((id): id is string => Boolean(id));
 }
 
+function extractExactChatGptConversationId(url: string): string | undefined {
+  try {
+    const parsed = new URL(url);
+    if (parsed.origin !== "https://chatgpt.com") return undefined;
+    return /^(?:\/c|\/g\/[^/?#]+\/(?:project\/)?c)\/([a-zA-Z0-9-]+)\/?$/.exec(parsed.pathname)?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveInitialRunConversationId(
+  config: Pick<ResolvedBrowserConfig, "url" | "resumeConversationUrl">,
+): string | undefined {
+  return extractExactChatGptConversationId(config.resumeConversationUrl ?? config.url);
+}
+
 function assertRunConversationId(
   expectedConversationId: string | undefined,
   url: string,
   action: string,
 ): void {
   if (!expectedConversationId) return;
-  if (extractConversationIdFromUrl(url) !== expectedConversationId) {
+  if (extractExactChatGptConversationId(url) !== expectedConversationId) {
     throw new BrowserAutomationError(`ChatGPT conversation changed before ${action}.`, {
       stage: "conversation-affinity",
       code: "conversation-mismatch",
@@ -998,7 +1014,7 @@ function latchRunConversationId(
   url: string,
   action: string,
 ): string {
-  const observedConversationId = extractConversationIdFromUrl(url);
+  const observedConversationId = extractExactChatGptConversationId(url);
   if (!observedConversationId) {
     throw new BrowserAutomationError(
       `ChatGPT did not establish a stable conversation before ${action}.`,
@@ -1136,6 +1152,13 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   const fallbackSubmission = options.fallbackSubmission;
 
   let config = resolveBrowserConfig(options.config);
+  const rawExpectedAccountDigest = config.expectedAccountDigest;
+  const expectedAccountDigest = normalizeChatGptAccountDigest(rawExpectedAccountDigest);
+  if (rawExpectedAccountDigest != null && !expectedAccountDigest) {
+    throw new BrowserAutomationError("Expected ChatGPT account identity is invalid.", {
+      stage: "conversation-affinity",
+    });
+  }
   if (process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" && !config.remoteChrome) {
     throw new BrowserAutomationError(
       "The agent wrapper requires a stored or wrapper-selected remote Chrome endpoint; refusing to launch or attach local Chrome.",
@@ -1176,9 +1199,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   const runtimeHintCb = options.runtimeHintCb;
   let lastTargetId: string | undefined;
   let lastUrl: string | undefined;
-  let runConversationId = config.resumeConversationUrl
-    ? extractConversationIdFromUrl(config.resumeConversationUrl)
-    : undefined;
+  let runConversationId = resolveInitialRunConversationId(config);
   let postSubmitConversationUrlPromise: Promise<boolean> | null = null;
   let promptSubmitted = false;
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
@@ -1484,6 +1505,29 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     const raceWithDisconnect = <T>(promise: Promise<T>): Promise<T> =>
       Promise.race([promise, disconnectPromise]);
     const { Network, Page, Runtime, Input, DOM, Target } = client;
+    const wrapperExpectedEmail = resolveWrapperExpectedAccountEmail();
+    const verifyLocalChatGptAccount = async (action: string): Promise<void> => {
+      const observedAccountDigest = await raceWithDisconnect(
+        wrapperExpectedEmail
+          ? assertChatGptAccountEmail(
+              Runtime,
+              wrapperExpectedEmail,
+              action,
+              accountAffinityProbeTimeoutMs(),
+            )
+          : readChatGptAccountDigest(Runtime, accountAffinityProbeTimeoutMs()),
+      );
+      if (
+        (expectedAccountDigest && observedAccountDigest !== expectedAccountDigest) ||
+        (chatGptAccountDigest && observedAccountDigest !== chatGptAccountDigest)
+      ) {
+        throw new BrowserAutomationError(`ChatGPT account identity changed before ${action}.`, {
+          stage: "conversation-affinity",
+        });
+      }
+      chatGptAccountDigest = observedAccountDigest;
+      config.expectedAccountDigest = observedAccountDigest;
+    };
 
     const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
     if (DOM && typeof DOM.enable === "function") {
@@ -1568,13 +1612,17 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     }
 
     if (config.browserTabRef) {
+      await raceWithDisconnect(ensureNotBlocked(Runtime, config.headless, logger));
+      await raceWithDisconnect(ensureLoggedIn(Runtime, logger));
+      await verifyLocalChatGptAccount("scoped ChatGPT navigation");
       if (isResumingConversation) {
         await raceWithDisconnect(
           navigateToChatGPT(Page, Runtime, config.resumeConversationUrl as string, logger),
         );
+        await raceWithDisconnect(ensureNotBlocked(Runtime, config.headless, logger));
+        await raceWithDisconnect(ensureLoggedIn(Runtime, logger));
+        await verifyLocalChatGptAccount("resumed conversation preparation");
       }
-      await raceWithDisconnect(ensureNotBlocked(Runtime, config.headless, logger));
-      await raceWithDisconnect(ensureLoggedIn(Runtime, logger));
       await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
       if (isResumingConversation) {
         await raceWithDisconnect(
@@ -1587,10 +1635,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     } else {
       const baseUrl = CHATGPT_URL;
       // First load the base ChatGPT homepage to satisfy potential interstitials,
-      // then hop to the requested URL if it differs.
+      // then verify the parent account before hopping to a scoped URL.
       await raceWithDisconnect(navigateToChatGPT(Page, Runtime, baseUrl, logger));
       await raceWithDisconnect(ensureNotBlocked(Runtime, config.headless, logger));
-      // Learned: login checks must happen on the base domain before jumping into project URLs.
       await raceWithDisconnect(
         waitForLogin({
           runtime: Runtime,
@@ -1603,12 +1650,15 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           keepBrowser: effectiveKeepBrowser,
         }),
       );
+      await verifyLocalChatGptAccount("scoped ChatGPT navigation");
 
       if (isResumingConversation) {
         await raceWithDisconnect(
           navigateToChatGPT(Page, Runtime, config.resumeConversationUrl as string, logger),
         );
         await raceWithDisconnect(ensureNotBlocked(Runtime, config.headless, logger));
+        await raceWithDisconnect(ensureLoggedIn(Runtime, logger));
+        await verifyLocalChatGptAccount("resumed conversation preparation");
         await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
       } else if (config.url !== baseUrl) {
         await raceWithDisconnect(
@@ -1620,15 +1670,13 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
             logger,
           }),
         );
+        await raceWithDisconnect(ensureNotBlocked(Runtime, config.headless, logger));
+        await raceWithDisconnect(ensureLoggedIn(Runtime, logger));
+        await verifyLocalChatGptAccount("configured ChatGPT page preparation");
       } else {
         await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
       }
       if (isResumingConversation) {
-        // A resumed thread loads its prior history after navigation; ChatGPT can reset the
-        // composer mid-hydration and wipe a freshly-typed prompt. Wait for hydration to settle
-        // and re-confirm the composer before the prompt is typed/submitted below. Wrapped in
-        // raceWithDisconnect so a dropped client aborts immediately instead of polling to the
-        // hydration deadline. Shared with the remote path via the same helper.
         await raceWithDisconnect(
           waitForResumedConversationHydration(Runtime, config.inputTimeoutMs, logger, {
             requirePriorTurns: true,
@@ -1644,6 +1692,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
             ? async () => {
                 await navigateToChatGPT(Page, Runtime, config.url, logger);
                 await ensureNotBlocked(Runtime, config.headless, logger);
+                await ensureLoggedIn(Runtime, logger);
+                await verifyLocalChatGptAccount("chat mode reset");
                 await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
               }
             : undefined,
@@ -1652,17 +1702,6 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     if (chatMode === "switched") {
       await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
     }
-    const wrapperExpectedEmail = resolveWrapperExpectedAccountEmail();
-    chatGptAccountDigest = await raceWithDisconnect(
-      wrapperExpectedEmail
-        ? assertChatGptAccountEmail(
-            Runtime,
-            wrapperExpectedEmail,
-            "Oracle prompt submission",
-            accountAffinityProbeTimeoutMs(),
-          )
-        : readChatGptAccountDigest(Runtime, accountAffinityProbeTimeoutMs()),
-    );
     const assertAttachedConversation = async (action: string): Promise<void> => {
       const url = await raceWithDisconnect(assertChatGptTabOrigin(Runtime, action));
       if (runConversationId) {
@@ -1889,7 +1928,14 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           await assertPageAffinity("attachment upload");
           logger(`Uploading attachment: ${attachment.displayPath}`);
           const uiConfirmed = await uploadAttachmentFile(
-            { runtime: Runtime, dom: DOM, input: Input, assertPageAffinity },
+            {
+              runtime: Runtime,
+              dom: DOM,
+              input: Input,
+              assertPageAffinity,
+              expectedConversationId: runConversationId,
+              expectedAccountDigest: chatGptAccountDigest ?? undefined,
+            },
             attachment,
             logger,
             { expectedCount: attachmentIndex + 1 },
@@ -1913,6 +1959,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           Math.max(baseTimeout, 45_000) + (submissionAttachments.length - 1) * perFileTimeout;
         const attachmentWaitBudget = Math.max(config.attachmentTimeoutMs ?? 0, waitBudget);
         await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentNames, logger);
+        await assertPageAffinity("attachment completion wait");
         logger("All attachments uploaded");
       }
       if (deepResearch) {
@@ -2585,6 +2632,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       waitTimeoutMs: options.config?.timeoutMs,
       expectedConversationId: runConversationId,
       assertPageAffinity,
+      expectedAccountDigest: chatGptAccountDigest ?? undefined,
       checkBlockingUiWarning: () =>
         throwChatGptUiWarningIfPresent({
           Runtime,
@@ -2621,6 +2669,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       sessionId: options.sessionId,
       expectedConversationId: runConversationId,
       assertPageAffinity,
+      expectedAccountDigest: chatGptAccountDigest ?? undefined,
     });
     const savedImageArtifacts = appendArtifacts(undefined, imageArtifacts.savedImages);
     const savedBrowserArtifacts = appendArtifacts(savedImageArtifacts, fileArtifacts.savedFiles);
@@ -3362,13 +3411,32 @@ async function runRemoteBrowserMode(
   }
   const { host, port } = remoteChromeConfig;
   const configuredBrowserId = config.remoteChromeBrowserId?.trim();
-  const configuredAccountDigest = config.remoteChromeAccountDigest;
-  const expectedAccountDigest = normalizeChatGptAccountDigest(configuredAccountDigest);
-  if (configuredAccountDigest != null && !expectedAccountDigest) {
+  const configuredGeneralAccountDigest = normalizeChatGptAccountDigest(
+    config.expectedAccountDigest,
+  );
+  if (config.expectedAccountDigest != null && !configuredGeneralAccountDigest) {
+    throw new BrowserAutomationError("Expected ChatGPT account identity is invalid.", {
+      stage: "remote-browser-identity",
+    });
+  }
+  const configuredRemoteAccountDigest = normalizeChatGptAccountDigest(
+    config.remoteChromeAccountDigest,
+  );
+  if (config.remoteChromeAccountDigest != null && !configuredRemoteAccountDigest) {
     throw new BrowserAutomationError("Remote Chrome account identity is invalid.", {
       stage: "remote-browser-identity",
     });
   }
+  if (
+    configuredGeneralAccountDigest &&
+    configuredRemoteAccountDigest &&
+    configuredGeneralAccountDigest !== configuredRemoteAccountDigest
+  ) {
+    throw new BrowserAutomationError("Stored ChatGPT account identity is conflicting.", {
+      stage: "remote-browser-identity",
+    });
+  }
+  const expectedAccountDigest = configuredRemoteAccountDigest ?? configuredGeneralAccountDigest;
   let expectedBrowserId = configuredBrowserId;
   let browserWSEndpoint = config.remoteChromeBrowserWSEndpoint ?? undefined;
   const liveIdentity = await resolveRemoteChromeBrowserIdentity({ host, port });
@@ -3425,9 +3493,7 @@ async function runRemoteBrowserMode(
   let remoteTargetId: string | null = null;
   let tabLease: BrowserTabLease | null = null;
   let lastUrl: string | undefined;
-  let runConversationId = config.resumeConversationUrl
-    ? extractConversationIdFromUrl(config.resumeConversationUrl)
-    : undefined;
+  let runConversationId = resolveInitialRunConversationId(config);
   let postSubmitConversationUrlPromise: Promise<boolean> | null = null;
   let promptSubmitted = false;
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
@@ -3685,9 +3751,8 @@ async function runRemoteBrowserMode(
         },
       );
     }
-    if (!expectedAccountDigest) {
-      config.remoteChromeAccountDigest = observedAccountDigest;
-    }
+    config.expectedAccountDigest = observedAccountDigest;
+    config.remoteChromeAccountDigest = observedAccountDigest;
     const assertAttachedConversation = async (action: string): Promise<void> => {
       const url = await assertChatGptTabOrigin(Runtime, action);
       if (runConversationId) {
@@ -3869,7 +3934,13 @@ async function runRemoteBrowserMode(
           await assertPageAffinity("attachment upload");
           logger(`Uploading attachment: ${attachment.displayPath}`);
           await uploadAttachmentViaDataTransfer(
-            { runtime: Runtime, dom: DOM, assertPageAffinity },
+            {
+              runtime: Runtime,
+              dom: DOM,
+              assertPageAffinity,
+              expectedConversationId: runConversationId,
+              expectedAccountDigest: config.remoteChromeAccountDigest ?? undefined,
+            },
             attachment,
             logger,
           );
@@ -3882,6 +3953,7 @@ async function runRemoteBrowserMode(
           Math.max(baseTimeout, 30_000) + (submissionAttachments.length - 1) * perFileTimeout;
         const attachmentWaitBudget = Math.max(config.attachmentTimeoutMs ?? 0, waitBudget);
         await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentNames, logger);
+        await assertPageAffinity("attachment completion wait");
         logger("All attachments uploaded");
       }
       if (deepResearch) {
@@ -4459,6 +4531,7 @@ async function runRemoteBrowserMode(
       waitTimeoutMs: options.config?.timeoutMs,
       expectedConversationId: runConversationId,
       assertPageAffinity,
+      expectedAccountDigest: config.remoteChromeAccountDigest ?? undefined,
       checkBlockingUiWarning: () =>
         throwChatGptUiWarningIfPresent({
           Runtime,
@@ -4495,6 +4568,7 @@ async function runRemoteBrowserMode(
       sessionId: options.sessionId,
       expectedConversationId: runConversationId,
       assertPageAffinity,
+      expectedAccountDigest: config.remoteChromeAccountDigest ?? undefined,
     });
     const savedImageArtifacts = appendArtifacts(undefined, imageArtifacts.savedImages);
     const savedBrowserArtifacts = appendArtifacts(savedImageArtifacts, fileArtifacts.savedFiles);
@@ -4714,6 +4788,8 @@ export const __test__ = {
   listIgnoredRemoteChromeFlags,
   normalizeAuthenticatedModelSelectionError,
   conversationCookieIdsToPreserve,
+  extractExactChatGptConversationId,
+  resolveInitialRunConversationId,
   resolveAttachmentUploadTimeoutMs,
   resolveManualLoginWaitMs,
   shouldCleanupBlankTabsAfterLastLease,

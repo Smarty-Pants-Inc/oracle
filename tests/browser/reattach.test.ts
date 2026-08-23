@@ -256,6 +256,29 @@ describe("resumeBrowserSession", () => {
     expect(recoverSession).toHaveBeenCalled();
   });
 
+  test("recovers an account-bound local session after a stale endpoint", async () => {
+    const recoverSession = vi.fn(async () => ({
+      answerText: "recovered",
+      answerMarkdown: "recovered-md",
+    }));
+    const result = await resumeBrowserSession(
+      {
+        chromeHost: "127.0.0.1",
+        chromePort: 51559,
+        tabUrl: "https://chatgpt.com/c/abc",
+        chatGptAccountDigest: "a".repeat(64),
+      },
+      { expectedAccountDigest: "a".repeat(64) },
+      vi.fn() as BrowserLogger,
+      {
+        listTargets: vi.fn().mockRejectedValue(new Error("ECONNREFUSED")),
+        recoverSession,
+      },
+    );
+    expect(result.answerMarkdown).toBe("recovered-md");
+    expect(recoverSession).toHaveBeenCalledOnce();
+  });
+
   test("tries live reattach from browser websocket metadata before falling back", async () => {
     const runtime = {
       chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",

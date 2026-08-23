@@ -134,11 +134,12 @@ describe("browser tab CLI helpers", () => {
         },
       },
     } as SessionMetadata;
-    expect(collectUniqueEndpointsForTest([runtimeOnly])).toEqual([
+    expect(
+      collectUniqueEndpointsForTest([runtimeOnly]).filter((endpoint) => endpoint.port === 9224),
+    ).toEqual([
       {
         host: "127.0.0.1",
         port: 9224,
-        browserId: "browser-runtime",
         accountDigest: "1".repeat(64),
       },
     ]);
@@ -157,7 +158,7 @@ describe("browser tab CLI helpers", () => {
       collectUniqueEndpointsForTest([localRuntimeDigest]).filter(
         (endpoint) => endpoint.port === 9224,
       ),
-    ).toEqual([{ host: "127.0.0.1", port: 9224 }]);
+    ).toEqual([{ host: "127.0.0.1", port: 9224, accountDigest: "1".repeat(64) }]);
 
     const malformedLocalRuntimeDigest = {
       ...localRuntimeDigest,

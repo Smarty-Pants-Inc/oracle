@@ -27,6 +27,68 @@ export function normalizeChatGptAccountDigest(value: unknown): string | undefine
   return /^[a-f0-9]{64}$/.test(digest) ? digest : undefined;
 }
 
+export interface EvaluatedChatGptPageAffinity {
+  expectedConversationId?: string;
+  expectedAccountDigest?: string;
+}
+
+export function buildEvaluatedChatGptPageAffinityGuard({
+  expectedConversationId,
+  expectedAccountDigest,
+}: EvaluatedChatGptPageAffinity): string {
+  const conversationId = expectedConversationId?.trim() || undefined;
+  const accountDigest = normalizeChatGptAccountDigest(expectedAccountDigest);
+  if (expectedAccountDigest !== undefined && !accountDigest) {
+    throw new Error("Expected ChatGPT account affinity is invalid.");
+  }
+  if (!conversationId && !accountDigest) return "";
+
+  return `
+    const assertOracleChatGptPageAffinity = async () => {
+      let pageUrl;
+      try {
+        pageUrl = new URL(location.href);
+      } catch {
+        throw new Error('ChatGPT page origin is unavailable.');
+      }
+      if (pageUrl.origin !== ${JSON.stringify(CHATGPT_ORIGIN)}) {
+        throw new Error('ChatGPT page origin changed.');
+      }
+      const expectedConversationId = ${JSON.stringify(conversationId ?? null)};
+      const conversationMatch = /^(?:\\/c|\\/g\\/[^/?#]+\\/(?:project\\/)?c)\\/([a-zA-Z0-9-]+)\\/?$/.exec(pageUrl.pathname);
+      if (expectedConversationId && conversationMatch?.[1] !== expectedConversationId) {
+        throw new Error('ChatGPT conversation changed.');
+      }
+      const expectedAccountDigest = ${JSON.stringify(accountDigest ?? null)};
+      if (!expectedAccountDigest) return;
+      const target = ${JSON.stringify(CHATGPT_SESSION_URL)};
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), ${DEFAULT_ACCOUNT_IDENTITY_TIMEOUT_MS});
+      try {
+        const response = await fetch(target, {
+          method: 'GET', cache: 'no-store', credentials: 'include', redirect: 'error', signal: controller.signal,
+        });
+        if (!response.ok || response.redirected || response.url !== target || controller.signal.aborted) {
+          throw new Error('Authenticated ChatGPT account identity is unavailable.');
+        }
+        const body = await response.json();
+        const rawUserId = typeof body?.user?.id === 'string' ? body.user.id.trim() : '';
+        if (!rawUserId || rawUserId.length > ${MAX_CHATGPT_ACCOUNT_ID_LENGTH} || !globalThis.crypto?.subtle) {
+          throw new Error('Authenticated ChatGPT account identity is unavailable.');
+        }
+        const bytes = new Uint8Array(await crypto.subtle.digest(
+          'SHA-256', new TextEncoder().encode(rawUserId),
+        ));
+        const observedAccountDigest = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+        if (observedAccountDigest !== expectedAccountDigest) {
+          throw new Error('ChatGPT account identity changed.');
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    };`;
+}
+
 const DEFAULT_ACCOUNT_IDENTITY_TIMEOUT_MS = 10_000;
 const ACCOUNT_IDENTITY_TIMEOUT_ERROR =
   "Timed out while reading authenticated ChatGPT account identity.";

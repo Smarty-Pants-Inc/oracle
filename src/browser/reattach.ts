@@ -1,3 +1,4 @@
+import type { LaunchedChrome } from "chrome-launcher";
 import CDP from "chrome-remote-interface";
 import os from "node:os";
 import path from "node:path";
@@ -47,6 +48,7 @@ import {
 } from "./reattachHelpers.js";
 import { waitForDeepResearchCompletion } from "./actions/deepResearch.js";
 import { normalizeChatGptAccountDigest } from "./chatgptAccount.js";
+class ReattachAffinityError extends Error {}
 
 export interface ReattachDeps {
   listTargets?: () => Promise<TargetInfoLite[]>;
@@ -88,13 +90,13 @@ async function assertReattachPageAffinity(
   try {
     currentUrl = new URL(href);
   } catch {
-    throw new Error(`ChatGPT page origin is unavailable before ${action}.`);
+    throw new ReattachAffinityError(`ChatGPT page origin is unavailable before ${action}.`);
   }
   if (currentUrl.origin !== new URL(CHATGPT_URL).origin) {
-    throw new Error(`ChatGPT page origin changed before ${action}.`);
+    throw new ReattachAffinityError(`ChatGPT page origin changed before ${action}.`);
   }
   if (expectedConversationId && extractConversationIdFromUrl(href) !== expectedConversationId) {
-    throw new Error(`ChatGPT conversation changed before ${action}.`);
+    throw new ReattachAffinityError(`ChatGPT conversation changed before ${action}.`);
   }
   if (expectedAccountDigest) {
     const remainingMs = remainingReattachMs(deadline);
@@ -102,7 +104,7 @@ async function assertReattachPageAffinity(
       throw new Error(`Reattach deadline elapsed before ${action}.`);
     }
     if ((await readChatGptAccountDigest(Runtime, remainingMs)) !== expectedAccountDigest) {
-      throw new Error(`Remote Chrome account identity changed before ${action}.`);
+      throw new ReattachAffinityError(`ChatGPT account identity changed before ${action}.`);
     }
   }
 }
@@ -126,9 +128,14 @@ export async function resumeBrowserSession(
 
   const expectedBrowserId = config?.remoteChromeBrowserId?.trim();
   const configuredBrowserWSEndpoint = config?.remoteChromeBrowserWSEndpoint?.trim();
-  const rawExpectedAccountDigest = config?.remoteChromeAccountDigest;
-  const expectedAccountDigest = normalizeChatGptAccountDigest(rawExpectedAccountDigest);
-  if (rawExpectedAccountDigest != null && !expectedAccountDigest) {
+  const rawConfiguredAccountDigest = config?.expectedAccountDigest;
+  const configuredAccountDigest = normalizeChatGptAccountDigest(rawConfiguredAccountDigest);
+  if (rawConfiguredAccountDigest != null && !configuredAccountDigest) {
+    throw new Error("Stored ChatGPT account identity is invalid.");
+  }
+  const rawRemoteAccountDigest = config?.remoteChromeAccountDigest;
+  const remoteAccountDigest = normalizeChatGptAccountDigest(rawRemoteAccountDigest);
+  if (rawRemoteAccountDigest != null && !remoteAccountDigest) {
     throw new Error("Stored remote Chrome account identity is invalid.");
   }
   const runtimeBrowserWSEndpoint = runtime.chromeBrowserWSEndpoint?.trim();
@@ -137,6 +144,17 @@ export async function resumeBrowserSession(
   if (rawRuntimeAccountDigest != null && !runtimeAccountDigest) {
     throw new Error("Stored ChatGPT account identity is invalid.");
   }
+  if (
+    (configuredAccountDigest &&
+      remoteAccountDigest &&
+      configuredAccountDigest !== remoteAccountDigest) ||
+    (configuredAccountDigest &&
+      runtimeAccountDigest &&
+      configuredAccountDigest !== runtimeAccountDigest) ||
+    (remoteAccountDigest && runtimeAccountDigest && remoteAccountDigest !== runtimeAccountDigest)
+  ) {
+    throw new Error("Stored ChatGPT account identity is conflicting.");
+  }
   const configuredRemoteChrome = config?.remoteChrome ?? undefined;
   const wrapperRemoteSession = process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1";
   const identityBoundRemoteSession = Boolean(
@@ -144,15 +162,15 @@ export async function resumeBrowserSession(
     configuredRemoteChrome ||
     expectedBrowserId ||
     configuredBrowserWSEndpoint ||
-    expectedAccountDigest,
+    remoteAccountDigest,
   );
-  const localAccountBoundSession = !identityBoundRemoteSession && Boolean(runtimeAccountDigest);
+  const expectedRemoteAccountDigest = remoteAccountDigest ?? configuredAccountDigest;
   if (identityBoundRemoteSession) {
     if (
       !expectedBrowserId ||
       !configuredBrowserWSEndpoint ||
       !configuredRemoteChrome ||
-      !expectedAccountDigest
+      !expectedRemoteAccountDigest
     ) {
       throw new Error(
         "Stored remote Chrome session has no verified browser and account identity; start a fresh browser conversation through the agent wrapper.",
@@ -166,9 +184,6 @@ export async function resumeBrowserSession(
       browserIdFromWebSocketEndpoint(runtimeBrowserWSEndpoint) !== expectedBrowserId
     ) {
       throw new Error("Stored remote Chrome browser identity is conflicting.");
-    }
-    if (runtimeAccountDigest && runtimeAccountDigest !== expectedAccountDigest) {
-      throw new Error("Stored remote Chrome account identity is conflicting.");
     }
   }
 
@@ -251,10 +266,9 @@ export async function resumeBrowserSession(
     const timeoutMs = config?.timeoutMs ?? 120_000;
     const responseDeadline = Date.now() + timeoutMs;
     const expectedConversationId = reattachConversationId(runtime);
-    const storedAccountDigest = identityBoundRemoteSession
-      ? expectedAccountDigest
-      : runtimeAccountDigest;
-    const expectedReattachAccountDigest = storedAccountDigest;
+    const expectedReattachAccountDigest = identityBoundRemoteSession
+      ? expectedRemoteAccountDigest
+      : (runtimeAccountDigest ?? configuredAccountDigest);
     const assertPageAffinity = async (action: string): Promise<void> => {
       await assertReattachPageAffinity(
         Runtime,
@@ -384,7 +398,7 @@ export async function resumeBrowserSession(
     return { answerText: aligned.answerText, answerMarkdown: aligned.answerMarkdown };
   } catch (error) {
     await closeAttached();
-    if (identityBoundRemoteSession || localAccountBoundSession) {
+    if (identityBoundRemoteSession || error instanceof ReattachAffinityError) {
       throw error;
     }
     const message = error instanceof Error ? error.message : String(error);
@@ -446,187 +460,221 @@ async function resumeBrowserSessionViaNewChrome(
   if (manualLogin) {
     await mkdir(userDataDir, { recursive: true });
   }
-  const chrome = await launchChrome(resolved, userDataDir, logger);
-  const chromeHost = (chrome as unknown as { host?: string }).host ?? "127.0.0.1";
-  const client = await connectToChrome(chrome.port, logger, chromeHost);
-  const { Network, Page, Runtime, DOM, Target } = client;
 
-  if (Runtime?.enable) {
-    await Runtime.enable();
-  }
-  if (DOM && typeof DOM.enable === "function") {
-    await DOM.enable();
-  }
-  if (!resolved.headless && resolved.hideWindow) {
-    await positionChromeWindowOffscreen(client, logger);
-  }
-  let appliedCookies = 0;
-  if (!manualLogin && resolved.cookieSync) {
-    appliedCookies = await syncCookies(Network, resolved.url, resolved.chromeProfile, logger, {
-      allowErrors: resolved.allowCookieErrors,
-      filterNames: resolved.cookieNames ?? undefined,
-      inlineCookies: resolved.inlineCookies ?? undefined,
-      cookiePath: resolved.chromeCookiePath ?? undefined,
-      waitMs: resolved.cookieSyncWaitMs ?? 0,
+  let chrome: (LaunchedChrome & { host?: string }) | null = null;
+  let client: ChromeClient | null = null;
+  let completed = false;
+  const cleanup = async (): Promise<void> => {
+    if (client && typeof client.close === "function") {
+      await client.close().catch(() => undefined);
+      client = null;
+    }
+    const shouldStopChrome = !resolved.keepBrowser || !completed;
+    if (!shouldStopChrome) return;
+    if (chrome) {
+      try {
+        await Promise.resolve(chrome.kill());
+      } catch {
+        // Best-effort cleanup; continue with profile cleanup.
+      }
+    }
+    if (manualLogin) {
+      if (chrome) {
+        await cleanupStaleProfileState(userDataDir, logger, {
+          lockRemovalMode: "never",
+        }).catch(() => undefined);
+      }
+    } else {
+      await rm(userDataDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  };
+
+  try {
+    chrome = await launchChrome(resolved, userDataDir, logger);
+    const chromeHost = chrome.host ?? "127.0.0.1";
+    client = await connectToChrome(chrome.port, logger, chromeHost);
+    const { Network, Page, Runtime, DOM, Target } = client;
+
+    if (Runtime?.enable) {
+      await Runtime.enable();
+    }
+    if (DOM && typeof DOM.enable === "function") {
+      await DOM.enable();
+    }
+    if (!resolved.headless && resolved.hideWindow) {
+      await positionChromeWindowOffscreen(client, logger);
+    }
+    let appliedCookies = 0;
+    if (!manualLogin && resolved.cookieSync) {
+      appliedCookies = await syncCookies(Network, resolved.url, resolved.chromeProfile, logger, {
+        allowErrors: resolved.allowCookieErrors,
+        filterNames: resolved.cookieNames ?? undefined,
+        inlineCookies: resolved.inlineCookies ?? undefined,
+        cookiePath: resolved.chromeCookiePath ?? undefined,
+        waitMs: resolved.cookieSyncWaitMs ?? 0,
+      });
+    }
+
+    await clearStaleChatGptConversationCookies(Network, Target, logger, {
+      preserveConversationIds: [
+        runtime.conversationId,
+        extractConversationIdFromUrl(runtime.tabUrl ?? ""),
+        extractConversationIdFromUrl(resolved.url),
+      ],
     });
-  }
 
-  await clearStaleChatGptConversationCookies(Network, Target, logger, {
-    preserveConversationIds: [
-      runtime.conversationId,
-      extractConversationIdFromUrl(runtime.tabUrl ?? ""),
-      extractConversationIdFromUrl(resolved.url),
-    ],
-  });
-
-  const timeoutMs = resolved.timeoutMs ?? 120_000;
-  const responseDeadline = Date.now() + timeoutMs;
-  const expectedConversationId = reattachConversationId(runtime);
-  const expectedAccountDigest = normalizeChatGptAccountDigest(runtime.chatGptAccountDigest);
-  const assertPageAffinity = async (action: string): Promise<void> => {
+    const timeoutMs = resolved.timeoutMs ?? 120_000;
+    const responseDeadline = Date.now() + timeoutMs;
+    const expectedConversationId = reattachConversationId(runtime);
+    const configuredAccountDigest = normalizeChatGptAccountDigest(resolved.expectedAccountDigest);
+    if (resolved.expectedAccountDigest != null && !configuredAccountDigest) {
+      throw new Error("Stored ChatGPT account identity is invalid.");
+    }
+    const runtimeAccountDigest = normalizeChatGptAccountDigest(runtime.chatGptAccountDigest);
+    if (runtime.chatGptAccountDigest != null && !runtimeAccountDigest) {
+      throw new Error("Stored ChatGPT account identity is invalid.");
+    }
+    if (
+      configuredAccountDigest &&
+      runtimeAccountDigest &&
+      configuredAccountDigest !== runtimeAccountDigest
+    ) {
+      throw new Error("Stored ChatGPT account identity is conflicting.");
+    }
+    const expectedAccountDigest = runtimeAccountDigest ?? configuredAccountDigest;
+    const assertPageAffinity = async (action: string): Promise<void> => {
+      await assertReattachPageAffinity(
+        Runtime,
+        expectedConversationId,
+        expectedAccountDigest,
+        responseDeadline,
+        action,
+      );
+    };
+    await navigateToChatGPT(Page, Runtime, CHATGPT_URL, logger);
+    await ensureNotBlocked(Runtime, resolved.headless, logger);
+    await ensureLoggedIn(Runtime, logger, { appliedCookies });
     await assertReattachPageAffinity(
       Runtime,
-      expectedConversationId,
+      undefined,
       expectedAccountDigest,
       responseDeadline,
-      action,
+      "new Chrome reattach navigation",
     );
-  };
-  await navigateToChatGPT(Page, Runtime, CHATGPT_URL, logger);
-  await ensureNotBlocked(Runtime, resolved.headless, logger);
-  await ensureLoggedIn(Runtime, logger, { appliedCookies });
-  await assertReattachPageAffinity(
-    Runtime,
-    undefined,
-    expectedAccountDigest,
-    responseDeadline,
-    "new Chrome reattach navigation",
-  );
-  if (resolved.url !== CHATGPT_URL) {
-    await navigateToChatGPT(Page, Runtime, resolved.url, logger);
-    await ensureNotBlocked(Runtime, resolved.headless, logger);
-  }
-  await ensurePromptReady(Runtime, resolved.inputTimeoutMs, logger);
-
-  const conversationUrl = buildConversationUrl(runtime, resolved.url);
-  if (conversationUrl) {
-    logger(`Reopening conversation at ${conversationUrl}`);
-    await navigateToChatGPT(Page, Runtime, conversationUrl, logger);
-    await ensureNotBlocked(Runtime, resolved.headless, logger);
+    if (resolved.url !== CHATGPT_URL) {
+      await navigateToChatGPT(Page, Runtime, resolved.url, logger);
+      await ensureNotBlocked(Runtime, resolved.headless, logger);
+      await assertReattachPageAffinity(
+        Runtime,
+        undefined,
+        expectedAccountDigest,
+        responseDeadline,
+        "new Chrome configured page navigation",
+      );
+    }
     await ensurePromptReady(Runtime, resolved.inputTimeoutMs, logger);
-  } else {
-    const opened = await openConversationFromSidebarWithRetry(
-      Runtime,
-      {
-        conversationId: expectedConversationId,
-        preferProjects:
-          resolved.url !== CHATGPT_URL ||
-          Boolean(
-            runtime.tabUrl && (/\/g\//.test(runtime.tabUrl) || runtime.tabUrl.includes("/project")),
-          ),
-        promptPreview: deps.promptPreview,
-      },
-      15_000,
-    );
-    if (!opened) {
-      throw new Error("Unable to locate prior ChatGPT conversation in sidebar.");
-    }
-    await waitForLocationChange(Runtime, 15_000);
-  }
 
-  const expectedConversationUrl =
-    conversationUrl ??
-    (expectedConversationId ? `${CHATGPT_URL}/c/${expectedConversationId}` : undefined);
-  const waitForHydration = deps.waitForConversationHydration ?? waitForResumedConversationHydration;
-  await waitForHydration(Runtime, resolved.inputTimeoutMs, logger, {
-    requirePriorTurns: true,
-    requirePromptReady: false,
-    expectedConversationUrl,
-  });
-  await assertPageAffinity("new Chrome reattach hydration");
-  const waitForResponse = deps.waitForAssistantResponse ?? waitForAssistantResponse;
-  const captureMarkdown = deps.captureAssistantMarkdown ?? captureAssistantMarkdown;
-  const cleanup = async () => {
-    if (client && typeof client.close === "function") {
-      try {
-        await client.close();
-      } catch {
-        // ignore
+    const conversationUrl = buildConversationUrl(runtime, resolved.url);
+    if (conversationUrl) {
+      logger(`Reopening conversation at ${conversationUrl}`);
+      await navigateToChatGPT(Page, Runtime, conversationUrl, logger);
+      await ensureNotBlocked(Runtime, resolved.headless, logger);
+      await ensurePromptReady(Runtime, resolved.inputTimeoutMs, logger);
+    } else {
+      const opened = await openConversationFromSidebarWithRetry(
+        Runtime,
+        {
+          conversationId: expectedConversationId,
+          preferProjects:
+            resolved.url !== CHATGPT_URL ||
+            Boolean(
+              runtime.tabUrl &&
+              (/\/g\//.test(runtime.tabUrl) || runtime.tabUrl.includes("/project")),
+            ),
+          promptPreview: deps.promptPreview,
+        },
+        15_000,
+      );
+      if (!opened) {
+        throw new Error("Unable to locate prior ChatGPT conversation in sidebar.");
       }
+      await waitForLocationChange(Runtime, 15_000);
     }
-    if (!resolved.keepBrowser) {
-      try {
-        await chrome.kill();
-      } catch {
-        // ignore
-      }
-      if (manualLogin) {
-        await cleanupStaleProfileState(userDataDir, logger, { lockRemovalMode: "never" }).catch(
-          () => undefined,
-        );
-      } else {
-        await rm(userDataDir, { recursive: true, force: true }).catch(() => undefined);
-      }
+
+    const expectedConversationUrl =
+      conversationUrl ??
+      (expectedConversationId ? `${CHATGPT_URL}/c/${expectedConversationId}` : undefined);
+    const waitForHydration =
+      deps.waitForConversationHydration ?? waitForResumedConversationHydration;
+    await waitForHydration(Runtime, resolved.inputTimeoutMs, logger, {
+      requirePriorTurns: true,
+      requirePromptReady: false,
+      expectedConversationUrl,
+    });
+    await assertPageAffinity("new Chrome reattach hydration");
+    const waitForResponse = deps.waitForAssistantResponse ?? waitForAssistantResponse;
+    const captureMarkdown = deps.captureAssistantMarkdown ?? captureAssistantMarkdown;
+    const minTurnIndex =
+      (await readPromptPreviewTurnIndex(Runtime, deps.promptPreview)) ??
+      (deps.promptPreview ? null : await readConversationTurnIndex(Runtime, logger));
+    if (resolved.researchMode === "deep") {
+      const waitForDeepResearch =
+        deps.waitForDeepResearchCompletion ?? waitForDeepResearchCompletion;
+      const researchResult = await waitForDeepResearch(
+        Runtime,
+        logger,
+        timeoutMs,
+        minTurnIndex ?? undefined,
+        Page,
+        client,
+        {
+          requireScopedTargetOwner: true,
+          expectedConversationId,
+          assertPageAffinity,
+        },
+      );
+      await assertPageAffinity("new Chrome reattach Deep Research final return");
+      completed = true;
+      return {
+        answerText: researchResult.text,
+        answerMarkdown: researchResult.text,
+      };
     }
-  };
-  const minTurnIndex =
-    (await readPromptPreviewTurnIndex(Runtime, deps.promptPreview)) ??
-    (deps.promptPreview ? null : await readConversationTurnIndex(Runtime, logger));
-  if (resolved.researchMode === "deep") {
-    const waitForDeepResearch = deps.waitForDeepResearchCompletion ?? waitForDeepResearchCompletion;
-    const researchResult = await waitForDeepResearch(
+    const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
+    await assertPageAffinity("new Chrome reattach response wait");
+    const answer = await waitForResponse(
       Runtime,
-      logger,
       timeoutMs,
+      logger,
       minTurnIndex ?? undefined,
-      Page,
-      client,
-      {
-        requireScopedTargetOwner: true,
+      expectedConversationId,
+    );
+    await assertPageAffinity("new Chrome reattach response capture");
+    const recovered = await recoverPromptEcho(
+      Runtime,
+      answer,
+      promptEcho,
+      logger,
+      minTurnIndex,
+      timeoutMs,
+      { expectedConversationId, assertPageAffinity },
+    );
+    const markdown =
+      (await captureMarkdown(
+        Runtime,
+        recovered.meta,
+        logger,
         expectedConversationId,
         assertPageAffinity,
-      },
-    );
-    await assertPageAffinity("new Chrome reattach Deep Research final return");
+      )) ?? recovered.text;
+    const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
+
+    await assertPageAffinity("new Chrome reattach final return");
+    completed = true;
+    return { answerText: aligned.answerText, answerMarkdown: aligned.answerMarkdown };
+  } finally {
     await cleanup();
-    return {
-      answerText: researchResult.text,
-      answerMarkdown: researchResult.text,
-    };
   }
-  const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
-  await assertPageAffinity("new Chrome reattach response wait");
-  const answer = await waitForResponse(
-    Runtime,
-    timeoutMs,
-    logger,
-    minTurnIndex ?? undefined,
-    expectedConversationId,
-  );
-  await assertPageAffinity("new Chrome reattach response capture");
-  const recovered = await recoverPromptEcho(
-    Runtime,
-    answer,
-    promptEcho,
-    logger,
-    minTurnIndex,
-    timeoutMs,
-    { expectedConversationId, assertPageAffinity },
-  );
-  const markdown =
-    (await captureMarkdown(
-      Runtime,
-      recovered.meta,
-      logger,
-      expectedConversationId,
-      assertPageAffinity,
-    )) ?? recovered.text;
-  const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
-
-  await assertPageAffinity("new Chrome reattach final return");
-  await cleanup();
-
-  return { answerText: aligned.answerText, answerMarkdown: aligned.answerMarkdown };
 }
 
 async function readPromptPreviewTurnIndex(

@@ -60,6 +60,7 @@ export const DEFAULT_BROWSER_CONFIG: ResolvedBrowserConfig = {
   modelStrategy: DEFAULT_MODEL_STRATEGY,
   debug: false,
   allowCookieErrors: false,
+  expectedAccountDigest: null,
   remoteChrome: null,
   remoteChromeBrowserId: null,
   remoteChromeBrowserWSEndpoint: null,
@@ -154,6 +155,8 @@ export function resolveBrowserConfig(
     debug: config?.debug ?? DEFAULT_BROWSER_CONFIG.debug,
     allowCookieErrors:
       config?.allowCookieErrors ?? envAllowCookieErrors ?? DEFAULT_BROWSER_CONFIG.allowCookieErrors,
+    expectedAccountDigest:
+      config?.expectedAccountDigest ?? DEFAULT_BROWSER_CONFIG.expectedAccountDigest,
     remoteChromeBrowserId:
       config?.remoteChromeBrowserId ?? DEFAULT_BROWSER_CONFIG.remoteChromeBrowserId,
     remoteChromeBrowserWSEndpoint:

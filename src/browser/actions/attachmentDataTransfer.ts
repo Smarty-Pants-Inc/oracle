@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { ChromeClient, BrowserAttachment } from "../types.js";
+import { buildEvaluatedChatGptPageAffinityGuard } from "../chatgptAccount.js";
 
 export const MAX_DATA_TRANSFER_BYTES = 512 * 1024 * 1024;
 
@@ -9,6 +10,8 @@ export async function transferAttachmentViaDataTransfer(
   attachment: BrowserAttachment,
   selector: string,
   assertPageAffinity?: (action: string) => Promise<void>,
+  expectedConversationId?: string,
+  expectedAccountDigest?: string,
 ): Promise<{ fileName: string; size: number }> {
   const fileContent = await readFile(attachment.path);
   if (fileContent.length > MAX_DATA_TRANSFER_BYTES) {
@@ -20,8 +23,13 @@ export async function transferAttachmentViaDataTransfer(
   const base64Content = fileContent.toString("base64");
   const fileName = path.basename(attachment.path);
   const mimeType = guessMimeType(fileName);
-
-  const expression = `(() => {
+  const affinityGuard = buildEvaluatedChatGptPageAffinityGuard({
+    expectedConversationId,
+    expectedAccountDigest,
+  });
+  const expression = `${affinityGuard ? "(async () => {" : "(() => {"}
+    ${affinityGuard}
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     if (!('File' in window) || !('Blob' in window) || !('DataTransfer' in window) || typeof atob !== 'function') {
       return { success: false, error: 'Required file APIs are not available in this browser' };
     }
@@ -34,6 +42,7 @@ export async function transferAttachmentViaDataTransfer(
       return { success: false, error: 'Found element is not a file input' };
     }
 
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     const base64Data = ${JSON.stringify(base64Content)};
     const binaryString = atob(base64Data);
     const bytes = new Uint8Array(binaryString.length);
@@ -51,6 +60,7 @@ export async function transferAttachmentViaDataTransfer(
     dataTransfer.items.add(file);
     let assigned = false;
 
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     const proto = Object.getPrototypeOf(fileInput);
     const descriptor = proto ? Object.getOwnPropertyDescriptor(proto, 'files') : null;
     if (descriptor?.set) {
@@ -84,16 +94,22 @@ export async function transferAttachmentViaDataTransfer(
       return { success: false, error: 'Unable to assign FileList to input' };
     }
 
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     return { success: true, fileName: file.name, size: file.size };
   })()`;
 
   await assertPageAffinity?.("attachment transfer");
-  const evalResult = await runtime.evaluate({ expression, returnByValue: true });
+  const evalResult = await runtime.evaluate({
+    expression,
+    awaitPromise: true,
+    returnByValue: true,
+  });
   if (evalResult.exceptionDetails) {
-    const description = evalResult.exceptionDetails.text ?? "JS evaluation failed";
-    throw new Error(`Failed to transfer file to browser: ${description}`);
+    throw new Error("Failed to transfer file to browser: in-page affinity guard failed.");
   }
+  await assertPageAffinity?.("attachment transfer completion");
 
   if (
     !evalResult.result ||

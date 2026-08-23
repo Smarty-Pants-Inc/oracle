@@ -381,12 +381,13 @@ module.exports = () => ({
         ],
         { env, stdio: ["ignore", "pipe", "pipe"] },
       );
-      let output = "";
+      let stdout = "";
+      let stderr = "";
       child.stdout.on("data", (chunk) => {
-        output += String(chunk);
+        stdout += String(chunk);
       });
       child.stderr.on("data", (chunk) => {
-        output += String(chunk);
+        stderr += String(chunk);
       });
 
       await waitForChildOutput(child, 2000);
@@ -399,7 +400,8 @@ module.exports = () => ({
       const exitedViaHandler = exit.code === 130 && exit.signal === null;
       expect(exitedViaSignal || exitedViaHandler).toBe(true);
       if (exitedViaHandler) {
-        expect(output).toContain("Cancelled.");
+        expect(stderr).toContain("Cancelled.");
+        expect(stdout).not.toContain("Cancelled.");
       }
       await expect(readFile(markerPath, "utf8")).rejects.toThrow();
       await rm(oracleHome, { recursive: true, force: true });

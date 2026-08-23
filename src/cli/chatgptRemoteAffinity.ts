@@ -63,11 +63,11 @@ export function parseRemoteChromeTarget(raw: string): { host: string; port: numb
 }
 
 export function hasChatGptRemoteAffinityFlags(options: ChatGptRemoteAffinityCliOptions): boolean {
-  return Boolean(
-    options.remoteChromeBrowserId ||
-    options.remoteChromeBrowserWs ||
-    options.remoteChromeAccountDigest ||
-    options.expectedEmail,
+  return (
+    options.remoteChromeBrowserId !== undefined ||
+    options.remoteChromeBrowserWs !== undefined ||
+    options.remoteChromeAccountDigest !== undefined ||
+    options.expectedEmail !== undefined
   );
 }
 

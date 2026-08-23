@@ -94,6 +94,15 @@ describe("ChatGPT account-bound wrapper CLI affinity", () => {
     ).rejects.toThrow(new RegExp(`${CHATGPT_ACCOUNT_BOUND_WRAPPER_ENV}=1`, "i"));
   });
 
+  test("treats empty hidden affinity values as explicitly supplied", async () => {
+    await expect(
+      handleChatGptExportCommand({
+        targetUrl: "https://chatgpt.com/c/conv-empty-affinity",
+        expectedEmail: "",
+      }),
+    ).rejects.toThrow(new RegExp(`${CHATGPT_ACCOUNT_BOUND_WRAPPER_ENV}=1`, "i"));
+  });
+
   test("inventory requires the dedicated marker and JSON output", async () => {
     await expect(
       handleChatGptInventoryCommand({ remoteChrome: "127.0.0.1:9223", json: true }),

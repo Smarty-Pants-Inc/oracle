@@ -19,7 +19,11 @@ import {
   bindRemoteChromeBrowserWebSocketEndpoint,
   resolveRemoteChromeBrowserIdentity,
 } from "./profileState.js";
-import { closeTab, connectToRemoteChromeTarget } from "./chromeLifecycle.js";
+import {
+  closeTab,
+  connectToRemoteChromeTarget,
+  type RemoteChromeConnection,
+} from "./chromeLifecycle.js";
 import {
   assertChatGptAccountAffinity,
   MAX_CHATGPT_ACCOUNT_ID_LENGTH,
@@ -241,9 +245,18 @@ async function runCleanupBeforeDeadline<T>(
   }
   void Promise.resolve()
     .then(operation)
+
     .then((result) => Promise.resolve(disposeLateResult?.(result)))
     .catch(() => undefined);
   throw new Error(timeoutMessage);
+}
+export function runBeforeExportDeadlineForTest<T>(
+  operation: () => Promise<T>,
+  deadline: number,
+  timeoutMessage: string,
+  disposeLateResult?: (result: T) => Promise<void> | void,
+): Promise<T> {
+  return runBeforeDeadline(operation, deadline, timeoutMessage, disposeLateResult);
 }
 
 const SECRET_PATTERNS: Array<{ label: string; pattern: RegExp }> = [
@@ -771,6 +784,40 @@ async function waitForConversationUrl(
   throw new Error("Conversation did not open at the approved URL.");
 }
 
+async function closeExportConnectionOrTarget(
+  connection: Pick<RemoteChromeConnection, "close">,
+  host: string,
+  port: number,
+  targetId: string,
+  deadline: number,
+): Promise<void> {
+  try {
+    await runCleanupBeforeDeadline(
+      () => connection.close(),
+      deadline,
+      "Timed out closing the ChatGPT export target.",
+    );
+    return;
+  } catch (closeError) {
+    let fallbackError: unknown;
+    try {
+      const closed = await runCleanupBeforeDeadline(
+        () => closeTab(port, targetId, () => {}, host),
+        deadline,
+        "Timed out fallback-closing the ChatGPT export target.",
+      );
+      if (closed) return;
+      fallbackError = new Error("ChatGPT export target cleanup was not confirmed.");
+    } catch (error) {
+      fallbackError = error;
+    }
+    throw new AggregateError(
+      [closeError, fallbackError],
+      "ChatGPT export target connection and fallback cleanup failed.",
+    );
+  }
+}
+
 async function closeOpenedChatGptTarget(
   host: string,
   port: number,
@@ -788,13 +835,16 @@ async function closeOpenedChatGptTarget(
         }),
       deadline,
       "Timed out reconnecting to clean up the ChatGPT export target.",
-      (lateConnection) => lateConnection.close(),
+      (lateConnection) =>
+        closeExportConnectionOrTarget(
+          lateConnection,
+          host,
+          port,
+          targetId,
+          Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS,
+        ),
     );
-    await runCleanupBeforeDeadline(
-      () => connection.close(),
-      deadline,
-      "Timed out closing the ChatGPT export target.",
-    );
+    await closeExportConnectionOrTarget(connection, host, port, targetId, deadline);
     return;
   }
   const closed = await runCleanupBeforeDeadline(
@@ -824,7 +874,7 @@ async function evaluateByValue<T>(
       ? await evaluate()
       : await runBeforeDeadline(evaluate, deadline, `Timed out waiting for ${timeoutLabel}.`);
   if (result.exceptionDetails) {
-    throw new Error(`${timeoutLabel} failed: ${JSON.stringify(result.exceptionDetails)}`);
+    throw new Error(`${timeoutLabel} failed in the page context.`);
   }
   return result.result?.value as T;
 }
@@ -890,7 +940,7 @@ async function evaluateObuByValue<T>(
     cleanup,
   );
   if (result.exceptionDetails) {
-    throw new Error(`${timeoutLabel} failed: ${JSON.stringify(result.exceptionDetails)}`);
+    throw new Error(`${timeoutLabel} failed in the page context.`);
   }
   return asRecord(result.result).value as T;
 }
@@ -1667,15 +1717,30 @@ async function evaluateReadOnlyConversationGet(
     "Timed out waiting for authenticated ChatGPT exact GET.",
   );
   if (outcome.exceptionDetails) {
-    throw new Error(
-      `Read-only conversation GET failed: ${JSON.stringify(outcome.exceptionDetails)}`,
-    );
+    throw new Error("Read-only conversation GET failed in the page context.");
   }
   const hit = outcome.result?.value;
   if (!hit || typeof hit !== "object" || Array.isArray(hit)) {
     throw new Error("Read-only conversation GET returned no response metadata.");
   }
   return hit as CaptureHitSummary;
+}
+export function evaluateReadOnlyConversationGetForTest(
+  Runtime: ChromeClient["Runtime"],
+  targetApiUrl: string,
+  conversationId: string,
+  expectedAccountDigest: string,
+  expectedEmail: string | undefined,
+  deadline: number,
+): Promise<CaptureHitSummary> {
+  return evaluateReadOnlyConversationGet(
+    Runtime,
+    targetApiUrl,
+    conversationId,
+    expectedAccountDigest,
+    expectedEmail,
+    deadline,
+  );
 }
 
 async function captureChatGptConversationReadOnly({
@@ -1721,7 +1786,14 @@ async function captureChatGptConversationReadOnly({
       }),
     deadline,
     "Timed out connecting to the read-only ChatGPT export target.",
-    (lateConnection) => lateConnection.close(),
+    (lateConnection) =>
+      closeExportConnectionOrTarget(
+        lateConnection,
+        host,
+        port,
+        lateConnection.targetId ?? "",
+        Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS,
+      ),
   );
   const targetId = opened.targetId;
 
@@ -1882,11 +1954,7 @@ async function captureChatGptConversationReadOnly({
     }
   }
   try {
-    await runCleanupBeforeDeadline(
-      () => opened.close(),
-      cleanupDeadline,
-      "Timed out closing the read-only ChatGPT export target.",
-    );
+    await closeExportConnectionOrTarget(opened, host, port, targetId ?? "", cleanupDeadline);
   } catch (error) {
     cleanupErrors.push(error);
   }
@@ -2163,6 +2231,15 @@ export async function captureApprovedChatGptConversationBackend(
         }),
       deadline,
       "Timed out registering the ChatGPT export capture hook.",
+      (lateRegistration) =>
+        runCleanupBeforeDeadline(
+          () =>
+            Page.removeScriptToEvaluateOnNewDocument({
+              identifier: lateRegistration.identifier,
+            }),
+          Date.now() + EXPORT_CLEANUP_ALLOWANCE_MS,
+          "Timed out removing a late ChatGPT export capture hook.",
+        ),
     );
     captureScriptIdentifier = registration.identifier;
     rawCapturePending = true;

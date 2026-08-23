@@ -12,6 +12,8 @@ export async function uploadAttachmentFile(
     dom?: ChromeClient["DOM"];
     input?: ChromeClient["Input"];
     assertPageAffinity?: (action: string) => Promise<void>;
+    expectedConversationId?: string;
+    expectedAccountDigest?: string;
   },
   attachment: BrowserAttachment,
   logger: BrowserLogger,
@@ -1043,6 +1045,8 @@ export async function uploadAttachmentFile(
                 attachment,
                 selector,
                 deps.assertPageAffinity,
+                deps.expectedConversationId,
+                deps.expectedAccountDigest,
               );
             } catch (error) {
               logger(

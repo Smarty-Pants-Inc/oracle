@@ -71,6 +71,8 @@ export interface BrowserSessionConfig {
   modelStrategy?: BrowserModelStrategy;
   debug?: boolean;
   allowCookieErrors?: boolean;
+  /** SHA-256 digest of the authenticated ChatGPT user id; never the user id itself. */
+  expectedAccountDigest?: string | null;
   remoteChrome?: { host: string; port: number } | null;
   remoteChromeBrowserId?: string | null;
   remoteChromeBrowserWSEndpoint?: string | null;

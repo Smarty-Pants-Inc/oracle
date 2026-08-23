@@ -1030,7 +1030,12 @@ describe("performSessionRun", () => {
     vi.mocked(runBrowserSessionExecution).mockResolvedValue({
       usage: { inputTokens: 100, outputTokens: 50, reasoningTokens: 0, totalTokens: 150 },
       elapsedMs: 2000,
-      runtime: { chromePid: 123, chromePort: 9222, userDataDir: "/tmp/profile" },
+      runtime: {
+        chromePid: 123,
+        chromePort: 9222,
+        userDataDir: "/tmp/profile",
+        chatGptAccountDigest: "a".repeat(64),
+      },
       modelSelection: {
         requestedModel: "GPT-5.5 Pro",
         resolvedLabel: "Pro",
@@ -1073,6 +1078,10 @@ describe("performSessionRun", () => {
         warnings: [expect.objectContaining({ code: "browser-pro-fast-large-run" })],
       }),
       artifacts: [{ kind: "transcript", path: "/tmp/transcript.md" }],
+    });
+    expect(finalUpdate).toMatchObject({
+      browser: { config: { expectedAccountDigest: "a".repeat(64) } },
+      options: { browserConfig: { expectedAccountDigest: "a".repeat(64) } },
     });
     expect(finalUpdate).toHaveProperty("errorMessage", undefined);
     expect(sessionStoreMock.updateModelRun).toHaveBeenCalledWith(

@@ -256,6 +256,15 @@ function parsePositiveInteger(raw: string | undefined, label: string): number | 
   return parsed;
 }
 
+function normalizeExportSelector(raw: string | undefined, label: string): string | undefined {
+  if (raw === undefined) return undefined;
+  const normalized = raw.trim();
+  if (!normalized) {
+    throw new Error(`${label} cannot be empty.`);
+  }
+  return normalized;
+}
+
 function assertCompatibleChatGptExportAffinitySources(options: ChatGptExportCliOptions): void {
   const hasSessionAffinity = options.sessionId !== undefined;
   const hasObuAffinity = options.obuSessionId !== undefined || options.obuTabId !== undefined;
@@ -284,6 +293,9 @@ function assertCompatibleChatGptExportAffinitySources(options: ChatGptExportCliO
 }
 
 export async function handleChatGptExportCommand(options: ChatGptExportCliOptions): Promise<void> {
+  options.sessionId = normalizeExportSelector(options.sessionId, "--session-id");
+  options.obuSessionId = normalizeExportSelector(options.obuSessionId, "--obu-session-id");
+  options.obuTabId = normalizeExportSelector(options.obuTabId, "--obu-tab-id");
   const targetUrl = options.targetUrl?.trim();
   if (!targetUrl) {
     throw new Error("--target-url is required.");

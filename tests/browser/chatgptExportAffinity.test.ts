@@ -623,7 +623,7 @@ describe("ChatGPT export account receipt", () => {
       browserWSEndpoint: string;
       close: () => Promise<void>;
     }) => void;
-    const lateClose = vi.fn(async () => undefined);
+    const lateClose = vi.fn().mockRejectedValue(new Error("late detach failed"));
     lifecycleMocks.connectToRemoteChromeTarget.mockImplementation(
       () =>
         new Promise((resolve) => {
@@ -658,9 +658,15 @@ describe("ChatGPT export account receipt", () => {
       browserWSEndpoint,
       close: lateClose,
     });
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(lateClose).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(lateClose).toHaveBeenCalledOnce());
+    await vi.waitFor(() =>
+      expect(lifecycleMocks.closeTab).toHaveBeenCalledWith(
+        9223,
+        "target-late",
+        expect.any(Function),
+        "127.0.0.1",
+      ),
+    );
   });
 
   test("bounds a stalled owned-target close to the cleanup allowance", async () => {

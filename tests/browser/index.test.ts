@@ -51,6 +51,35 @@ describe("conversation cookie cleanup", () => {
 
     expect(__test__.conversationCookieIdsToPreserve(config, null)).toEqual(["current-thread"]);
   });
+
+  test("seeds run affinity from the exact resume URL or configured URL", () => {
+    expect(
+      __test__.resolveInitialRunConversationId(
+        resolveBrowserConfig({ url: "https://chatgpt.com/c/configured-thread" }),
+      ),
+    ).toBe("configured-thread");
+    expect(
+      __test__.resolveInitialRunConversationId(
+        resolveBrowserConfig({
+          url: "https://chatgpt.com/c/configured-thread",
+          resumeConversationUrl: "https://chatgpt.com/c/resumed-thread",
+        }),
+      ),
+    ).toBe("resumed-thread");
+  });
+
+  test("does not read conversation affinity from query strings or fragments", () => {
+    expect(
+      __test__.extractExactChatGptConversationId(
+        "https://chatgpt.com/?next=https://chatgpt.com/c/private-thread",
+      ),
+    ).toBeUndefined();
+    expect(
+      __test__.extractExactChatGptConversationId(
+        "https://chatgpt.com/#https://chatgpt.com/c/private-thread",
+      ),
+    ).toBeUndefined();
+  });
 });
 
 describe("remote browser identity", () => {
