@@ -624,7 +624,7 @@ export function buildChatGptInventoryAuthCaptureHook(
       retainedHeaders = null;
       if (window.fetch === wrappedFetch) window.fetch = originalFetch;
       if (window[KEY] === inventory) delete window[KEY];
-      return window.fetch === originalFetch && window[KEY] !== inventory;
+      return window.fetch !== wrappedFetch && window[KEY] !== inventory;
     },
   };
   const wrappedFetch = async function(input, init) {
