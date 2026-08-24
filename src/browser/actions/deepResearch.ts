@@ -12,8 +12,10 @@ import {
 import { buildConversationTurnListExpression } from "../conversationTurns.js";
 import { delay } from "../utils.js";
 import { isDeepResearchIncompleteText } from "../deepResearchResult.js";
+import { CHATGPT_ORIGINS } from "../conversationUrl.js";
 import { buildClickDispatcher } from "./domEvents.js";
 import { captureAssistantMarkdown, readAssistantSnapshot } from "./assistantResponse.js";
+import { buildEvaluatedChatGptPageAffinityGuard } from "../chatgptAccount.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
 
 type ActivateOutcome =
@@ -21,8 +23,35 @@ type ActivateOutcome =
   | { status: "already-active" }
   | { status: "plus-button-missing" }
   | { status: "dropdown-item-missing"; available?: string[] }
-  | { status: "pill-not-confirmed"; clickPoint?: { x?: number; y?: number } };
+  | { status: "pill-not-confirmed"; clickPoint?: { x?: number; y?: number } }
+  | { status: "conversation-mismatch" };
 
+interface DeepResearchAffinityOptions {
+  expectedConversationId?: string;
+  expectedConversationUrl?: string;
+  assertPageAffinity?: (action: string) => Promise<void>;
+}
+function buildGuardedDeepResearchProbeExpression(
+  expression: string,
+  expectedConversationId?: string,
+  expectedConversationUrl?: string,
+): { expression: string; awaitPromise: boolean } {
+  const affinityGuard = buildEvaluatedChatGptPageAffinityGuard({
+    expectedConversationId,
+    expectedConversationUrl,
+  });
+  if (!affinityGuard) return { expression, awaitPromise: false };
+  return {
+    expression: `(async () => {
+      ${affinityGuard}
+      await assertOracleChatGptPageAffinity();
+      const value = await (${expression});
+      await assertOracleChatGptPageAffinity();
+      return value;
+    })()`,
+    awaitPromise: true,
+  };
+}
 /**
  * Activates Deep Research mode through ChatGPT's composer tools menu and
  * verifies the selected tool pill before prompt submission.
@@ -31,8 +60,13 @@ export async function activateDeepResearch(
   Runtime: ChromeClient["Runtime"],
   Input: ChromeClient["Input"],
   logger: BrowserLogger,
+  options: DeepResearchAffinityOptions = {},
 ): Promise<void> {
-  const expression = buildActivateDeepResearchExpression();
+  await options.assertPageAffinity?.("Deep Research activation");
+  const expression = buildActivateDeepResearchExpression(
+    options.expectedConversationId,
+    options.expectedConversationUrl,
+  );
   const outcome = await Runtime.evaluate({
     expression,
     awaitPromise: true,
@@ -65,8 +99,8 @@ export async function activateDeepResearch(
     case "pill-not-confirmed": {
       const point = result.clickPoint;
       if (typeof point?.x === "number" && typeof point.y === "number") {
-        await clickTrustedPoint(Runtime, Input, point.x, point.y);
-        if (await waitForDeepResearchPill(Runtime)) {
+        await clickTrustedPoint(Runtime, Input, point.x, point.y, options);
+        if (await waitForDeepResearchPill(Runtime, 5000, options)) {
           logger("Deep Research mode activated");
           return;
         }
@@ -76,6 +110,11 @@ export async function activateDeepResearch(
         { stage: "deep-research-activate", code: "pill-not-confirmed" },
       );
     }
+    case "conversation-mismatch":
+      throw new BrowserAutomationError(
+        "ChatGPT conversation changed before Deep Research activation.",
+        { stage: "deep-research-activate", code: "conversation-mismatch" },
+      );
     default:
       throw new BrowserAutomationError("Unexpected result from Deep Research activation.", {
         stage: "deep-research-activate",
@@ -88,30 +127,57 @@ async function clickTrustedPoint(
   Input: ChromeClient["Input"],
   x: number,
   y: number,
+  options: DeepResearchAffinityOptions,
 ): Promise<void> {
+  const affinityGuard = buildEvaluatedChatGptPageAffinityGuard(options);
   if (Input && typeof Input.dispatchMouseEvent === "function") {
+    await options.assertPageAffinity?.("Deep Research trusted click start");
     await Input.dispatchMouseEvent({ type: "mouseMoved", x, y });
+    await options.assertPageAffinity?.("Deep Research trusted click");
     await Input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", clickCount: 1 });
+    await options.assertPageAffinity?.("Deep Research trusted click release");
     await Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+    await options.assertPageAffinity?.("Deep Research trusted click completion");
     return;
   }
-  await Runtime.evaluate({
-    expression: `(() => {
+  const expression = affinityGuard
+    ? `(async () => {
+      ${affinityGuard}
+      await assertOracleChatGptPageAffinity();
+      const el = document.elementFromPoint(${JSON.stringify(x)}, ${JSON.stringify(y)});
+      if (!(el instanceof HTMLElement)) return false;
+      el.click();
+      await assertOracleChatGptPageAffinity();
+      return true;
+    })()`
+    : `(() => {
       const el = document.elementFromPoint(${JSON.stringify(x)}, ${JSON.stringify(y)});
       if (!(el instanceof HTMLElement)) return false;
       el.click();
       return true;
-    })()`,
+    })()`;
+  const outcome = await Runtime.evaluate({
+    expression,
+    ...(affinityGuard ? { awaitPromise: true } : {}),
     returnByValue: true,
   });
+  if (outcome.exceptionDetails || outcome.result?.value !== true) {
+    throw new Error("Deep Research trusted click failed.");
+  }
 }
 
 async function waitForDeepResearchPill(
   Runtime: ChromeClient["Runtime"],
   timeoutMs = 5000,
+  options: DeepResearchAffinityOptions = {},
 ): Promise<boolean> {
+  await options.assertPageAffinity?.("Deep Research pill read");
   const { result } = await Runtime.evaluate({
-    expression: buildWaitForDeepResearchPillExpression(timeoutMs),
+    expression: buildWaitForDeepResearchPillExpression(
+      timeoutMs,
+      options.expectedConversationId,
+      options.expectedConversationUrl,
+    ),
     awaitPromise: true,
     returnByValue: true,
   });
@@ -126,14 +192,16 @@ export async function waitForResearchPlanAutoConfirm(
   Runtime: ChromeClient["Runtime"],
   logger: BrowserLogger,
   autoConfirmWaitMs: number = DEEP_RESEARCH_AUTO_CONFIRM_WAIT_MS,
+  options: DeepResearchAffinityOptions = {},
 ): Promise<void> {
   // Phase A: Detect research plan appearance (up to 60s)
   const planDeadline = Date.now() + 60_000;
   let planDetected = false;
 
   while (Date.now() < planDeadline) {
-    const { result } = await Runtime.evaluate({
-      expression: `(() => {
+    await options.assertPageAffinity?.("Deep Research plan read");
+    const planProbe = buildGuardedDeepResearchProbeExpression(
+      `(() => {
         const iframes = document.querySelectorAll('iframe');
         const hasResearchIframe = Array.from(iframes).some(f => {
           const rect = f.getBoundingClientRect();
@@ -146,6 +214,12 @@ export async function waitForResearchPlanAutoConfirm(
           assistantText.includes('analyze');
         return { hasResearchIframe, hasResearchText };
       })()`,
+      options.expectedConversationId,
+      options.expectedConversationUrl,
+    );
+    const { result } = await Runtime.evaluate({
+      expression: planProbe.expression,
+      ...(planProbe.awaitPromise ? { awaitPromise: true } : {}),
       returnByValue: true,
     });
 
@@ -170,8 +244,9 @@ export async function waitForResearchPlanAutoConfirm(
   // Phase B: Wait for auto-confirm countdown
   const confirmStart = Date.now();
   while (Date.now() - confirmStart < autoConfirmWaitMs) {
-    const { result } = await Runtime.evaluate({
-      expression: `(() => {
+    await options.assertPageAffinity?.("Deep Research plan confirmation read");
+    const confirmationProbe = buildGuardedDeepResearchProbeExpression(
+      `(() => {
         const iframes = document.querySelectorAll('iframe');
         const hasLargeIframe = Array.from(iframes).some(f => {
           const rect = f.getBoundingClientRect();
@@ -183,6 +258,12 @@ export async function waitForResearchPlanAutoConfirm(
           text.includes('considering');
         return { hasLargeIframe, isResearching };
       })()`,
+      options.expectedConversationId,
+      options.expectedConversationUrl,
+    );
+    const { result } = await Runtime.evaluate({
+      expression: confirmationProbe.expression,
+      ...(confirmationProbe.awaitPromise ? { awaitPromise: true } : {}),
       returnByValue: true,
     });
     const val = result?.value as { hasLargeIframe?: boolean; isResearching?: boolean } | undefined;
@@ -213,6 +294,9 @@ export async function waitForDeepResearchCompletion(
     ignoredTargetKeys?: readonly string[];
     requireScopedTargetOwner?: boolean;
     targetBaselineCaptured?: boolean;
+    expectedConversationId?: string;
+    expectedConversationUrl?: string;
+    assertPageAffinity?: (action: string) => Promise<void>;
   },
 ): Promise<{
   text: string;
@@ -237,8 +321,15 @@ export async function waitForDeepResearchCompletion(
   logger(`Monitoring Deep Research (timeout: ${Math.round(timeoutMs / 60_000)}min)...`);
 
   while (Date.now() - start < timeoutMs) {
+    await options?.assertPageAffinity?.("Deep Research progress read");
+    const completionProbe = buildDeepResearchCompletionPollExpressionWithAffinity(
+      minTurnLiteral,
+      options?.expectedConversationId,
+      options?.expectedConversationUrl,
+    );
     const { result } = await Runtime.evaluate({
-      expression: buildDeepResearchCompletionPollExpression(minTurnLiteral),
+      expression: completionProbe.expression,
+      ...(completionProbe.awaitPromise ? { awaitPromise: true } : {}),
       returnByValue: true,
     });
 
@@ -269,6 +360,7 @@ export async function waitForDeepResearchCompletion(
     // (readDeepResearchTargetResult) attaches to the iframe's own CDP target and
     // walks its nested frames, so it CAN read the report. Prefer the target path
     // and fall back to the in-page frame path for legacy/inline rendering.
+    await options?.assertPageAffinity?.("Deep Research report read");
     const rawTargetResult = client
       ? ((
           await readDeepResearchTargetResult(
@@ -282,18 +374,20 @@ export async function waitForDeepResearchCompletion(
     // A completed target read is authoritative. If the target read is missing or
     // only in-progress, still try the in-page frame path so an incomplete target
     // read does not suppress a completed report there (legacy/inline rendering).
-    const inPageScan =
-      !targetResult?.completed && Page
-        ? await readDeepResearchFrameResult(
-            Runtime,
-            Page,
-            client,
-            scopedToNewTurns ? minTurnLiteral : -1,
-          ).catch(() => null)
-        : null;
+    let inPageScan = null;
+    if (!targetResult?.completed && Page) {
+      await options?.assertPageAffinity?.("Deep Research frame report read");
+      inPageScan = await readDeepResearchFrameResult(
+        Runtime,
+        Page,
+        client,
+        scopedToNewTurns ? minTurnLiteral : -1,
+      ).catch(() => null);
+    }
     const rawInPageResult = inPageScan?.read ?? null;
     const inPageResult = filterIncompleteDeepResearchRead(rawInPageResult);
     const read = pickPreferredDeepResearchRead(targetResult, inPageResult);
+    await options?.assertPageAffinity?.("Deep Research report read completion");
     // Target keys captured before submission are ignored, so a target result is
     // tied to this run. Main-page iframes are not: old reports can remain in the
     // conversation and must never authorize a new normal-response fallback.
@@ -321,7 +415,7 @@ export async function waitForDeepResearchCompletion(
         );
       }
       logger(`Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed)`);
-      return await extractDeepResearchResult(Runtime, logger, minTurnIndex ?? undefined);
+      return await extractDeepResearchResult(Runtime, logger, minTurnIndex ?? undefined, options);
     }
 
     const incompleteFrameResult = Boolean(
@@ -374,19 +468,34 @@ export async function extractDeepResearchResult(
   Runtime: ChromeClient["Runtime"],
   logger: BrowserLogger,
   minTurnIndex?: number,
+  options: DeepResearchAffinityOptions = {},
 ): Promise<{
   text: string;
   html?: string;
   meta: { turnId?: string | null; messageId?: string | null };
 }> {
-  const snapshot = await readAssistantSnapshot(Runtime, minTurnIndex);
+  await options.assertPageAffinity?.("Deep Research assistant response read");
+  const snapshot = await readAssistantSnapshot(
+    Runtime,
+    minTurnIndex,
+    options.expectedConversationId,
+    undefined,
+    options.expectedConversationUrl,
+  );
   const meta = {
     turnId: snapshot?.turnId ?? null,
     messageId: snapshot?.messageId ?? null,
   };
 
   // Try the copy-button approach first for clean markdown
-  const markdown = await captureAssistantMarkdown(Runtime, meta, logger);
+  const markdown = await captureAssistantMarkdown(
+    Runtime,
+    meta,
+    logger,
+    options.expectedConversationId,
+    options.assertPageAffinity,
+    options.expectedConversationUrl,
+  );
   if (markdown && !isDeepResearchIncompleteText(markdown)) {
     return { text: markdown, html: snapshot?.html ?? undefined, meta };
   }
@@ -987,6 +1096,7 @@ export function buildDeepResearchFrameStatusExpressionForTest(): string {
 export async function checkDeepResearchStatus(
   Runtime: ChromeClient["Runtime"],
   _logger: BrowserLogger,
+  options: DeepResearchAffinityOptions = {},
 ): Promise<{
   completed: boolean;
   inProgress: boolean;
@@ -994,8 +1104,15 @@ export async function checkDeepResearchStatus(
   textLength: number;
   placeholderOnly: boolean;
 }> {
+  await options.assertPageAffinity?.("Deep Research status read");
+  const statusProbe = buildGuardedDeepResearchProbeExpression(
+    buildDeepResearchStatusExpression(),
+    options.expectedConversationId,
+    options.expectedConversationUrl,
+  );
   const { result } = await Runtime.evaluate({
-    expression: buildDeepResearchStatusExpression(),
+    expression: statusProbe.expression,
+    ...(statusProbe.awaitPromise ? { awaitPromise: true } : {}),
     returnByValue: true,
   });
 
@@ -1048,7 +1165,6 @@ function buildDeepResearchStatusExpression(): string {
     };
   })()`;
 }
-
 function buildDeepResearchCompletionPollExpression(minTurnIndex: number): string {
   const finishedSelector = JSON.stringify(FINISHED_ACTIONS_SELECTOR);
   const stopSelector = JSON.stringify(STOP_BUTTON_SELECTOR);
@@ -1114,12 +1230,32 @@ function buildDeepResearchCompletionPollExpression(minTurnIndex: number): string
   })()`;
 }
 
+function buildDeepResearchCompletionPollExpressionWithAffinity(
+  minTurnIndex: number,
+  expectedConversationId?: string,
+  expectedConversationUrl?: string,
+): { expression: string; awaitPromise: boolean } {
+  return buildGuardedDeepResearchProbeExpression(
+    buildDeepResearchCompletionPollExpression(minTurnIndex),
+    expectedConversationId,
+    expectedConversationUrl,
+  );
+}
+
 export function buildDeepResearchStatusExpressionForTest(): string {
   return buildDeepResearchStatusExpression();
 }
 
-export function buildDeepResearchCompletionPollExpressionForTest(minTurnIndex = -1): string {
-  return buildDeepResearchCompletionPollExpression(minTurnIndex);
+export function buildDeepResearchCompletionPollExpressionForTest(
+  minTurnIndex = -1,
+  expectedConversationId?: string,
+  expectedConversationUrl?: string,
+): string {
+  return buildGuardedDeepResearchProbeExpression(
+    buildDeepResearchCompletionPollExpression(minTurnIndex),
+    expectedConversationId,
+    expectedConversationUrl,
+  ).expression;
 }
 
 function buildFindDeepResearchPillExpression(functionName = "findDeepResearchPill"): string {
@@ -1156,25 +1292,114 @@ function buildFindDeepResearchPillExpression(functionName = "findDeepResearchPil
     };`;
 }
 
-function buildWaitForDeepResearchPillExpression(timeoutMs: number): string {
+function buildWaitForDeepResearchPillExpression(
+  timeoutMs: number,
+  expectedConversationId?: string,
+  expectedConversationUrl?: string,
+): string {
+  const affinityGuard = buildEvaluatedChatGptPageAffinityGuard({
+    expectedConversationId,
+    expectedConversationUrl,
+  });
+  const expectedConversationIdLiteral = JSON.stringify(expectedConversationId?.trim() || null);
+  const expectedConversationUrlLiteral = JSON.stringify(expectedConversationUrl?.trim() || null);
   return `(async () => {
+    ${affinityGuard}
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     ${buildFindDeepResearchPillExpression()}
+    const EXPECTED_CONVERSATION_ID = ${expectedConversationIdLiteral};
+    const EXPECTED_CONVERSATION_URL = ${expectedConversationUrlLiteral};
+    const CHATGPT_ORIGINS = ${JSON.stringify(CHATGPT_ORIGINS)};
+    const CONVERSATION_PATTERN = /^(?:\\/c|\\/g\\/[^/?#]+\\/(?:project\\/)?c)\\/([a-zA-Z0-9-]+)\\/?$/;
+    const matchesExpectedConversation = () => {
+      if (!EXPECTED_CONVERSATION_ID && !EXPECTED_CONVERSATION_URL) return true;
+      try {
+        const currentUrl = new URL(location.href);
+        if (
+          currentUrl.protocol !== 'https:' ||
+          currentUrl.username || currentUrl.password || currentUrl.port ||
+          !CHATGPT_ORIGINS.includes(currentUrl.origin) ||
+          currentUrl.search || currentUrl.hash
+        ) return false;
+        const currentMatch = CONVERSATION_PATTERN.exec(currentUrl.pathname);
+        if (!currentMatch) return false;
+        if (!EXPECTED_CONVERSATION_URL) {
+          return !EXPECTED_CONVERSATION_ID || currentMatch[1] === EXPECTED_CONVERSATION_ID;
+        }
+        const expectedUrl = new URL(EXPECTED_CONVERSATION_URL);
+        const expectedMatch = CONVERSATION_PATTERN.exec(expectedUrl.pathname);
+        return expectedUrl.protocol === 'https:' &&
+          !expectedUrl.username && !expectedUrl.password && !expectedUrl.port &&
+          CHATGPT_ORIGINS.includes(expectedUrl.origin) &&
+          !expectedUrl.search && !expectedUrl.hash && Boolean(expectedMatch) &&
+          (!EXPECTED_CONVERSATION_ID || expectedMatch[1] === EXPECTED_CONVERSATION_ID) &&
+          currentUrl.origin === expectedUrl.origin &&
+          currentUrl.pathname.replace(/\\/$/, '') === expectedUrl.pathname.replace(/\\/$/, '');
+      } catch {
+        return false;
+      }
+    };
     const deadline = Date.now() + ${JSON.stringify(Math.max(timeoutMs, 0))};
     while (Date.now() < deadline) {
+      if (!matchesExpectedConversation()) return false;
       if (findDeepResearchPill()) return true;
       await new Promise(resolve => setTimeout(resolve, 200));
     }
+    if (!matchesExpectedConversation()) return false;
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     return Boolean(findDeepResearchPill());
   })()`;
 }
 
-function buildActivateDeepResearchExpression(): string {
+function buildActivateDeepResearchExpression(
+  expectedConversationId?: string,
+  expectedConversationUrl?: string,
+): string {
   const plusBtnSelector = JSON.stringify(DEEP_RESEARCH_PLUS_BUTTON);
   const targetText = JSON.stringify(DEEP_RESEARCH_DROPDOWN_ITEM_TEXT);
-
+  const expectedConversationLiteral = JSON.stringify(expectedConversationId?.trim() || null);
+  const expectedConversationUrlLiteral = JSON.stringify(expectedConversationUrl?.trim() || null);
+  const affinityGuard = buildEvaluatedChatGptPageAffinityGuard({
+    expectedConversationId,
+    expectedConversationUrl,
+  });
   return `(async () => {
+    ${affinityGuard}
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     ${buildClickDispatcher()}
     ${buildFindDeepResearchPillExpression()}
+    const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
+    const EXPECTED_CONVERSATION_URL = ${expectedConversationUrlLiteral};
+    const CHATGPT_ORIGINS = ${JSON.stringify(CHATGPT_ORIGINS)};
+    const CONVERSATION_PATTERN = /^(?:\\/c|\\/g\\/[^/?#]+\\/(?:project\\/)?c)\\/([a-zA-Z0-9-]+)\\/?$/;
+    const matchesExpectedConversation = () => {
+      if (!EXPECTED_CONVERSATION_ID && !EXPECTED_CONVERSATION_URL) return true;
+      try {
+        const currentUrl = new URL(location.href);
+        if (
+          currentUrl.protocol !== 'https:' ||
+          currentUrl.username || currentUrl.password || currentUrl.port ||
+          !CHATGPT_ORIGINS.includes(currentUrl.origin) ||
+          currentUrl.search || currentUrl.hash
+        ) return false;
+        const currentMatch = CONVERSATION_PATTERN.exec(currentUrl.pathname);
+        if (!currentMatch) return false;
+        if (!EXPECTED_CONVERSATION_URL) {
+          return !EXPECTED_CONVERSATION_ID || currentMatch[1] === EXPECTED_CONVERSATION_ID;
+        }
+        const expectedUrl = new URL(EXPECTED_CONVERSATION_URL);
+        const expectedMatch = CONVERSATION_PATTERN.exec(expectedUrl.pathname);
+        return expectedUrl.protocol === 'https:' &&
+          !expectedUrl.username && !expectedUrl.password && !expectedUrl.port &&
+          CHATGPT_ORIGINS.includes(expectedUrl.origin) &&
+          !expectedUrl.search && !expectedUrl.hash && Boolean(expectedMatch) &&
+          (!EXPECTED_CONVERSATION_ID || expectedMatch[1] === EXPECTED_CONVERSATION_ID) &&
+          currentUrl.origin === expectedUrl.origin &&
+          currentUrl.pathname.replace(/\\/$/, '') === expectedUrl.pathname.replace(/\\/$/, '');
+      } catch {
+        return false;
+      }
+    };
 
     const waitForPill = () => new Promise((resolve) => {
       let elapsed = 0;
@@ -1302,6 +1527,8 @@ function buildActivateDeepResearchExpression(): string {
         b => (b.getAttribute('aria-label') || '').toLowerCase().includes('add files')
       );
     if (!plusBtn) return { status: 'plus-button-missing' };
+    if (!matchesExpectedConversation()) return { status: 'conversation-mismatch' };
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     dispatchClickSequence(plusBtn);
 
     // Step 2: Wait for dropdown
@@ -1333,12 +1560,14 @@ function buildActivateDeepResearchExpression(): string {
     if (!match) {
       const searchInput = findPopoverSearchInput();
       if (searchInput) {
+        if (!matchesExpectedConversation()) return { status: 'conversation-mismatch' };
         setSearchText(searchInput, ${targetText});
         await new Promise(resolve => setTimeout(resolve, 600));
         match = findDeepResearchItem({ requirePopover: true });
         available = collectAvailableItems({ requirePopover: true });
       }
     }
+    if (!matchesExpectedConversation()) return { status: 'conversation-mismatch' };
     if (!match) return { status: 'dropdown-item-missing', available };
 
     // Step 4: Click it
@@ -1348,14 +1577,21 @@ function buildActivateDeepResearchExpression(): string {
     const clickPoint = rect && rect.width > 0 && rect.height > 0
       ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
       : undefined;
+    if (!matchesExpectedConversation()) return { status: 'conversation-mismatch' };
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     dispatchClickSequence(match);
 
     // Step 5: Verify pill appeared
     const pillConfirmed = await waitForPill();
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
+    if (!matchesExpectedConversation()) return { status: 'conversation-mismatch' };
     return pillConfirmed ? { status: 'activated' } : { status: 'pill-not-confirmed', clickPoint };
   })()`;
 }
 
-export function buildActivateDeepResearchExpressionForTest(): string {
-  return buildActivateDeepResearchExpression();
+export function buildActivateDeepResearchExpressionForTest(
+  expectedConversationId?: string,
+  expectedConversationUrl?: string,
+): string {
+  return buildActivateDeepResearchExpression(expectedConversationId, expectedConversationUrl);
 }

@@ -30,6 +30,7 @@ import {
   writeDevToolsActivePort,
 } from "../browser/profileState.js";
 import { normalizeChatgptUrl } from "../browser/utils.js";
+import { normalizeChatGptAccountDigest } from "../browser/chatgptAccount.js";
 import {
   computeFileSha256,
   sanitizeArtifactFilename,
@@ -718,6 +719,18 @@ function sanitizeResult(
   result: BrowserRunResult,
   warnings: BrowserRunWarning[] = [],
 ): BrowserRunResult {
+  const cleanupWarning = result.warnings?.some(
+    (warning) => warning?.code === "browser-cleanup-incomplete",
+  )
+    ? [
+        {
+          code: "browser-cleanup-incomplete",
+          severity: "warning" as const,
+          message: "Browser cleanup could not be fully confirmed.",
+        },
+      ]
+    : [];
+  const sanitizedWarnings = [...cleanupWarning, ...warnings];
   return {
     answerText: result.answerText,
     answerMarkdown: result.answerMarkdown,
@@ -725,7 +738,8 @@ function sanitizeResult(
     tookMs: result.tookMs,
     answerTokens: result.answerTokens,
     answerChars: result.answerChars,
-    warnings: warnings.length > 0 ? warnings : undefined,
+    warnings: sanitizedWarnings.length > 0 ? sanitizedWarnings : undefined,
+    chatGptAccountDigest: normalizeChatGptAccountDigest(result.chatGptAccountDigest),
     chromePid: undefined,
     chromePort: undefined,
     userDataDir: undefined,

@@ -14,6 +14,7 @@ import {
   type BrowserLiveTailOptions,
 } from "./browserTabs.js";
 import { sessionStore } from "../sessionStore.js";
+import { writeSessionIdReceipt } from "../sessionManager.js";
 
 export interface StatusOptions extends OptionValues {
   hours: number;
@@ -47,6 +48,7 @@ interface SessionCommandDependencies {
     sessionId: string,
     options?: BrowserLiveTailOptions,
   ) => Promise<unknown>;
+  readSession: (sessionId: string) => Promise<{ id: string } | null>;
   usesDefaultStatusFilters: (cmd: Command) => boolean;
   deleteSessionsOlderThan: (options?: {
     hours?: number;
@@ -55,6 +57,7 @@ interface SessionCommandDependencies {
   getSessionPaths: (
     sessionId: string,
   ) => Promise<{ dir: string; metadata: string; log: string; request: string }>;
+  writeSessionIdReceipt: (sessionId: string) => Promise<void>;
 }
 
 const defaultDependencies: SessionCommandDependencies = {
@@ -65,6 +68,8 @@ const defaultDependencies: SessionCommandDependencies = {
   usesDefaultStatusFilters,
   deleteSessionsOlderThan: (options) => sessionStore.deleteOlderThan(options),
   getSessionPaths: (sessionId) => sessionStore.getPaths(sessionId),
+  readSession: (sessionId) => sessionStore.readSession(sessionId),
+  writeSessionIdReceipt,
 };
 
 const SESSION_OPTION_KEYS = new Set([
@@ -176,19 +181,24 @@ export async function handleSessionCommand(
     }
     // Commander sets `recover: false` when --no-recover is passed; default is `true`.
     const recoverIfMissing = sessionOptions.recover !== false;
+    const metadata = await deps.readSession(sessionId);
+    if (!metadata) {
+      throw new Error(`No session found with ID ${sessionId}.`);
+    }
     if (harvestRequested) {
       await deps.harvestSessionBrowserOutput(sessionId, {
         writeOutputPath,
         browserTabRef,
         recoverIfMissing,
       });
-      return;
+    } else {
+      await deps.liveTailSessionBrowserOutput(sessionId, {
+        writeOutputPath,
+        browserTabRef,
+        recoverIfMissing,
+      });
     }
-    await deps.liveTailSessionBrowserOutput(sessionId, {
-      writeOutputPath,
-      browserTabRef,
-      recoverIfMissing,
-    });
+    await deps.writeSessionIdReceipt(metadata.id);
     return;
   }
   if (!sessionId) {
@@ -210,11 +220,15 @@ export async function handleSessionCommand(
   const renderMarkdown = Boolean(
     sessionOptions.render || sessionOptions.renderMarkdown || autoRender,
   );
+  const metadata = await deps.readSession(sessionId);
   await deps.attachSession(sessionId, {
     renderMarkdown,
     renderPrompt: !sessionOptions.hidePrompt,
     model: sessionOptions.model,
   });
+  if (!process.exitCode && metadata) {
+    await deps.writeSessionIdReceipt(metadata.id);
+  }
 }
 
 export function formatSessionCleanupMessage(

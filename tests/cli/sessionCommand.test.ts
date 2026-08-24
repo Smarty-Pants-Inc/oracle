@@ -37,9 +37,11 @@ function createDeps() {
     attachSession: vi.fn(),
     harvestSessionBrowserOutput: vi.fn(),
     liveTailSessionBrowserOutput: vi.fn(),
+    readSession: vi.fn().mockResolvedValue({ id: "abc" }),
     usesDefaultStatusFilters: vi.fn(),
     deleteSessionsOlderThan: vi.fn(),
     getSessionPaths: vi.fn(),
+    writeSessionIdReceipt: vi.fn(),
   };
 }
 
@@ -60,6 +62,7 @@ describe("handleSessionCommand", () => {
       limit: 5,
       showExamples: true,
     });
+    expect(deps.writeSessionIdReceipt).not.toHaveBeenCalled();
   });
 
   test("attaches when id provided", async () => {
@@ -70,6 +73,50 @@ describe("handleSessionCommand", () => {
       "abc",
       expect.objectContaining({ renderMarkdown: false }),
     );
+    expect(deps.writeSessionIdReceipt).toHaveBeenCalledWith("abc");
+    expect(deps.attachSession.mock.invocationCallOrder[0]).toBeLessThan(
+      deps.writeSessionIdReceipt.mock.invocationCallOrder[0],
+    );
+  });
+
+  test("writes the loaded canonical metadata id after a successful attach", async () => {
+    const command = createCommandWithOptions({ hours: 24, limit: 10, all: false });
+    const deps = createDeps();
+    deps.readSession.mockResolvedValue({ id: "canonical-session-id" });
+
+    await handleSessionCommand("directory-key", command, deps);
+
+    expect(deps.attachSession).toHaveBeenCalledWith(
+      "directory-key",
+      expect.objectContaining({ renderMarkdown: false }),
+    );
+    expect(deps.writeSessionIdReceipt).toHaveBeenCalledWith("canonical-session-id");
+  });
+
+  test("keeps attach's missing-session behavior without writing a receipt", async () => {
+    const command = createCommandWithOptions({ hours: 24, limit: 10, all: false });
+    const deps = createDeps();
+    deps.readSession.mockResolvedValue(null);
+    deps.attachSession.mockImplementation(async () => {
+      process.exitCode = 1;
+    });
+
+    await handleSessionCommand("missing", command, deps);
+
+    expect(deps.attachSession).toHaveBeenCalledOnce();
+    expect(deps.writeSessionIdReceipt).not.toHaveBeenCalled();
+  });
+
+  test("does not write a receipt when attach reports failure", async () => {
+    const command = createCommandWithOptions({ hours: 24, limit: 10, all: false });
+    const deps = createDeps();
+    deps.attachSession.mockImplementation(async () => {
+      process.exitCode = 1;
+    });
+
+    await handleSessionCommand("missing", command, deps);
+
+    expect(deps.writeSessionIdReceipt).not.toHaveBeenCalled();
   });
 
   test("ignores unrelated root-only flags and logs a note when attaching by id", async () => {
@@ -114,6 +161,7 @@ describe("handleSessionCommand", () => {
     expect(logSpy).toHaveBeenCalledWith("Request: /tmp/.oracle/sessions/abc/request.json");
     expect(logSpy).toHaveBeenCalledWith("Log: /tmp/.oracle/sessions/abc/output.log");
     expect(process.exitCode).toBeUndefined();
+    expect(deps.writeSessionIdReceipt).not.toHaveBeenCalled();
   });
 
   test("errors when --path is provided without an id", async () => {
@@ -196,7 +244,7 @@ describe("handleSessionCommand", () => {
     expect(process.exitCode).toBe(1);
   });
 
-  test("harvests browser output when requested", async () => {
+  test("harvests browser output and writes its metadata id to the receipt", async () => {
     const command = createCommandWithOptions({
       hours: 24,
       limit: 10,
@@ -206,18 +254,21 @@ describe("handleSessionCommand", () => {
       browserTab: "current",
     } as StatusOptions);
     const deps = createDeps();
+    deps.readSession.mockResolvedValue({ id: "canonical-harvest" });
 
-    await handleSessionCommand("abc", command, deps);
+    await handleSessionCommand("legacy-harvest-directory", command, deps);
 
-    expect(deps.harvestSessionBrowserOutput).toHaveBeenCalledWith("abc", {
+    expect(deps.readSession).toHaveBeenCalledWith("legacy-harvest-directory");
+    expect(deps.harvestSessionBrowserOutput).toHaveBeenCalledWith("legacy-harvest-directory", {
       writeOutputPath: "/tmp/out.md",
       browserTabRef: "current",
       recoverIfMissing: true,
     });
+    expect(deps.writeSessionIdReceipt).toHaveBeenCalledWith("canonical-harvest");
     expect(deps.liveTailSessionBrowserOutput).not.toHaveBeenCalled();
   });
 
-  test("tails browser output when requested", async () => {
+  test("tails browser output and writes its metadata id to the receipt", async () => {
     const command = createCommandWithOptions({
       hours: 24,
       limit: 10,
@@ -226,14 +277,17 @@ describe("handleSessionCommand", () => {
       browserTab: "tab-123",
     } as StatusOptions);
     const deps = createDeps();
+    deps.readSession.mockResolvedValue({ id: "canonical-live" });
 
-    await handleSessionCommand("abc", command, deps);
+    await handleSessionCommand("legacy-live-directory", command, deps);
 
-    expect(deps.liveTailSessionBrowserOutput).toHaveBeenCalledWith("abc", {
+    expect(deps.readSession).toHaveBeenCalledWith("legacy-live-directory");
+    expect(deps.liveTailSessionBrowserOutput).toHaveBeenCalledWith("legacy-live-directory", {
       writeOutputPath: undefined,
       browserTabRef: "tab-123",
       recoverIfMissing: true,
     });
+    expect(deps.writeSessionIdReceipt).toHaveBeenCalledWith("canonical-live");
     expect(deps.harvestSessionBrowserOutput).not.toHaveBeenCalled();
   });
 

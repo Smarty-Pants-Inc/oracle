@@ -6,6 +6,7 @@ import CDP from "chrome-remote-interface";
 import { launch, Launcher, type LaunchedChrome } from "chrome-launcher";
 import type { BrowserLogger, ResolvedBrowserConfig, ChromeClient } from "./types.js";
 import {
+  bindRemoteChromeBrowserWebSocketEndpoint,
   cleanupStaleProfileState,
   findRunningChromeDebugTargetForProfile,
   terminateRecordedChromeForProfile,
@@ -14,6 +15,29 @@ import {
 import { delay } from "./utils.js";
 import { isWsl, resolveWslChromeLaunchRoute } from "./wslHost.js";
 const execFileAsync = promisify(execFile);
+const REMOTE_TARGET_CLEANUP_TIMEOUT_MS = 1_000;
+const REMOTE_TARGET_CLEANUP_COMMAND_TIMEOUT_MS = 250;
+const REMOTE_TARGET_ATTACH_TIMEOUT_MS = 5_000;
+const SIGNAL_RUNTIME_HINT_TIMEOUT_MS = 250;
+
+async function persistRuntimeHintBeforeSignalExit(
+  emitRuntimeHint: (() => Promise<void>) | undefined,
+): Promise<void> {
+  if (!emitRuntimeHint) return;
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      emitRuntimeHint(),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, SIGNAL_RUNTIME_HINT_TIMEOUT_MS);
+      }),
+    ]);
+  } catch {
+    // Signal handling must reach the exit path even if hint persistence fails.
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export interface ChromeLaunchDeps {
   platform?: NodeJS.Platform;
@@ -159,7 +183,7 @@ export function registerTerminationHooks(
     void (async () => {
       if (leaveRunning) {
         // Ensure reattach hints are written before we exit.
-        await opts?.emitRuntimeHint?.().catch(() => undefined);
+        await persistRuntimeHintBeforeSignalExit(opts?.emitRuntimeHint);
         if (inFlight) {
           logger('Session still in flight; reattach with "oracle session <slug>" to continue.');
         }
@@ -232,13 +256,13 @@ export async function connectToRemoteChrome(
   }
   if (targetUrl) {
     const targetConnection = await connectToNewTarget(host, port, targetUrl, logger, {
-      opened: () => `Opened dedicated remote Chrome tab targeting ${targetUrl}`,
+      opened: () => "Opened a dedicated remote Chrome tab.",
       openFailed: (message) =>
         `Failed to open dedicated remote Chrome tab (${message}); falling back to first target.`,
-      attachFailed: (targetId, message) =>
-        `Failed to attach to dedicated remote Chrome tab ${targetId} (${message}); falling back to first target.`,
-      closeFailed: (targetId, message) =>
-        `Failed to close unused remote Chrome tab ${targetId}: ${message}`,
+      attachFailed: (_targetId, message) =>
+        `Failed to attach to the dedicated remote Chrome tab (${message}); falling back to first target.`,
+      closeFailed: (_targetId, message) =>
+        `Failed to close an unused remote Chrome tab: ${message}`,
     });
     if (targetConnection) {
       return {
@@ -273,11 +297,11 @@ export async function closeRemoteChromeTarget(
   try {
     await CDP.Close({ host, port, id: targetId });
     if (logger.verbose) {
-      logger(`Closed remote Chrome tab ${targetId}`);
+      logger("Closed remote Chrome tab.");
     }
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger(`Failed to close remote Chrome tab ${targetId}: ${message}`);
+    logger("Failed to close remote Chrome tab.");
+    throw new Error("Remote Chrome tab cleanup failed.", { cause: error });
   }
 }
 
@@ -315,7 +339,12 @@ export async function listRemoteChromeTargets(options: {
     const targets = await CDP.List({ host: options.host, port: options.port });
     return targets as unknown as RemoteTargetInfo[];
   }
-  const browser = await CDP({ target: options.browserWSEndpoint, local: true });
+  const { browserWSEndpoint } = bindRemoteChromeBrowserWebSocketEndpoint({
+    browserWSEndpoint: options.browserWSEndpoint,
+    host: options.host,
+    port: options.port,
+  });
+  const browser = await CDP({ target: browserWSEndpoint, local: true });
   try {
     const result = await browser.Target.getTargets();
     return (result.targetInfos ?? []).map((target) => ({
@@ -328,6 +357,130 @@ export async function listRemoteChromeTargets(options: {
   }
 }
 
+async function runRemoteTargetCleanupCommand<T>(
+  operation: () => Promise<T>,
+  deadline: number,
+): Promise<T> {
+  const remainingMs = Math.max(0, deadline - Date.now());
+  if (remainingMs <= 0) {
+    throw new Error("Timed out during remote Chrome target cleanup.");
+  }
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation(),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error("Timed out during remote Chrome target cleanup.")),
+          Math.min(REMOTE_TARGET_CLEANUP_COMMAND_TIMEOUT_MS, remainingMs),
+        );
+        timeout.unref?.();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function attachToRemoteTarget(
+  browser: ChromeClient,
+  targetId: string,
+): Promise<Awaited<ReturnType<ChromeClient["Target"]["attachToTarget"]>>> {
+  let timedOut = false;
+  let timeout: NodeJS.Timeout | undefined;
+  const attached = browser.Target.attachToTarget({ targetId, flatten: true });
+  void attached
+    .then((result) => {
+      if (!timedOut) return;
+      return browser.Target.detachFromTarget({ sessionId: result.sessionId }).catch(
+        () => undefined,
+      );
+    })
+    .catch(() => undefined);
+  try {
+    return await Promise.race([
+      attached,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => {
+          timedOut = true;
+          reject(new Error("Timed out attaching to remote Chrome target."));
+        }, REMOTE_TARGET_ATTACH_TIMEOUT_MS);
+        timeout.unref?.();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function closeRemoteTargetAndConfirm(
+  browser: ChromeClient,
+  targetId: string,
+  deadline = Date.now() + REMOTE_TARGET_CLEANUP_TIMEOUT_MS,
+): Promise<void> {
+  const browserEvents = browser as ChromeClient & {
+    removeListener?: (event: string, listener: (event: { targetId?: string }) => void) => void;
+  };
+  let destroyed = false;
+  let listening = false;
+  let resolveTargetDestroyed: (() => void) | undefined;
+  const targetDestroyed = new Promise<void>((resolve) => {
+    resolveTargetDestroyed = resolve;
+  });
+  const onTargetDestroyed = (event: { targetId?: string }) => {
+    if (event.targetId === targetId) {
+      destroyed = true;
+      resolveTargetDestroyed?.();
+    }
+  };
+  try {
+    browser.on?.("Target.targetDestroyed", onTargetDestroyed);
+    listening = true;
+  } catch {
+    // Polling remains available when the browser connection cannot subscribe.
+  }
+  let closeError: unknown;
+  try {
+    try {
+      const result = await runRemoteTargetCleanupCommand(
+        () => browser.Target.closeTarget({ targetId }),
+        deadline,
+      );
+      if (result.success === false) {
+        throw new Error("Remote Chrome target cleanup failed.");
+      }
+    } catch (error) {
+      closeError = error;
+    }
+    for (let attempt = 0; attempt < 40 && Date.now() < deadline; attempt += 1) {
+      await Promise.race([
+        delay(Math.min(25, Math.max(0, deadline - Date.now()))),
+        targetDestroyed,
+      ]);
+      if (destroyed) return;
+      try {
+        const remaining = await runRemoteTargetCleanupCommand(
+          () => browser.Target.getTargets(),
+          deadline,
+        );
+        if (!(remaining.targetInfos ?? []).some((target) => target.targetId === targetId)) return;
+      } catch {
+        // Continue polling until the bounded cleanup window expires.
+      }
+    }
+  } finally {
+    if (listening) {
+      try {
+        browserEvents.removeListener?.("Target.targetDestroyed", onTargetDestroyed);
+      } catch {
+        // Listener cleanup is best effort.
+      }
+    }
+  }
+  if (closeError) throw closeError;
+  throw new Error("Remote Chrome target cleanup was not confirmed.");
+}
+
 export async function connectToRemoteChromeTarget(
   host: string,
   port: number,
@@ -338,6 +491,7 @@ export async function connectToRemoteChromeTarget(
     browserWSEndpoint?: string;
     closeTargetOnDispose?: boolean;
     approvalWaitMs?: number;
+    onTargetCreated?: (targetId: string) => void;
   },
 ): Promise<RemoteChromeConnection> {
   if (!options.browserWSEndpoint) {
@@ -351,40 +505,122 @@ export async function connectToRemoteChromeTarget(
     };
   }
 
+  const { browserWSEndpoint } = bindRemoteChromeBrowserWebSocketEndpoint({
+    browserWSEndpoint: options.browserWSEndpoint,
+    host,
+    port,
+  });
   const browser = await connectToBrowserWebSocket(
     host,
     port,
-    options.browserWSEndpoint,
+    browserWSEndpoint,
     logger,
     options.approvalWaitMs,
   );
   let targetId = options.targetId;
+  let createdTarget = false;
   try {
     if (!targetId) {
       const created = await browser.Target.createTarget({
         url: options.targetUrl ?? "about:blank",
       });
       targetId = created.targetId;
-      logger(`Opened dedicated remote Chrome tab targeting ${options.targetUrl ?? "about:blank"}`);
+      createdTarget = true;
+      options.onTargetCreated?.(targetId);
+      logger("Opened a dedicated remote Chrome tab.");
     }
-    const attached = await browser.Target.attachToTarget({ targetId, flatten: true });
+    const attached = await attachToRemoteTarget(browser, targetId);
     const client = createSessionBoundChromeClient(browser, attached.sessionId);
     return {
       client,
       targetId,
-      browserWSEndpoint: options.browserWSEndpoint,
+      browserWSEndpoint,
       close: async () => {
-        await browser.Target.detachFromTarget({ sessionId: attached.sessionId }).catch(
-          () => undefined,
-        );
-        if (options.closeTargetOnDispose && targetId) {
-          await browser.Target.closeTarget({ targetId }).catch(() => undefined);
+        if (!options.closeTargetOnDispose) {
+          const cleanupDeadline = Date.now() + REMOTE_TARGET_CLEANUP_TIMEOUT_MS;
+          const cleanupErrors: unknown[] = [];
+          try {
+            await runRemoteTargetCleanupCommand(
+              () => browser.Target.detachFromTarget({ sessionId: attached.sessionId }),
+              cleanupDeadline,
+            );
+          } catch (error) {
+            cleanupErrors.push(error);
+          }
+          try {
+            await runRemoteTargetCleanupCommand(
+              () => browser.close(),
+              Math.max(cleanupDeadline, Date.now() + REMOTE_TARGET_CLEANUP_COMMAND_TIMEOUT_MS),
+            );
+          } catch (error) {
+            cleanupErrors.push(error);
+          }
+          if (cleanupErrors.length > 0) {
+            throw new AggregateError(cleanupErrors, "Remote Chrome connection cleanup failed.");
+          }
+          return;
         }
-        await browser.close().catch(() => undefined);
+        const cleanupDeadline = Date.now() + REMOTE_TARGET_CLEANUP_TIMEOUT_MS;
+        let targetCleanupError: unknown;
+        try {
+          await runRemoteTargetCleanupCommand(
+            () => browser.Target.detachFromTarget({ sessionId: attached.sessionId }),
+            cleanupDeadline,
+          );
+        } catch (error) {
+          targetCleanupError = error;
+        }
+        if (targetId) {
+          try {
+            await closeRemoteTargetAndConfirm(browser, targetId, cleanupDeadline);
+            targetCleanupError = undefined;
+          } catch (error) {
+            targetCleanupError = error;
+          }
+        }
+        const browserCloseDeadline = Math.max(
+          cleanupDeadline,
+          Date.now() + REMOTE_TARGET_CLEANUP_COMMAND_TIMEOUT_MS,
+        );
+        let browserCloseError: unknown;
+        try {
+          await runRemoteTargetCleanupCommand(() => browser.close(), browserCloseDeadline);
+        } catch (error) {
+          browserCloseError = error;
+        }
+        if (targetCleanupError && browserCloseError) {
+          throw new AggregateError(
+            [targetCleanupError, browserCloseError],
+            "Remote Chrome target cleanup failed.",
+          );
+        }
+        if (targetCleanupError) {
+          throw new AggregateError([targetCleanupError], "Remote Chrome target cleanup failed.");
+        }
+        if (browserCloseError) throw browserCloseError;
       },
     };
   } catch (error) {
-    await browser.close().catch(() => undefined);
+    const cleanupDeadline = Date.now() + REMOTE_TARGET_CLEANUP_TIMEOUT_MS;
+    const failures: unknown[] = [error];
+    if (createdTarget && targetId) {
+      try {
+        await closeRemoteTargetAndConfirm(browser, targetId, cleanupDeadline);
+      } catch (closeError) {
+        failures.push(closeError);
+      }
+    }
+    try {
+      await runRemoteTargetCleanupCommand(
+        () => browser.close(),
+        Math.max(cleanupDeadline, Date.now() + REMOTE_TARGET_CLEANUP_COMMAND_TIMEOUT_MS),
+      );
+    } catch (closeError) {
+      failures.push(closeError);
+    }
+    if (failures.length > 1) {
+      throw new AggregateError(failures, "Remote Chrome target setup and cleanup failed.");
+    }
     throw error;
   }
 }
@@ -407,14 +643,32 @@ async function connectToBrowserWebSocket(
   while (Date.now() < deadline) {
     const remainingMs = Math.max(1, deadline - Date.now());
     try {
-      return await Promise.race([
-        CDP({ target: browserWSEndpoint, local: true }) as Promise<ChromeClient>,
-        new Promise<never>((_, reject) => {
-          setTimeout(() => {
-            reject(new Error("__oracle_remote_debugging_approval_timeout__"));
-          }, remainingMs);
-        }),
-      ]);
+      let timedOut = false;
+      let timeout: NodeJS.Timeout | undefined;
+      const connectionAttempt = CDP({
+        target: browserWSEndpoint,
+        local: true,
+      }) as Promise<ChromeClient>;
+      void connectionAttempt
+        .then((client) => {
+          if (!timedOut) return;
+          return client.close().catch(() => undefined);
+        })
+        .catch(() => undefined);
+      try {
+        return await Promise.race([
+          connectionAttempt,
+          new Promise<never>((_resolve, reject) => {
+            timeout = setTimeout(() => {
+              timedOut = true;
+              reject(new Error("__oracle_remote_debugging_approval_timeout__"));
+            }, remainingMs);
+            timeout.unref?.();
+          }),
+        ]);
+      } finally {
+        clearTimeout(timeout);
+      }
     } catch (error) {
       if (
         error instanceof Error &&
@@ -569,12 +823,11 @@ export async function connectWithNewTab(
   let attempt = 0;
   while (attempt <= retries) {
     const targetConnection = await connectToNewTarget(effectiveHost, port, url, logger, {
-      opened: (targetId) => `Opened isolated browser tab (target=${targetId})`,
+      opened: () => "Opened isolated browser tab.",
       openFailed: (message) => `Failed to open isolated browser tab (${message}); ${fallbackLabel}`,
-      attachFailed: (targetId, message) =>
-        `Failed to attach to isolated browser tab ${targetId} (${message}); ${fallbackLabel}`,
-      closeFailed: (targetId, message) =>
-        `Failed to close unused browser tab ${targetId}: ${message}`,
+      attachFailed: (_targetId, message) =>
+        `Failed to attach to isolated browser tab (${message}); ${fallbackLabel}`,
+      closeFailed: (_targetId, message) => `Failed to close unused browser tab: ${message}`,
     });
     if (targetConnection) {
       return targetConnection;
@@ -614,27 +867,26 @@ export async function closeTab(
         continue;
       }
       if (!targets.some((target) => (target.targetId ?? target.id) === targetId)) {
-        logger(`Closed isolated browser tab (target=${targetId})`);
+        logger("Closed isolated browser tab.");
         return true;
       }
     }
-    logger(`Browser tab close was not confirmed (target=${targetId})`);
+    logger("Browser tab close was not confirmed.");
     return false;
-  } catch (error) {
+  } catch {
     try {
       const targets = (await CDP.List({ host: effectiveHost, port })) as Array<{
         id?: string;
         targetId?: string;
       }>;
       if (!targets.some((target) => (target.targetId ?? target.id) === targetId)) {
-        logger(`Closed isolated browser tab (target=${targetId})`);
+        logger("Closed isolated browser tab.");
         return true;
       }
     } catch {
       // Preserve the original close error below.
     }
-    const message = error instanceof Error ? error.message : String(error);
-    logger(`Failed to close browser tab ${targetId}: ${message}`);
+    logger("Failed to close browser tab.");
     return false;
   }
 }
@@ -656,11 +908,10 @@ export async function createChromePageTarget(
       logger("Failed to create a replacement Chrome tab.");
       return undefined;
     }
-    logger(`Opened replacement Chrome tab (target=${createdTargetId})`);
+    logger("Opened replacement Chrome tab.");
     return createdTargetId;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger(`Failed to create a replacement Chrome tab: ${message}`);
+  } catch {
+    logger("Failed to create a replacement Chrome tab.");
     return undefined;
   }
 }
@@ -685,9 +936,8 @@ export async function ensureChromePageTargetAfterClose(
     if (existingPageTargetId) {
       return existingPageTargetId;
     }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger(`Failed to inspect Chrome tabs before closing ${closingTargetId}: ${message}`);
+  } catch {
+    logger("Failed to inspect Chrome tabs before closing the current tab.");
   }
   return await createChromePageTarget(port, logger, host);
 }
@@ -742,9 +992,8 @@ export async function closeBlankChromeTabs(
     try {
       await CDP.Close({ host: effectiveHost, port, id: targetId });
       closed += 1;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logger(`Failed to close blank Chrome tab ${targetId}: ${message}`);
+    } catch {
+      logger("Failed to close blank Chrome tab.");
     }
   }
   if (closed > 0) {

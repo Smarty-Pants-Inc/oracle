@@ -52,6 +52,8 @@ import { estimateTokenCount } from "../browser/utils.js";
 import type { BrowserLogger } from "../browser/types.js";
 import { formatElapsed } from "../oracle/format.js";
 import { formatBrowserReattachGuidance } from "./reattachGuidance.js";
+import { normalizeChatGptAccountDigest } from "../browser/chatgptAccount.js";
+import { browserIdFromWebSocketEndpoint } from "../browser/profileState.js";
 
 const isTty = process.stdout.isTTY;
 const dim = (text: string): string => (isTty ? kleur.dim(text) : text);
@@ -68,6 +70,71 @@ export interface SessionRunParams {
   notifications?: NotificationSettings;
   browserDeps?: BrowserSessionRunnerDeps;
   muteStdout?: boolean;
+}
+
+function applyRuntimeAffinityToBrowserConfig(
+  browserConfig: BrowserSessionConfig,
+  runtime: BrowserRuntimeMetadata,
+): BrowserRuntimeMetadata {
+  const accountDigest =
+    runtime.chatGptAccountDigest === undefined
+      ? undefined
+      : normalizeChatGptAccountDigest(runtime.chatGptAccountDigest);
+  if (runtime.chatGptAccountDigest !== undefined && !accountDigest) {
+    throw new Error("ChatGPT account identity is invalid.");
+  }
+  const expectedAccountDigest = normalizeChatGptAccountDigest(browserConfig.expectedAccountDigest);
+  if (browserConfig.expectedAccountDigest != null && !expectedAccountDigest) {
+    throw new Error("Stored ChatGPT account identity is invalid.");
+  }
+  const remoteAccountDigest = normalizeChatGptAccountDigest(
+    browserConfig.remoteChromeAccountDigest,
+  );
+  if (browserConfig.remoteChromeAccountDigest != null && !remoteAccountDigest) {
+    throw new Error("Stored remote Chrome account identity is invalid.");
+  }
+  if (
+    expectedAccountDigest &&
+    remoteAccountDigest &&
+    expectedAccountDigest !== remoteAccountDigest
+  ) {
+    throw new Error("Stored ChatGPT account identity is conflicting.");
+  }
+  if (accountDigest && expectedAccountDigest && expectedAccountDigest !== accountDigest) {
+    throw new Error("Stored ChatGPT account identity is conflicting.");
+  }
+  if (accountDigest && remoteAccountDigest && remoteAccountDigest !== accountDigest) {
+    throw new Error("Stored remote Chrome account identity is conflicting.");
+  }
+  const normalizedRuntime = accountDigest
+    ? { ...runtime, chatGptAccountDigest: accountDigest }
+    : runtime;
+  if (accountDigest) {
+    browserConfig.expectedAccountDigest = accountDigest;
+    if (browserConfig.remoteChrome) {
+      browserConfig.remoteChromeAccountDigest = accountDigest;
+    }
+  }
+  if (!browserConfig.remoteChrome) {
+    return normalizedRuntime;
+  }
+  const browserWSEndpoint = normalizedRuntime.chromeBrowserWSEndpoint?.trim();
+  if (!browserWSEndpoint) {
+    return normalizedRuntime;
+  }
+  const browserId = browserIdFromWebSocketEndpoint(browserWSEndpoint);
+  if (browserConfig.remoteChromeBrowserId && browserConfig.remoteChromeBrowserId !== browserId) {
+    throw new Error("Stored remote Chrome browser identity is conflicting.");
+  }
+  if (
+    browserConfig.remoteChromeBrowserWSEndpoint &&
+    browserConfig.remoteChromeBrowserWSEndpoint !== browserWSEndpoint
+  ) {
+    throw new Error("Stored remote Chrome browser identity is conflicting.");
+  }
+  browserConfig.remoteChromeBrowserId = browserId;
+  browserConfig.remoteChromeBrowserWSEndpoint = browserWSEndpoint;
+  return normalizedRuntime;
 }
 
 export async function performSessionRun({
@@ -95,7 +162,12 @@ export async function performSessionRun({
     status: "running",
     startedAt: new Date().toISOString(),
     mode,
-    ...(browserConfig ? { browser: { config: browserConfig } } : {}),
+    ...(browserConfig
+      ? {
+          browser: { config: browserConfig },
+          options: { ...sessionMeta.options, browserConfig },
+        }
+      : {}),
   });
   const notificationSettings =
     notifications ?? deriveNotificationSettingsFromMetadata(sessionMeta, process.env);
@@ -117,14 +189,16 @@ export async function performSessionRun({
           runtime: BrowserRuntimeMetadata,
           modelSelection?: BrowserModelSelectionEvidence,
         ) => {
+          const persistedRuntime = applyRuntimeAffinityToBrowserConfig(browserConfig, runtime);
           const browser = {
             config: browserConfig,
-            runtime,
+            runtime: persistedRuntime,
             ...(modelSelection ? { modelSelection } : {}),
           };
           await sessionStore.updateSession(sessionMeta.id, {
             status: "running",
             browser,
+            options: { ...sessionMeta.options, browserConfig },
           });
           // Keep this attempt's copy fresh so error paths fall back to the
           // latest persisted browser evidence instead of stale session input.
@@ -161,6 +235,7 @@ export async function performSessionRun({
           usage: result.usage,
         });
       }
+      const persistedRuntime = applyRuntimeAffinityToBrowserConfig(browserConfig, result.runtime);
       await sessionStore.updateSession(sessionMeta.id, {
         status: "completed",
         completedAt: new Date().toISOString(),
@@ -169,11 +244,12 @@ export async function performSessionRun({
         errorMessage: undefined,
         browser: {
           config: browserConfig,
-          runtime: result.runtime,
+          runtime: persistedRuntime,
           archive: result.archive,
           modelSelection: result.modelSelection,
           warnings: result.warnings,
         },
+        options: { ...sessionMeta.options, browserConfig },
         artifacts: mergeArtifacts(sessionMeta.artifacts, result.artifacts),
         response: undefined,
         transport: undefined,

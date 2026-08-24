@@ -8,6 +8,10 @@ Read this file whenever you're working from Windows and add new findings so the 
 - browser-tools binary: not built in `agent-scripts/bin` on Windows; `pnpm tsx scripts/browser-tools.ts` also fails there (no package manifest). Use a macOS-built binary or run from macOS if you need it.
 - Prefer PowerShell + pnpm directly; watch for CRLF warnings when touching tracked files.
 - WSL browser launch host detection: a systemd-resolved stub such as `nameserver 127.0.0.53` is guest loopback, not the Windows host. Keep resolver-derived non-loopback hosts for Windows Chrome compatibility, but route resolver-derived `127/8` values to the standard local Chrome launcher.
+- Existing literal file paths must be `stat`ed before fast-glob classification; Windows absolute paths use backslashes that fast-glob can classify as dynamic patterns.
+- The SIGTERM delivery-order fixture is POSIX-only; Windows may terminate the child immediately without delivering the fixture's IPC acknowledgement.
+- `chatgpt-export` fails closed on Windows until Oracle can establish and verify an owner-exclusive DACL for every bundle path; POSIX `0700`/`0600` mode bits do not prove Windows ACL privacy.
+- `ORACLE_SESSION_ID_RECEIPT` is disabled on Windows until an owner-exclusive receipt DACL can be established and verified; the receipt is left unchanged on failure.
 
 Future Windows gotchas belong here. Update this doc when you learn something new.
 

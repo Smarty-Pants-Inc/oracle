@@ -21,6 +21,7 @@ type ModelSelectionResult =
       hint?: { temporaryChat?: boolean; availableOptions?: string[] };
     }
   | { status: "button-missing" }
+  | { status: "conversation-mismatch" }
   | undefined;
 
 // The model/effort picker is a composer pill that React mounts a beat after the page
@@ -36,7 +37,12 @@ export async function ensureModelSelection(
   desiredModel: string,
   logger: BrowserLogger,
   strategy: BrowserModelStrategy = "select",
-  options: { buttonWaitMs?: number; buttonPollMs?: number } = {},
+  options: {
+    buttonWaitMs?: number;
+    buttonPollMs?: number;
+    expectedConversationId?: string;
+    assertPageAffinity?: (action: string) => Promise<void>;
+  } = {},
 ): Promise<BrowserModelSelectionEvidence> {
   const buttonWaitMs = options.buttonWaitMs ?? MODEL_BUTTON_WAIT_MS;
   const buttonPollMs = options.buttonPollMs ?? MODEL_BUTTON_POLL_MS;
@@ -45,8 +51,13 @@ export async function ensureModelSelection(
   let result: ModelSelectionResult;
   let announcedWait = false;
   for (;;) {
+    await options.assertPageAffinity?.("model selection");
     const outcome = await Runtime.evaluate({
-      expression: buildModelSelectionExpression(desiredModel, strategy),
+      expression: buildModelSelectionExpression(
+        desiredModel,
+        strategy,
+        options.expectedConversationId,
+      ),
       awaitPromise: true,
       returnByValue: true,
     });
@@ -83,6 +94,8 @@ export async function ensureModelSelection(
         capturedAt: new Date().toISOString(),
       };
     }
+    case "conversation-mismatch":
+      throw new Error("ChatGPT conversation changed before model selection.");
     case "option-not-found": {
       await logDomFailure(Runtime, logger, "model-switcher-option");
       const isTemporary = result.hint?.temporaryChat ?? false;
@@ -189,6 +202,7 @@ export function assertResolvedModelSelectionForTest(
 function buildModelSelectionExpression(
   targetModel: string,
   strategy: BrowserModelStrategy,
+  expectedConversationId?: string,
 ): string {
   const matchers = buildModelMatchersLiteral(targetModel);
   const composerSignalMatchers = buildComposerSignalMatchers(targetModel);
@@ -200,6 +214,10 @@ function buildModelSelectionExpression(
   const composerIncludesLiteral = JSON.stringify(composerSignalMatchers.includesAny);
   const composerExcludesLiteral = JSON.stringify(composerSignalMatchers.excludesAny);
   const composerAllowBlankLiteral = JSON.stringify(composerSignalMatchers.allowBlank);
+  const expectedConversationLiteral =
+    typeof expectedConversationId === "string" && expectedConversationId.trim().length > 0
+      ? JSON.stringify(expectedConversationId.trim())
+      : "null";
   const menuContainerLiteral = JSON.stringify(
     `${MENU_CONTAINER_SELECTOR}, [role="listbox"], [role="dialog"]`,
   );
@@ -218,6 +236,12 @@ function buildModelSelectionExpression(
     const COMPOSER_SIGNAL_INCLUDES = ${composerIncludesLiteral};
     const COMPOSER_SIGNAL_EXCLUDES = ${composerExcludesLiteral};
     const COMPOSER_SIGNAL_ALLOW_BLANK = ${composerAllowBlankLiteral};
+    const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
+    const matchesExpectedConversation = () => {
+      if (!EXPECTED_CONVERSATION_ID) return true;
+      const href = typeof location === 'object' && location.href ? location.href : '';
+      return href.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] === EXPECTED_CONVERSATION_ID;
+    };
     const INITIAL_WAIT_MS = 150;
     const REOPEN_INTERVAL_MS = 400;
     const MAX_WAIT_MS = 20000;
@@ -366,6 +390,7 @@ function buildModelSelectionExpression(
     };
     const driveIntelligenceSliderToMaximum = (slider) => {
       if (!slider || intelligenceSliderIsAtMaximum(slider)) return true;
+      if (!matchesExpectedConversation()) return false;
       try {
         slider.focus?.();
         const KeyboardEventCtor = window.KeyboardEvent;
@@ -386,6 +411,7 @@ function buildModelSelectionExpression(
       }
     };
     const closeMenu = () => {
+      if (!matchesExpectedConversation()) return;
       const dialogCloseButton = document.querySelector(
         '[role="dialog"] [data-testid="close-button"]',
       );
@@ -685,9 +711,12 @@ function buildModelSelectionExpression(
 
     let lastPointerClick = 0;
     const pointerClick = () => {
+      if (!matchesExpectedConversation()) return false;
       if (dispatchClickSequence(button)) {
         lastPointerClick = performance.now();
+        return true;
       }
+      return false;
     };
 
     const getOptionLabel = (node) => node?.textContent?.trim() ?? '';
@@ -1151,6 +1180,7 @@ function buildModelSelectionExpression(
       check();
     });
     const dispatchHoverSequence = (target) => {
+      if (!matchesExpectedConversation()) return false;
       if (!target || !(target instanceof EventTarget)) return false;
       const rect = target.getBoundingClientRect?.();
       const clientX = rect ? rect.x + rect.width / 2 : 0;
@@ -1172,8 +1202,11 @@ function buildModelSelectionExpression(
       return true;
     };
     const openSubmenuOption = (node) => {
+      if (!matchesExpectedConversation()) return false;
       dispatchHoverSequence(node);
+      if (!matchesExpectedConversation()) return false;
       dispatchClickSequence(node);
+      return true;
     };
 
     return new Promise((resolve) => {
@@ -1206,10 +1239,18 @@ function buildModelSelectionExpression(
       };
 
       // Open once and wait a tick before first scan.
+      if (!matchesExpectedConversation()) {
+        resolve({ status: 'conversation-mismatch' });
+        return;
+      }
       pointerClick();
       const openDelay = () => new Promise((r) => setTimeout(r, INITIAL_WAIT_MS));
       let initialized = false;
       const attempt = async () => {
+        if (!matchesExpectedConversation()) {
+          resolve({ status: 'conversation-mismatch' });
+          return;
+        }
         if (performance.now() - start > MAX_WAIT_MS) {
           resolve({
             status: 'option-not-found',
@@ -1222,6 +1263,10 @@ function buildModelSelectionExpression(
           await openDelay();
         }
         ensureMenuOpen();
+        if (!matchesExpectedConversation()) {
+          resolve({ status: 'conversation-mismatch' });
+          return;
+        }
         const intelligenceSlider = findIntelligenceSlider();
         if (intelligenceSlider && intelligencePickerMatchesTarget()) {
           if (intelligenceSliderIsAtMaximum(intelligenceSlider)) {
@@ -1264,11 +1309,18 @@ function buildModelSelectionExpression(
           const isSubmenu = isSubmenuOption(match.node, match.testid);
           if (isSubmenu) {
             openedSubmenuKeys.add(match.submenuKey);
-            openSubmenuOption(match.node);
+            if (!openSubmenuOption(match.node)) {
+              resolve({ status: 'conversation-mismatch' });
+              return;
+            }
             setTimeout(attempt, REOPEN_INTERVAL_MS / 2);
             return;
           }
           clickedTargetOption = true;
+          if (!matchesExpectedConversation()) {
+            resolve({ status: 'conversation-mismatch' });
+            return;
+          }
           dispatchClickSequence(match.node);
           // Wait for the selected model signal to settle before reopening the picker.
           waitForTargetSelection(previousButtonLabel, previousComposerSignal).then((selectionSettled) => {
@@ -1576,6 +1628,7 @@ function buildModelMatchersLiteral(targetModel: string): {
 export function buildModelSelectionExpressionForTest(
   targetModel: string,
   strategy: BrowserModelStrategy = "select",
+  expectedConversationId?: string,
 ): string {
-  return buildModelSelectionExpression(targetModel, strategy);
+  return buildModelSelectionExpression(targetModel, strategy, expectedConversationId);
 }

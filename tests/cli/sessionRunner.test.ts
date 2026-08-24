@@ -1030,7 +1030,12 @@ describe("performSessionRun", () => {
     vi.mocked(runBrowserSessionExecution).mockResolvedValue({
       usage: { inputTokens: 100, outputTokens: 50, reasoningTokens: 0, totalTokens: 150 },
       elapsedMs: 2000,
-      runtime: { chromePid: 123, chromePort: 9222, userDataDir: "/tmp/profile" },
+      runtime: {
+        chromePid: 123,
+        chromePort: 9222,
+        userDataDir: "/tmp/profile",
+        chatGptAccountDigest: "a".repeat(64),
+      },
       modelSelection: {
         requestedModel: "GPT-5.5 Pro",
         resolvedLabel: "Pro",
@@ -1073,6 +1078,10 @@ describe("performSessionRun", () => {
         warnings: [expect.objectContaining({ code: "browser-pro-fast-large-run" })],
       }),
       artifacts: [{ kind: "transcript", path: "/tmp/transcript.md" }],
+    });
+    expect(finalUpdate).toMatchObject({
+      browser: { config: { expectedAccountDigest: "a".repeat(64) } },
+      options: { browserConfig: { expectedAccountDigest: "a".repeat(64) } },
     });
     expect(finalUpdate).toHaveProperty("errorMessage", undefined);
     expect(sessionStoreMock.updateModelRun).toHaveBeenCalledWith(
@@ -1256,6 +1265,8 @@ describe("performSessionRun", () => {
   });
 
   test("preserves persisted runtime hints when browser automation fails without runtime details", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const accountDigest = "a".repeat(64);
     const automationError = new BrowserAutomationError(
       "Prompt did not appear in conversation before timeout (send may have failed)",
       { stage: "submit-prompt", code: "prompt-commit-timeout" },
@@ -1274,6 +1285,8 @@ describe("performSessionRun", () => {
         {
           chromePort: 9222,
           chromeHost: "127.0.0.1",
+          chromeBrowserWSEndpoint: browserWSEndpoint,
+          chatGptAccountDigest: accountDigest,
           tabUrl: "https://chatgpt.com/c/demo",
           promptSubmitted: true,
         },
@@ -1295,7 +1308,12 @@ describe("performSessionRun", () => {
         sessionMeta: { ...baseSessionMeta },
         runOptions: baseRunOptions,
         mode: "browser",
-        browserConfig: { chromePath: null },
+        browserConfig: {
+          chromePath: null,
+          remoteChrome: { host: "127.0.0.1", port: 9223 },
+          remoteChromeBrowserId: "browser-a",
+          remoteChromeBrowserWSEndpoint: browserWSEndpoint,
+        },
         cwd: "/tmp",
         log,
         write,
@@ -1307,7 +1325,7 @@ describe("performSessionRun", () => {
     expect(finalUpdate).toMatchObject({
       status: "error",
       browser: expect.objectContaining({
-        config: expect.any(Object),
+        config: expect.objectContaining({ remoteChromeAccountDigest: accountDigest }),
         runtime: expect.objectContaining({
           promptSubmitted: true,
           tabUrl: "https://chatgpt.com/c/demo",
@@ -1318,6 +1336,90 @@ describe("performSessionRun", () => {
         details: expect.objectContaining({ code: "prompt-commit-timeout" }),
       }),
     });
+  });
+
+  test("persists a local account digest in successful browser runtime metadata", async () => {
+    const accountDigest = "a".repeat(64);
+    vi.mocked(runBrowserSessionExecution).mockResolvedValue({
+      usage: { inputTokens: 1, outputTokens: 1, reasoningTokens: 0, totalTokens: 2 },
+      elapsedMs: 1,
+      runtime: { chatGptAccountDigest: accountDigest, tabUrl: "https://chatgpt.com/c/local" },
+      answerText: "ok",
+    });
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate?.browser?.runtime).toMatchObject({ chatGptAccountDigest: accountDigest });
+    expect(finalUpdate?.browser?.config).not.toHaveProperty("remoteChromeAccountDigest");
+  });
+
+  test("persists resolved affinity for a direct raw remote Chrome run", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const accountDigest = "a".repeat(64);
+    vi.mocked(runBrowserSessionExecution).mockResolvedValue({
+      usage: { inputTokens: 1, outputTokens: 1, reasoningTokens: 0, totalTokens: 2 },
+      elapsedMs: 1,
+      runtime: {
+        chromeHost: "127.0.0.1",
+        chromePort: 9223,
+        chromeBrowserWSEndpoint: browserWSEndpoint,
+        chatGptAccountDigest: accountDigest,
+        tabUrl: "https://chatgpt.com/c/remote",
+      },
+      answerText: "ok",
+    });
+
+    await performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { remoteChrome: { host: "127.0.0.1", port: 9223 } },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+    });
+
+    const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+    expect(finalUpdate?.browser?.config).toMatchObject({
+      remoteChromeBrowserId: "browser-a",
+      remoteChromeBrowserWSEndpoint: browserWSEndpoint,
+      remoteChromeAccountDigest: accountDigest,
+    });
+    expect(finalUpdate?.browser?.runtime).toMatchObject({
+      chromeBrowserWSEndpoint: browserWSEndpoint,
+      chatGptAccountDigest: accountDigest,
+    });
+  });
+
+  test("rejects a malformed local runtime account digest before persistence", async () => {
+    vi.mocked(runBrowserSessionExecution).mockImplementationOnce(async (_args, deps) => {
+      await deps?.persistRuntimeHint?.({ chatGptAccountDigest: "not-a-digest" });
+      throw new Error("unreachable");
+    });
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow(/ChatGPT account identity is invalid/i);
   });
 
   test("keeps session running when browser connection is lost", async () => {

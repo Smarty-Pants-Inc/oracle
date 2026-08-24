@@ -11,6 +11,8 @@ import {
   buildConversationTurnCountExpression,
   buildConversationTurnListExpression,
 } from "../conversationTurns.js";
+import { extractStableConversationIdFromUrl } from "../conversationUrl.js";
+import { isChatGptUrl } from "../liveTabs.js";
 import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
@@ -29,6 +31,11 @@ export interface AttachmentReadyExpectation {
   generatedBundle?: boolean;
 }
 
+export interface PromptCommitEvidence {
+  turnsCount: number | null;
+  conversationUrl: string;
+}
+
 type AttachmentReadyInput = string | AttachmentReadyExpectation;
 
 export async function submitPrompt(
@@ -40,13 +47,15 @@ export async function submitPrompt(
     inputTimeoutMs?: number | null;
     attachmentTimeoutMs?: number | null;
     onPromptSubmitted?: () => Promise<void> | void;
+    assertPageAffinity: (action: string) => Promise<void>;
   },
   prompt: string,
   logger: BrowserLogger,
-): Promise<number | null> {
+): Promise<PromptCommitEvidence> {
   const { runtime, input } = deps;
 
   await waitForDomReady(runtime, logger, deps.inputTimeoutMs ?? undefined);
+  await deps.assertPageAffinity("prompt composer focus");
   const encodedPrompt = JSON.stringify(prompt);
   const focusResult = await runtime.evaluate({
     expression: `(() => {
@@ -101,6 +110,7 @@ export async function submitPrompt(
     throw new Error("Failed to focus prompt textarea");
   }
 
+  await deps.assertPageAffinity("prompt text insertion");
   await input.insertText({ text: prompt });
 
   // Some pages (notably ChatGPT when subscriptions/widgets load) need a brief settle
@@ -145,6 +155,7 @@ export async function submitPrompt(
   const activeValueTrimmed = activeValueRaw?.trim?.() ?? "";
   if (!editorTextTrimmed && !fallbackValueTrimmed && !activeValueTrimmed) {
     // Learned: occasionally Input.insertText doesn't land in the editor; force textContent/value + input events.
+    await deps.assertPageAffinity("prompt fallback text insertion");
     await runtime.evaluate({
       expression: `(() => {
         const fallback = document.querySelector(${fallbackSelectorLiteral});
@@ -212,6 +223,34 @@ export async function submitPrompt(
       },
     );
   }
+  const baselineResult = await runtime.evaluate({
+    expression: buildConversationTurnCountExpression(),
+    returnByValue: true,
+  });
+  const rawBaseline =
+    typeof baselineResult.result?.value === "number"
+      ? baselineResult.result.value
+      : Number(baselineResult.result?.value);
+  const measuredBaselineTurns =
+    Number.isFinite(rawBaseline) && rawBaseline >= 0 ? Math.floor(rawBaseline) : undefined;
+  const callerBaselineTurns =
+    typeof deps.baselineTurns === "number" &&
+    Number.isFinite(deps.baselineTurns) &&
+    deps.baselineTurns >= 0
+      ? Math.floor(deps.baselineTurns)
+      : undefined;
+  const commitBaselineTurns =
+    measuredBaselineTurns === undefined
+      ? callerBaselineTurns
+      : callerBaselineTurns === undefined
+        ? measuredBaselineTurns
+        : Math.max(callerBaselineTurns, measuredBaselineTurns);
+  if (commitBaselineTurns === undefined) {
+    throw new BrowserAutomationError("Could not establish a conversation baseline before send.", {
+      stage: "submit-prompt",
+      code: "prompt-baseline-unavailable",
+    });
+  }
 
   const clicked = await attemptSendButton(
     runtime,
@@ -219,8 +258,10 @@ export async function submitPrompt(
     logger,
     deps?.attachmentNames,
     deps?.attachmentTimeoutMs,
+    deps.assertPageAffinity,
   );
   if (!clicked) {
+    await deps.assertPageAffinity("prompt send");
     await input.dispatchKeyEvent({
       type: "keyDown",
       ...ENTER_KEY_EVENT,
@@ -239,19 +280,18 @@ export async function submitPrompt(
 
   const commitTimeoutMs = Math.max(60_000, deps.inputTimeoutMs ?? 0);
   // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
-  return await verifyPromptCommitted(
-    runtime,
-    prompt,
-    commitTimeoutMs,
-    logger,
-    deps.baselineTurns ?? undefined,
-  );
+  return await verifyPromptCommitted(runtime, prompt, commitTimeoutMs, logger, commitBaselineTurns);
 }
 
-export async function clearPromptComposer(Runtime: ChromeClient["Runtime"], logger: BrowserLogger) {
+export async function clearPromptComposer(
+  Runtime: ChromeClient["Runtime"],
+  logger: BrowserLogger,
+  assertPageAffinity?: (action: string) => Promise<void>,
+) {
   const primarySelectorLiteral = JSON.stringify(PROMPT_PRIMARY_SELECTOR);
   const fallbackSelectorLiteral = JSON.stringify(PROMPT_FALLBACK_SELECTOR);
   const inputSelectorsLiteral = JSON.stringify(INPUT_SELECTORS);
+  await assertPageAffinity?.("prompt composer clearing");
   const result = await Runtime.evaluate({
     expression: `(() => {
       const SELECTORS = ${inputSelectorsLiteral};
@@ -651,6 +691,7 @@ async function attemptSendButton(
   _logger?: BrowserLogger,
   attachmentNames?: AttachmentReadyInput[],
   attachmentTimeoutMs?: number | null,
+  assertPageAffinity?: (action: string) => Promise<void>,
 ): Promise<boolean> {
   const script = `(() => {
     ${buildClickDispatcher()}
@@ -685,9 +726,16 @@ async function attemptSendButton(
     if (rect.width > 0 && rect.height > 0) {
       return { status: 'point', x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
     }
-    // Last-resort fallback for unusual DOMs where the button is visible but has no useful rect.
-    dispatchClickSequence(button);
-    return { status: 'clicked' };
+    return { status: 'fallback' };
+  })()`;
+  const fallbackClickScript = `(() => {
+    const selectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
+    const button = selectors
+      .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+      .find((node) => node instanceof HTMLElement && !node.hasAttribute('disabled'));
+    if (!(button instanceof HTMLElement)) return false;
+    button.click();
+    return true;
   })()`;
 
   // Give attachment-bearing submissions more headroom. ChatGPT's chip render can
@@ -700,7 +748,7 @@ async function attemptSendButton(
   while (Date.now() < deadline) {
     const { result } = await Runtime.evaluate({ expression: script, returnByValue: true });
     const value = result.value as
-      | { status?: "clicked" | "missing" | "point"; x?: number; y?: number }
+      | { status?: "fallback" | "missing" | "point"; x?: number; y?: number }
       | string
       | undefined;
     const status = typeof value === "string" ? value : value?.status;
@@ -710,11 +758,17 @@ async function attemptSendButton(
       typeof value.x === "number" &&
       typeof value.y === "number"
     ) {
+      await assertPageAffinity?.("prompt send");
       await clickTrustedPoint(Runtime, Input, value.x, value.y);
       return true;
     }
-    if (status === "clicked") {
-      return true;
+    if (status === "fallback") {
+      await assertPageAffinity?.("prompt send");
+      const fallback = await Runtime.evaluate({
+        expression: fallbackClickScript,
+        returnByValue: true,
+      });
+      if (fallback.result?.value === true) return true;
     }
     if (status === "missing") {
       break;
@@ -785,7 +839,7 @@ async function verifyPromptCommitted(
   timeoutMs: number,
   logger?: BrowserLogger,
   baselineTurns?: number,
-): Promise<number | null> {
+): Promise<PromptCommitEvidence> {
   const deadline = Date.now() + timeoutMs;
   const encodedPrompt = JSON.stringify(prompt.trim());
   const primarySelectorLiteral = JSON.stringify(PROMPT_PRIMARY_SELECTOR);
@@ -793,90 +847,151 @@ async function verifyPromptCommitted(
   const inputSelectorsLiteral = JSON.stringify(INPUT_SELECTORS);
   const stopSelectorLiteral = JSON.stringify(STOP_BUTTON_SELECTOR);
   const assistantSelectorLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
-  let baseline: number | null =
+  const baseline =
     typeof baselineTurns === "number" && Number.isFinite(baselineTurns) && baselineTurns >= 0
       ? Math.floor(baselineTurns)
-      : null;
-  if (baseline === null) {
-    try {
-      const { result } = await Runtime.evaluate({
-        expression: buildConversationTurnCountExpression(),
-        returnByValue: true,
-      });
-      const raw = typeof result?.value === "number" ? result.value : Number(result?.value);
-      if (Number.isFinite(raw)) {
-        baseline = Math.max(0, Math.floor(raw));
-      }
-    } catch {
-      // ignore; baseline stays unknown
-    }
-  }
-  const baselineLiteral = baseline ?? -1;
+      : -1;
+  const baselineLiteral = baseline;
   // Learned: ChatGPT can echo/format text; normalize markdown and use prefix matches to detect the sent prompt.
   const script = `(() => {
-		    const editor = document.querySelector(${primarySelectorLiteral});
-		    const fallback = document.querySelector(${fallbackSelectorLiteral});
-		    const inputSelectors = ${inputSelectorsLiteral};
-	    const normalize = (value) => {
-	      let text = value?.toLowerCase?.() ?? '';
-	      // Strip markdown *markers* but keep content (ChatGPT renders fence markers differently).
-	      text = text.replace(/\`\`\`[^\\n]*\\n([\\s\\S]*?)\`\`\`/g, ' $1 ');
-	      text = text.replace(/\`\`\`/g, ' ');
-	      text = text.replace(/\`([^\`]*)\`/g, '$1');
-	      return text.replace(/\\s+/g, ' ').trim();
-	    };
-	    const normalizedPrompt = normalize(${encodedPrompt});
-	    const normalizedPromptPrefix = normalizedPrompt.slice(0, 120);
-	    const articles = ${buildConversationTurnListExpression()};
-	    const normalizedTurns = articles.map((node) => normalize(node?.innerText));
-	    const readValue = (node) => {
-	      if (!node) return '';
-	      if (node instanceof HTMLTextAreaElement) return node.value ?? '';
-	      return node.innerText ?? '';
-	    };
-	    const isVisible = (node) => {
-	      if (!node || typeof node.getBoundingClientRect !== 'function') return false;
-	      const rect = node.getBoundingClientRect();
-	      return rect.width > 0 && rect.height > 0;
-	    };
-	    const inputs = inputSelectors
-	      .map((selector) => document.querySelector(selector))
-	      .filter((node) => Boolean(node));
-	    const visibleInputs = inputs.filter((node) => isVisible(node));
-	    const activeInputs = visibleInputs.length > 0 ? visibleInputs : inputs;
-	    const userMatched =
-	      normalizedPrompt.length > 0 && normalizedTurns.some((text) => text.includes(normalizedPrompt));
-	    const prefixMatched =
-	      normalizedPromptPrefix.length > 30 &&
-	      normalizedTurns.some((text) => text.includes(normalizedPromptPrefix));
-		    const lastTurn = normalizedTurns[normalizedTurns.length - 1] ?? '';
-		    const lastMatched =
-		      normalizedPrompt.length > 0 &&
-		      (lastTurn.includes(normalizedPrompt) ||
-		        (normalizedPromptPrefix.length > 30 && lastTurn.includes(normalizedPromptPrefix)));
-		    const baseline = ${baselineLiteral};
-		    const hasNewTurn = baseline < 0 ? false : normalizedTurns.length > baseline;
-		    const stopVisible = Boolean(document.querySelector(${stopSelectorLiteral}));
-		    const assistantVisible = Boolean(
-		      document.querySelector(${assistantSelectorLiteral}) ||
-		      document.querySelector('[data-testid*="assistant"]'),
-		    );
-	    // Learned: composer clearing + stop button or assistant presence is a reliable fallback signal.
-      const editorValue = editor?.innerText ?? '';
-      const fallbackValue = fallback?.value ?? '';
-      const activeEmpty =
-        activeInputs.length === 0 ? null : activeInputs.every((node) => !String(readValue(node)).trim());
-      const composerCleared = activeEmpty ?? !(String(editorValue).trim() || String(fallbackValue).trim());
-      const href = typeof location === 'object' && location.href ? location.href : '';
-      const inConversation = /\\/c\\//.test(href);
-		    return {
-        baseline,
-	      userMatched,
-	      prefixMatched,
-	      lastMatched,
-	      hasNewTurn,
-	      stopVisible,
+    const editor = document.querySelector(${primarySelectorLiteral});
+    const fallback = document.querySelector(${fallbackSelectorLiteral});
+    const inputSelectors = ${inputSelectorsLiteral};
+    const normalize = (value) => {
+      let text = value?.toLowerCase?.() ?? '';
+      // Strip markdown *markers* but keep content (ChatGPT renders fence markers differently).
+      text = text.replace(/\`\`\`[^\\n]*\\n([\\s\\S]*?)\`\`\`/g, ' $1 ');
+      text = text.replace(/\`\`\`/g, ' ');
+      text = text.replace(/\`([^\`]*)\`/g, '$1');
+      return text.replace(/\\s+/g, ' ').trim();
+    };
+    const normalizedPrompt = normalize(${encodedPrompt});
+    const normalizedPromptPrefix = normalizedPrompt.slice(0, 120);
+    const matchesPromptText = (text) => {
+      if (!normalizedPrompt.length) return false;
+      if (text.includes(normalizedPrompt)) return true;
+      return normalizedPromptPrefix.length > 30 && text.includes(normalizedPromptPrefix);
+    };
+    const articles = ${buildConversationTurnListExpression()};
+    const normalizedTurns = articles.map((node) => normalize(node?.innerText));
+    const isUserTurn = (node) => {
+      const role = String(
+        node?.getAttribute?.('data-message-author-role') ||
+          node?.getAttribute?.('data-turn') ||
+          '',
+      ).toLowerCase();
+      if (role) return role === 'user';
+      return Boolean(
+        node?.querySelector?.('[data-message-author-role="user"], [data-turn="user"]'),
+      );
+    };
+    const readValue = (node) => {
+      if (!node) return '';
+      if (node instanceof HTMLTextAreaElement) return node.value ?? '';
+      return node.innerText ?? '';
+    };
+    const isVisible = (node) => {
+      if (!node || typeof node.getBoundingClientRect !== 'function') return false;
+      const rect = node.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    };
+    const inputs = inputSelectors
+      .map((selector) => document.querySelector(selector))
+      .filter((node) => Boolean(node));
+    const visibleInputs = inputs.filter((node) => isVisible(node));
+    const activeInputs = visibleInputs.length > 0 ? visibleInputs : inputs;
+    const readIdentityPart = (value) => {
+      const raw = String(value ?? '').trim();
+      return raw.length > 0 &&
+        raw.length <= 200 &&
+        /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(raw)
+        ? raw
+        : '';
+    };
+    const identityNodesFor = (node) => {
+      const nodes = [node];
+      const candidates = [
+        node?.querySelector?.('[data-message-author-role="user"], [data-turn="user"]'),
+        node?.querySelector?.('[data-message-id]'),
+        node?.querySelector?.('[data-testid^="conversation-turn"]'),
+      ];
+      for (const candidate of candidates) {
+        if (candidate && !nodes.includes(candidate)) nodes.push(candidate);
+      }
+      return nodes;
+    };
+    const readTurnIdentity = (node) => {
+      const identityNodes = identityNodesFor(node);
+      for (const identityNode of identityNodes) {
+        const messageId = readIdentityPart(identityNode?.getAttribute?.('data-message-id'));
+        if (messageId) return 'message:' + messageId;
+      }
+      for (const identityNode of identityNodes) {
+        const testId = readIdentityPart(identityNode?.getAttribute?.('data-testid'));
+        if (testId) return 'testid:' + testId;
+      }
+      return null;
+    };
+    const baseline = ${baselineLiteral};
+    const lastTurn = normalizedTurns[normalizedTurns.length - 1] ?? '';
+    const lastMatched = matchesPromptText(lastTurn);
+    const hasNewTurn = baseline < 0 ? false : normalizedTurns.length > baseline;
+    let submittedTurnIndex = -1;
+    const firstCandidateIndex = baseline < 0 ? 0 : baseline;
+    for (let index = normalizedTurns.length - 1; index >= firstCandidateIndex; index -= 1) {
+      if (isUserTurn(articles[index]) && matchesPromptText(normalizedTurns[index])) {
+        submittedTurnIndex = index;
+        break;
+      }
+    }
+    let submittedTurnIdentity =
+      submittedTurnIndex >= 0 ? readTurnIdentity(articles[submittedTurnIndex]) : null;
+    if (submittedTurnIdentity) {
+      const identityCounts = new Map();
+      for (const article of articles) {
+        const identity = readTurnIdentity(article);
+        if (identity) identityCounts.set(identity, (identityCounts.get(identity) || 0) + 1);
+      }
+      if (identityCounts.get(submittedTurnIdentity) !== 1) submittedTurnIdentity = null;
+    }
+    const submittedTurnMatched =
+      submittedTurnIndex >= 0 &&
+      isUserTurn(articles[submittedTurnIndex]) &&
+      matchesPromptText(normalizedTurns[submittedTurnIndex] ?? '');
+    const userMatched =
+      normalizedPrompt.length > 0 && normalizedTurns.some((text) => text.includes(normalizedPrompt));
+    const prefixMatched =
+      normalizedPromptPrefix.length > 30 &&
+      normalizedTurns.some((text) => text.includes(normalizedPromptPrefix));
+    const stopVisible = Boolean(document.querySelector(${stopSelectorLiteral}));
+    const assistantVisible = Boolean(
+      document.querySelector(${assistantSelectorLiteral}) ||
+        document.querySelector('[data-testid*="assistant"]'),
+    );
+    const editorValue = editor?.innerText ?? '';
+    const fallbackValue = fallback?.value ?? '';
+    const activeEmpty =
+      activeInputs.length === 0
+        ? null
+        : activeInputs.every((node) => !String(readValue(node)).trim());
+    const composerKnown = activeInputs.length > 0 || Boolean(editor || fallback);
+    const composerCleared =
+      composerKnown &&
+      (activeEmpty ?? !(String(editorValue).trim() || String(fallbackValue).trim()));
+    const href = typeof location === 'object' && location.href ? location.href : '';
+    const inConversation = /\\/c\\//.test(href);
+    return {
+      baseline,
+      userMatched,
+      prefixMatched,
+      submittedTurnIndex,
+      submittedTurnIdentity,
+      lastMatched,
+      submittedTurnMatched,
+      hasNewTurn,
+      stopVisible,
       assistantVisible,
+      composerKnown,
       composerCleared,
       inConversation,
       href,
@@ -887,6 +1002,9 @@ async function verifyPromptCommitted(
     };
   })()`;
 
+  const unclearedSubmittedTurnIdentities = new Set<string>();
+  let observedSubmittedTurnIdentity: string | undefined;
+  let submittedTurnIdentityAmbiguous = false;
   let lastProbe: CommitProbeState | undefined;
   while (Date.now() < deadline) {
     const { result } = await Runtime.evaluate({ expression: script, returnByValue: true });
@@ -895,18 +1013,52 @@ async function verifyPromptCommitted(
       lastProbe = info;
     }
     const turnsCount = (result.value as { turnsCount?: number } | undefined)?.turnsCount;
-    const matchesPrompt = Boolean(info?.lastMatched || info?.userMatched || info?.prefixMatched);
-    const baselineUnknown =
-      typeof info?.baseline === "number" ? info.baseline < 0 : baselineLiteral < 0;
-    if (matchesPrompt && (baselineUnknown || info?.hasNewTurn)) {
-      return typeof turnsCount === "number" && Number.isFinite(turnsCount) ? turnsCount : null;
+    const currentSubmittedTurnIdentity = sanitizeCommitProbeIdentity(info?.submittedTurnIdentity);
+    if (info?.submittedTurnMatched === true) {
+      if (!currentSubmittedTurnIdentity) {
+        submittedTurnIdentityAmbiguous = true;
+      } else if (
+        observedSubmittedTurnIdentity &&
+        observedSubmittedTurnIdentity !== currentSubmittedTurnIdentity
+      ) {
+        submittedTurnIdentityAmbiguous = true;
+      } else if (!observedSubmittedTurnIdentity) {
+        observedSubmittedTurnIdentity = currentSubmittedTurnIdentity;
+      }
     }
-    const fallbackCommit =
-      info?.composerCleared &&
-      Boolean(info?.hasNewTurn) &&
-      ((info?.stopVisible ?? false) || info?.assistantVisible || info?.inConversation);
-    if (fallbackCommit) {
-      return typeof turnsCount === "number" && Number.isFinite(turnsCount) ? turnsCount : null;
+    const baselineKnown =
+      typeof info?.baseline === "number" ? info.baseline >= 0 : baselineLiteral >= 0;
+    const parsedConversationUrl =
+      typeof info?.href === "string" && isChatGptUrl(info.href) ? new URL(info.href) : null;
+    const conversationUrl =
+      parsedConversationUrl && extractStableConversationIdFromUrl(parsedConversationUrl.pathname)
+        ? info?.href
+        : null;
+    const submittedTurnIsFresh =
+      info?.submittedTurnMatched === true &&
+      info.composerKnown === true &&
+      info.composerCleared === true &&
+      currentSubmittedTurnIdentity !== null &&
+      submittedTurnIdentityAmbiguous === false &&
+      observedSubmittedTurnIdentity === currentSubmittedTurnIdentity &&
+      !unclearedSubmittedTurnIdentities.has(currentSubmittedTurnIdentity);
+    if (baselineKnown && info?.hasNewTurn && submittedTurnIsFresh && conversationUrl) {
+      return {
+        turnsCount:
+          typeof turnsCount === "number" && Number.isFinite(turnsCount) ? turnsCount : null,
+        conversationUrl,
+      };
+    }
+    if (
+      baselineKnown &&
+      info?.hasNewTurn === true &&
+      info.submittedTurnMatched === true &&
+      currentSubmittedTurnIdentity !== null &&
+      info.composerCleared !== true &&
+      // A visible stop control binds this identity to the active send before React clears the composer.
+      info.stopVisible !== true
+    ) {
+      unclearedSubmittedTurnIdentities.add(currentSubmittedTurnIdentity);
     }
     await delay(100);
   }
@@ -916,7 +1068,7 @@ async function verifyPromptCommitted(
   const probe = finalProbe && typeof finalProbe === "object" ? finalProbe : lastProbe;
   if (logger) {
     logger(
-      `Prompt commit check failed; latest state: ${probe ? JSON.stringify(probe) : "unavailable"}`,
+      `Prompt commit check failed; latest state: ${probe ? JSON.stringify(summarizeCommitProbe(probe)) : "unavailable"}`,
     );
     await logDomFailure(Runtime, logger, "prompt-commit");
   }
@@ -945,12 +1097,16 @@ async function verifyPromptCommitted(
 
 interface CommitProbeState {
   baseline?: number;
+  submittedTurnIndex?: number;
   userMatched?: boolean;
   prefixMatched?: boolean;
+  submittedTurnIdentity?: string | null;
   lastMatched?: boolean;
+  submittedTurnMatched?: boolean;
   hasNewTurn?: boolean;
   stopVisible?: boolean;
   assistantVisible?: boolean;
+  composerKnown?: boolean;
   composerCleared?: boolean;
   inConversation?: boolean;
   turnsCount?: number;
@@ -961,16 +1117,26 @@ interface CommitProbeState {
 }
 
 // Keep booleans/counts but replace free text with lengths so session metadata stays lean.
+
+function sanitizeCommitProbeIdentity(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(normalized) ? normalized : null;
+}
 function summarizeCommitProbe(probe: CommitProbeState): Record<string, unknown> {
   return {
     baseline: probe.baseline,
     turnsCount: probe.turnsCount,
+    submittedTurnIndex: probe.submittedTurnIndex,
     userMatched: probe.userMatched,
     prefixMatched: probe.prefixMatched,
     lastMatched: probe.lastMatched,
+    submittedTurnIdentityPresent: typeof probe.submittedTurnIdentity === "string",
+    submittedTurnMatched: probe.submittedTurnMatched,
     hasNewTurn: probe.hasNewTurn,
     stopVisible: probe.stopVisible,
     assistantVisible: probe.assistantVisible,
+    composerKnown: probe.composerKnown,
     composerCleared: probe.composerCleared,
     inConversation: probe.inConversation,
     editorLength: typeof probe.editorValue === "string" ? probe.editorValue.length : undefined,

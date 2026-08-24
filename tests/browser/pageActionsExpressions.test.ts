@@ -5,6 +5,7 @@ import {
   buildConversationDebugExpressionForTest,
   buildMarkdownFallbackExtractorForTest,
   buildCopyExpressionForTest,
+  buildResponseObserverExpressionForTest,
   buildUserTurnAttachmentExpressionForTest,
 } from "../../src/browser/pageActions.ts";
 import {
@@ -12,6 +13,7 @@ import {
   CONVERSATION_TURN_SELECTOR,
   ASSISTANT_ROLE_SELECTOR,
 } from "../../src/browser/constants.ts";
+import { CHATGPT_ORIGINS } from "../../src/browser/conversationUrl.ts";
 
 describe("browser automation expressions", () => {
   test("assistant extractor references constants", () => {
@@ -111,6 +113,38 @@ describe("browser automation expressions", () => {
     expect(expression).toContain("currentConversationId !== EXPECTED_CONVERSATION_ID");
     expect(expression).toContain("return null;");
   });
+  test("assistant snapshot expression rejects a missing conversation id", () => {
+    const expression = buildAssistantSnapshotExpressionForTest(4, "conv-123");
+    expect(expression).not.toContain("currentConversationId &&");
+  });
+
+  test("assistant snapshot expression accepts every supported ChatGPT origin", () => {
+    const expression = buildAssistantSnapshotExpressionForTest(4, "conv-123");
+    expect(expression).toContain(JSON.stringify(CHATGPT_ORIGINS[0]));
+    expect(expression).toContain("currentPageUrl?.protocol === 'https:'");
+    expect(expression).toContain("currentPageUrl.pathname");
+  });
+
+  test("assistant expressions preserve exact conversation origin and project path", () => {
+    const conversationUrl = "https://chat.openai.com/g/team/project/c/conv-123";
+    const snapshot = buildAssistantSnapshotExpressionForTest(
+      4,
+      "conv-123",
+      undefined,
+      conversationUrl,
+    );
+    const observer = buildResponseObserverExpressionForTest(5_000, 4, "conv-123", conversationUrl);
+    const copy = buildCopyExpressionForTest({}, "conv-123", conversationUrl);
+    for (const expression of [snapshot, observer, copy]) {
+      expect(expression).toContain(JSON.stringify(conversationUrl));
+      expect(expression).toContain("origin");
+      expect(expression).toContain("pathname");
+      expect(expression).toContain("search");
+      expect(expression).toContain("hash");
+    }
+    expect(observer).toContain("approvedConversationScope");
+    expect(copy).toContain("conversation-mismatch");
+  });
 
   test("markdown fallback filters user turns and respects assistant indicators", () => {
     const expression = buildMarkdownFallbackExtractorForTest("2");
@@ -129,12 +163,27 @@ describe("browser automation expressions", () => {
     expect(expression).toContain("const __minTurn");
   });
 
-  test("copy expression scopes to assistant turn buttons", () => {
-    const expression = buildCopyExpressionForTest({});
+  test("copy expression scopes to assistant turns and the expected conversation", () => {
+    const expression = buildCopyExpressionForTest({}, "conv-123");
     expect(expression).toContain(JSON.stringify(CONVERSATION_TURN_SELECTOR));
     expect(expression).toContain(ASSISTANT_ROLE_SELECTOR);
     expect(expression).toContain("isAssistantTurn");
     expect(expression).toContain("copy-turn-action-button");
+    expect(expression).toContain('const EXPECTED_CONVERSATION_ID = "conv-123"');
+    expect(expression).toContain("conversation-mismatch");
+  });
+
+  test("copy expression rechecks the conversation immediately before clicking", () => {
+    const expression = buildCopyExpressionForTest({}, "conv-123");
+    const clickIndex = expression.indexOf("dispatchClickSequence(button);");
+    const guardIndex = expression.lastIndexOf("if (!matchesExpectedConversation())", clickIndex);
+    const scrollIndex = expression.indexOf("button.scrollIntoView");
+
+    expect(clickIndex).toBeGreaterThan(-1);
+    expect(guardIndex).toBeGreaterThan(-1);
+    expect(scrollIndex).toBeGreaterThan(-1);
+    expect(scrollIndex).toBeLessThan(guardIndex);
+    expect(guardIndex).toBeLessThan(clickIndex);
   });
 
   test("user-turn attachment expression requires non-empty prompt text for prefix fallback", () => {
@@ -144,5 +193,13 @@ describe("browser automation expressions", () => {
     expect(expression).toContain("const textPrefix = text.slice");
     expect(expression).toContain("text.length > 0");
     expect(expression).toContain("textPrefix.length > 0");
+  });
+
+  test("user-turn attachment expression rejects a missing conversation id", () => {
+    const expression = buildUserTurnAttachmentExpressionForTest({
+      expectedConversationId: "conv-123",
+    });
+    expect(expression).toContain("currentConversationId !== EXPECTED_CONVERSATION_ID");
+    expect(expression).not.toContain("currentConversationId &&");
   });
 });

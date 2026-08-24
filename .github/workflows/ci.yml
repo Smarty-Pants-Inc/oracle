@@ -2,9 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - mergify/merge-queue/**
+      - tmp-mergify/merge-queue/**
   pull_request:
-    branches: [main]
+    branches:
+      - main
 
 jobs:
   build:
@@ -62,3 +66,18 @@ jobs:
           fi
           echo "CHROME_PATH=${CHROME_PATH}"
           node scripts/cdp-disconnect-proof.mjs
+
+  smarty-ci:
+    if: always()
+    needs:
+      - build
+      - cdp-disconnect-proof-linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all CI jobs
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          CDP_RESULT: ${{ needs.cdp-disconnect-proof-linux.result }}
+        run: |
+          test "$BUILD_RESULT" = success
+          test "$CDP_RESULT" = success

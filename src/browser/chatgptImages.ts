@@ -14,6 +14,93 @@ import { readAssistantSnapshot } from "./pageActions.js";
 import { getOracleHomeDir } from "../oracleHome.js";
 import { resolveSessionArtifactsDir } from "./artifacts.js";
 import { saveAssistantDownloadButtonArtifacts } from "./chatgptFiles.js";
+import type { BrowserDownloadBehaviorLockScope } from "./downloadBehaviorLock.js";
+import { buildEvaluatedChatGptPageAffinityGuard } from "./chatgptAccount.js";
+function buildAssistantImageExpression(
+  minTurnIndex?: number,
+  affinity: {
+    expectedConversationId?: string;
+    expectedConversationUrl?: string;
+    expectedAccountDigest?: string;
+  } = {},
+): string {
+  const minTurnLiteral =
+    typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex) && minTurnIndex >= 0
+      ? Math.floor(minTurnIndex)
+      : -1;
+  const assistantLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
+  const affinityGuard = buildEvaluatedChatGptPageAffinityGuard(affinity);
+  return `${affinityGuard ? "(async () => {" : "(() => {"}
+    ${affinityGuard}
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
+    const MIN_TURN_INDEX = ${minTurnLiteral};
+    const ASSISTANT_SELECTOR = ${assistantLiteral};
+    const isGeneratedImage = (img) => {
+      const url = new URL(img?.src || '', location.origin || 'https://chatgpt.com');
+      const host = url.hostname.toLowerCase();
+      if (url.protocol !== 'https:' || url.port) return false;
+      if (host !== 'chatgpt.com' && host !== 'chat.openai.com') return false;
+      if (url.pathname !== '/backend-api/estuary/content') return false;
+      if (!String(url.searchParams.get('id') || '').startsWith('file_')) return false;
+      const alt = String(img.alt || '').toLowerCase();
+      if (alt.includes('generated image')) return true;
+      let node = img;
+      while (node instanceof HTMLElement) {
+        if (String(node.id || '').startsWith('image-')) return true;
+        if (String(node.className || '').includes('imagegen-image')) return true;
+        node = node.parentElement;
+      }
+      return false;
+    };
+    const serializeImages = (root) =>
+      Array.from(root.querySelectorAll('img')).filter(isGeneratedImage).map((img) => ({
+        url: img.src || '',
+        alt: img.alt || '',
+        width: img.naturalWidth || 0,
+        height: img.naturalHeight || 0,
+      }));
+    const isAssistantTurn = (node) => {
+      if (!(node instanceof HTMLElement)) return false;
+      const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
+      if (turnAttr === 'assistant') return true;
+      const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
+      if (role === 'assistant') return true;
+      const testId = (node.getAttribute('data-testid') || '').toLowerCase();
+      if (testId.includes('assistant')) return true;
+      return Boolean(node.querySelector(ASSISTANT_SELECTOR) || node.querySelector('[data-testid*="assistant"]'));
+    };
+    const turns = ${buildConversationTurnListExpression()};
+    for (let index = turns.length - 1; index >= 0; index -= 1) {
+      const turn = turns[index];
+      if (!isAssistantTurn(turn)) continue;
+      if (MIN_TURN_INDEX >= 0 && index < MIN_TURN_INDEX) continue;
+      const messageRoot = turn.querySelector(ASSISTANT_SELECTOR) || turn;
+      const images = serializeImages(messageRoot);
+      if (images.length > 0) {
+        ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
+        return images;
+      }
+    }
+    const boundary =
+      MIN_TURN_INDEX > 0 && turns.length > 0
+        ? turns[Math.min(MIN_TURN_INDEX - 1, turns.length - 1)]
+        : null;
+    const fallbackImages = Array.from(document.querySelectorAll('img'))
+      .filter(isGeneratedImage)
+      .filter((img) => {
+        if (!boundary) return true;
+        return Boolean(boundary.compareDocumentPosition(img) & Node.DOCUMENT_POSITION_FOLLOWING);
+      })
+      .map((img) => ({
+        url: img.src || '',
+        alt: img.alt || '',
+        width: img.naturalWidth || 0,
+        height: img.naturalHeight || 0,
+      }));
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
+    return fallbackImages;
+  })()`;
+}
 
 const GENERATED_IMAGE_WAIT_MIN_MS = 15_000;
 const GENERATED_IMAGE_WAIT_MAX_MS = 15 * 60_000;
@@ -67,85 +154,28 @@ function dedupeImages(images: BrowserGeneratedImage[]): BrowserGeneratedImage[] 
   return [...best.values()];
 }
 
-function buildAssistantImageExpression(minTurnIndex?: number): string {
-  const minTurnLiteral =
-    typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex) && minTurnIndex >= 0
-      ? Math.floor(minTurnIndex)
-      : -1;
-  const assistantLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
-  return `(() => {
-    const MIN_TURN_INDEX = ${minTurnLiteral};
-    const ASSISTANT_SELECTOR = ${assistantLiteral};
-    const isGeneratedImage = (img) => {
-      const url = new URL(img?.src || '', location.origin || 'https://chatgpt.com');
-      const host = url.hostname.toLowerCase();
-      if (url.protocol !== 'https:' || url.port) return false;
-      if (host !== 'chatgpt.com' && host !== 'chat.openai.com') return false;
-      if (url.pathname !== '/backend-api/estuary/content') return false;
-      if (!String(url.searchParams.get('id') || '').startsWith('file_')) return false;
-      const alt = String(img.alt || '').toLowerCase();
-      if (alt.includes('generated image')) return true;
-      let node = img;
-      while (node instanceof HTMLElement) {
-        if (String(node.id || '').startsWith('image-')) return true;
-        if (String(node.className || '').includes('imagegen-image')) return true;
-        node = node.parentElement;
-      }
-      return false;
-    };
-    const serializeImages = (root) =>
-      Array.from(root.querySelectorAll('img')).filter(isGeneratedImage).map((img) => ({
-        url: img.src || '',
-        alt: img.alt || '',
-        width: img.naturalWidth || 0,
-        height: img.naturalHeight || 0,
-      }));
-    const isAssistantTurn = (node) => {
-      if (!(node instanceof HTMLElement)) return false;
-      const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
-      if (turnAttr === 'assistant') return true;
-      const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
-      if (role === 'assistant') return true;
-      const testId = (node.getAttribute('data-testid') || '').toLowerCase();
-      if (testId.includes('assistant')) return true;
-      return Boolean(node.querySelector(ASSISTANT_SELECTOR) || node.querySelector('[data-testid*="assistant"]'));
-    };
-    const turns = ${buildConversationTurnListExpression()};
-    for (let index = turns.length - 1; index >= 0; index -= 1) {
-      const turn = turns[index];
-      if (!isAssistantTurn(turn)) continue;
-      if (MIN_TURN_INDEX >= 0 && index < MIN_TURN_INDEX) continue;
-      const messageRoot = turn.querySelector(ASSISTANT_SELECTOR) || turn;
-      const images = serializeImages(messageRoot);
-      if (images.length > 0) return images;
-    }
-    const boundary =
-      MIN_TURN_INDEX > 0 && turns.length > 0
-        ? turns[Math.min(MIN_TURN_INDEX - 1, turns.length - 1)]
-        : null;
-    return Array.from(document.querySelectorAll('img'))
-      .filter(isGeneratedImage)
-      .filter((img) => {
-        if (!boundary) return true;
-        return Boolean(boundary.compareDocumentPosition(img) & Node.DOCUMENT_POSITION_FOLLOWING);
-      })
-      .map((img) => ({
-        url: img.src || '',
-        alt: img.alt || '',
-        width: img.naturalWidth || 0,
-        height: img.naturalHeight || 0,
-      }));
-  })()`;
-}
-
 export async function readAssistantGeneratedImages(
   Runtime: ChromeClient["Runtime"],
   minTurnIndex?: number,
+  assertPageAffinity?: (action: string) => Promise<void>,
+  expectedConversationId?: string,
+  expectedAccountDigest?: string,
+  expectedConversationUrl?: string,
 ): Promise<BrowserGeneratedImage[]> {
-  const { result } = await Runtime.evaluate({
-    expression: buildAssistantImageExpression(minTurnIndex),
+  await assertPageAffinity?.("generated image DOM read");
+  const { result, exceptionDetails } = await Runtime.evaluate({
+    expression: buildAssistantImageExpression(minTurnIndex, {
+      expectedConversationId,
+      expectedConversationUrl,
+      expectedAccountDigest,
+    }),
+    awaitPromise: true,
     returnByValue: true,
   });
+  if (exceptionDetails) {
+    throw new Error("Generated image DOM read failed its in-page affinity guard.");
+  }
+  await assertPageAffinity?.("generated image DOM read completion");
   const raw = Array.isArray(result?.value) ? result.value : [];
   const normalized = raw
     .map((item) => {
@@ -165,11 +195,28 @@ export async function readAssistantGeneratedImages(
 async function readAssistantGeneratedImagesWithFallback(
   Runtime: ChromeClient["Runtime"],
   minTurnIndex?: number | null,
+  assertPageAffinity?: (action: string) => Promise<void>,
+  expectedConversationId?: string,
+  expectedAccountDigest?: string,
+  expectedConversationUrl?: string,
 ): Promise<BrowserGeneratedImage[]> {
-  const filteredImages = await readAssistantGeneratedImages(
-    Runtime,
-    minTurnIndex ?? undefined,
-  ).catch(() => []);
+  const readImages = async (minimumTurnIndex: number | undefined, action: string) => {
+    await assertPageAffinity?.(action);
+    try {
+      return await readAssistantGeneratedImages(
+        Runtime,
+        minimumTurnIndex,
+        assertPageAffinity,
+        expectedConversationId,
+        expectedAccountDigest,
+        expectedConversationUrl,
+      );
+    } catch (error) {
+      if (expectedConversationId || expectedConversationUrl || expectedAccountDigest) throw error;
+      return [];
+    }
+  };
+  const filteredImages = await readImages(minTurnIndex ?? undefined, "generated image DOM read");
   if (
     filteredImages.length > 0 ||
     typeof minTurnIndex !== "number" ||
@@ -178,10 +225,22 @@ async function readAssistantGeneratedImagesWithFallback(
     return filteredImages;
   }
 
-  const [fallbackImages, fallbackSnapshot] = await Promise.all([
-    readAssistantGeneratedImages(Runtime).catch(() => []),
-    readAssistantSnapshot(Runtime).catch(() => null),
-  ]);
+  const fallbackImages = await readImages(undefined, "generated image fallback DOM read");
+  await assertPageAffinity?.("generated image fallback snapshot read");
+  let fallbackSnapshot;
+  try {
+    fallbackSnapshot = await readAssistantSnapshot(
+      Runtime,
+      undefined,
+      expectedConversationId,
+      expectedAccountDigest,
+      expectedConversationUrl,
+    );
+  } catch (error) {
+    if (expectedConversationId || expectedConversationUrl || expectedAccountDigest) throw error;
+    fallbackSnapshot = null;
+  }
+  await assertPageAffinity?.("generated image fallback snapshot read completion");
   const fallbackTurnIndex =
     typeof fallbackSnapshot?.turnIndex === "number" ? fallbackSnapshot.turnIndex : null;
   const nearBoundary =
@@ -260,7 +319,6 @@ function sanitizeGeneratedImageStem(value: string): string {
     .replace(/^-|-$/g, "")
     .slice(0, 48);
 }
-
 function resolveDefaultGeneratedImagePath(
   images: BrowserGeneratedImage[],
   sessionId?: string,
@@ -275,39 +333,129 @@ function resolveDefaultGeneratedImagePath(
   return path.join(baseDir, `${stem}${uniqueSuffix}.png`);
 }
 
-async function buildCookieHeader(Network: ChromeClient["Network"]): Promise<string> {
-  const response = await Network.getCookies({ urls: ["https://chatgpt.com/"] });
+const GENERATED_IMAGE_REDIRECT_LIMIT = 5;
+
+async function buildCookieHeader(
+  Network: ChromeClient["Network"],
+  downloadUrl: string,
+): Promise<string> {
+  const response = await Network.getCookies({ urls: [downloadUrl] });
   return (response.cookies ?? [])
     .filter((cookie) => cookie.name && typeof cookie.value === "string")
     .map((cookie) => `${cookie.name}=${cookie.value}`)
     .join("; ");
 }
 
+function shouldSendGeneratedImageCookies(url: URL): boolean {
+  return (
+    url.protocol === "https:" &&
+    !url.port &&
+    isAllowedChatGptHost(url.hostname) &&
+    url.pathname === "/backend-api/estuary/content" &&
+    (url.searchParams.get("id") ?? "").startsWith("file_")
+  );
+}
+
+function validateGeneratedImageFinalUrl(value: string): string {
+  const url = new URL(value);
+  if (url.protocol !== "https:" || url.username || url.password || url.port) {
+    throw new Error(`generated image redirect rejected: ${url.protocol}`);
+  }
+  return url.href;
+}
+
+async function fetchGeneratedImageWithNode(
+  imageUrl: string,
+  getCookieHeader: (url: string) => Promise<string>,
+  assertPageAffinity?: (action: string) => Promise<void>,
+): Promise<{ buffer: Buffer; contentType: string | null; finalUrl: string }> {
+  let currentUrl = new URL(imageUrl);
+  for (let redirects = 0; redirects <= GENERATED_IMAGE_REDIRECT_LIMIT; redirects += 1) {
+    const headers: Record<string, string> = { "user-agent": "Mozilla/5.0" };
+    if (shouldSendGeneratedImageCookies(currentUrl)) {
+      const cookieHeader = await getCookieHeader(currentUrl.href);
+      if (!cookieHeader) throw new Error("Missing ChatGPT cookies for image download.");
+      headers.cookie = cookieHeader;
+    }
+    await assertPageAffinity?.("generated image download");
+    const response = await fetch(currentUrl, { headers, redirect: "manual" });
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location) throw new Error("generated image redirect missing location");
+      const redirectedUrl = new URL(location, currentUrl);
+      if (redirectedUrl.protocol !== "https:") {
+        throw new Error(`generated image redirect rejected: ${redirectedUrl.protocol}`);
+      }
+      currentUrl = redirectedUrl;
+      continue;
+    }
+    if (!response.ok) {
+      throw new Error(`download failed: ${response.status} ${response.statusText}`);
+    }
+    const finalUrl = validateGeneratedImageFinalUrl(response.url || currentUrl.href);
+    return {
+      buffer: Buffer.from(await response.arrayBuffer()),
+      contentType: response.headers.get("content-type"),
+      finalUrl,
+    };
+  }
+  throw new Error(`generated image download exceeded ${GENERATED_IMAGE_REDIRECT_LIMIT} redirects`);
+}
+
 async function fetchGeneratedImageInBrowserContext(
   Runtime: ChromeClient["Runtime"],
   url: string,
+  assertPageAffinity?: (action: string) => Promise<void>,
+  expectedConversationId?: string,
+  expectedAccountDigest?: string,
+  expectedConversationUrl?: string,
 ): Promise<{ buffer: Buffer; contentType: string | null; finalUrl: string }> {
-  const expression = `
-    (async () => {
-      const url = ${JSON.stringify(url)};
-      const response = await fetch(url, { credentials: 'include', redirect: 'follow' });
-      const contentType = response.headers.get('content-type') || '';
-      const buffer = await response.arrayBuffer();
-      const bytes = new Uint8Array(buffer);
-      let binary = '';
-      for (let index = 0; index < bytes.length; index += 0x8000) {
-        binary += String.fromCharCode(...bytes.slice(index, index + 0x8000));
-      }
-      return {
-        ok: response.ok,
-        status: response.status,
-        statusText: response.statusText,
-        contentType,
-        finalUrl: response.url,
-        b64: btoa(binary),
-      };
-    })()
-  `;
+  await assertPageAffinity?.("generated image browser download");
+  const affinityGuard = buildEvaluatedChatGptPageAffinityGuard({
+    expectedConversationId,
+    expectedConversationUrl,
+    expectedAccountDigest,
+  });
+  const expression = `${affinityGuard ? "(async () => {" : "(async () => {"}
+    ${affinityGuard}
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
+    const requestedUrl = new URL(url);
+    const response = await fetch(url, { credentials: 'include', redirect: 'manual' });
+    if (
+      (response.status >= 300 && response.status < 400) ||
+      response.type === 'opaqueredirect'
+    ) {
+      throw new Error('generated image redirect rejected');
+    }
+    const finalUrl = new URL(response.url || url);
+    if (
+      finalUrl.protocol !== 'https:' ||
+      finalUrl.username ||
+      finalUrl.password ||
+      finalUrl.port ||
+      finalUrl.origin !== requestedUrl.origin ||
+      finalUrl.pathname !== requestedUrl.pathname ||
+      finalUrl.search !== requestedUrl.search
+    ) {
+      throw new Error('generated image redirect rejected');
+    }
+    const contentType = response.headers.get('content-type') || '';
+    const buffer = await response.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    for (let index = 0; index < bytes.length; index += 0x8000) {
+      binary += String.fromCharCode(...bytes.slice(index, index + 0x8000));
+    }
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
+    return {
+      ok: response.ok,
+      status: response.status,
+      statusText: response.statusText,
+      contentType,
+      finalUrl: finalUrl.href,
+      b64: btoa(binary),
+    };
+  })()`;
   const { result, exceptionDetails } = await Runtime.evaluate({
     expression,
     awaitPromise: true,
@@ -315,8 +463,9 @@ async function fetchGeneratedImageInBrowserContext(
     timeout: 120_000,
   });
   if (exceptionDetails) {
-    throw new Error("browser-context fetch threw an exception");
+    throw new Error("Generated image browser fetch failed its in-page affinity guard.");
   }
+  await assertPageAffinity?.("generated image browser download completion");
   const value = result?.value as
     | {
         ok?: boolean;
@@ -339,12 +488,49 @@ async function fetchGeneratedImageInBrowserContext(
   };
 }
 
+interface StagedGeneratedImage extends Omit<SavedBrowserImage, "path"> {
+  stagingPath: string;
+  targetPath: string;
+}
+
+async function createGeneratedImageStagingDir(targetPath: string): Promise<string> {
+  const targetDir = path.dirname(path.resolve(targetPath));
+  await fs.mkdir(targetDir, { recursive: true });
+  return fs.mkdtemp(path.join(targetDir, ".oracle-image-"));
+}
+
+async function publishStagedGeneratedImages(
+  stagedImages: StagedGeneratedImage[],
+  assertPageAffinity?: (action: string) => Promise<void>,
+  logger?: BrowserLogger,
+): Promise<{ savedImages: SavedBrowserImage[]; errors: string[] }> {
+  await assertPageAffinity?.("generated image artifact final return");
+  const savedImages: SavedBrowserImage[] = [];
+  const errors: string[] = [];
+  for (const stagedImage of stagedImages) {
+    try {
+      await fs.rename(stagedImage.stagingPath, stagedImage.targetPath);
+      const { stagingPath: _stagingPath, targetPath, ...image } = stagedImage;
+      savedImages.push({ ...image, path: targetPath });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      errors.push(`${stagedImage.fileId ?? stagedImage.url}: ${message}`);
+      logger?.(`[browser] Failed to publish generated image: ${message}`);
+    }
+  }
+  return { savedImages, errors };
+}
+
 export async function saveChatGptGeneratedImages(params: {
   Network: ChromeClient["Network"];
   Runtime?: ChromeClient["Runtime"];
   images: BrowserGeneratedImage[];
   outputPath: string;
   logger?: BrowserLogger;
+  assertPageAffinity?: (action: string) => Promise<void>;
+  expectedConversationId?: string;
+  expectedConversationUrl?: string;
+  expectedAccountDigest?: string;
 }): Promise<{
   saved: boolean;
   imageCount: number;
@@ -354,92 +540,116 @@ export async function saveChatGptGeneratedImages(params: {
   const { Network, Runtime, images, outputPath, logger } = params;
   if (!images.length) return { saved: false, imageCount: 0, savedImages: [], errors: [] };
 
-  const cookieHeader = await buildCookieHeader(Network);
-  if (!cookieHeader) {
-    return {
-      saved: false,
-      imageCount: images.length,
-      savedImages: [],
-      errors: ["Missing ChatGPT cookies for image download."],
-    };
-  }
-
-  const savedImages: SavedBrowserImage[] = [];
-  const errors: string[] = [];
-  await fs.mkdir(path.dirname(path.resolve(outputPath)), { recursive: true });
-
-  for (let index = 0; index < images.length; index += 1) {
-    const image = images[index];
-    try {
-      const imageUrl = normalizeGeneratedImageUrl(image.url);
-      if (!imageUrl) {
-        throw new Error("rejected non-ChatGPT generated image URL");
-      }
-      let contentType: string | null = null;
-      let finalUrl = imageUrl;
-      let buffer: Buffer;
-
-      try {
-        const response = await fetch(imageUrl, {
-          headers: {
-            cookie: cookieHeader,
-            "user-agent": "Mozilla/5.0",
-          },
-          redirect: "follow",
-        });
-        if (!response.ok) {
-          throw new Error(`download failed: ${response.status} ${response.statusText}`);
-        }
-        contentType = response.headers.get("content-type");
-        finalUrl = response.url;
-        buffer = Buffer.from(await response.arrayBuffer());
-      } catch (downloadError) {
-        if (!Runtime) {
-          throw downloadError;
-        }
-        const message =
-          downloadError instanceof Error ? downloadError.message : String(downloadError);
-        logger?.(
-          `[browser] ChatGPT generated image download failed via Node fetch; retrying in browser context (${image.fileId ?? imageUrl}: ${message}).`,
-        );
-        const browserFetch = await fetchGeneratedImageInBrowserContext(Runtime, imageUrl);
-        contentType = browserFetch.contentType;
-        finalUrl = browserFetch.finalUrl;
-        buffer = browserFetch.buffer;
-      }
-
-      const extension = contentTypeToExtension(contentType);
-      const targetPath = resolveSiblingImagePath(path.resolve(outputPath), index, extension);
-      await fs.writeFile(targetPath, buffer);
-      savedImages.push({
-        kind: "image",
-        path: targetPath,
-        label: index === 0 ? "Generated image" : `Generated image ${index + 1}`,
-        mimeType: contentType ?? undefined,
-        sizeBytes: buffer.length,
-        sourceUrl: imageUrl,
-        url: imageUrl,
-        finalUrl,
-        alt: image.alt,
-        width: image.width,
-        height: image.height,
-        fileId: image.fileId,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      errors.push(`${image.fileId ?? image.url}: ${message}`);
-      logger?.(
-        `[browser] Failed to save generated image ${index + 1}/${images.length}: ${message}`,
-      );
-    }
-  }
-
-  return {
-    saved: savedImages.length > 0,
-    imageCount: images.length,
-    savedImages,
-    errors,
+  const cookieHeaders = new Map<string, string>();
+  const getCookieHeader = async (downloadUrl: string) => {
+    const origin = new URL(downloadUrl).origin;
+    const cached = cookieHeaders.get(origin);
+    if (cached !== undefined) return cached;
+    await params.assertPageAffinity?.("generated image cookie read");
+    const cookieHeader = await buildCookieHeader(Network, downloadUrl);
+    cookieHeaders.set(origin, cookieHeader);
+    return cookieHeader;
   };
+
+  const resolvedOutputPath = path.resolve(outputPath);
+  const stagingDir = await createGeneratedImageStagingDir(resolvedOutputPath);
+  try {
+    const stagedImages: StagedGeneratedImage[] = [];
+    const errors: string[] = [];
+    for (let index = 0; index < images.length; index += 1) {
+      const image = images[index];
+      await params.assertPageAffinity?.("generated image download");
+      let imageUrl: string;
+      let contentType: string | null = null;
+      let finalUrl: string;
+      let buffer: Buffer;
+      try {
+        imageUrl = normalizeGeneratedImageUrl(image.url) ?? "";
+        if (!imageUrl) {
+          throw new Error("rejected non-ChatGPT generated image URL");
+        }
+        finalUrl = imageUrl;
+        try {
+          const nodeFetch = await fetchGeneratedImageWithNode(
+            imageUrl,
+            getCookieHeader,
+            params.assertPageAffinity,
+          );
+          contentType = nodeFetch.contentType;
+          finalUrl = nodeFetch.finalUrl;
+          buffer = nodeFetch.buffer;
+        } catch (downloadError) {
+          if (!Runtime) throw downloadError;
+          const message =
+            downloadError instanceof Error ? downloadError.message : String(downloadError);
+          logger?.(
+            `[browser] ChatGPT generated image download failed via Node fetch; retrying in browser context (${image.fileId ?? imageUrl}: ${message}).`,
+          );
+          const browserFetch = await fetchGeneratedImageInBrowserContext(
+            Runtime,
+            imageUrl,
+            params.assertPageAffinity,
+            params.expectedConversationId,
+            params.expectedAccountDigest,
+            params.expectedConversationUrl,
+          );
+          contentType = browserFetch.contentType;
+          finalUrl = validateGeneratedImageFinalUrl(browserFetch.finalUrl);
+          buffer = browserFetch.buffer;
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        errors.push(`${image.fileId ?? image.url}: ${message}`);
+        logger?.(
+          `[browser] Failed to save generated image ${index + 1}/${images.length}: ${message}`,
+        );
+        continue;
+      }
+
+      await params.assertPageAffinity?.("generated image artifact save");
+      try {
+        const extension = contentTypeToExtension(contentType);
+        const targetPath = resolveSiblingImagePath(resolvedOutputPath, index, extension);
+        const stagingPath = path.join(stagingDir, `${index}.${extension}`);
+        await fs.writeFile(stagingPath, buffer!);
+        stagedImages.push({
+          stagingPath,
+          targetPath,
+          kind: "image",
+          label: index === 0 ? "Generated image" : `Generated image ${index + 1}`,
+          mimeType: contentType ?? undefined,
+          sizeBytes: buffer!.length,
+          sourceUrl: imageUrl!,
+          url: imageUrl!,
+          finalUrl: finalUrl!,
+          alt: image.alt,
+          width: image.width,
+          height: image.height,
+          fileId: image.fileId,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        errors.push(`${image.fileId ?? image.url}: ${message}`);
+        logger?.(
+          `[browser] Failed to save generated image ${index + 1}/${images.length}: ${message}`,
+        );
+      }
+    }
+
+    const publication = await publishStagedGeneratedImages(
+      stagedImages,
+      params.assertPageAffinity,
+      logger,
+    );
+    return {
+      saved: publication.savedImages.length > 0,
+      imageCount: images.length,
+      savedImages: publication.savedImages,
+      errors: [...errors, ...publication.errors],
+    };
+  } finally {
+    await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
+  }
 }
 
 async function saveGeneratedImageButtonArtifacts(params: {
@@ -450,50 +660,75 @@ async function saveGeneratedImageButtonArtifacts(params: {
   logger?: BrowserLogger;
   minTurnIndex?: number | null;
   targetPath: string;
+  assertPageAffinity?: (action: string) => Promise<void>;
+  expectedConversationId?: string;
+  expectedConversationUrl?: string;
+  expectedAccountDigest?: string;
+  downloadBehaviorLockScope?: BrowserDownloadBehaviorLockScope;
 }): Promise<SavedBrowserImage[]> {
-  const buttonDownloads = await saveAssistantDownloadButtonArtifacts({
-    Browser: params.Browser,
-    Client: params.Client,
-    Page: params.Page,
-    Runtime: params.Runtime,
-    logger: params.logger,
-    files: [],
-    allowGenericDownloadLabels: true,
-    downloadPath: path.dirname(params.targetPath),
-    minTurnIndex: params.minTurnIndex,
-  });
-  const buttonImages: SavedBrowserImage[] = [];
-  for (const download of buttonDownloads) {
-    const contents = await fs.readFile(download.path);
-    const detected = detectImageFile(contents);
-    if (!detected) {
-      await fs.unlink(download.path).catch(() => undefined);
-      params.logger?.(`[browser] Ignored non-image assistant download: ${download.label}`);
-      continue;
-    }
-    const index = buttonImages.length;
-    const resolvedPath = resolveSiblingImagePath(params.targetPath, index, detected.extension);
-    if (path.resolve(download.path) !== resolvedPath) {
-      await fs.copyFile(download.path, resolvedPath);
-      await fs.unlink(download.path);
-    }
-    const stat = await fs.stat(resolvedPath);
-    buttonImages.push({
-      kind: "image",
-      path: resolvedPath,
-      label: index === 0 ? "Generated image" : `Generated image ${index + 1}`,
-      mimeType: detected.mimeType,
-      sizeBytes: stat.size,
-      sourceUrl: "browser-download",
-      url: "browser-download",
-      finalUrl: "browser-download",
-      alt: download.label,
+  await params.assertPageAffinity?.("generated image download button fallback");
+  const targetPath = path.resolve(params.targetPath);
+  const stagingDir = await createGeneratedImageStagingDir(targetPath);
+  let preserveStagingDir = false;
+  try {
+    const buttonDownloads = await saveAssistantDownloadButtonArtifacts({
+      Browser: params.Browser,
+      Client: params.Client,
+      Page: params.Page,
+      Runtime: params.Runtime,
+      logger: params.logger,
+      files: [],
+      allowGenericDownloadLabels: true,
+      downloadPath: stagingDir,
+      minTurnIndex: params.minTurnIndex,
+      assertPageAffinity: params.assertPageAffinity,
+      expectedConversationId: params.expectedConversationId,
+      expectedConversationUrl: params.expectedConversationUrl,
+      expectedAccountDigest: params.expectedAccountDigest,
+      downloadBehaviorLockScope: params.downloadBehaviorLockScope,
+      onStagingRetained: () => {
+        preserveStagingDir = true;
+      },
     });
+    preserveStagingDir ||= Boolean(buttonDownloads.retainedStagingDir);
+    const stagedImages: StagedGeneratedImage[] = [];
+    for (const download of buttonDownloads) {
+      await params.assertPageAffinity?.("generated image button artifact save");
+      const contents = await fs.readFile(download.path);
+      const detected = detectImageFile(contents);
+      if (!detected) {
+        params.logger?.(`[browser] Ignored non-image assistant download: ${download.label}`);
+        continue;
+      }
+      const index = stagedImages.length;
+      stagedImages.push({
+        stagingPath: download.path,
+        targetPath: resolveSiblingImagePath(targetPath, index, detected.extension),
+        kind: "image",
+        label: index === 0 ? "Generated image" : `Generated image ${index + 1}`,
+        mimeType: detected.mimeType,
+        sizeBytes: contents.length,
+        sourceUrl: "browser-download",
+        url: "browser-download",
+        finalUrl: "browser-download",
+        alt: download.label,
+      });
+    }
+    if (stagedImages.length === 0) {
+      return [];
+    }
+    const { savedImages } = await publishStagedGeneratedImages(
+      stagedImages,
+      params.assertPageAffinity,
+      params.logger,
+    );
+    params.logger?.(`[browser] Saved ${savedImages.length} generated image download artifact(s).`);
+    return savedImages;
+  } finally {
+    if (!preserveStagingDir) {
+      await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
-  if (buttonImages.length > 0) {
-    params.logger?.(`[browser] Saved ${buttonImages.length} generated image download artifact(s).`);
-  }
-  return buttonImages;
 }
 
 function formatButtonImageArtifacts(
@@ -530,12 +765,17 @@ export async function collectGeneratedImageArtifacts(params: {
   Network: ChromeClient["Network"];
   logger?: BrowserLogger;
   minTurnIndex?: number | null;
+  expectedConversationId?: string;
+  expectedConversationUrl?: string;
+  assertPageAffinity?: (action: string) => Promise<void>;
+  expectedAccountDigest?: string;
   sessionId?: string;
   generateImagePath?: string;
   outputPath?: string;
   answerText: string;
   waitTimeoutMs?: number;
   checkBlockingUiWarning?: () => Promise<void>;
+  downloadBehaviorLockScope?: BrowserDownloadBehaviorLockScope;
 }): Promise<{
   generatedImages: BrowserGeneratedImage[];
   savedImages: SavedBrowserImage[];
@@ -544,14 +784,20 @@ export async function collectGeneratedImageArtifacts(params: {
   answerText: string;
 }> {
   const explicitTargetPath = params.generateImagePath ?? params.outputPath;
+  await params.assertPageAffinity?.("generated image artifact collection");
   let generatedImages = await readAssistantGeneratedImagesWithFallback(
     params.Runtime,
     params.minTurnIndex ?? undefined,
+    params.assertPageAffinity,
+    params.expectedConversationId,
+    params.expectedAccountDigest,
+    params.expectedConversationUrl,
   );
   let latestAnswerText = params.answerText;
 
   if (explicitTargetPath && generatedImages.length === 0) {
     await params.checkBlockingUiWarning?.();
+    await params.assertPageAffinity?.("generated image button fallback");
     const targetPath = path.resolve(explicitTargetPath);
     const buttonImages = await saveGeneratedImageButtonArtifacts({
       Browser: params.Browser,
@@ -561,6 +807,11 @@ export async function collectGeneratedImageArtifacts(params: {
       logger: params.logger,
       minTurnIndex: params.minTurnIndex,
       targetPath,
+      assertPageAffinity: params.assertPageAffinity,
+      expectedConversationId: params.expectedConversationId,
+      expectedConversationUrl: params.expectedConversationUrl,
+      expectedAccountDigest: params.expectedAccountDigest,
+      downloadBehaviorLockScope: params.downloadBehaviorLockScope,
     });
     if (buttonImages.length > 0) {
       return formatButtonImageArtifacts(buttonImages, latestAnswerText);
@@ -569,17 +820,39 @@ export async function collectGeneratedImageArtifacts(params: {
     while (Date.now() < deadline) {
       await delay(1500);
       await params.checkBlockingUiWarning?.();
+      await params.assertPageAffinity?.("generated image artifact polling");
       generatedImages = await readAssistantGeneratedImagesWithFallback(
         params.Runtime,
         params.minTurnIndex ?? undefined,
+        params.assertPageAffinity,
+        params.expectedConversationId,
+        params.expectedAccountDigest,
+        params.expectedConversationUrl,
       );
       if (generatedImages.length > 0) {
         break;
       }
-      const latestSnapshot = await readAssistantSnapshot(
-        params.Runtime,
-        params.minTurnIndex ?? undefined,
-      ).catch(() => null);
+      await params.assertPageAffinity?.("generated image fallback answer read");
+      let latestSnapshot;
+      try {
+        latestSnapshot = await readAssistantSnapshot(
+          params.Runtime,
+          params.minTurnIndex ?? undefined,
+          params.expectedConversationId,
+          params.expectedAccountDigest,
+          params.expectedConversationUrl,
+        );
+      } catch (error) {
+        if (
+          params.expectedConversationId ||
+          params.expectedConversationUrl ||
+          params.expectedAccountDigest
+        ) {
+          throw error;
+        }
+        latestSnapshot = null;
+      }
+      await params.assertPageAffinity?.("generated image fallback answer read completion");
       const snapshotText =
         typeof latestSnapshot?.text === "string" ? latestSnapshot.text.trim() : "";
       if (snapshotText) {
@@ -596,6 +869,11 @@ export async function collectGeneratedImageArtifacts(params: {
         logger: params.logger,
         minTurnIndex: params.minTurnIndex,
         targetPath,
+        assertPageAffinity: params.assertPageAffinity,
+        expectedConversationId: params.expectedConversationId,
+        expectedConversationUrl: params.expectedConversationUrl,
+        expectedAccountDigest: params.expectedAccountDigest,
+        downloadBehaviorLockScope: params.downloadBehaviorLockScope,
       });
       if (delayedButtonImages.length > 0) {
         return formatButtonImageArtifacts(delayedButtonImages, latestAnswerText);
@@ -610,6 +888,7 @@ export async function collectGeneratedImageArtifacts(params: {
     );
   }
   if (imageCount === 0) {
+    await params.assertPageAffinity?.("generated image artifact final return");
     return {
       generatedImages,
       savedImages: [],
@@ -630,6 +909,10 @@ export async function collectGeneratedImageArtifacts(params: {
     Runtime: params.Runtime,
     images: generatedImages,
     outputPath: targetPath,
+    assertPageAffinity: params.assertPageAffinity,
+    expectedConversationId: params.expectedConversationId,
+    expectedConversationUrl: params.expectedConversationUrl,
+    expectedAccountDigest: params.expectedAccountDigest,
     logger: params.logger,
   });
   if (!saved.saved) {
@@ -641,7 +924,12 @@ export async function collectGeneratedImageArtifacts(params: {
         Runtime: params.Runtime,
         logger: params.logger,
         minTurnIndex: params.minTurnIndex,
+        assertPageAffinity: params.assertPageAffinity,
+        expectedConversationId: params.expectedConversationId,
+        expectedConversationUrl: params.expectedConversationUrl,
+        expectedAccountDigest: params.expectedAccountDigest,
         targetPath: path.resolve(explicitTargetPath),
+        downloadBehaviorLockScope: params.downloadBehaviorLockScope,
       });
       if (buttonImages.length > 0) {
         return formatButtonImageArtifacts(buttonImages, latestAnswerText);
@@ -656,6 +944,7 @@ export async function collectGeneratedImageArtifacts(params: {
     params.logger?.(
       `[browser] Auto-save for generated images failed; returning metadata only.${detail}`,
     );
+    await params.assertPageAffinity?.("generated image artifact final return");
     return {
       generatedImages,
       savedImages: [],

@@ -25,6 +25,194 @@ describe("background-only browser policy", () => {
       runBrowserMode({ prompt: "review", config: { attachRunning: true } }),
     ).rejects.toMatchObject({ details: { stage: "background-browser-policy" } });
   });
+
+  test("rejects local Chrome when invoked through the agent wrapper", async () => {
+    const previous = process.env.ORACLE_WRAPPER_REMOTE_ONLY;
+    process.env.ORACLE_WRAPPER_REMOTE_ONLY = "1";
+    try {
+      await expect(
+        runBrowserMode({ prompt: "review", config: { manualLogin: true } }),
+      ).rejects.toMatchObject({ details: { stage: "background-browser-policy" } });
+    } finally {
+      if (previous === undefined) {
+        delete process.env.ORACLE_WRAPPER_REMOTE_ONLY;
+      } else {
+        process.env.ORACLE_WRAPPER_REMOTE_ONLY = previous;
+      }
+    }
+  });
+});
+
+describe("conversation cookie cleanup", () => {
+  test("preserves an exact conversation configured as the browser URL", () => {
+    const config = resolveBrowserConfig({
+      url: "https://chatgpt.com/g/project/c/current-thread",
+    });
+
+    expect(__test__.conversationCookieIdsToPreserve(config, null)).toEqual(["current-thread"]);
+  });
+
+  test("seeds run affinity from the exact resume URL or configured URL", () => {
+    expect(
+      __test__.resolveInitialRunConversationId(
+        resolveBrowserConfig({ url: "https://chatgpt.com/c/configured-thread" }),
+      ),
+    ).toBe("configured-thread");
+    expect(
+      __test__.resolveInitialRunConversationId(
+        resolveBrowserConfig({
+          url: "https://chatgpt.com/c/configured-thread",
+          resumeConversationUrl: "https://chatgpt.com/c/resumed-thread",
+        }),
+      ),
+    ).toBe("resumed-thread");
+    expect(
+      __test__.resolveInitialRunConversationUrl(
+        resolveBrowserConfig({
+          url: "https://chatgpt.com/g/project/c/configured-thread",
+          resumeConversationUrl: "https://chatgpt.com/g/project/c/resumed-thread",
+        }),
+      ),
+    ).toBe("https://chatgpt.com/g/project/c/resumed-thread");
+  });
+  test("accepts exact conversation affinity on the supported legacy ChatGPT host", () => {
+    expect(
+      __test__.extractExactChatGptConversationId("https://chat.openai.com/c/legacy-thread"),
+    ).toBe("legacy-thread");
+    expect(
+      __test__.extractExactChatGptConversationId(
+        "https://chat.openai.com/g/project/project/c/legacy-thread",
+      ),
+    ).toBe("legacy-thread");
+  });
+
+  test("does not read conversation affinity from query strings or fragments", () => {
+    expect(
+      __test__.extractExactChatGptConversationId(
+        "https://chatgpt.com/?next=https://chatgpt.com/c/private-thread",
+      ),
+    ).toBeUndefined();
+    expect(
+      __test__.extractExactChatGptConversationId(
+        "https://chatgpt.com/#https://chatgpt.com/c/private-thread",
+      ),
+    ).toBeUndefined();
+  });
+  test.each([
+    [
+      "root versus project route",
+      "https://chatgpt.com/g/project-a/project/c/same-thread",
+      "https://chatgpt.com/c/same-thread",
+    ],
+    [
+      "cross-project route",
+      "https://chatgpt.com/g/project-a/project/c/same-thread",
+      "https://chatgpt.com/g/project-b/project/c/same-thread",
+    ],
+    [
+      "cross-origin route",
+      "https://chatgpt.com/c/same-thread",
+      "https://chat.openai.com/c/same-thread",
+    ],
+  ])("rejects same-id %s affinity drift", (_case, expectedUrl, actualUrl) => {
+    expect(() =>
+      __test__.assertRunConversationId(
+        "same-thread",
+        expectedUrl,
+        actualUrl,
+        "strict affinity test",
+      ),
+    ).toThrow(/conversation changed/i);
+  });
+
+  test("accepts the exact conversation URL with a trailing slash", () => {
+    expect(() =>
+      __test__.assertRunConversationId(
+        "same-thread",
+        "https://chatgpt.com/g/project/project/c/same-thread",
+        "https://chatgpt.com/g/project/project/c/same-thread/",
+        "strict affinity test",
+      ),
+    ).not.toThrow();
+  });
+});
+
+describe("remote browser identity", () => {
+  test("rejects a browser swap before actual attachment", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          webSocketDebuggerUrl: "ws://127.0.0.1:9223/devtools/browser/browser-b",
+        }),
+      }),
+    );
+    try {
+      await expect(
+        runBrowserMode({
+          prompt: "must not send",
+          config: {
+            remoteChrome: { host: "127.0.0.1", port: 9223 },
+            remoteChromeBrowserId: "browser-a",
+            remoteChromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+          },
+        }),
+      ).rejects.toMatchObject({
+        details: {
+          stage: "remote-browser-identity",
+        },
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  test("gives each account affinity probe a fresh input timeout after a long response", () => {
+    vi.useFakeTimers();
+    try {
+      const runStartedAt = Date.now();
+      vi.advanceTimersByTime(10 * 60_000);
+
+      expect(Date.now() - runStartedAt).toBe(10 * 60_000);
+      expect(__test__.resolveAccountAffinityProbeTimeoutMs(250)).toBe(250);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  test("rechecks the stored account digest at the requested action boundary", async () => {
+    const digest = "a".repeat(64);
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({ result: { value: digest } }),
+    };
+
+    await expect(
+      __test__.assertRemoteChatGptAccountAffinity(runtime as never, digest, "submission"),
+    ).resolves.toBeUndefined();
+    await expect(
+      __test__.assertRemoteChatGptAccountAffinity(
+        runtime as never,
+        "b".repeat(64),
+        "attachment upload",
+      ),
+    ).rejects.toMatchObject({
+      message: expect.stringMatching(/changed before attachment upload/i),
+      details: { stage: "remote-browser-identity" },
+    });
+  });
+
+  test("rejects a missing stored account digest before submission", async () => {
+    await expect(
+      __test__.assertRemoteChatGptAccountAffinity(
+        { evaluate: vi.fn() } as never,
+        null,
+        "submission",
+      ),
+    ).rejects.toMatchObject({
+      message: expect.stringMatching(/unavailable before submission/i),
+      details: { stage: "remote-browser-identity" },
+    });
+  });
 });
 
 describe("shouldPreserveBrowserOnErrorForTest", () => {
@@ -242,6 +430,27 @@ describe("browser run target cleanup", () => {
         chromePort: 9222,
       }),
     ).toBe(false);
+  });
+
+  test("marks a completed result when browser cleanup is not confirmed", () => {
+    const result = {
+      answerText: "kept answer",
+      answerMarkdown: "kept answer",
+      tookMs: 1,
+      answerTokens: 2,
+      answerChars: 11,
+      warnings: undefined,
+    };
+
+    __test__.appendBrowserCleanupWarning(result, 2);
+
+    expect(result.answerText).toBe("kept answer");
+    expect(result.warnings).toEqual([
+      expect.objectContaining({
+        code: "browser-cleanup-incomplete",
+        details: { failureCount: 2 },
+      }),
+    ]);
   });
 });
 
@@ -561,15 +770,15 @@ describe("ChatGPT UI warning detection", () => {
           if (expression.includes("const selectors =")) {
             return { result: { value: true } };
           }
-          if (params.awaitPromise) {
+          if (params.awaitPromise && expression.includes("MutationObserver")) {
             responseProbeHydrationStates.push(hydrated);
             if (!reloaded) {
               return new Promise(() => undefined);
             }
             return { result: { type: "object", value: complete } };
           }
-          if (expression.includes("extractAssistantTurn")) {
-            return { result: { value: reloaded ? complete : partial } };
+          if (params.awaitPromise) {
+            return { result: { type: "object", value: reloaded ? complete : partial } };
           }
           if (expression.includes("Find the LAST assistant turn")) {
             return { result: { value: reloaded } };
@@ -595,6 +804,7 @@ describe("ChatGPT UI warning detection", () => {
         vi.fn() as never,
         undefined,
         "synthetic-recovery",
+        "https://chatgpt.com/c/synthetic-recovery",
       );
       await vi.advanceTimersByTimeAsync(10_000);
 
@@ -655,19 +865,14 @@ describe("browser follow-ups", () => {
 describe("browser conversation archiving", () => {
   test("archives interrupted project one-shots in auto mode", async () => {
     const runtime = {
-      evaluate: vi
-        .fn()
-        .mockResolvedValueOnce({
-          result: { value: "https://chatgpt.com/g/g-p-demo/project/c/abc" },
-        })
-        .mockResolvedValueOnce({
-          result: {
-            value: {
-              status: "archived",
-              conversationUrl: "https://chatgpt.com/g/g-p-demo/project/c/abc",
-            },
+      evaluate: vi.fn().mockResolvedValueOnce({
+        result: {
+          value: {
+            status: "archived",
+            conversationUrl: "https://chatgpt.com/g/g-p-demo/project/c/abc",
           },
-        }),
+        },
+      }),
     };
     const log = vi.fn();
 
@@ -679,6 +884,7 @@ describe("browser conversation archiving", () => {
           archiveConversations: "auto",
           chatgptUrl: "https://chatgpt.com/g/g-p-demo/project",
         }),
+        accountDigest: "a".repeat(64),
         conversationUrl: "https://chatgpt.com/g/g-p-demo/project/c/abc",
         followUpCount: 0,
       }),
@@ -688,7 +894,181 @@ describe("browser conversation archiving", () => {
       archived: true,
       conversationUrl: "https://chatgpt.com/g/g-p-demo/project/c/abc",
     });
-    expect(runtime.evaluate).toHaveBeenCalledTimes(2);
+    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+  });
+
+  test("does not archive a completed remote run after the account changes", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValueOnce({
+        result: {
+          value: {
+            status: "skipped",
+            reason: "affinity-mismatch",
+            conversationUrl: "https://chatgpt.com/c/abc",
+          },
+        },
+      }),
+    };
+
+    await expect(
+      maybeArchiveCompletedConversationForTest({
+        Runtime: runtime as never,
+        logger: vi.fn() as never,
+        config: resolveBrowserConfig({
+          archiveConversations: "always",
+          remoteChrome: { host: "127.0.0.1", port: 9223 },
+          remoteChromeBrowserId: "browser-a",
+          remoteChromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+          remoteChromeAccountDigest: "a".repeat(64),
+        }),
+        accountDigest: "a".repeat(64),
+        conversationUrl: "https://chatgpt.com/c/abc",
+        followUpCount: 0,
+        requiredArtifactsSaved: true,
+      }),
+    ).resolves.toMatchObject({
+      attempted: false,
+      archived: false,
+      reason: "affinity-mismatch",
+    });
+    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+  });
+
+  test("does not archive a completed run after the conversation changes", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValueOnce({
+        result: {
+          value: {
+            status: "skipped",
+            reason: "affinity-mismatch",
+            conversationUrl: "https://chatgpt.com/c/other",
+          },
+        },
+      }),
+    };
+
+    await expect(
+      maybeArchiveCompletedConversationForTest({
+        Runtime: runtime as never,
+        logger: vi.fn() as never,
+        config: resolveBrowserConfig({ archiveConversations: "always" }),
+        accountDigest: "a".repeat(64),
+        conversationUrl: "https://chatgpt.com/c/abc",
+        followUpCount: 0,
+        requiredArtifactsSaved: true,
+      }),
+    ).resolves.toMatchObject({
+      attempted: false,
+      archived: false,
+      reason: "affinity-mismatch",
+      conversationUrl: "https://chatgpt.com/c/abc",
+    });
+    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+  });
+
+  test("does not substitute the current conversation during interrupted archiving", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValueOnce({
+        result: {
+          value: {
+            status: "skipped",
+            reason: "affinity-mismatch",
+            conversationUrl: "https://chatgpt.com/c/other",
+          },
+        },
+      }),
+    };
+
+    await expect(
+      maybeArchiveInterruptedConversationForTest({
+        Runtime: runtime as never,
+        logger: vi.fn() as never,
+        config: resolveBrowserConfig({ archiveConversations: "always" }),
+        accountDigest: "a".repeat(64),
+        conversationUrl: "https://chatgpt.com/c/abc",
+        followUpCount: 0,
+      }),
+    ).resolves.toMatchObject({
+      attempted: false,
+      archived: false,
+      reason: "affinity-mismatch",
+      conversationUrl: "https://chatgpt.com/c/abc",
+    });
+    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+  });
+
+  test("does not archive any run without an originating account digest", async () => {
+    const runtime = { evaluate: vi.fn() };
+
+    await expect(
+      maybeArchiveCompletedConversationForTest({
+        Runtime: runtime as never,
+        logger: vi.fn() as never,
+        config: resolveBrowserConfig({ archiveConversations: "always" }),
+        conversationUrl: "https://chatgpt.com/c/abc",
+        followUpCount: 0,
+        requiredArtifactsSaved: true,
+      }),
+    ).resolves.toMatchObject({
+      attempted: false,
+      archived: false,
+      reason: "affinity-mismatch",
+    });
+    expect(runtime.evaluate).not.toHaveBeenCalled();
+  });
+
+  test("does not archive any run with a malformed originating account digest", async () => {
+    const runtime = { evaluate: vi.fn() };
+
+    await expect(
+      maybeArchiveCompletedConversationForTest({
+        Runtime: runtime as never,
+        logger: vi.fn() as never,
+        config: resolveBrowserConfig({ archiveConversations: "always" }),
+        accountDigest: "not-a-digest",
+        conversationUrl: "https://chatgpt.com/c/abc",
+        followUpCount: 0,
+        requiredArtifactsSaved: true,
+      }),
+    ).resolves.toMatchObject({
+      attempted: false,
+      archived: false,
+      reason: "affinity-mismatch",
+    });
+    expect(runtime.evaluate).not.toHaveBeenCalled();
+  });
+
+  test("archives once when the bound account and conversation still match", async () => {
+    const accountDigest = "a".repeat(64);
+    const conversationUrl = "https://chatgpt.com/c/abc";
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValueOnce({
+        result: { value: { status: "archived", conversationUrl } },
+      }),
+    };
+
+    await expect(
+      maybeArchiveCompletedConversationForTest({
+        Runtime: runtime as never,
+        logger: vi.fn() as never,
+        config: resolveBrowserConfig({
+          archiveConversations: "always",
+          remoteChrome: { host: "127.0.0.1", port: 9223 },
+          remoteChromeBrowserId: "browser-a",
+          remoteChromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+          remoteChromeAccountDigest: accountDigest,
+        }),
+        accountDigest,
+        conversationUrl,
+        followUpCount: 0,
+        requiredArtifactsSaved: true,
+      }),
+    ).resolves.toMatchObject({
+      attempted: true,
+      archived: true,
+      conversationUrl,
+    });
+    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
   });
 
   test("does not attempt interrupted archive before a conversation exists", async () => {
@@ -710,7 +1090,7 @@ describe("browser conversation archiving", () => {
         followUpCount: 0,
       }),
     ).resolves.toBeNull();
-    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+    expect(runtime.evaluate).not.toHaveBeenCalled();
   });
 
   test("does not attempt archive when required local artifacts were not saved", async () => {
@@ -840,24 +1220,56 @@ describe("image-only assistant turn detection", () => {
 });
 
 describe("redactBrowserConfigForDebugLogForTest", () => {
-  test("redacts inline cookie values while preserving count context", () => {
+  test("redacts inline cookies and private browser affinity while preserving safe context", () => {
     const redacted = redactBrowserConfigForDebugLogForTest({
       inlineCookies: [
         { name: "__Secure-next-auth.session-token", value: "secret-token" },
         { name: "_account", value: "secret-account" },
       ],
       inlineCookiesSource: "inline-file",
+      remoteChrome: { host: "127.0.0.1", port: 9222 },
+      remoteChromeBrowserWSEndpoint: "wss://private.example/devtools/browser/secret",
+      remoteChromeAccountDigest: "a".repeat(64),
+      expectedAccountDigest: "b".repeat(64),
+      expectedEmail: "owner@example.com",
+      remoteChromeProfileRoot: "/private/profile/root",
+      browserTabRef: "tab-secret",
+      resumeConversationUrl: "https://chatgpt.com/g/private/project/c/private-thread",
       debug: true,
+      metadata: { sessionToken: "nested-session-secret", safe: "visible" },
+      nested: { cookies: { value: "nested-cookie-secret" }, token: "nested-token-secret" },
     });
 
     expect(redacted).toMatchObject({
       inlineCookies: "[redacted:2 cookies]",
       inlineCookieCount: 2,
       inlineCookiesSource: "inline-file",
+      remoteChrome: true,
+      remoteChromeBrowserWSEndpoint: true,
+      remoteChromeAccountDigest: true,
+      expectedAccountDigest: true,
+      expectedEmail: true,
+      remoteChromeProfileRoot: true,
+      browserTabRef: true,
+      resumeConversationUrl: true,
       debug: true,
+      metadata: { sessionToken: true, safe: "visible" },
+      nested: { cookies: true, token: true },
     });
-    expect(JSON.stringify(redacted)).not.toContain("secret-token");
-    expect(JSON.stringify(redacted)).not.toContain("secret-account");
+    const serialized = JSON.stringify(redacted);
+    for (const secret of [
+      "secret-token",
+      "secret-account",
+      "private.example",
+      "owner@example.com",
+      "/private/profile/root",
+      "private-thread",
+      "nested-session-secret",
+      "nested-cookie-secret",
+      "nested-token-secret",
+    ]) {
+      expect(serialized).not.toContain(secret);
+    }
   });
 
   test("leaves missing inline cookies unchanged", () => {

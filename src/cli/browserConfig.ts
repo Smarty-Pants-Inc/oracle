@@ -15,6 +15,10 @@ import type {
 } from "../browser/types.js";
 import type { CookieParam } from "../browser/types.js";
 import { getOracleHomeDir } from "../oracleHome.js";
+import {
+  browserIdFromWebSocketEndpoint,
+  resolveRemoteChromeBrowserIdentity,
+} from "../browser/profileState.js";
 
 const DEFAULT_BROWSER_TIMEOUT_MS = 1_200_000;
 const DEFAULT_BROWSER_INPUT_TIMEOUT_MS = 60_000;
@@ -88,6 +92,8 @@ export interface BrowserFlagOptions {
   browserModelStrategy?: BrowserModelStrategy;
   browserAllowCookieErrors?: boolean;
   remoteChrome?: string;
+  remoteChromeBrowserId?: string;
+  remoteChromeBrowserWs?: string;
   browserPort?: number;
   browserDebugPort?: number;
   model: ModelName;
@@ -184,6 +190,25 @@ export async function buildBrowserConfig(
   let remoteChrome: { host: string; port: number } | undefined;
   if (options.remoteChrome) {
     remoteChrome = parseRemoteChromeTarget(options.remoteChrome);
+  }
+  const expectedBrowserId = options.remoteChromeBrowserId?.trim();
+  let browserWSEndpoint = options.remoteChromeBrowserWs?.trim();
+  if (expectedBrowserId || browserWSEndpoint) {
+    if (!remoteChrome || !expectedBrowserId || !browserWSEndpoint) {
+      throw new Error(
+        "Remote Chrome browser identity requires --remote-chrome, --remote-chrome-browser-id, and --remote-chrome-browser-ws together.",
+      );
+    }
+    if (browserIdFromWebSocketEndpoint(browserWSEndpoint) !== expectedBrowserId) {
+      throw new Error("Remote Chrome browser id does not match its browser WebSocket URL.");
+    }
+    const liveIdentity = await resolveRemoteChromeBrowserIdentity(remoteChrome);
+    if (liveIdentity.browserId !== expectedBrowserId) {
+      throw new Error("Remote Chrome browser identity changed before session creation.");
+    }
+    browserWSEndpoint = liveIdentity.browserWSEndpoint;
+  } else if (process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" && remoteChrome) {
+    throw new Error("The agent wrapper requires a verified remote Chrome browser identity.");
   }
   const attachRunning = options.browserAttachRunning === true;
   validateAttachRunningOptions(options, {
@@ -287,6 +312,8 @@ export async function buildBrowserConfig(
     // Allow cookie failures by default so runs can continue without Chrome/Keychain secrets.
     allowCookieErrors: options.browserAllowCookieErrors ?? true,
     remoteChrome,
+    remoteChromeBrowserId: expectedBrowserId,
+    remoteChromeBrowserWSEndpoint: browserWSEndpoint,
     browserTabRef: options.browserTab ?? undefined,
     thinkingTime: normalizeThinkingTimeLevel(options.browserThinkingTime) ?? undefined,
     researchMode: options.browserResearch === "deep" ? "deep" : "off",

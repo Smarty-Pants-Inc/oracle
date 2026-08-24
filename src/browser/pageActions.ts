@@ -3,6 +3,7 @@ export {
   navigateToPromptReadyWithFallback,
   ensureNotBlocked,
   ensureLoggedIn,
+  readChatGptAccountDigest,
   ensurePromptReady,
   ensureChatMode,
   waitForResumedConversationHydration,
@@ -27,4 +28,5 @@ export {
   buildConversationDebugExpressionForTest,
   buildMarkdownFallbackExtractorForTest,
   buildCopyExpressionForTest,
+  buildResponseObserverExpressionForTest,
 } from "./actions/assistantResponse.js";

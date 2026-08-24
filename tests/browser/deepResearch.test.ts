@@ -80,6 +80,47 @@ describe("activateDeepResearch", () => {
     mockLogger = createMockLogger();
   });
 
+  it("checks affinity immediately before Deep Research evaluation and trusted click release", async () => {
+    const events: string[] = [];
+    mockRuntime.evaluate
+      .mockImplementationOnce(async ({ expression }: { expression: string }) => {
+        events.push("evaluate");
+        expect(expression).toContain('const EXPECTED_CONVERSATION_ID = "conv-123"');
+        return {
+          result: { value: { status: "pill-not-confirmed", clickPoint: { x: 12, y: 34 } } },
+        };
+      })
+      .mockImplementationOnce(async () => {
+        events.push("evaluate");
+        return { result: { value: true } };
+      });
+    mockInput = {
+      dispatchMouseEvent: vi.fn(async ({ type }: { type: string }) => {
+        events.push(type);
+      }),
+    };
+
+    await activateDeepResearch(mockRuntime as never, mockInput as never, mockLogger, {
+      expectedConversationId: "conv-123",
+      assertPageAffinity: async () => {
+        events.push("affinity");
+      },
+    });
+
+    expect(events).toEqual([
+      "affinity",
+      "evaluate",
+      "affinity",
+      "mouseMoved",
+      "affinity",
+      "mousePressed",
+      "affinity",
+      "mouseReleased",
+      "affinity",
+      "affinity",
+      "evaluate",
+    ]);
+  });
   it("activates Deep Research when all steps succeed", async () => {
     mockRuntime.evaluate.mockResolvedValueOnce({
       result: { value: { status: "activated" } },
@@ -166,6 +207,16 @@ describe("activateDeepResearch", () => {
 });
 
 describe("Deep Research activation expression", () => {
+  it("rechecks the pinned conversation immediately before both activation clicks", () => {
+    const expression = buildActivateDeepResearchExpressionForTest("conv-123");
+    for (const click of ["dispatchClickSequence(plusBtn);", "dispatchClickSequence(match);"]) {
+      const clickIndex = expression.indexOf(click);
+      const guardIndex = expression.lastIndexOf("if (!matchesExpectedConversation())", clickIndex);
+      expect(clickIndex).toBeGreaterThan(-1);
+      expect(guardIndex).toBeGreaterThan(-1);
+      expect(guardIndex).toBeLessThan(clickIndex);
+    }
+  });
   it("uses the composer tools menu without mutating the queued prompt", () => {
     const expression = buildActivateDeepResearchExpressionForTest();
 
@@ -1591,6 +1642,7 @@ describe("waitForDeepResearchCompletion", () => {
     });
 
     const listeners = new Map<string, (params: unknown, sessionId?: string) => void>();
+    let targetReadCompleted = false;
     const mockClient = {
       on: vi.fn((event: string, listener: (params: unknown, sessionId?: string) => void) => {
         listeners.set(event, listener);
@@ -1642,6 +1694,7 @@ describe("waitForDeepResearchCompletion", () => {
           sessionId === "deep-session" &&
           (params as { contextId?: number }).contextId === 12
         ) {
+          targetReadCompleted = true;
           return {
             result: {
               value: {
@@ -1685,6 +1738,25 @@ describe("waitForDeepResearchCompletion", () => {
       { frameId: "sandbox" },
       undefined,
     );
+
+    targetReadCompleted = false;
+    await expect(
+      waitForDeepResearchCompletion(
+        mockRuntime as never,
+        mockLogger,
+        60_000,
+        1,
+        mockPage as never,
+        mockClient as never,
+        {
+          ignoredTargetKeys: [],
+          targetBaselineCaptured: true,
+          assertPageAffinity: async () => {
+            if (targetReadCompleted) throw new Error("conversation retargeted during OOPIF read");
+          },
+        },
+      ),
+    ).rejects.toThrow(/retargeted during OOPIF read/i);
   });
 
   it("does not complete from an unscoped frame result during a scoped run", async () => {
@@ -1903,6 +1975,32 @@ describe("checkDeepResearchStatus", () => {
     expect(status.inProgress).toBe(false);
     expect(status.textLength).toBe(0);
     expect(status.placeholderOnly).toBe(false);
+  });
+
+  it("guards status reads with the exact conversation URL", async () => {
+    mockRuntime.evaluate.mockResolvedValueOnce({
+      result: {
+        value: {
+          completed: false,
+          inProgress: true,
+          hasIframe: true,
+          textLength: 12,
+        },
+      },
+    });
+    const affinity = vi.fn(async () => undefined);
+    await checkDeepResearchStatus(mockRuntime as never, mockLogger, {
+      expectedConversationId: "conv-123",
+      expectedConversationUrl: "https://chatgpt.com/c/conv-123",
+      assertPageAffinity: affinity,
+    });
+    expect(affinity).toHaveBeenCalledWith("Deep Research status read");
+    expect(mockRuntime.evaluate).toHaveBeenCalledWith(
+      expect.objectContaining({ awaitPromise: true, returnByValue: true }),
+    );
+    expect(mockRuntime.evaluate.mock.calls[0][0].expression).toContain(
+      "assertOracleChatGptPageAffinity",
+    );
   });
 
   it("does not report completed for a tool-only Deep Research placeholder", () => {

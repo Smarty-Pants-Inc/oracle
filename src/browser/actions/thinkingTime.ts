@@ -5,6 +5,7 @@ import {
   MENU_ITEM_SELECTOR,
   MODEL_BUTTON_SELECTOR,
 } from "../constants.js";
+import { buildEvaluatedChatGptPageAffinityGuard } from "../chatgptAccount.js";
 import { logDomFailure } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
 
@@ -24,6 +25,7 @@ type ThinkingTimeOutcome = (
       status: "model-kind-not-found";
       diagnostic?: ThinkingTimePickerDiagnostic;
     }
+  | { status: "conversation-mismatch" }
 ) & { modelKind?: string | null };
 
 const BROWSER_THINKING_LOG_PREFIX = "[browser] Thinking time:";
@@ -59,8 +61,13 @@ export async function ensureThinkingTime(
   level: ThinkingTimeLevel,
   logger: BrowserLogger,
   desiredModel?: string | null,
+  options: {
+    expectedConversationId?: string;
+    expectedConversationUrl?: string;
+    assertPageAffinity?: (action: string) => Promise<void>;
+  } = {},
 ) {
-  const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel);
+  const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel, options);
   const capitalizedLevel = level.charAt(0).toUpperCase() + level.slice(1);
   const targetModelKind = inferThinkingTargetModelKind(desiredModel);
   const observedModelKind = result && "modelKind" in result ? result.modelKind : null;
@@ -74,6 +81,8 @@ export async function ensureThinkingTime(
     case "switched":
       logger(formatBrowserThinkingLog(result.label ?? capitalizedLevel));
       return;
+    case "conversation-mismatch":
+      throw new Error("ChatGPT conversation changed before thinking-time selection.");
     case "chip-not-found":
     case "menu-not-found":
     case "option-not-found":
@@ -122,9 +131,14 @@ export async function ensureThinkingTimeIfAvailable(
   level: ThinkingTimeLevel,
   logger: BrowserLogger,
   desiredModel?: string | null,
+  options: {
+    expectedConversationId?: string;
+    expectedConversationUrl?: string;
+    assertPageAffinity?: (action: string) => Promise<void>;
+  } = {},
 ): Promise<boolean> {
   try {
-    const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel);
+    const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel, options);
     const capitalizedLevel = level.charAt(0).toUpperCase() + level.slice(1);
 
     switch (result?.status) {
@@ -134,6 +148,8 @@ export async function ensureThinkingTimeIfAvailable(
       case "switched":
         logger(formatBrowserThinkingLog(result.label ?? capitalizedLevel));
         return true;
+      case "conversation-mismatch":
+        throw new Error("ChatGPT conversation changed before thinking-time selection.");
       case "chip-not-found":
       case "menu-not-found":
       case "option-not-found":
@@ -155,6 +171,9 @@ export async function ensureThinkingTimeIfAvailable(
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (/conversation changed before thinking-time selection/i.test(message)) {
+      throw error;
+    }
     if (logger.verbose) {
       logger(formatBrowserThinkingLog(`selection failed (${message}); continuing with default.`));
       await logDomFailure(Runtime, logger, "thinking-time");
@@ -167,9 +186,20 @@ async function evaluateThinkingTimeSelection(
   Runtime: ChromeClient["Runtime"],
   level: ThinkingTimeLevel,
   desiredModel?: string | null,
+  options: {
+    expectedConversationId?: string;
+    expectedConversationUrl?: string;
+    assertPageAffinity?: (action: string) => Promise<void>;
+  } = {},
 ): Promise<ThinkingTimeOutcome | undefined> {
+  await options.assertPageAffinity?.("thinking-time selection");
   const outcome = await Runtime.evaluate({
-    expression: buildThinkingTimeExpression(level, desiredModel),
+    expression: buildThinkingTimeExpression(
+      level,
+      desiredModel,
+      options.expectedConversationId,
+      options.expectedConversationUrl,
+    ),
     awaitPromise: true,
     returnByValue: true,
   });
@@ -180,6 +210,8 @@ async function evaluateThinkingTimeSelection(
 function buildThinkingTimeExpression(
   level: ThinkingTimeLevel,
   desiredModel?: string | null,
+  expectedConversationId?: string,
+  expectedConversationUrl?: string,
 ): string {
   const menuContainerLiteral = JSON.stringify(MENU_CONTAINER_SELECTOR);
   const menuItemLiteral = JSON.stringify(MENU_ITEM_SELECTOR);
@@ -189,8 +221,22 @@ function buildThinkingTimeExpression(
   const targetIsGpt56ModelLiteral = JSON.stringify(
     /(?:^|[^0-9])5[._ -]6(?:[^0-9]|$)/i.test(desiredModel ?? ""),
   );
+  const expectedConversationLiteral =
+    typeof expectedConversationId === "string" && expectedConversationId.trim().length > 0
+      ? JSON.stringify(expectedConversationId.trim())
+      : "null";
+  const expectedConversationUrlLiteral =
+    typeof expectedConversationUrl === "string" && expectedConversationUrl.trim().length > 0
+      ? JSON.stringify(expectedConversationUrl.trim())
+      : "null";
+  const affinityGuard = buildEvaluatedChatGptPageAffinityGuard({
+    expectedConversationId,
+    expectedConversationUrl,
+  });
 
   return `(async () => {
+    ${affinityGuard}
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     ${buildClickDispatcher()}
 
     const MENU_CONTAINER_SELECTOR = ${menuContainerLiteral};
@@ -199,6 +245,37 @@ function buildThinkingTimeExpression(
     const TARGET_LEVEL = ${targetLevelLiteral};
     const TARGET_MODEL_KIND = ${targetModelKindLiteral};
     const TARGET_IS_GPT56_MODEL = ${targetIsGpt56ModelLiteral};
+    const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
+    const EXPECTED_CONVERSATION_URL = ${expectedConversationUrlLiteral};
+    const CONVERSATION_PATTERN = /^(?:\\/c|\\/g\\/[^/?#]+\\/(?:project\\/)?c)\\/([a-zA-Z0-9-]+)\\/?$/;
+    const matchesExpectedConversation = () => {
+      if (!EXPECTED_CONVERSATION_ID && !EXPECTED_CONVERSATION_URL) return true;
+      try {
+        const currentUrl = new URL(location.href);
+        if (
+          currentUrl.protocol !== 'https:' ||
+          currentUrl.username || currentUrl.password || currentUrl.port ||
+          !CHATGPT_ORIGINS.includes(currentUrl.origin) ||
+          currentUrl.search || currentUrl.hash
+        ) return false;
+        const currentMatch = CONVERSATION_PATTERN.exec(currentUrl.pathname);
+        if (!currentMatch) return false;
+        if (!EXPECTED_CONVERSATION_URL) {
+          return !EXPECTED_CONVERSATION_ID || currentMatch[1] === EXPECTED_CONVERSATION_ID;
+        }
+        const expectedUrl = new URL(EXPECTED_CONVERSATION_URL);
+        const expectedMatch = CONVERSATION_PATTERN.exec(expectedUrl.pathname);
+        return expectedUrl.protocol === 'https:' &&
+          !expectedUrl.username && !expectedUrl.password && !expectedUrl.port &&
+          CHATGPT_ORIGINS.includes(expectedUrl.origin) &&
+          !expectedUrl.search && !expectedUrl.hash && Boolean(expectedMatch) &&
+          (!EXPECTED_CONVERSATION_ID || expectedMatch[1] === EXPECTED_CONVERSATION_ID) &&
+          currentUrl.origin === expectedUrl.origin &&
+          currentUrl.pathname.replace(/\\/$/, '') === expectedUrl.pathname.replace(/\\/$/, '');
+      } catch {
+        return false;
+      }
+    };
 
     // Bilingual matchers: English level token + observed Chinese variants.
     const LEVEL_TOKENS = {
@@ -278,6 +355,7 @@ function buildThinkingTimeExpression(
       );
     };
     const closeOpenMenus = () => {
+      if (!matchesExpectedConversation()) return;
       try {
         document.dispatchEvent(
           new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }),
@@ -335,6 +413,7 @@ function buildThinkingTimeExpression(
       return hasToken(label, 'pro') && label.includes('5 of 5');
     };
     const selectIntelligenceSliderMaximum = async () => {
+      if (!matchesExpectedConversation()) return failure('conversation-mismatch');
       const slider = findIntelligenceSlider();
       if (!slider) return null;
       if (intelligenceSliderIsAtMaximum(slider)) {
@@ -687,6 +766,7 @@ function buildThinkingTimeExpression(
         return { status: 'already-selected', label };
       }
 
+      if (!matchesExpectedConversation()) return failure('conversation-mismatch');
       dispatchClickSequence(option);
       await sleep(STEP_WAIT_MS);
       const refreshed = findOption();
@@ -701,6 +781,7 @@ function buildThinkingTimeExpression(
 
       const reopenTrigger = freshComposerTrigger(trigger) || trigger;
       if (!refreshed && reopenTrigger?.getAttribute?.('aria-expanded') !== 'true') {
+        if (!matchesExpectedConversation()) return failure('conversation-mismatch');
         dispatchClickSequence(reopenTrigger);
         await sleep(INITIAL_WAIT_MS);
       }
@@ -729,8 +810,10 @@ function buildThinkingTimeExpression(
       if (!trigger) {
         return null;
       }
+      if (!matchesExpectedConversation()) return failure('conversation-mismatch');
       dispatchHoverSequence(trigger);
       if (trigger.getAttribute?.('aria-expanded') !== 'true') {
+        if (!matchesExpectedConversation()) return failure('conversation-mismatch');
         dispatchClickSequence(trigger);
       }
       const deadline = performance.now() + MAX_WAIT_MS;
@@ -829,6 +912,7 @@ function buildThinkingTimeExpression(
         attemptedModelButton !== modelBtn &&
         modelBtn.getAttribute?.('aria-expanded') !== 'true'
       ) {
+        if (!matchesExpectedConversation()) return failure('conversation-mismatch');
         dispatchClickSequence(modelBtn);
         attemptedModelButton = modelBtn;
         await sleep(INITIAL_WAIT_MS);
@@ -847,6 +931,7 @@ function buildThinkingTimeExpression(
         TARGET_MODEL_KIND ||
         (TARGET_IS_GPT56_MODEL ? 'versioned' : modelKindFromNode(composerEffortPill));
       if (composerEffortPill.getAttribute?.('aria-expanded') !== 'true') {
+        if (!matchesExpectedConversation()) return failure('conversation-mismatch');
         dispatchClickSequence(composerEffortPill);
         await sleep(INITIAL_WAIT_MS);
       }
@@ -980,6 +1065,7 @@ function buildThinkingTimeExpression(
       modelBtn.getAttribute('aria-expanded') !== 'true' &&
       !legacyEffortOwnerIsReady()
     ) {
+      if (!matchesExpectedConversation()) return failure('conversation-mismatch');
       dispatchClickSequence(modelBtn);
       await sleep(INITIAL_WAIT_MS);
     }
@@ -1038,6 +1124,7 @@ function buildThinkingTimeExpression(
       return result;
     }
 
+    if (!matchesExpectedConversation()) return failure('conversation-mismatch');
     dispatchClickSequence(trailing);
     await sleep(STEP_WAIT_MS);
 
@@ -1083,8 +1170,15 @@ function buildThinkingTimeExpression(
 export function buildThinkingTimeExpressionForTest(
   level: ThinkingTimeLevel = "extended",
   desiredModel?: string | null,
+  expectedConversationId?: string,
+  expectedConversationUrl?: string,
 ): string {
-  return buildThinkingTimeExpression(level, desiredModel);
+  return buildThinkingTimeExpression(
+    level,
+    desiredModel,
+    expectedConversationId,
+    expectedConversationUrl,
+  );
 }
 
 function inferThinkingTargetModelKind(

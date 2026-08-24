@@ -2,7 +2,7 @@
 import "dotenv/config";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { Command, Option } from "commander";
+import { Command, InvalidArgumentError, Option } from "commander";
 import type { OptionValues } from "commander";
 // Allow `npx @steipete/oracle oracle-mcp` to resolve the MCP server even though npx runs the default binary.
 if (process.argv[2] === "oracle-mcp") {
@@ -16,6 +16,11 @@ import { resolveDashPrompt } from "../src/cli/stdin.js";
 import chalk from "chalk";
 import type { SessionMetadata, SessionMode, BrowserSessionConfig } from "../src/sessionStore.js";
 import { sessionStore, pruneOldSessions } from "../src/sessionStore.js";
+import {
+  preflightSessionIdReceipt,
+  removeSessionReservation,
+  writeSessionIdReceipt,
+} from "../src/sessionManager.js";
 import {
   DEFAULT_API_MODEL,
   DEFAULT_BROWSER_MODEL,
@@ -61,6 +66,8 @@ import { shouldDetachSession, stopDetachedWorker } from "../src/cli/detach.js";
 import { applyHiddenAliases } from "../src/cli/hiddenAliases.js";
 import type { BrowserSessionRunnerDeps } from "../src/browser/sessionRunner.js";
 import { isMediaFile } from "../src/browser/prompt.js";
+import { handleChatGptInventoryCommand } from "../src/cli/chatgptInventory.js";
+import { oracleCliExitCodeForError } from "../src/cli/archiveRepair.js";
 import { formatCompactNumber } from "../src/cli/format.js";
 import { formatIntroLine } from "../src/cli/tagline.js";
 import { warnIfOversizeBundle } from "../src/cli/bundleWarnings.js";
@@ -90,7 +97,10 @@ import {
   createPerfTrace,
   isTraceValueFlag,
 } from "../src/cli/perfTrace.js";
-import { resolveBrowserFollowupReference } from "../src/cli/followup.js";
+import {
+  resolveBrowserFollowupReference,
+  type BrowserFollowupResolution,
+} from "../src/cli/followup.js";
 
 interface CliOptions extends OptionValues {
   prompt?: string;
@@ -165,6 +175,8 @@ interface CliOptions extends OptionValues {
   browserBundleFiles?: boolean;
   browserBundleFormat?: "auto" | "text" | "zip";
   remoteChrome?: string;
+  remoteChromeBrowserId?: string;
+  remoteChromeBrowserWs?: string;
   browserPort?: number;
   browserDebugPort?: number;
   remoteHost?: string;
@@ -219,6 +231,12 @@ interface RestartCommandOptions {
   wait?: boolean;
   remoteHost?: string;
   remoteToken?: string;
+}
+
+function parseStrictBoolean(value: string): boolean {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new InvalidArgumentError('Value must be exactly "true" or "false".');
 }
 
 const VERSION = getCliVersion();
@@ -334,10 +352,16 @@ function normalizePerfTraceArgs(args: string[]): {
 const doctorArgIndex = routingCliArgs.indexOf("doctor");
 const doctorJsonRequested =
   doctorArgIndex >= 0 && routingCliArgs.slice(doctorArgIndex).includes("--json");
+const chatGptCommandIndex = routingCliArgs.findIndex(
+  (arg) => arg === "chatgpt-inventory" || arg === "chatgpt-export",
+);
+const chatGptJsonRequested =
+  chatGptCommandIndex >= 0 && routingCliArgs.slice(chatGptCommandIndex).includes("--json");
 const docsArgIndex = routingCliArgs.indexOf("docs");
 const docsCheckRequested = docsArgIndex >= 0 && routingCliArgs[docsArgIndex + 1] === "check";
 const suppressIntro =
   doctorJsonRequested ||
+  chatGptJsonRequested ||
   docsCheckRequested ||
   (routingCliArgs[0] === "bridge" &&
     (routingCliArgs[1] === "codex-config" || routingCliArgs[1] === "claude-config"));
@@ -858,6 +882,18 @@ program
       "Connect to a dedicated background Chrome DevTools Protocol endpoint.",
     ),
   )
+  .addOption(
+    new Option(
+      "--remote-chrome-browser-id <id>",
+      "Expected remote Chrome browser identity supplied by the agent wrapper.",
+    ).hideHelp(),
+  )
+  .addOption(
+    new Option(
+      "--remote-chrome-browser-ws <url>",
+      "Exact remote Chrome browser WebSocket supplied by the agent wrapper.",
+    ).hideHelp(),
+  )
   .option(
     "--browser-tab <ref>",
     "Reuse an existing ChatGPT tab by ref (current, target id, full URL, or title substring) instead of opening a new tab.",
@@ -1059,11 +1095,26 @@ addProjectSourcesCommonOptions(
 });
 
 program
+  .command("chatgpt-inventory")
+  .description("List active and archived ChatGPT conversations through an account-bound wrapper.")
+  .addOption(new Option("--expected-email <email>").hideHelp())
+  .option("--json", "Print the safe structured inventory result.", false)
+  .action(async function (this: Command) {
+    await handleChatGptInventoryCommand(this.optsWithGlobals());
+  });
+
+program
   .command("chatgpt-export")
-  .description("Export an approved existing ChatGPT conversation by capturing its backend payload.")
+  .description(
+    "Export an approved existing ChatGPT conversation without changing it unless post-export archiving is explicitly requested.",
+  )
   .requiredOption(
     "--target-url <url>",
     "Exact approved ChatGPT conversation URL, e.g. https://chatgpt.com/c/<conversation-id>.",
+  )
+  .option(
+    "--session-id <id>",
+    "Originating Oracle session whose stored browser affinity must be used for this export.",
   )
   .option(
     "--out <dir>",
@@ -1073,10 +1124,9 @@ program
     "--browser-tab <ref>",
     "Existing ChatGPT tab ref to use (defaults to the exact target URL; accepts current, target id, URL, or title substring).",
   )
-  .option(
-    "--remote-chrome <host:port>",
-    "Chrome DevTools endpoint to inspect (default 127.0.0.1:9222).",
-  )
+  .addOption(new Option("--remote-chrome-account-digest <sha256>").hideHelp())
+  .addOption(new Option("--expected-email <email>").hideHelp())
+  .addOption(new Option("--known-archived <bool>").argParser(parseStrictBoolean).hideHelp())
   .option("--obu-session-id <id>", "Open Browser Use session id for OBU-managed tabs.")
   .option("--obu-tab-id <id>", "Open Browser Use tab id for an approved OBU-managed tab.")
   .option(
@@ -1085,18 +1135,25 @@ program
   )
   .option("--chunk-size <chars>", "Characters to retrieve per CDP chunk (default 250000).")
   .option(
-    "--no-recover-archived",
-    "Disable automatic exact-conversation recovery from ChatGPT Archived Chats.",
-  )
-  .option(
     "--archive-after-export",
-    "Archive the exact conversation only after its export succeeds.",
+    "Archive an active account-bound conversation only after its export succeeds.",
     false,
   )
   .option("--json", "Print structured JSON result.", false)
   .action(async function (this: Command) {
     const { handleChatGptExportCommand } = await import("../src/cli/chatgptExport.js");
-    await handleChatGptExportCommand(this.opts());
+    const local = this.opts();
+    const globals = this.optsWithGlobals();
+    await handleChatGptExportCommand({
+      ...local,
+      remoteChrome: globals.remoteChrome,
+      remoteChromeBrowserId: globals.remoteChromeBrowserId,
+      remoteChromeBrowserWs: globals.remoteChromeBrowserWs,
+      browserTab: globals.browserTab,
+      ...(this.parent?.getOptionValueSource("timeout") === "cli"
+        ? { timeout: globals.timeout }
+        : {}),
+    });
   });
 
 const bridgeCommand = program
@@ -1339,16 +1396,8 @@ program
       return;
     }
     if (sessionId) {
-      const autoRender =
-        !command.getOptionValueSource?.("render") &&
-        !command.getOptionValueSource?.("renderMarkdown")
-          ? process.stdout.isTTY
-          : false;
-      const renderMarkdown = Boolean(
-        statusOptions.render || statusOptions.renderMarkdown || autoRender,
-      );
-      const { attachSession } = await import("../src/cli/sessionDisplay.js");
-      await attachSession(sessionId, { renderMarkdown, renderPrompt: !statusOptions.hidePrompt });
+      const { handleSessionCommand } = await import("../src/cli/sessionCommand.js");
+      await handleSessionCommand(sessionId, command);
       return;
     }
     const showExamples = usesDefaultStatusFilters(command);
@@ -1762,6 +1811,14 @@ function getSessionMode(metadata: SessionMetadata): SessionMode {
 function getBrowserConfigFromMetadata(metadata: SessionMetadata): BrowserSessionConfig | undefined {
   return metadata.options?.browserConfig ?? metadata.browser?.config;
 }
+async function attachRootSession(sessionId: string): Promise<void> {
+  const metadata = await sessionStore.readSession(sessionId);
+  const { attachSession } = await import("../src/cli/sessionDisplay.js");
+  await attachSession(sessionId);
+  if (!process.exitCode && metadata) {
+    await writeSessionIdReceipt(metadata.id);
+  }
+}
 
 async function runRootCommand(options: CliOptions): Promise<void> {
   perfTrace.mark("root-command-start");
@@ -1876,6 +1933,8 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   }
 
   const providerMode = resolveApiProviderMode(options);
+  const explicitApiProviderRequested =
+    providerMode !== "auto" || hasExplicitAzureOption(optionUsesDefault);
   const engineModels = multiModelProvided
     ? Array.from(new Set(options.models!.map((entry) => resolveApiModel(entry))))
     : [resolveApiModel(normalizeModelOption(options.model) || DEFAULT_MODEL)];
@@ -1919,6 +1978,49 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   const retentionHours = typeof options.retainHours === "number" ? options.retainHours : undefined;
   await sessionStore.ensureStorage();
   await pruneOldSessions(retentionHours, (message) => console.log(chalk.dim(message)));
+  const explicitFollowupEngine = options.browser
+    ? "browser"
+    : !optionUsesDefault("engine")
+      ? options.engine
+      : !optionUsesDefault("mode")
+        ? (options as CliOptions & { mode?: EngineMode }).mode
+        : explicitApiProviderRequested
+          ? "api"
+          : undefined;
+  let browserFollowup: BrowserFollowupResolution | null = null;
+  let apiFollowup: FollowupResolution | null = null;
+  if (
+    options.followup &&
+    !options.status &&
+    !options.session &&
+    !options.execSession &&
+    !renderMarkdown &&
+    !copyMarkdown
+  ) {
+    if (multiModelProvided) {
+      throw new Error("--followup cannot be combined with --models.");
+    }
+    browserFollowup = await resolveBrowserFollowupReference(options.followup, sessionStore);
+    if (browserFollowup) {
+      if (explicitFollowupEngine === "api") {
+        throw new Error(
+          "API engine/provider settings cannot continue a browser --followup session. Omit them to reuse the parent browser session.",
+        );
+      }
+    } else {
+      apiFollowup = await resolveFollowupReference(options.followup, options.followupModel);
+      if (explicitFollowupEngine === "browser") {
+        throw new Error(
+          "--engine browser cannot continue an API --followup session. Omit --engine to reuse the parent API session.",
+        );
+      }
+    }
+  }
+  if (browserFollowup && remoteHost) {
+    throw new Error(
+      "--remote-host cannot continue a browser --followup session that is bound to its stored Chrome endpoint.",
+    );
+  }
   if (providerMode === "openai") {
     if (hasExplicitAzureOption(optionUsesDefault)) {
       throw new Error("--provider openai/--no-azure cannot be combined with Azure options.");
@@ -1957,8 +2059,6 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     providerMode !== "openai" &&
     Boolean(options.azureEndpoint?.trim()) &&
     engineModels.some((model) => isAzureOpenAICandidateModel(model));
-  const explicitApiProviderRequested =
-    providerMode !== "auto" || hasExplicitAzureOption(optionUsesDefault);
   const envEnginePreference = (process.env.ORACLE_ENGINE ?? "").trim().toLowerCase();
   const explicitApiEngineRequested =
     options.engine === "api" || (!options.engine && envEnginePreference === "api");
@@ -1971,7 +2071,13 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     apiProviderRequested: explicitApiProviderRequested,
     env: process.env,
   });
+  if (browserFollowup) {
+    engine = "browser";
+  } else if (apiFollowup) {
+    engine = "api";
+  }
   const browserEngineRequested =
+    Boolean(browserFollowup) ||
     options.browser ||
     options.engine === "browser" ||
     Boolean(remoteHost) ||
@@ -1999,7 +2105,8 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     : [];
   const defaultModel = engine === "browser" ? DEFAULT_BROWSER_MODEL : DEFAULT_API_MODEL;
   const cliModelArg =
-    normalizeModelOption(options.model) || (multiModelProvided ? "" : defaultModel);
+    browserFollowup?.model ??
+    (normalizeModelOption(options.model) || (multiModelProvided ? "" : defaultModel));
   const inferredModelCandidate: ModelName = multiModelProvided
     ? normalizedMultiModels[0]
     : engine === "browser"
@@ -2073,9 +2180,9 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   resolvedOptions.writeOutputPath = resolveOutputPath(options.writeOutput, process.cwd());
 
   if (options.status) {
-    const { attachSession, showStatus } = await import("../src/cli/sessionDisplay.js");
+    const { showStatus } = await import("../src/cli/sessionDisplay.js");
     if (options.session) {
-      await attachSession(options.session);
+      await attachRootSession(options.session);
     } else {
       await showStatus({ hours: 24, includeAll: false, limit: 100, showExamples: true });
     }
@@ -2083,8 +2190,7 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   }
 
   if (options.session) {
-    const { attachSession } = await import("../src/cli/sessionDisplay.js");
-    await attachSession(options.session);
+    await attachRootSession(options.session);
     return;
   }
 
@@ -2159,30 +2265,21 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     options.browserAttachmentTimeout = attachmentTimeoutEnv;
   }
 
-  let browserFollowup: Awaited<ReturnType<typeof resolveBrowserFollowupReference>> = null;
-  if (options.followup) {
-    if (normalizedMultiModels.length > 0) {
-      throw new Error("--followup cannot be combined with --models.");
-    }
-    browserFollowup = await resolveBrowserFollowupReference(options.followup, sessionStore);
-    if (browserFollowup) {
-      engine = "browser";
-      resolvedOptions.model = browserFollowup.model;
-      resolvedOptions.effectiveModelId = browserFollowup.model;
-      resolvedOptions.followupSessionId = browserFollowup.sessionId;
-      resolvedOptions.browserResumeConversationUrl = browserFollowup.resumeConversationUrl;
-    } else {
-      assertFollowupSupported({
-        engine,
-        model: resolvedModel,
-        baseUrl: resolvedBaseUrl,
-        azureEndpoint: resolvedOptions.azure?.endpoint,
-      });
-      const followup = await resolveFollowupReference(options.followup, options.followupModel);
-      resolvedOptions.previousResponseId = followup.responseId;
-      resolvedOptions.followupSessionId = followup.sessionId;
-      resolvedOptions.followupModel = options.followupModel;
-    }
+  if (browserFollowup) {
+    resolvedOptions.model = browserFollowup.model;
+    resolvedOptions.effectiveModelId = browserFollowup.model;
+    resolvedOptions.followupSessionId = browserFollowup.sessionId;
+    resolvedOptions.browserResumeConversationUrl = browserFollowup.resumeConversationUrl;
+  } else if (apiFollowup) {
+    assertFollowupSupported({
+      engine,
+      model: resolvedModel,
+      baseUrl: resolvedBaseUrl,
+      azureEndpoint: resolvedOptions.azure?.endpoint,
+    });
+    resolvedOptions.previousResponseId = apiFollowup.responseId;
+    resolvedOptions.followupSessionId = apiFollowup.sessionId;
+    resolvedOptions.followupModel = options.followupModel;
   }
   const activeModel = resolvedOptions.model;
   if (options.reasoningMode && engine !== "api") {
@@ -2378,6 +2475,7 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     waitPreference = true;
   }
 
+  await preflightSessionIdReceipt();
   await sessionStore.ensureStorage();
   const baseRunOptions = buildRunOptions(resolvedOptions, {
     preview: false,
@@ -2414,6 +2512,19 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     process.cwd(),
     notifications,
   );
+  try {
+    await writeSessionIdReceipt(sessionMeta.id);
+  } catch (receiptError) {
+    try {
+      await removeSessionReservation(sessionMeta.id);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [receiptError, cleanupError],
+        "Oracle session ID receipt write and reservation cleanup failed.",
+      );
+    }
+    throw receiptError;
+  }
   const liveRunOptions: RunOracleOptions = {
     ...baseRunOptions,
     sessionId: sessionMeta.id,
@@ -3037,7 +3148,7 @@ async function main(): Promise<void> {
     return;
   }
   const handleSigint = (): void => {
-    console.log(chalk.yellow("\nCancelled."));
+    console.error(chalk.yellow("\nCancelled."));
     process.exitCode = 130;
     // Browser/serve modes install their own SIGINT cleanup after this top-level handler.
     if (process.listenerCount("SIGINT") <= 1) {
@@ -3060,5 +3171,5 @@ void main().catch((error: unknown) => {
   } else {
     console.error(chalk.red("✖"), error);
   }
-  process.exitCode = 1;
+  process.exitCode = oracleCliExitCodeForError(error);
 });

@@ -12,6 +12,7 @@ import {
   ensureNotBlocked,
   ensureLoggedIn,
   ensureChatGptScopeRetained,
+  readChatGptAccountDigest,
 } from "../../src/browser/pageActions.js";
 import { isAnswerNowPlaceholderText } from "../../src/browser/actions/assistantResponse.js";
 import { createContext, Script } from "node:vm";
@@ -646,6 +647,27 @@ describe("ensureChatMode", () => {
     expect(input.dispatchMouseEvent).not.toHaveBeenCalled();
   });
 
+  test("allows conversation metadata to hydrate for the configured input timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = {
+        evaluate: vi
+          .fn()
+          .mockResolvedValueOnce({ result: { value: { status: "conversation-unresolved" } } })
+          .mockResolvedValueOnce({ result: { value: { status: "conversation-unresolved" } } })
+          .mockResolvedValueOnce({ result: { value: { status: "chat-conversation" } } }),
+      } as unknown as ChromeClient["Runtime"];
+      const input = { dispatchMouseEvent: vi.fn() } as unknown as ChromeClient["Input"];
+
+      const result = ensureChatMode(runtime, input, 20_000, logger, { pollMs: 10_001 });
+      await vi.advanceTimersByTimeAsync(20_002);
+
+      await expect(result).resolves.toBe("chat");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("aggregates responsive duplicates for the exact conversation id", () => {
     expect(
       runConversationModeProbe("/c/duplicate-thread", [
@@ -747,7 +769,7 @@ describe("ensureChatMode", () => {
 });
 
 describe("waitForResumedConversationHydration", () => {
-  test("waits for stable prior turns and verifies the expected conversation", async () => {
+  test("waits for stable prior turns and verifies the exact conversation scope", async () => {
     vi.useFakeTimers();
     try {
       const runtime = {
@@ -758,7 +780,7 @@ describe("waitForResumedConversationHydration", () => {
           .mockResolvedValueOnce({ result: { value: 2 } })
           .mockResolvedValueOnce({ result: { value: 2 } })
           .mockResolvedValueOnce({
-            result: { value: "https://chatgpt.com/c/expected-thread" },
+            result: { value: "https://chatgpt.com/g/project/c/expected-thread" },
           }),
       } as unknown as ChromeClient["Runtime"];
       const ensurePromptReadyMock = vi.fn().mockResolvedValue(undefined);
@@ -823,7 +845,32 @@ describe("waitForResumedConversationHydration", () => {
     }
   });
 
-  test("fails closed when navigation lands on a different conversation", async () => {
+  test.each([
+    [
+      "different conversation id",
+      "https://chatgpt.com/c/expected-thread",
+      "https://chatgpt.com/c/other-thread",
+      "other-thread",
+    ],
+    [
+      "project route to root route with the same id",
+      "https://chatgpt.com/g/g-project-a/project/c/expected-thread",
+      "https://chatgpt.com/c/expected-thread",
+      "expected-thread",
+    ],
+    [
+      "different project route with the same id",
+      "https://chatgpt.com/g/g-project-a/project/c/expected-thread",
+      "https://chatgpt.com/g/g-project-b/project/c/expected-thread",
+      "expected-thread",
+    ],
+    [
+      "different supported origin with the same id",
+      "https://chatgpt.com/c/expected-thread",
+      "https://chat.openai.com/c/expected-thread",
+      "expected-thread",
+    ],
+  ])("fails closed on %s", async (_case, expectedUrl, actualUrl, actualConversationId) => {
     vi.useFakeTimers();
     try {
       const runtime = {
@@ -833,18 +880,19 @@ describe("waitForResumedConversationHydration", () => {
           .mockResolvedValueOnce({ result: { value: 1 } })
           .mockResolvedValueOnce({ result: { value: 1 } })
           .mockResolvedValueOnce({ result: { value: 1 } })
-          .mockResolvedValueOnce({ result: { value: "https://chatgpt.com/c/other-thread" } }),
+          .mockResolvedValueOnce({ result: { value: actualUrl } }),
       } as unknown as ChromeClient["Runtime"];
       const promise = waitForResumedConversationHydration(runtime, 5_000, logger, {
         ensurePromptReady: vi.fn().mockResolvedValue(undefined),
         requirePriorTurns: true,
-        expectedConversationUrl: "https://chatgpt.com/c/expected-thread",
+        expectedConversationUrl: expectedUrl,
       });
       const assertion = expect(promise).rejects.toMatchObject({
         details: {
           stage: "resume-conversation",
           expectedConversationId: "expected-thread",
-          actualConversationId: "other-thread",
+          actualConversationId,
+          actualUrl,
         },
       });
       await vi.runAllTimersAsync();
@@ -1572,6 +1620,55 @@ describe("ensureLoggedIn", () => {
     expect(logger).toHaveBeenCalledWith("Welcome back account click triggered navigation.");
     expect(logger).toHaveBeenCalledWith("Login restored via Welcome back account picker");
   });
+  test("accepts only a SHA-256 account digest from the page probe", async () => {
+    const digest = "a".repeat(64);
+    const evaluate = vi.fn().mockResolvedValue({ result: { value: digest } });
+    const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
+
+    await expect(readChatGptAccountDigest(runtime, 250)).resolves.toBe(digest);
+    expect(evaluate).toHaveBeenCalledWith(
+      expect.objectContaining({ awaitPromise: true, returnByValue: true }),
+    );
+    const expression = evaluate.mock.calls[0]?.[0]?.expression;
+    expect(expression).toContain("const pageOrigin = new URL(location.href).origin;");
+    expect(expression).toContain(
+      '["https://chatgpt.com","https://chat.openai.com"].includes(pageOrigin)',
+    );
+    expect(expression).toContain("const target = new URL('/api/auth/session', pageOrigin).href;");
+    expect(expression).toContain("redirect: 'error'");
+    expect(expression).toContain("response.redirected");
+    expect(expression).toContain("response.url !== target");
+    expect(expression).toContain("const timeoutMs = 250");
+  });
+  test("bounds a stalled account digest CDP evaluation by its supplied deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = {
+        evaluate: vi.fn(() => new Promise<never>(() => undefined)),
+      } as unknown as ChromeClient["Runtime"];
+      const failure = readChatGptAccountDigest(runtime, 25).catch((error: unknown) => error);
+
+      await vi.advanceTimersByTimeAsync(25);
+
+      const error = await failure;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toMatch(
+        /timed out while reading authenticated ChatGPT account identity/i,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("rejects raw or unavailable account identifiers", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({ result: { value: "raw-user-id" } }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(readChatGptAccountDigest(runtime)).rejects.toThrow(
+      /account identity is unavailable/i,
+    );
+  });
 });
 
 describe("waitForAssistantResponse", () => {
@@ -2140,10 +2237,16 @@ describe("uploadAttachmentFile", () => {
   test("avoids retrying other inputs once upload shows progress", async () => {
     logger.mockClear();
     let readSignalCalls = 0;
+    const mutationOrder: string[] = [];
+    const assertPageAffinity = vi.fn(async (action: string) => {
+      mutationOrder.push(`guard:${action}`);
+    });
     const dom = {
       getDocument: vi.fn().mockResolvedValue({ root: { nodeId: 1 } }),
       querySelector: vi.fn().mockResolvedValue({ nodeId: 2 }),
-      setFileInputFiles: vi.fn().mockResolvedValue(undefined),
+      setFileInputFiles: vi.fn(async () => {
+        mutationOrder.push("set-file-input");
+      }),
     } as unknown as ChromeClient["DOM"];
     const runtime = {
       evaluate: vi.fn().mockImplementation(async (params: { expression?: string }) => {
@@ -2206,7 +2309,7 @@ describe("uploadAttachmentFile", () => {
 
     await expect(
       uploadAttachmentFile(
-        { runtime, dom },
+        { runtime, dom, assertPageAffinity },
         { path: "/tmp/oracle-browser-smoke.txt", displayPath: "oracle-browser-smoke.txt" },
         logger,
       ),
@@ -2214,6 +2317,11 @@ describe("uploadAttachmentFile", () => {
 
     expect(dom.querySelector).toHaveBeenCalledTimes(1);
     expect(dom.setFileInputFiles).toHaveBeenCalledTimes(1);
+    expect(mutationOrder).toEqual([
+      "guard:attachment controls",
+      "guard:attachment transfer",
+      "set-file-input",
+    ]);
   });
 
   test("checks for late attachment signals before trying alternate inputs", async () => {

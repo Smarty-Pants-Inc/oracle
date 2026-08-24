@@ -24,6 +24,7 @@ import {
   formatBrowserModelTarget,
   resolveBrowserModelDisplayName,
 } from "./modelDisplay.js";
+import { normalizeChatGptAccountDigest } from "./chatgptAccount.js";
 
 export interface BrowserExecutionResult {
   usage: {
@@ -221,8 +222,18 @@ export async function runBrowserSessionExecution(
       outputPath: runOptions.outputPath,
       followUpPrompts: runOptions.browserFollowUps,
       runtimeHintCb: async (runtime, modelSelection) => {
+        const digest =
+          runtime.chatGptAccountDigest === undefined
+            ? undefined
+            : normalizeChatGptAccountDigest(runtime.chatGptAccountDigest);
+        if (runtime.chatGptAccountDigest !== undefined && !digest) {
+          throw new BrowserAutomationError("ChatGPT account identity is invalid.", {
+            stage: "remote-browser-identity",
+          });
+        }
         const runtimeWithController = {
           ...runtime,
+          ...(digest ? { chatGptAccountDigest: digest } : {}),
           controllerPid: runtime.controllerPid ?? process.pid,
         };
         if (modelSelection) {
@@ -239,6 +250,15 @@ export async function runBrowserSessionExecution(
     const message = error instanceof Error ? error.message : "Browser automation failed.";
     throw new BrowserAutomationError(message, { stage: "execute-browser" }, error);
   }
+  const resultDigest =
+    browserResult.chatGptAccountDigest === undefined
+      ? undefined
+      : normalizeChatGptAccountDigest(browserResult.chatGptAccountDigest);
+  if (browserResult.chatGptAccountDigest !== undefined && !resultDigest) {
+    throw new BrowserAutomationError("ChatGPT account identity is invalid.", {
+      stage: "remote-browser-identity",
+    });
+  }
   const modelSelection =
     browserResult.modelSelection ?? buildUnavailableModelSelectionEvidence(browserConfig);
   if (modelSelection) {
@@ -246,13 +266,16 @@ export async function runBrowserSessionExecution(
       `[browser] Model selection evidence: ${formatBrowserModelSelectionEvidence(modelSelection, runOptions.model)}`,
     );
   }
-  const warnings = buildBrowserRunWarnings({
-    runOptions,
-    browserConfig,
-    inputTokens: promptArtifacts.estimatedInputTokens,
-    elapsedMs: browserResult.tookMs,
-    modelSelection,
-  });
+  const warnings = [
+    ...(browserResult.warnings ?? []),
+    ...buildBrowserRunWarnings({
+      runOptions,
+      browserConfig,
+      inputTokens: promptArtifacts.estimatedInputTokens,
+      elapsedMs: browserResult.tookMs,
+      modelSelection,
+    }),
+  ];
   for (const warning of warnings) {
     log(chalk.yellow(`[browser] ${warning.message}`));
   }
@@ -311,6 +334,7 @@ export async function runBrowserSessionExecution(
       chromePort: browserResult.chromePort,
       chromeHost: browserResult.chromeHost,
       chromeBrowserWSEndpoint: browserResult.chromeBrowserWSEndpoint,
+      chatGptAccountDigest: resultDigest,
       chromeProfileRoot: browserResult.chromeProfileRoot,
       userDataDir: browserResult.userDataDir,
       chromeTargetId: browserResult.chromeTargetId,

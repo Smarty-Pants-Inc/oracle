@@ -74,16 +74,39 @@ sending a prompt:
 ```bash
 oracle chatgpt-export \
   --target-url "https://chatgpt.com/c/<conversation-id>" \
-  --remote-chrome 127.0.0.1:9222 \
-  --out ~/Documents/chatgpt-conversation-exports/review
+  --session-id "<originating-oracle-session-id>"
 ```
 
 The command scopes capture to that exact backend conversation URL and writes
-raw JSON, normalized JSON, Markdown, a manifest, and checksums. It does not read
-cookies, local storage, browser profiles, or unrelated history. Archived targets
-are recovered only for the exact approved id and re-archived after export; use
-`--no-recover-archived` to disable recovery. `--archive-after-export` is an
-explicit mutation that archives an active conversation after a successful export.
+raw JSON, normalized JSON, Markdown, a manifest, and checksums. By default it
+creates a fresh directory with an opaque random leaf under
+`~/Documents/chatgpt-conversation-exports`; an explicit `--out` path must not
+already exist. Symlink parent components are rejected. On POSIX systems, the
+final directory is mode `0700` and every file is created exclusively with mode
+`0600`. On Windows, export fails closed until Oracle can establish and verify an
+owner-exclusive DACL; POSIX mode bits are not treated as an ACL guarantee.
+
+`--session-id` uses only that Oracle session's stored browser UUID, refreshed
+WebSocket, and SHA-256 digest of the originating ChatGPT user id; the raw id and
+session payload never leave the page context. Omit it only when the conversation
+has one globally unique stored affinity. Direct raw `--remote-chrome` and OBU
+CLI exports are rejected because they do not carry authoritative approved
+account affinity; the account-bound wrapper supplies its own verified affinity.
+Stored-session, auto-resolved, and wrapper read-only exports use one exact
+authenticated GET after browser and account affinity validation. The cookie and
+bearer identities plus expected digest are bound inside that expression, so a
+stored read-only export does not require an expected email. The command does not
+read cookie values, local storage, browser profiles, or unrelated history, and
+never automatically unarchives or re-archives an export target.
+`--archive-after-export` is the sole opt-in archive mutation. It is available
+only to the account-bound wrapper for an inventory-confirmed active conversation
+and runs after a successful bundle write; already archived conversations reject
+the flag and remain read-only.
+
+The account-bound wrapper passes browser/account affinity identifiers to its
+child Oracle process in local argv. Same-user process inspection may observe
+those identifiers under this local-tool threat model. Cookies, bearer tokens,
+and the raw ChatGPT user id are not passed in argv.
 
 ## Current Pipeline
 
@@ -93,10 +116,10 @@ explicit mutation that archives an active conversation after a successful export
    - Remote mode connects only to an explicitly supplied dedicated Chrome CDP endpoint and opens an Oracle-owned tab.
    - Launcher mode can optionally copy cookies from the requested browser profile via Oracle’s built-in cookie reader (Keychain/DPAPI aware) so you stay signed in.
    - Navigates to `chatgpt.com`, switches the model to the requested GPT-5.5 / GPT-5.4 / GPT-5.2 variant, optionally activates Deep Research, pastes the prompt, waits for completion, and copies the markdown via the built-in “copy turn” button.
-   - Immediately probes the cookie-authenticated `/api/auth/session` endpoint in the ChatGPT tab and checks only whether it contains a user; returned tokens are never logged. If that endpoint is unavailable, Oracle falls back to the legacy `/backend-api/me` probe and a visible composer plus profile or chat-history authentication signals. Auth pages, visible login controls, resolved sessions without a user, composer-only shells, and pages without profile/history signals still fail with login guidance.
+   - Probes the cookie-authenticated `/api/auth/session` endpoint in the ChatGPT tab. Remote CDP sessions hash `user.id` inside the page with SHA-256 and return only that digest for account affinity; tokens, names, email, the raw id, and the session payload are never persisted or logged. General login detection can still fall back to `/backend-api/me` and visible composer plus profile/history signals, but a remote session cannot be affinity-bound unless the digest probe succeeds.
    - When `--file` inputs would push the pasted composer content over ~60k characters, we switch to uploading attachments (optionally bundled) and wait for ChatGPT to re-enable the send button before submitting the combined system+user prompt.
    - Launcher mode cleans up the temporary profile unless `--browser-keep-browser` is passed.
-3. **Session integration** – browser sessions use the normal log writer, add `mode: "browser"` plus `browser.config/runtime` metadata, and persist Chrome pid/port or websocket attach metadata plus the Oracle-owned target/tab URL for reattach.
+3. **Session integration** – browser sessions use the normal log writer, add `mode: "browser"` plus `browser.config/runtime` metadata, and persist Chrome pid/port or WebSocket attach metadata, the Oracle-owned target/tab URL, and only a SHA-256 digest of the authenticated ChatGPT user id. Remote follow-ups, reattach, harvest/live inspection, and session-derived exports revalidate the browser UUID and account digest before using the stored conversation.
 4. **Usage accounting** – we estimate input tokens with the same tokenizer used for API runs and estimate output tokens via `estimateTokenCount`. `oracle status` therefore shows comparable cost/timing info even though the call ran through the browser.
 
 ### CLI Options
@@ -120,7 +143,7 @@ explicit mutation that archives an active conversation after a successful export
 - GPT-5.5 Pro Extended is verified from the selected item in ChatGPT's standalone Pro/Thinking effort pill or compatible Intelligence/model-picker menu. A run **fails closed** if Extended cannot be confirmed rather than silently submitting at a weaker effort. Detection failures write a bounded, redacted model-picker diagnostic to the normal session log.
 - `--browser-research deep`: activate ChatGPT Deep Research before submitting the prompt. Use this for broad public-web research and final cited reports, not as a replacement for GPT-5.x Pro Heavy code review or pure reasoning.
 - `--browser-follow-up <prompt>`: submit another prompt in the same ChatGPT conversation after the initial answer. Repeat the flag for multi-turn reviews such as “challenge your recommendation”, “compare against this constraint”, then “give the final decision”. Deep Research has its own report lifecycle, so browser follow-ups are rejected when `--browser-research deep` is enabled.
-- `--followup <session-id>`: reopen the exact saved ChatGPT conversation from a completed browser session. Oracle inherits the parent browser profile, configuration, and model, then verifies the thread and prior turns before submitting.
+- `--followup <session-id>`: reopen the exact saved ChatGPT conversation from a completed browser session. Oracle inherits the parent browser profile, configuration, and model, then verifies the browser UUID, signed-in account digest, thread, and prior turns before submitting.
 - `--browser-archive <auto|always|never>`: archive completed ChatGPT conversations after local artifacts are saved. The default `auto` archives only successful one-shot chats and skips project, Deep Research, multi-turn, failed, and incomplete sessions.
 - `--browser-port <port>` (alias: `--browser-debug-port`; env: `ORACLE_BROWSER_PORT`/`ORACLE_BROWSER_DEBUG_PORT`): pin the DevTools port (handy on WSL/Windows firewalls). When omitted, a random open port is chosen.
 - `ORACLE_CHATGPT_ACCOUNT_EMAIL`: exact saved-account email to select if ChatGPT shows its “Welcome back” account picker. Set it on the machine running browser automation. Oracle never logs the address; without it, Oracle selects only a single unambiguous saved account and fails closed when several are present.

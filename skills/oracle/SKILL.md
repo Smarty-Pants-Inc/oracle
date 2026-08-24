@@ -196,16 +196,20 @@ Use `chatgpt-export` only for an exact conversation URL the user has approved:
 ```bash
 oracle chatgpt-export \
   --target-url "https://chatgpt.com/c/<conversation-id>" \
-  --remote-chrome 127.0.0.1:9222 \
+  --session-id "<originating-oracle-session-id>" \
   --out ~/Documents/chatgpt-conversation-exports/review
 ```
 
 The exporter captures only that conversation's authenticated backend response
-during page load and writes raw JSON, normalized JSON, Markdown, a manifest,
-and SHA-256 checksums. It does not read cookies, local storage, browser profiles,
-or unrelated history. Exact archived conversations may be temporarily recovered
-and are re-archived after export; pass `--no-recover-archived` to disable that
-path. `--archive-after-export` intentionally archives an active conversation.
+during page load or with one exact authenticated GET, then writes raw JSON,
+normalized JSON, Markdown, a manifest, and SHA-256 checksums. It does not read
+cookie values, local storage, browser profiles, or unrelated history. Archived
+targets are exported through the exact GET only when browser and account affinity
+can be verified; otherwise Oracle fails closed. It never automatically unarchives
+or re-archives a target. `--archive-after-export` is the sole explicit opt-in
+archive mutation for an inventory-confirmed active conversation exported through
+the account-bound wrapper, and runs only after a successful export. Conversation
+export is disabled on Windows until owner-exclusive DACLs can be verified.
 
 ## Prompt template
 

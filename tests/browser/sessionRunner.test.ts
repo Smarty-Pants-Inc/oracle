@@ -45,6 +45,13 @@ describe("runBrowserSessionExecution", () => {
         tookMs: 1000,
         answerTokens: 12,
         answerChars: 20,
+        warnings: [
+          {
+            code: "browser-cleanup-incomplete",
+            severity: "warning" as const,
+            message: "Browser cleanup could not be fully confirmed.",
+          },
+        ],
         conversationId: "foo",
       };
     });
@@ -79,6 +86,12 @@ describe("runBrowserSessionExecution", () => {
     });
     expect(result.runtime).toMatchObject({ chromePid: undefined, conversationId: "foo" });
     expect(result.artifacts).toEqual([{ kind: "transcript", path: "/tmp/transcript.md" }]);
+    expect(result.warnings).toEqual([
+      expect.objectContaining({ code: "browser-cleanup-incomplete" }),
+    ]);
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining("Browser cleanup could not be fully confirmed"),
+    );
     expect(persistRuntimeHint).toHaveBeenCalledWith(
       expect.objectContaining({ chromePort: 9999, chromeHost: "127.0.0.1", chromeTargetId: "t-1" }),
       expect.objectContaining({ resolvedLabel: "Pro", verified: true }),

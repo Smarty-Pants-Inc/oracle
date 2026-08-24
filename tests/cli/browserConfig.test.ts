@@ -22,6 +22,56 @@ describe("buildBrowserConfig", () => {
       archiveConversations: undefined,
     });
   });
+  test("binds the wrapper-selected browser identity before session creation", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ webSocketDebuggerUrl: browserWSEndpoint }),
+      }),
+    );
+    try {
+      await expect(
+        buildBrowserConfig({
+          model: "gpt-5.6-sol-pro",
+          remoteChrome: "127.0.0.1:9223",
+          remoteChromeBrowserId: "browser-a",
+          remoteChromeBrowserWs: browserWSEndpoint,
+        }),
+      ).resolves.toMatchObject({
+        remoteChrome: { host: "127.0.0.1", port: 9223 },
+        remoteChromeBrowserId: "browser-a",
+        remoteChromeBrowserWSEndpoint: browserWSEndpoint,
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  test("rejects a wrapper browser identity that changes before session creation", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          webSocketDebuggerUrl: "ws://127.0.0.1:9223/devtools/browser/browser-b",
+        }),
+      }),
+    );
+    try {
+      await expect(
+        buildBrowserConfig({
+          model: "gpt-5.6-sol-pro",
+          remoteChrome: "127.0.0.1:9223",
+          remoteChromeBrowserId: "browser-a",
+          remoteChromeBrowserWs: "ws://127.0.0.1:9223/devtools/browser/browser-a",
+        }),
+      ).rejects.toThrow(/identity changed before session creation/i);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 
   test("resolves Pro browser runs with a 24-hour default answer budget", async () => {
     const config = await buildBrowserConfig({ model: "gpt-5.6-sol-pro" });

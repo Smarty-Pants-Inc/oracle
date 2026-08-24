@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, test } from "vitest";
-import { mkdtemp, writeFile, readdir, readFile, rm, mkdir } from "node:fs/promises";
+import { chmod, mkdtemp, writeFile, readdir, readFile, rm, mkdir } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { pathToFileURL } from "node:url";
@@ -19,6 +19,7 @@ const TSX_LOADER = pathToFileURL(
   path.join(process.cwd(), "node_modules", "tsx", "dist", "loader.mjs"),
 ).href;
 const CLIENT_FACTORY = path.join(process.cwd(), "tests", "fixtures", "mockClientFactory.cjs");
+const CLI_ERROR_FIXTURE = path.join(process.cwd(), "tests", "fixtures", "cli-error-child.ts");
 const INTEGRATION_TIMEOUT = 60000;
 const AZURE_ENV_KEYS = [
   "AZURE_OPENAI_ENDPOINT",
@@ -64,6 +65,242 @@ function execCli(
       },
     );
   });
+}
+
+function execCliErrorFixture(
+  mode: "archive-repair" | "ordinary",
+  options: ExecFileOptions = {},
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    execFile(
+      process.execPath,
+      ["--import", "tsx", CLI_ERROR_FIXTURE, mode],
+      options,
+      (error, stdout, stderr) => {
+        const code = typeof error?.code === "number" ? error.code : error ? 1 : 0;
+        resolve({
+          code,
+          stdout: typeof stdout === "string" ? stdout : stdout.toString("utf8"),
+          stderr: typeof stderr === "string" ? stderr : stderr.toString("utf8"),
+        });
+      },
+    );
+  });
+}
+
+describe("account-bound ChatGPT command CLI wiring", () => {
+  const affinityArgs = [
+    "--remote-chrome",
+    "127.0.0.1:1",
+    "--remote-chrome-browser-id",
+    "expected",
+    "--remote-chrome-browser-ws",
+    "ws://127.0.0.1:1/devtools/browser/other",
+    "--expected-email",
+    "account@example.com",
+  ];
+
+  test("forwards parent remote Chrome options to chatgpt-inventory", async () => {
+    const result = await execCli(["chatgpt-inventory", ...affinityArgs, "--json"], {
+      env: { ...process.env, ORACLE_WRAPPER_CHATGPT_ACCOUNT_BOUND: "1" },
+    });
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("Remote Chrome browser id does not match");
+    expect(result.stderr).not.toContain("required option '--remote-chrome");
+    expect(result.stdout).not.toContain("🧿 oracle");
+  });
+
+  test.each([
+    ["subcommand duration", ["--timeout", "45s"]],
+    ["subcommand bare seconds", ["--timeout", "45"]],
+    ["parent duration", []],
+    ["parent bare seconds", []],
+    ["parent auto", []],
+  ])(
+    "forwards parent remote Chrome options to chatgpt-export with %s timeout",
+    async (placement, localTimeout) => {
+      const command = [
+        "chatgpt-export",
+        "--target-url",
+        "https://chatgpt.com/c/00000000-0000-0000-0000-000000000000",
+        ...affinityArgs,
+        "--remote-chrome-account-digest",
+        "a".repeat(64),
+        "--known-archived",
+        "false",
+        ...localTimeout,
+        "--json",
+      ];
+      const args =
+        placement === "parent duration"
+          ? ["--timeout", "45s", ...command]
+          : placement === "parent bare seconds"
+            ? ["--timeout", "45", ...command]
+            : placement === "parent auto"
+              ? ["--timeout", "auto", ...command]
+              : command;
+      const result = await execCli(args, {
+        env: { ...process.env, ORACLE_WRAPPER_CHATGPT_ACCOUNT_BOUND: "1" },
+      });
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("Remote Chrome browser id does not match");
+      expect(result.stderr).not.toContain("required option '--remote-chrome");
+      expect(result.stderr).not.toMatch(/--timeout must be|\.trim is not a function/i);
+      expect(result.stdout).not.toContain("🧿 oracle");
+    },
+  );
+
+  test("rejects malformed hidden archive state before browser access", async () => {
+    const result = await execCli([
+      "chatgpt-export",
+      "--target-url",
+      "https://chatgpt.com/c/00000000-0000-0000-0000-000000000000",
+      "--known-archived",
+      "not-a-boolean",
+      "--json",
+    ]);
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain('Value must be exactly "true" or "false"');
+    expect(result.stderr).not.toContain("authoritative approved account affinity");
+  });
+
+  test.each([
+    ["raw remote Chrome", ["--remote-chrome", "127.0.0.1:1"]],
+    ["OBU", ["--obu-session-id", "obu-session", "--obu-tab-id", "obu-tab"]],
+  ])("rejects direct %s exports without approved account affinity", async (_name, affinity) => {
+    const result = await execCli([
+      "chatgpt-export",
+      "--target-url",
+      "https://chatgpt.com/c/00000000-0000-0000-0000-000000000000",
+      ...affinity,
+      "--json",
+    ]);
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("authoritative approved account affinity");
+  });
+
+  test("documents post-export archive as the only export mutation", async () => {
+    const result = await execCli(["chatgpt-export", "--help"]);
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("--archive-after-export");
+    expect(result.stdout).not.toContain("--no-recover-archived");
+    expect(result.stdout).toMatch(
+      /without changing it unless\s+post-export archiving is explicitly requested/,
+    );
+  });
+
+  test("rejects post-export archiving for OBU exports", async () => {
+    const result = await execCli([
+      "chatgpt-export",
+      "--target-url",
+      "https://chatgpt.com/c/00000000-0000-0000-0000-000000000000",
+      "--obu-tab-id",
+      "approved-tab",
+      "--archive-after-export",
+      "--json",
+    ]);
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("--archive-after-export is not supported for OBU exports");
+  });
+});
+
+describe("root session receipt reservation", () => {
+  test("does not reserve a session when receipt preflight fails", async () => {
+    const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-receipt-preflight-"));
+    const receiptPath = path.join(oracleHome, "session-id-receipt");
+    await writeFile(receiptPath, "unchanged\n", { mode: 0o600 });
+    if (process.platform !== "win32") {
+      await chmod(receiptPath, 0o644);
+    }
+
+    try {
+      const result = await execCli(
+        ["--provider", "openai", "--model", "gpt-5.1", "--wait", "-p", "receipt failure"],
+        {
+          env: {
+            ...process.env,
+            OPENAI_API_KEY: "sk-receipt-test",
+            ORACLE_HOME_DIR: oracleHome,
+            ORACLE_CLIENT_FACTORY: CLIENT_FACTORY,
+            ORACLE_DISABLE_KEYTAR: "1",
+            ORACLE_NO_DETACH: "1",
+            ORACLE_SESSION_ID_RECEIPT: receiptPath,
+          },
+        },
+      );
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toMatch(
+        process.platform === "win32" ? /disabled on Windows.*ACL/i : /private regular file/i,
+      );
+      const sessions = await readdir(path.join(oracleHome, "sessions")).catch(() => []);
+      expect(sessions).toEqual([]);
+      expect(await readFile(receiptPath, "utf8")).toBe("unchanged\n");
+    } finally {
+      await rm(oracleHome, { recursive: true, force: true });
+    }
+  });
+  test.skipIf(process.platform === "win32")(
+    "publishes canonical receipts for legacy root session aliases",
+    async () => {
+      for (const aliasArgs of [
+        ["--session", "legacy-root-directory"],
+        ["--status", "--session", "legacy-root-directory"],
+      ]) {
+        const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-root-receipt-"));
+        const sessionDir = path.join(oracleHome, "sessions", "legacy-root-directory");
+        const receiptPath = path.join(oracleHome, "session-id-receipt");
+        await mkdir(sessionDir, { recursive: true });
+        await writeFile(
+          path.join(sessionDir, "meta.json"),
+          JSON.stringify({
+            id: "canonical-root-session",
+            createdAt: "2026-08-22T00:00:00.000Z",
+            status: "completed",
+            mode: "api",
+            model: "gpt-5.5-pro",
+            options: {},
+          }),
+          "utf8",
+        );
+        await writeFile(path.join(sessionDir, "output.log"), "Answer:\ndone\n", "utf8");
+        await writeFile(receiptPath, "", { mode: 0o600 });
+
+        try {
+          const result = await execCli(aliasArgs, {
+            env: {
+              ...process.env,
+              ORACLE_HOME_DIR: oracleHome,
+              ORACLE_DISABLE_KEYTAR: "1",
+              ORACLE_SESSION_ID_RECEIPT: receiptPath,
+            },
+            timeout: INTEGRATION_TIMEOUT,
+          });
+          expect(result.code).toBe(0);
+          expect(await readFile(receiptPath, "utf8")).toBe("canonical-root-session\n");
+        } finally {
+          await rm(oracleHome, { recursive: true, force: true });
+        }
+      }
+    },
+    INTEGRATION_TIMEOUT,
+  );
+});
+
+async function writeFollowupFixture(
+  oracleHome: string,
+  id: string,
+  metadata: Record<string, unknown>,
+): Promise<void> {
+  const sessionDir = path.join(oracleHome, "sessions", id);
+  await mkdir(sessionDir, { recursive: true });
+  await writeFile(path.join(sessionDir, "meta.json"), JSON.stringify(metadata), "utf8");
 }
 
 type CliChild = ChildProcessByStdio<null, Readable, Readable>;
@@ -215,12 +452,13 @@ module.exports = () => ({
         ],
         { env, stdio: ["ignore", "pipe", "pipe"] },
       );
-      let output = "";
+      let stdout = "";
+      let stderr = "";
       child.stdout.on("data", (chunk) => {
-        output += String(chunk);
+        stdout += String(chunk);
       });
       child.stderr.on("data", (chunk) => {
-        output += String(chunk);
+        stderr += String(chunk);
       });
 
       await waitForChildOutput(child, 2000);
@@ -233,7 +471,8 @@ module.exports = () => ({
       const exitedViaHandler = exit.code === 130 && exit.signal === null;
       expect(exitedViaSignal || exitedViaHandler).toBe(true);
       if (exitedViaHandler) {
-        expect(output).toContain("Cancelled.");
+        expect(stderr).toContain("Cancelled.");
+        expect(stdout).not.toContain("Cancelled.");
       }
       await expect(readFile(markerPath, "utf8")).rejects.toThrow();
       await rm(oracleHome, { recursive: true, force: true });
@@ -910,7 +1149,190 @@ module.exports = () => ({
     },
     INTEGRATION_TIMEOUT,
   );
+  test(
+    "reconciles --followup engine intent to the stored parent before previewing",
+    async () => {
+      const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-followup-engine-"));
+      const browserParentId = "browser-parent";
+      const apiParentId = "api-parent";
+      await Promise.all([
+        writeFollowupFixture(oracleHome, browserParentId, {
+          id: browserParentId,
+          createdAt: "2026-08-14T00:00:00.000Z",
+          status: "completed",
+          mode: "browser",
+          model: "gpt-5.5-pro",
+          options: {},
+          browser: {
+            config: {
+              url: "https://chatgpt.com/g/g-p-parent/project",
+              manualLogin: true,
+              remoteChrome: { host: "127.0.0.1", port: 9223 },
+              remoteChromeBrowserId: "browser-parent",
+              remoteChromeBrowserWSEndpoint: "ws://127.0.0.1:9223/devtools/browser/browser-parent",
+              remoteChromeAccountDigest: "a".repeat(64),
+            },
+            harvest: { url: "https://chatgpt.com/c/browser-parent" },
+          },
+        }),
+        writeFollowupFixture(oracleHome, apiParentId, {
+          id: apiParentId,
+          createdAt: "2026-08-14T00:00:00.000Z",
+          status: "completed",
+          mode: "api",
+          model: "gpt-5.5-pro",
+          options: {},
+          response: { responseId: "resp_api_parent" },
+        }),
+      ]);
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        // biome-ignore lint/style/useNamingConvention: env var name
+        ORACLE_HOME_DIR: oracleHome,
+        // biome-ignore lint/style/useNamingConvention: env var name
+        ORACLE_DISABLE_KEYTAR: "1",
+      };
+      delete env.OPENAI_API_KEY;
+      delete env.OPENROUTER_API_KEY;
+      env.ORACLE_ENGINE = "api";
+      const browserEnv: NodeJS.ProcessEnv = {
+        ...env,
+        // biome-ignore lint/style/useNamingConvention: env var name
+        AZURE_OPENAI_ENDPOINT: "https://followup-test.openai.azure.com",
+      };
 
+      const browserWithApi = await execCli(
+        [
+          "--dry-run",
+          "summary",
+          "--engine",
+          "api",
+          "--followup",
+          browserParentId,
+          "--prompt",
+          "Child",
+        ],
+        { env, timeout: INTEGRATION_TIMEOUT },
+      );
+      expect(browserWithApi.code).toBe(1);
+      expect(`${browserWithApi.stdout}\n${browserWithApi.stderr}`).toMatch(
+        /API engine\/provider.*browser/i,
+      );
+
+      const browserWithProvider = await execCli(
+        [
+          "--dry-run",
+          "summary",
+          "--provider",
+          "openai",
+          "--followup",
+          browserParentId,
+          "--prompt",
+          "Child",
+        ],
+        { env, timeout: INTEGRATION_TIMEOUT },
+      );
+      expect(browserWithProvider.code).toBe(1);
+      expect(`${browserWithProvider.stdout}\n${browserWithProvider.stderr}`).toMatch(
+        /API engine\/provider.*browser/i,
+      );
+
+      const browserWithRemoteHost = await execCli(
+        [
+          "--dry-run",
+          "summary",
+          "--followup",
+          browserParentId,
+          "--remote-host",
+          "127.0.0.1:9473",
+          "--prompt",
+          "Child",
+        ],
+        { env, timeout: INTEGRATION_TIMEOUT },
+      );
+      expect(browserWithRemoteHost.code).toBe(1);
+      expect(`${browserWithRemoteHost.stdout}\n${browserWithRemoteHost.stderr}`).toMatch(
+        /remote-host.*stored Chrome endpoint/i,
+      );
+
+      for (const apiFollowup of [apiParentId, "resp_direct_parent"]) {
+        const apiWithBrowser = await execCli(
+          [
+            "--dry-run",
+            "summary",
+            "--engine",
+            "browser",
+            "--followup",
+            apiFollowup,
+            "--prompt",
+            "Child",
+          ],
+          { env, timeout: INTEGRATION_TIMEOUT },
+        );
+        expect(apiWithBrowser.code).toBe(1);
+        expect(`${apiWithBrowser.stdout}\n${apiWithBrowser.stderr}`).toMatch(
+          /--engine browser.*API/i,
+        );
+      }
+
+      const browserPreview = await execCli(
+        ["--dry-run", "summary", "--followup", browserParentId, "--prompt", "Child"],
+        { env: browserEnv, timeout: INTEGRATION_TIMEOUT },
+      );
+      expect(browserPreview.code).toBe(0);
+      expect(browserPreview.stdout).toContain("[preview] Oracle");
+      expect(browserPreview.stdout).toContain("browser mode");
+      expect(browserPreview.stdout).toContain("target: https://chatgpt.com/g/g-p-parent/project");
+      expect(browserPreview.stdout).toContain("manual-login: yes");
+      expect(browserPreview.stdout).toContain("reuse an existing remote Chrome session");
+
+      const browserWithIncompatibleCurrentModel = await execCli(
+        [
+          "--dry-run",
+          "summary",
+          "--model",
+          "claude-4.6-sonnet",
+          "--followup",
+          browserParentId,
+          "--prompt",
+          "Child",
+        ],
+        { env: browserEnv, timeout: INTEGRATION_TIMEOUT },
+      );
+      expect(browserWithIncompatibleCurrentModel.code).toBe(0);
+      expect(browserWithIncompatibleCurrentModel.stdout).toContain("browser mode (gpt-5.5-pro)");
+
+      for (const apiFollowup of [apiParentId, "resp_direct_parent"]) {
+        const apiPreview = await execCli(
+          ["--dry-run", "summary", "--followup", apiFollowup, "--prompt", "Child"],
+          { env, timeout: INTEGRATION_TIMEOUT },
+        );
+        expect(apiPreview.code).toBe(0);
+        expect(apiPreview.stdout).toContain("[dry-run] Oracle");
+        expect(apiPreview.stdout).not.toContain("browser mode");
+      }
+
+      const renderWithUnusedFollowup = await execCli(
+        [
+          "--render-markdown",
+          "--followup",
+          "missing-session",
+          "--prompt",
+          "Render without following up",
+        ],
+        { env, timeout: INTEGRATION_TIMEOUT },
+      );
+      expect(renderWithUnusedFollowup.code).toBe(0);
+      expect(renderWithUnusedFollowup.stdout).toContain("Render without following up");
+
+      expect((await readdir(path.join(oracleHome, "sessions"))).sort()).toEqual([
+        apiParentId,
+        browserParentId,
+      ]);
+      await rm(oracleHome, { recursive: true, force: true });
+    },
+    INTEGRATION_TIMEOUT,
+  );
   test(
     "persists followup lineage and reuses previous_response_id during --exec-session",
     async () => {
@@ -1997,4 +2419,18 @@ module.exports = () => ({
     },
     INTEGRATION_TIMEOUT,
   );
+});
+describe("archive repair child-process contract", () => {
+  test("maps archive repair to exit 20 with generic stderr", async () => {
+    const result = await execCliErrorFixture("archive-repair");
+    expect(result.code).toBe(20);
+    expect(result.stderr).toContain("Archive cleanup could not be confirmed; repair is required.");
+    expect(result.stderr).not.toContain("sensitive operation details");
+  });
+
+  test("keeps ordinary child failures at exit 1", async () => {
+    const result = await execCliErrorFixture("ordinary");
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("ordinary child failure");
+  });
 });

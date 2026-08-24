@@ -26,6 +26,8 @@ const readyHarvest = {
   lastAssistantMarkdown: "Recovered answer",
   lastAssistantSnippet: "Recovered answer",
   state: "completed",
+  url: "https://chatgpt.com/c/saved-conversation",
+  conversationId: "saved-conversation",
 };
 const logger = (_message: string) => {};
 
@@ -53,7 +55,7 @@ describe("recoverConversationTab flow", () => {
     const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
     const recovered = await recoverConversationTab(meta, logger, {
       existingEndpoint: { host: "127.0.0.1", port: 9222 },
-      readyTimeoutMs: 1,
+      readyTimeoutMs: 1_000,
     });
 
     expect(openChatGptTarget).toHaveBeenCalledWith({
@@ -65,10 +67,246 @@ describe("recoverConversationTab flow", () => {
       host: "127.0.0.1",
       port: 9222,
       ref: "target-1",
+      expectedConversationId: "saved-conversation",
     });
     expect(acquireManualLoginChromeForRun).not.toHaveBeenCalled();
     expect(recovered.ref).toBe("target-1");
     expect(recovered.chrome).toBeNull();
+  });
+
+  test("reopens a missing bound tab only after browser and account verification", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const accountDigest = "a".repeat(64);
+    const openChatGptTarget = vi.fn(async () => "target-bound");
+    const harvestChatGptTab = vi.fn(async () => readyHarvest);
+    const navigate = vi.fn(async () => ({}));
+    const close = vi.fn(async () => undefined);
+    const closeTab = vi.fn(async () => true);
+    const acquireManualLoginChromeForRun = vi.fn();
+    vi.doMock("../../src/browser/liveTabs.js", () => ({
+      extractConversationIdFromUrl: (url: string) =>
+        url.includes("/c/") ? url.split("/c/")[1] : null,
+      openChatGptTarget,
+      harvestChatGptTab,
+    }));
+    vi.doMock("../../src/browser/index.js", () => ({
+      acquireManualLoginChromeForRun,
+      isImageOnlyUiChromeText: () => false,
+    }));
+    vi.doMock("../../src/browser/profileState.js", () => ({
+      resolveRemoteChromeBrowserIdentity: vi.fn(async () => ({
+        browserId: "browser-a",
+        browserWSEndpoint,
+      })),
+    }));
+    vi.doMock("../../src/browser/pageActions.js", () => ({
+      readChatGptAccountDigest: vi.fn(async () => accountDigest),
+    }));
+    const connectToRemoteChromeTarget = vi.fn(async () => ({
+      client: {
+        Page: { enable: vi.fn(async () => ({})), navigate },
+        Runtime: { enable: vi.fn(async () => ({})) },
+      },
+      close,
+    }));
+    vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
+      closeTab,
+      connectToRemoteChromeTarget,
+    }));
+
+    // vi.doMock requires a fresh import so this test observes its isolated module graph.
+    const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
+    const recovered = await recoverConversationTab(meta, logger, {
+      existingEndpoint: {
+        host: "127.0.0.1",
+        port: 9223,
+        browserId: "browser-a",
+        accountDigest,
+      },
+      readyTimeoutMs: 1_000,
+    });
+
+    expect(openChatGptTarget).toHaveBeenCalledWith({
+      host: "127.0.0.1",
+      port: 9223,
+      browserWSEndpoint,
+      url: "https://chatgpt.com/",
+    });
+    expect(connectToRemoteChromeTarget).toHaveBeenCalledWith(
+      "127.0.0.1",
+      9223,
+      logger,
+      expect.objectContaining({ browserWSEndpoint, targetId: "target-bound" }),
+    );
+    expect(navigate).toHaveBeenCalledWith({ url: "https://chatgpt.com/c/saved-conversation" });
+    expect(harvestChatGptTab).toHaveBeenCalledWith({
+      host: "127.0.0.1",
+      port: 9223,
+      browserId: "browser-a",
+      accountDigest,
+      ref: "target-bound",
+      expectedConversationId: "saved-conversation",
+    });
+    expect(recovered).toMatchObject({ browserId: "browser-a", accountDigest });
+    expect(acquireManualLoginChromeForRun).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledOnce();
+    expect(closeTab).not.toHaveBeenCalled();
+  });
+
+  test("does not fall back to another profile after a bound account mismatch", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const accountDigest = "a".repeat(64);
+    const acquireManualLoginChromeForRun = vi.fn();
+    const closeTab = vi.fn(async () => true);
+    vi.doMock("../../src/browser/liveTabs.js", () => ({
+      extractConversationIdFromUrl: (url: string) =>
+        url.includes("/c/") ? url.split("/c/")[1] : null,
+      openChatGptTarget: vi.fn(async () => "target-bound"),
+      harvestChatGptTab: vi.fn(),
+    }));
+    vi.doMock("../../src/browser/index.js", () => ({
+      acquireManualLoginChromeForRun,
+      isImageOnlyUiChromeText: () => false,
+    }));
+    vi.doMock("../../src/browser/profileState.js", () => ({
+      resolveRemoteChromeBrowserIdentity: vi.fn(async () => ({
+        browserId: "browser-a",
+        browserWSEndpoint,
+      })),
+    }));
+    vi.doMock("../../src/browser/pageActions.js", () => ({
+      readChatGptAccountDigest: vi.fn(async () => "b".repeat(64)),
+    }));
+    vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
+      closeTab,
+      connectToRemoteChromeTarget: vi.fn(async () => ({
+        client: {
+          Page: { enable: vi.fn(async () => ({})), navigate: vi.fn() },
+          Runtime: { enable: vi.fn(async () => ({})) },
+        },
+        close: vi.fn(async () => undefined),
+      })),
+    }));
+
+    // vi.doMock requires a fresh import so this test observes its isolated module graph.
+    const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
+    await expect(
+      recoverConversationTab(meta, logger, {
+        existingEndpoint: {
+          host: "127.0.0.1",
+          port: 9223,
+          browserId: "browser-a",
+          accountDigest,
+        },
+        waitForReady: false,
+      }),
+    ).rejects.toThrow(/account identity changed before conversation recovery/i);
+    expect(acquireManualLoginChromeForRun).not.toHaveBeenCalled();
+    expect(closeTab).toHaveBeenCalledWith(9223, "target-bound", logger, "127.0.0.1");
+  });
+
+  test("closes a newly opened bound target when attachment setup fails", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const accountDigest = "a".repeat(64);
+    const acquireManualLoginChromeForRun = vi.fn();
+    const closeTab = vi.fn(async () => true);
+    const connectToRemoteChromeTarget = vi.fn(async () => {
+      throw new Error("target attach failed");
+    });
+    vi.doMock("../../src/browser/liveTabs.js", () => ({
+      extractConversationIdFromUrl: (url: string) =>
+        url.includes("/c/") ? url.split("/c/")[1] : null,
+      openChatGptTarget: vi.fn(async () => "target-bound"),
+      harvestChatGptTab: vi.fn(),
+    }));
+    vi.doMock("../../src/browser/index.js", () => ({
+      acquireManualLoginChromeForRun,
+      isImageOnlyUiChromeText: () => false,
+    }));
+    vi.doMock("../../src/browser/profileState.js", () => ({
+      resolveRemoteChromeBrowserIdentity: vi.fn(async () => ({
+        browserId: "browser-a",
+        browserWSEndpoint,
+      })),
+    }));
+    vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
+      closeTab,
+      connectToRemoteChromeTarget,
+    }));
+
+    // vi.doMock requires a fresh import so this test observes its isolated module graph.
+    const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
+    await expect(
+      recoverConversationTab(meta, logger, {
+        existingEndpoint: {
+          host: "127.0.0.1",
+          port: 9223,
+          browserId: "browser-a",
+          accountDigest,
+        },
+        waitForReady: false,
+      }),
+    ).rejects.toThrow(/target attach failed/i);
+
+    expect(closeTab).toHaveBeenCalledWith(9223, "target-bound", logger, "127.0.0.1");
+    expect(acquireManualLoginChromeForRun).not.toHaveBeenCalled();
+  });
+
+  test("rejects a wrong final conversation and cleans the opened bound target", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const accountDigest = "a".repeat(64);
+    const close = vi.fn(async () => undefined);
+    const closeTab = vi.fn(async () => true);
+    vi.doMock("../../src/browser/liveTabs.js", () => ({
+      extractConversationIdFromUrl: (url: string) =>
+        url.includes("/c/") ? url.split("/c/")[1] : undefined,
+      openChatGptTarget: vi.fn(async () => "target-bound"),
+      harvestChatGptTab: vi.fn(async () => ({
+        ...readyHarvest,
+        url: "https://chatgpt.com/c/different-conversation",
+        conversationId: "different-conversation",
+      })),
+    }));
+    vi.doMock("../../src/browser/index.js", () => ({
+      acquireManualLoginChromeForRun: vi.fn(),
+      isImageOnlyUiChromeText: () => false,
+    }));
+    vi.doMock("../../src/browser/profileState.js", () => ({
+      resolveRemoteChromeBrowserIdentity: vi.fn(async () => ({
+        browserId: "browser-a",
+        browserWSEndpoint,
+      })),
+    }));
+    vi.doMock("../../src/browser/pageActions.js", () => ({
+      readChatGptAccountDigest: vi.fn(async () => accountDigest),
+    }));
+    vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
+      closeTab,
+      connectToRemoteChromeTarget: vi.fn(async () => ({
+        client: {
+          Page: { enable: vi.fn(async () => ({})), navigate: vi.fn(async () => ({})) },
+          Runtime: { enable: vi.fn(async () => ({})) },
+        },
+        close,
+      })),
+    }));
+
+    // vi.doMock requires a fresh import so this test observes its isolated module graph.
+    const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
+    await expect(
+      recoverConversationTab(meta, logger, {
+        existingEndpoint: {
+          host: "127.0.0.1",
+          port: 9223,
+          browserId: "browser-a",
+          accountDigest,
+        },
+        readyTimeoutMs: 1_000,
+      }),
+    ).rejects.toThrow(/conversation changed before recovery completed/i);
+
+    expect(close).toHaveBeenCalledOnce();
+    expect(closeTab).toHaveBeenCalledWith(9223, "target-bound", logger, "127.0.0.1");
   });
 
   test("launches the stored manual-login profile when the existing endpoint is gone", async () => {
@@ -94,7 +332,7 @@ describe("recoverConversationTab flow", () => {
     const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
     const recovered = await recoverConversationTab(meta, logger, {
       existingEndpoint: { host: "127.0.0.1", port: 9222 },
-      readyTimeoutMs: 1,
+      readyTimeoutMs: 1_000,
     });
 
     expect(acquireManualLoginChromeForRun).toHaveBeenCalledWith(
@@ -108,6 +346,7 @@ describe("recoverConversationTab flow", () => {
       host: "127.0.0.1",
       port: 53999,
       ref: "target-2",
+      expectedConversationId: "saved-conversation",
     });
     expect(recovered.ref).toBe("target-2");
     expect(recovered.chrome).toBe(chrome);
@@ -143,21 +382,19 @@ describe("recoverConversationTab flow", () => {
     const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
     const recovered = await recoverConversationTab(remoteMeta, logger, {
       existingEndpoint: { host: "127.0.0.1", port: 9222 },
-      readyTimeoutMs: 1,
+      readyTimeoutMs: 1_000,
     });
 
     expect(recovered.chrome).toBeNull();
     expect(acquireManualLoginChromeForRun).not.toHaveBeenCalled();
   });
 
-  test("kills launched Chrome when recovered content never becomes ready", async () => {
-    const openChatGptTarget = vi
-      .fn()
-      .mockRejectedValueOnce(new Error("ECONNREFUSED"))
-      .mockResolvedValueOnce("target-2");
+  test("does not allocate a local profile after the recovery budget is exhausted", async () => {
+    const openChatGptTarget = vi.fn();
     const harvestChatGptTab = vi.fn();
     const chrome = { port: 53999, kill: vi.fn(), process: { unref: vi.fn() } };
     const acquireManualLoginChromeForRun = vi.fn(async () => ({ chrome }));
+    const closeTab = vi.fn(async () => true);
 
     vi.doMock("../../src/browser/liveTabs.js", () => ({
       extractConversationIdFromUrl: (url: string) =>
@@ -169,6 +406,10 @@ describe("recoverConversationTab flow", () => {
       acquireManualLoginChromeForRun,
       isImageOnlyUiChromeText: () => false,
     }));
+    vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
+      closeTab,
+      connectToRemoteChromeTarget: vi.fn(),
+    }));
 
     const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
     await expect(
@@ -176,9 +417,101 @@ describe("recoverConversationTab flow", () => {
         existingEndpoint: { host: "127.0.0.1", port: 9222 },
         readyTimeoutMs: 0,
       }),
-    ).rejects.toThrow(/did not become ready/);
+    ).rejects.toThrow(/timed out while opening the recovery target/i);
 
-    expect(chrome.kill).toHaveBeenCalledTimes(1);
+    expect(openChatGptTarget).not.toHaveBeenCalled();
+    expect(acquireManualLoginChromeForRun).not.toHaveBeenCalled();
+    expect(closeTab).not.toHaveBeenCalled();
+    expect(chrome.kill).not.toHaveBeenCalled();
+  });
+
+  test("uses its cleanup allowance and reports an unconfirmed target cleanup after readiness times out", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const closeTab = vi.fn(() => new Promise<never>(() => undefined));
+    vi.doMock("../../src/browser/liveTabs.js", () => ({
+      extractConversationIdFromUrl: (url: string) =>
+        url.includes("/c/") ? url.split("/c/")[1] : null,
+      openChatGptTarget: vi.fn(async () => "target-cleanup-timeout"),
+      harvestChatGptTab: vi.fn(() => new Promise<never>(() => undefined)),
+    }));
+    vi.doMock("../../src/browser/index.js", () => ({
+      acquireManualLoginChromeForRun: vi.fn(),
+      isImageOnlyUiChromeText: () => false,
+    }));
+    vi.doMock("../../src/browser/chromeLifecycle.js", () => ({
+      closeTab,
+      connectToRemoteChromeTarget: vi.fn(),
+    }));
+
+    try {
+      const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
+      const pending = recoverConversationTab(meta, logger, {
+        existingEndpoint: { host: "127.0.0.1", port: 9222 },
+        readyTimeoutMs: 100,
+      });
+      const outcome = pending.then(
+        () => new Error("Expected recovery target cleanup to remain unconfirmed."),
+        (error: unknown) => error,
+      );
+
+      await vi.advanceTimersByTimeAsync(100);
+      expect(closeTab).toHaveBeenCalledWith(9222, "target-cleanup-timeout", logger, "127.0.0.1");
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      const error = await outcome;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toMatch(/conversation recovery and target cleanup failed/i);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  test("kills a Chrome allocation that resolves after the recovery deadline", async () => {
+    let resolveLateLaunch!: (value: {
+      chrome: { port: number; kill: () => Promise<void>; process: { unref: () => void } };
+    }) => void;
+    const chrome = { port: 53999, kill: vi.fn(async () => undefined), process: { unref: vi.fn() } };
+    const acquireManualLoginChromeForRun = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          resolveLateLaunch = resolve;
+        }),
+    );
+
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.doMock("../../src/browser/liveTabs.js", () => ({
+      extractConversationIdFromUrl: (url: string) =>
+        url.includes("/c/") ? url.split("/c/")[1] : null,
+      openChatGptTarget: vi.fn(),
+      harvestChatGptTab: vi.fn(),
+    }));
+    vi.doMock("../../src/browser/index.js", () => ({
+      acquireManualLoginChromeForRun,
+      isImageOnlyUiChromeText: () => false,
+    }));
+
+    // This module must load after vi.doMock so its static imports see the late allocation stub.
+    const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
+    try {
+      const failure = recoverConversationTab(meta, logger, { readyTimeoutMs: 100 }).catch(
+        (error: unknown) => error,
+      );
+      await Promise.resolve();
+      expect(acquireManualLoginChromeForRun).toHaveBeenCalledOnce();
+
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(failure).resolves.toMatchObject({
+        message: "Timed out while launching Chrome for conversation recovery.",
+      });
+
+      resolveLateLaunch({ chrome });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(chrome.kill).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("kills launched Chrome when opening the recovery target fails", async () => {
@@ -202,7 +535,7 @@ describe("recoverConversationTab flow", () => {
     const { recoverConversationTab } = await import("../../src/browser/recoverConversation.js");
     await expect(
       recoverConversationTab(meta, logger, {
-        readyTimeoutMs: 1,
+        readyTimeoutMs: 1_000,
       }),
     ).rejects.toThrow(/CDP.New failed/);
 

@@ -102,8 +102,13 @@ export interface BrowserAutomationConfig {
   modelStrategy?: BrowserModelStrategy;
   debug?: boolean;
   allowCookieErrors?: boolean;
+  /** SHA-256 digest of the authenticated ChatGPT user id; never the user id itself. */
+  expectedAccountDigest?: string | null;
   remoteChrome?: { host: string; port: number } | null;
+  remoteChromeBrowserId?: string | null;
   remoteChromeBrowserWSEndpoint?: string | null;
+  /** SHA-256 digest of the authenticated ChatGPT user id; never the user id itself. */
+  remoteChromeAccountDigest?: string | null;
   remoteChromeProfileRoot?: string | null;
   manualLogin?: boolean;
   manualLoginProfileDir?: string | null;
@@ -182,6 +187,7 @@ export interface BrowserRunResult {
   chromePort?: number;
   chromeHost?: string;
   chromeBrowserWSEndpoint?: string;
+  chatGptAccountDigest?: string;
   chromeProfileRoot?: string;
   userDataDir?: string;
   chromeTargetId?: string;
@@ -199,7 +205,9 @@ export type ResolvedBrowserConfig = Required<
     | "chromeCookiePath"
     | "desiredModel"
     | "remoteChrome"
+    | "remoteChromeBrowserId"
     | "remoteChromeBrowserWSEndpoint"
+    | "remoteChromeAccountDigest"
     | "remoteChromeProfileRoot"
     | "thinkingTime"
     | "modelStrategy"
@@ -219,7 +227,9 @@ export type ResolvedBrowserConfig = Required<
   debugPort?: number | null;
   inlineCookiesSource?: string | null;
   remoteChrome?: { host: string; port: number } | null;
+  remoteChromeBrowserId?: string | null;
   remoteChromeBrowserWSEndpoint?: string | null;
+  remoteChromeAccountDigest?: string | null;
   remoteChromeProfileRoot?: string | null;
   manualLogin?: boolean;
   manualLoginProfileDir?: string | null;

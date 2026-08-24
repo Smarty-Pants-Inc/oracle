@@ -14,13 +14,18 @@ interface ChatgptDomProviderState {
   baselineTurns?: number | null;
   attachmentNames?: AttachmentReadyExpectation[];
   committedTurns?: number | null;
+  committedConversationUrl?: string;
+  expectedConversationId?: string;
+  expectedConversationUrl?: string;
   onPromptSubmitted?: () => Promise<void> | void;
+  assertPageAffinity: (action: string) => Promise<void>;
 }
-
 function requireState(ctx: ProviderDomFlowContext): ChatgptDomProviderState {
   const state = ctx.state as ChatgptDomProviderState | undefined;
-  if (!state?.runtime || !state?.input || !state?.logger) {
-    throw new Error("chatgptDomProvider requires runtime/input/logger in context.state.");
+  if (!state?.runtime || !state?.input || !state?.logger || !state.assertPageAffinity) {
+    throw new Error(
+      "chatgptDomProvider requires runtime/input/logger/affinity guard in context.state.",
+    );
   }
   return state;
 }
@@ -36,7 +41,7 @@ async function typePrompt(_ctx: ProviderDomFlowContext): Promise<void> {
 
 async function submitPromptViaAdapter(ctx: ProviderDomFlowContext): Promise<void> {
   const state = requireState(ctx);
-  const committedTurns = await submitPrompt(
+  const commit = await submitPrompt(
     {
       runtime: state.runtime,
       input: state.input,
@@ -45,16 +50,14 @@ async function submitPromptViaAdapter(ctx: ProviderDomFlowContext): Promise<void
       inputTimeoutMs: state.inputTimeoutMs ?? undefined,
       attachmentTimeoutMs: state.attachmentTimeoutMs ?? undefined,
       onPromptSubmitted: state.onPromptSubmitted,
+      assertPageAffinity: state.assertPageAffinity,
     },
     ctx.prompt,
     state.logger,
   );
-  state.committedTurns =
-    typeof committedTurns === "number" && Number.isFinite(committedTurns) ? committedTurns : null;
-  if (
-    state.committedTurns != null &&
-    (state.baselineTurns == null || state.committedTurns > state.baselineTurns)
-  ) {
+  state.committedTurns = commit.turnsCount;
+  state.committedConversationUrl = commit.conversationUrl;
+  if (state.committedTurns != null && Number.isFinite(state.committedTurns)) {
     state.baselineTurns = Math.max(0, state.committedTurns - 1);
   }
 }
@@ -70,6 +73,8 @@ async function waitForResponse(ctx: ProviderDomFlowContext): Promise<{
     state.timeoutMs,
     state.logger,
     state.baselineTurns ?? undefined,
+    state.expectedConversationId,
+    state.committedConversationUrl ?? state.expectedConversationUrl,
   );
   return {
     text: answer.text,

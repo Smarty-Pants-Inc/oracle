@@ -7,6 +7,7 @@ import {
 import {
   CONVERSATION_TURN_CONTAINER_SELECTOR,
   CONVERSATION_TURN_SELECTOR,
+  PROMPT_PRIMARY_SELECTOR,
 } from "../../src/browser/constants.js";
 
 describe("promptComposer", () => {
@@ -25,28 +26,28 @@ describe("promptComposer", () => {
     );
   });
 
-  test("does not treat historical assistant content as committed without a new turn", async () => {
+  test("does not accept a cleared-composer fallback without a matching submitted turn", async () => {
     vi.useFakeTimers();
     try {
       const runtime = {
         evaluate: vi
           .fn()
-          // Baseline read (turn count)
           .mockResolvedValueOnce({ result: { value: 10 } })
-          // Polls (repeat)
           .mockResolvedValue({
             result: {
               value: {
                 baseline: 10,
-                turnsCount: 10,
+                turnsCount: 11,
                 userMatched: false,
                 prefixMatched: false,
                 lastMatched: false,
-                hasNewTurn: false,
+                submittedTurnMatched: false,
+                hasNewTurn: true,
                 stopVisible: true,
                 assistantVisible: true,
                 composerCleared: true,
-                inConversation: false,
+                inConversation: true,
+                href: "https://chatgpt.com/c/unrelated",
               },
             },
           }),
@@ -55,7 +56,6 @@ describe("promptComposer", () => {
       };
 
       const promise = promptComposer.verifyPromptCommitted(runtime as never, "hello", 150);
-      // Attach the rejection handler before timers advance to avoid unhandled-rejection warnings.
       const assertion = expect(promise).rejects.toThrow(/prompt did not appear/i);
       await vi.advanceTimersByTimeAsync(250);
       await assertion;
@@ -112,6 +112,254 @@ describe("promptComposer", () => {
       vi.useRealTimers();
     }
   });
+  test("accepts a fresh submitted prompt followed by an assistant turn before the first probe", async () => {
+    const turn = (role: "user" | "assistant", innerText: string, id: string) => ({
+      innerText,
+      getAttribute: (name: string) => {
+        if (name === "data-message-author-role") return role;
+        if (name === "data-testid") return id;
+        return null;
+      },
+      querySelector: () => null,
+    });
+    const topLevelTurns = [
+      turn("user", "old prompt", "conversation-turn-old-user"),
+      turn("assistant", "old answer", "conversation-turn-old-assistant"),
+      turn("assistant", "late hydrated answer", "conversation-turn-late-assistant"),
+      turn("user", "new prompt", "conversation-turn-new-user"),
+      turn("assistant", "Thinking", "conversation-turn-new-assistant"),
+    ];
+    const composer = {
+      innerText: "",
+      getBoundingClientRect: () => ({ width: 100, height: 40 }),
+    };
+    const document = {
+      querySelector: (selector: string) => (selector === PROMPT_PRIMARY_SELECTOR ? composer : null),
+      querySelectorAll: (selector: string) => {
+        if (
+          selector === CONVERSATION_TURN_CONTAINER_SELECTOR ||
+          selector === CONVERSATION_TURN_SELECTOR
+        ) {
+          return topLevelTurns;
+        }
+        return [];
+      },
+    };
+    class FakeTextArea {}
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: Function(
+            "document",
+            "HTMLTextAreaElement",
+            "location",
+            `return ${expression};`,
+          )(document, FakeTextArea, { href: "https://chatgpt.com/c/reused" }),
+        },
+      })),
+    } as unknown as {
+      evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+    };
+
+    await expect(
+      promptComposer.verifyPromptCommitted(runtime as never, "new prompt", 150, undefined, 2),
+    ).resolves.toEqual({
+      turnsCount: 5,
+      conversationUrl: "https://chatgpt.com/c/reused",
+    });
+  });
+
+  test("accepts a submitted turn with stop evidence when composer clears on a later poll", async () => {
+    vi.useFakeTimers();
+    try {
+      const firstProbe = {
+        baseline: 2,
+        turnsCount: 3,
+        submittedTurnIndex: 2,
+        submittedTurnIdentity: "testid:conversation-turn-new-user",
+        submittedTurnMatched: true,
+        hasNewTurn: true,
+        lastMatched: true,
+        stopVisible: true,
+        composerKnown: true,
+        composerCleared: false,
+        inConversation: true,
+        href: "https://chatgpt.com/c/reused",
+      };
+      const laterProbe = {
+        ...firstProbe,
+        turnsCount: 4,
+        lastMatched: false,
+        stopVisible: false,
+        composerCleared: true,
+        assistantVisible: true,
+      };
+      const runtime = {
+        evaluate: vi
+          .fn()
+          .mockResolvedValueOnce({ result: { value: firstProbe } })
+          .mockResolvedValue({ result: { value: laterProbe } }),
+      } as unknown as {
+        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+      };
+
+      const promise = promptComposer.verifyPromptCommitted(
+        runtime as never,
+        "new prompt",
+        150,
+        undefined,
+        2,
+      );
+      const assertion = expect(promise).resolves.toEqual({
+        turnsCount: 4,
+        conversationUrl: "https://chatgpt.com/c/reused",
+      });
+      await vi.advanceTimersByTimeAsync(250);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not accept a stale matching tail after later hydration clears the composer", async () => {
+    vi.useFakeTimers();
+    try {
+      const firstProbe = {
+        baseline: 2,
+        turnsCount: 3,
+        submittedTurnIndex: 2,
+        submittedTurnIdentity: "testid:conversation-turn-stale-user",
+        submittedTurnMatched: true,
+        hasNewTurn: true,
+        lastMatched: true,
+        stopVisible: false,
+        composerKnown: true,
+        composerCleared: false,
+        inConversation: true,
+        href: "https://chatgpt.com/c/reused",
+      };
+      const laterProbe = {
+        ...firstProbe,
+        turnsCount: 4,
+        lastMatched: false,
+        composerCleared: true,
+        assistantVisible: true,
+      };
+      const runtime = {
+        evaluate: vi
+          .fn()
+          .mockResolvedValueOnce({ result: { value: firstProbe } })
+          .mockResolvedValue({ result: { value: laterProbe } }),
+      } as unknown as {
+        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+      };
+
+      const promise = promptComposer.verifyPromptCommitted(
+        runtime as never,
+        "new prompt",
+        150,
+        undefined,
+        2,
+      );
+      const assertion = expect(promise).rejects.toMatchObject({
+        details: expect.objectContaining({ code: "prompt-commit-timeout" }),
+      });
+      await vi.advanceTimersByTimeAsync(250);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not accept a stale matching turn reindexed when the composer clears", async () => {
+    vi.useFakeTimers();
+    try {
+      const firstProbe = {
+        baseline: 2,
+        turnsCount: 3,
+        submittedTurnIndex: 2,
+        submittedTurnIdentity: "testid:conversation-turn-stale-user",
+        submittedTurnMatched: true,
+        hasNewTurn: true,
+        stopVisible: false,
+        composerKnown: true,
+        composerCleared: false,
+        href: "https://chatgpt.com/c/reused",
+      };
+      const runtime = {
+        evaluate: vi
+          .fn()
+          .mockResolvedValueOnce({ result: { value: firstProbe } })
+          .mockResolvedValue({
+            result: {
+              value: {
+                ...firstProbe,
+                turnsCount: 4,
+                submittedTurnIndex: 3,
+                composerCleared: true,
+              },
+            },
+          }),
+      } as unknown as {
+        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+      };
+
+      const promise = promptComposer.verifyPromptCommitted(
+        runtime as never,
+        "new prompt",
+        150,
+        undefined,
+        2,
+      );
+      const assertion = expect(promise).rejects.toMatchObject({
+        details: expect.objectContaining({ code: "prompt-commit-timeout" }),
+      });
+      await vi.advanceTimersByTimeAsync(250);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("fails closed when a matched turn has no stable identity", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: {
+            value: {
+              baseline: 2,
+              turnsCount: 3,
+              submittedTurnIndex: 2,
+              submittedTurnMatched: true,
+              hasNewTurn: true,
+              stopVisible: true,
+              composerKnown: true,
+              composerCleared: true,
+              href: "https://chatgpt.com/c/reused",
+            },
+          },
+        }),
+      } as unknown as {
+        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+      };
+
+      const promise = promptComposer.verifyPromptCommitted(
+        runtime as never,
+        "new prompt",
+        150,
+        undefined,
+        2,
+      );
+      const assertion = expect(promise).rejects.toMatchObject({
+        details: expect.objectContaining({ code: "prompt-commit-timeout" }),
+      });
+      await vi.advanceTimersByTimeAsync(250);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   test("commit timeout throws a structured error with probe diagnostics", async () => {
     vi.useFakeTimers();
@@ -131,17 +379,18 @@ describe("promptComposer", () => {
         lastTurn: "previous turn text",
       };
       const runtime = {
-        evaluate: vi
-          .fn()
-          // Baseline read (turn count)
-          .mockResolvedValueOnce({ result: { value: 10 } })
-          // Polls + final diagnostic probe
-          .mockResolvedValue({ result: { value: probe } }),
+        evaluate: vi.fn().mockResolvedValue({ result: { value: probe } }),
       } as unknown as {
         evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
       };
 
-      const promise = promptComposer.verifyPromptCommitted(runtime as never, "hello", 150);
+      const promise = promptComposer.verifyPromptCommitted(
+        runtime as never,
+        "hello",
+        150,
+        undefined,
+        10,
+      );
       const assertion = promise.then(
         () => {
           throw new Error("expected verifyPromptCommitted to reject");
@@ -175,36 +424,40 @@ describe("promptComposer", () => {
     }
   });
 
-  test("allows prompt match even if baseline turn count cannot be read", async () => {
-    const runtime = {
-      evaluate: vi
-        .fn()
-        // Baseline read fails
-        .mockRejectedValueOnce(new Error("turn read failed"))
-        // First poll shows prompt match (baseline unknown)
-        .mockResolvedValueOnce({
+  test("fails closed when no pre-send baseline is available", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
           result: {
             value: {
               baseline: -1,
               turnsCount: 1,
-              userMatched: true,
-              prefixMatched: false,
-              lastMatched: true,
+              submittedTurnIndex: 0,
+              submittedTurnMatched: true,
               hasNewTurn: false,
-              stopVisible: false,
-              assistantVisible: false,
-              composerCleared: false,
+              lastMatched: true,
+              composerKnown: true,
+              composerCleared: true,
               inConversation: true,
+              href: "https://chatgpt.com/c/created-for-prompt",
+              submittedTurnIdentity: "testid:conversation-turn-new-user",
             },
           },
         }),
-    } as unknown as {
-      evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
-    };
+      } as unknown as {
+        evaluate: (args: { expression: string; returnByValue?: boolean }) => Promise<unknown>;
+      };
 
-    await expect(
-      promptComposer.verifyPromptCommitted(runtime as never, "hello", 150),
-    ).resolves.toBe(1);
+      const promise = promptComposer.verifyPromptCommitted(runtime as never, "hello", 150);
+      const assertion = expect(promise).rejects.toMatchObject({
+        details: expect.objectContaining({ code: "prompt-commit-timeout" }),
+      });
+      await vi.advanceTimersByTimeAsync(250);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("attachment sends time out instead of allowing Enter fallback", async () => {
@@ -269,7 +522,7 @@ describe("promptComposer", () => {
     expect(promptComposer.sendButtonTimeoutMs(["oracle-attach-verify.txt"], 120_000)).toBe(120_000);
   });
 
-  test("marks prompt submitted before commit verification finishes", async () => {
+  test("keeps the caller-hydrated baseline when the post-typing turn count drops", async () => {
     const onPromptSubmitted = vi.fn();
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
@@ -284,8 +537,11 @@ describe("promptComposer", () => {
             result: { value: { editorText: "hello", fallbackValue: "", activeValue: "hello" } },
           };
         }
+        if (expression.trim().endsWith(").length")) {
+          return { result: { value: 0 } };
+        }
         if (expression.includes("button.scrollIntoView")) {
-          return { result: { value: { status: "clicked" } } };
+          return { result: { value: { status: "point", x: 1, y: 1 } } };
         }
         return {
           result: {
@@ -295,31 +551,52 @@ describe("promptComposer", () => {
               userMatched: true,
               prefixMatched: false,
               lastMatched: true,
+              submittedTurnIndex: 0,
+              submittedTurnIdentity: "testid:conversation-turn-new-user",
+              submittedTurnMatched: true,
               hasNewTurn: true,
               stopVisible: true,
               assistantVisible: false,
+              composerKnown: true,
               composerCleared: true,
               inConversation: true,
+              href: "https://chatgpt.com/c/created-for-prompt",
             },
           },
         };
       }),
     };
-    const input = { insertText: vi.fn(), dispatchKeyEvent: vi.fn() };
+    const input = {
+      insertText: vi.fn(),
+      dispatchKeyEvent: vi.fn(),
+      dispatchMouseEvent: vi.fn(),
+    };
     const logger = Object.assign(vi.fn(), { verbose: false });
+    const assertPageAffinity = vi.fn().mockResolvedValue(undefined);
 
     await submitPrompt(
       {
         runtime: runtime as never,
         input: input as never,
-        baselineTurns: 0,
+        baselineTurns: 7,
         onPromptSubmitted,
+        assertPageAffinity,
       },
       "hello",
       logger as never,
     );
 
     expect(onPromptSubmitted).toHaveBeenCalledTimes(1);
+    expect(
+      vi
+        .mocked(runtime.evaluate)
+        .mock.calls.some(([{ expression }]) => String(expression).includes("const baseline = 7;")),
+    ).toBe(true);
+    expect(assertPageAffinity.mock.calls.map(([action]) => action)).toEqual([
+      "prompt composer focus",
+      "prompt text insertion",
+      "prompt send",
+    ]);
   });
 
   test("waits for a delayed trusted click without issuing a second send", async () => {

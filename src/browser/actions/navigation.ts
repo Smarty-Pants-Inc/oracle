@@ -8,6 +8,15 @@ import {
 import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
+import { MAX_CHATGPT_ACCOUNT_ID_LENGTH } from "../chatgptAccount.js";
+import {
+  CHATGPT_ORIGINS,
+  isSameChatGptConversationUrl,
+  parseChatGptConversationScope,
+} from "../conversationUrl.js";
+const DEFAULT_ACCOUNT_DIGEST_TIMEOUT_MS = 10_000;
+const ACCOUNT_DIGEST_TIMEOUT_ERROR =
+  "Timed out while reading authenticated ChatGPT account identity.";
 
 export function installJavaScriptDialogAutoDismissal(
   Page: ChromeClient["Page"],
@@ -326,7 +335,7 @@ export async function ensureChatMode(
   logger: BrowserLogger,
   options: { pollMs?: number; resetWorkConversation?: () => Promise<void> } = {},
 ): Promise<"chat" | "switched" | "unavailable"> {
-  const verificationWindowMs = Math.min(Math.max(0, timeoutMs), 10_000);
+  const verificationWindowMs = Math.max(0, timeoutMs);
   let deadline = Date.now() + verificationWindowMs;
   const pollMs = Math.max(0, options.pollMs ?? 200);
   let changedFromWork = false;
@@ -540,6 +549,78 @@ export async function ensureLoggedIn(
   throw new Error(`ChatGPT session not detected.${domLabel}${accountHint} ${cookieHint}`);
 }
 
+/** Returns only the SHA-256 digest of ChatGPT's authenticated user id. */
+export async function readChatGptAccountDigest(
+  Runtime: ChromeClient["Runtime"],
+  remainingMs?: number,
+): Promise<string> {
+  const timeoutMs =
+    typeof remainingMs === "number" && Number.isFinite(remainingMs)
+      ? Math.max(0, Math.floor(remainingMs))
+      : DEFAULT_ACCOUNT_DIGEST_TIMEOUT_MS;
+  if (timeoutMs <= 0) {
+    throw new Error(ACCOUNT_DIGEST_TIMEOUT_ERROR);
+  }
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    const outcome = await Promise.race([
+      Runtime.evaluate({
+        expression: `(() => (async () => {
+          const timeoutMs = ${JSON.stringify(timeoutMs)};
+          let timeout;
+          try {
+            const pageOrigin = new URL(location.href).origin;
+            if (!${JSON.stringify(CHATGPT_ORIGINS)}.includes(pageOrigin)) return null;
+            const target = new URL('/api/auth/session', pageOrigin).href;
+            const deadline = Date.now() + timeoutMs;
+            const controller = new AbortController();
+            timeout = setTimeout(() => controller.abort(), timeoutMs);
+            const response = await fetch(target, {
+              method: 'GET', cache: 'no-store', credentials: 'include', redirect: 'error', signal: controller.signal,
+            });
+            if (
+              !response.ok ||
+              response.redirected ||
+              response.url !== target ||
+              controller.signal.aborted ||
+              Date.now() >= deadline
+            ) return null;
+            const body = await response.json();
+            const rawUserId = typeof body?.user?.id === 'string' ? body.user.id.trim() : '';
+            const userId = rawUserId.length > 0 && rawUserId.length <= ${MAX_CHATGPT_ACCOUNT_ID_LENGTH}
+              ? rawUserId
+              : '';
+            if (!userId || !globalThis.crypto?.subtle) return null;
+            const bytes = new Uint8Array(await crypto.subtle.digest(
+              'SHA-256', new TextEncoder().encode(userId),
+            ));
+            return controller.signal.aborted || Date.now() >= deadline
+              ? null
+              : Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+          } catch {
+            return null;
+          } finally {
+            if (timeout !== undefined) clearTimeout(timeout);
+          }
+        })())()`,
+        awaitPromise: true,
+        returnByValue: true,
+      }),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(ACCOUNT_DIGEST_TIMEOUT_ERROR)), timeoutMs);
+        timeout.unref?.();
+      }),
+    ]);
+    const digest = outcome.result?.value;
+    if (typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest)) {
+      throw new Error("Authenticated ChatGPT account identity is unavailable.");
+    }
+    return digest;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 interface WelcomeBackLoginAttempt {
   accepted: boolean;
   hint?: string;
@@ -709,15 +790,6 @@ export interface ResumedConversationHydrationDeps {
   expectedConversationUrl?: string;
 }
 
-function conversationIdFromUrl(value: string | undefined): string | null {
-  if (!value) return null;
-  try {
-    return new URL(value).pathname.match(/(?:^|\/)c\/([^/]+)/)?.[1] ?? null;
-  } catch {
-    return null;
-  }
-}
-
 /**
  * After navigating to a *resumed* ChatGPT conversation, its prior turns hydrate
  * asynchronously and ChatGPT can reset the composer mid-hydration — wiping a
@@ -788,15 +860,19 @@ export async function waitForResumedConversationHydration(
       returnByValue: true,
     });
     const actualUrl = typeof result?.value === "string" ? result.value : undefined;
-    const expectedConversationId = conversationIdFromUrl(deps.expectedConversationUrl);
-    const actualConversationId = conversationIdFromUrl(actualUrl);
-    if (!expectedConversationId || actualConversationId !== expectedConversationId) {
+    const expectedScope = parseChatGptConversationScope(deps.expectedConversationUrl);
+    const actualScope = parseChatGptConversationScope(actualUrl);
+    if (
+      !expectedScope ||
+      !actualScope ||
+      !isSameChatGptConversationUrl(actualUrl, deps.expectedConversationUrl)
+    ) {
       throw new BrowserAutomationError(
         "Saved ChatGPT conversation redirected to a different thread; refusing to submit follow-up.",
         {
           stage: "resume-conversation",
-          expectedConversationId,
-          actualConversationId,
+          expectedConversationId: expectedScope?.conversationId ?? null,
+          actualConversationId: actualScope?.conversationId ?? null,
           actualUrl,
         },
       );

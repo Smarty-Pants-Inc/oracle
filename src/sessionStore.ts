@@ -7,8 +7,9 @@ import type {
 import {
   ensureSessionStorage,
   initializeSession,
+  listSessionMetadataForArchiveAffinity,
+  readSessionMetadataForArchiveAffinity,
   readSessionMetadata,
-  updateSessionMetadata,
   createSessionLogWriter,
   readSessionLog,
   readModelLog,
@@ -16,6 +17,7 @@ import {
   listSessionsMetadata,
   filterSessionsByRange,
   deleteSessionsOlderThan,
+  updateSessionMetadata,
   updateModelRunMetadata,
   getSessionPaths,
   getSessionsDir,
@@ -31,6 +33,8 @@ export interface SessionStore {
     baseSlugOverride?: string,
   ): Promise<SessionMetadata>;
   readSession(sessionId: string): Promise<SessionMetadata | null>;
+  readSessionMetadataForArchiveAffinity?(sessionId: string): Promise<SessionMetadata | null>;
+  listSessionsMetadataForArchiveAffinity?(): Promise<SessionMetadata[]>;
   updateSession(sessionId: string, updates: Partial<SessionMetadata>): Promise<SessionMetadata>;
   createLogWriter(sessionId: string, model?: string): ReturnType<typeof createSessionLogWriter>;
   updateModelRun(
@@ -72,6 +76,12 @@ class FileSessionStore implements SessionStore {
 
   readSession(sessionId: string): Promise<SessionMetadata | null> {
     return readSessionMetadata(sessionId);
+  }
+  readSessionMetadataForArchiveAffinity(sessionId: string): Promise<SessionMetadata | null> {
+    return readSessionMetadataForArchiveAffinity(sessionId);
+  }
+  listSessionsMetadataForArchiveAffinity(): Promise<SessionMetadata[]> {
+    return listSessionMetadataForArchiveAffinity();
   }
 
   updateSession(sessionId: string, updates: Partial<SessionMetadata>): Promise<SessionMetadata> {
