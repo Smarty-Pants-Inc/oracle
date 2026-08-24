@@ -18,7 +18,11 @@ import type { BrowserDownloadBehaviorLockScope } from "./downloadBehaviorLock.js
 import { buildEvaluatedChatGptPageAffinityGuard } from "./chatgptAccount.js";
 function buildAssistantImageExpression(
   minTurnIndex?: number,
-  affinity: { expectedConversationId?: string; expectedAccountDigest?: string } = {},
+  affinity: {
+    expectedConversationId?: string;
+    expectedConversationUrl?: string;
+    expectedAccountDigest?: string;
+  } = {},
 ): string {
   const minTurnLiteral =
     typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex) && minTurnIndex >= 0
@@ -156,11 +160,13 @@ export async function readAssistantGeneratedImages(
   assertPageAffinity?: (action: string) => Promise<void>,
   expectedConversationId?: string,
   expectedAccountDigest?: string,
+  expectedConversationUrl?: string,
 ): Promise<BrowserGeneratedImage[]> {
   await assertPageAffinity?.("generated image DOM read");
   const { result, exceptionDetails } = await Runtime.evaluate({
     expression: buildAssistantImageExpression(minTurnIndex, {
       expectedConversationId,
+      expectedConversationUrl,
       expectedAccountDigest,
     }),
     awaitPromise: true,
@@ -192,6 +198,7 @@ async function readAssistantGeneratedImagesWithFallback(
   assertPageAffinity?: (action: string) => Promise<void>,
   expectedConversationId?: string,
   expectedAccountDigest?: string,
+  expectedConversationUrl?: string,
 ): Promise<BrowserGeneratedImage[]> {
   const readImages = async (minimumTurnIndex: number | undefined, action: string) => {
     await assertPageAffinity?.(action);
@@ -202,9 +209,10 @@ async function readAssistantGeneratedImagesWithFallback(
         assertPageAffinity,
         expectedConversationId,
         expectedAccountDigest,
+        expectedConversationUrl,
       );
     } catch (error) {
-      if (expectedConversationId || expectedAccountDigest) throw error;
+      if (expectedConversationId || expectedConversationUrl || expectedAccountDigest) throw error;
       return [];
     }
   };
@@ -228,7 +236,7 @@ async function readAssistantGeneratedImagesWithFallback(
       expectedAccountDigest,
     );
   } catch (error) {
-    if (expectedConversationId || expectedAccountDigest) throw error;
+    if (expectedConversationId || expectedConversationUrl || expectedAccountDigest) throw error;
     fallbackSnapshot = null;
   }
   await assertPageAffinity?.("generated image fallback snapshot read completion");
@@ -339,10 +347,12 @@ async function fetchGeneratedImageInBrowserContext(
   assertPageAffinity?: (action: string) => Promise<void>,
   expectedConversationId?: string,
   expectedAccountDigest?: string,
+  expectedConversationUrl?: string,
 ): Promise<{ buffer: Buffer; contentType: string | null; finalUrl: string }> {
   await assertPageAffinity?.("generated image browser download");
   const affinityGuard = buildEvaluatedChatGptPageAffinityGuard({
     expectedConversationId,
+    expectedConversationUrl,
     expectedAccountDigest,
   });
   const expression = `${affinityGuard ? "(async () => {" : "(async () => {"}
@@ -440,6 +450,7 @@ export async function saveChatGptGeneratedImages(params: {
   logger?: BrowserLogger;
   assertPageAffinity?: (action: string) => Promise<void>;
   expectedConversationId?: string;
+  expectedConversationUrl?: string;
   expectedAccountDigest?: string;
 }): Promise<{
   saved: boolean;
@@ -510,6 +521,7 @@ export async function saveChatGptGeneratedImages(params: {
             params.assertPageAffinity,
             params.expectedConversationId,
             params.expectedAccountDigest,
+            params.expectedConversationUrl,
           );
           contentType = browserFetch.contentType;
           finalUrl = browserFetch.finalUrl;
@@ -580,6 +592,7 @@ async function saveGeneratedImageButtonArtifacts(params: {
   targetPath: string;
   assertPageAffinity?: (action: string) => Promise<void>;
   expectedConversationId?: string;
+  expectedConversationUrl?: string;
   expectedAccountDigest?: string;
   downloadBehaviorLockScope?: BrowserDownloadBehaviorLockScope;
 }): Promise<SavedBrowserImage[]> {
@@ -600,6 +613,7 @@ async function saveGeneratedImageButtonArtifacts(params: {
       minTurnIndex: params.minTurnIndex,
       assertPageAffinity: params.assertPageAffinity,
       expectedConversationId: params.expectedConversationId,
+      expectedConversationUrl: params.expectedConversationUrl,
       expectedAccountDigest: params.expectedAccountDigest,
       downloadBehaviorLockScope: params.downloadBehaviorLockScope,
       onStagingRetained: () => {
@@ -682,6 +696,7 @@ export async function collectGeneratedImageArtifacts(params: {
   logger?: BrowserLogger;
   minTurnIndex?: number | null;
   expectedConversationId?: string;
+  expectedConversationUrl?: string;
   assertPageAffinity?: (action: string) => Promise<void>;
   expectedAccountDigest?: string;
   sessionId?: string;
@@ -706,6 +721,7 @@ export async function collectGeneratedImageArtifacts(params: {
     params.assertPageAffinity,
     params.expectedConversationId,
     params.expectedAccountDigest,
+    params.expectedConversationUrl,
   );
   let latestAnswerText = params.answerText;
 
@@ -723,6 +739,7 @@ export async function collectGeneratedImageArtifacts(params: {
       targetPath,
       assertPageAffinity: params.assertPageAffinity,
       expectedConversationId: params.expectedConversationId,
+      expectedConversationUrl: params.expectedConversationUrl,
       expectedAccountDigest: params.expectedAccountDigest,
       downloadBehaviorLockScope: params.downloadBehaviorLockScope,
     });
@@ -740,6 +757,7 @@ export async function collectGeneratedImageArtifacts(params: {
         params.assertPageAffinity,
         params.expectedConversationId,
         params.expectedAccountDigest,
+        params.expectedConversationUrl,
       );
       if (generatedImages.length > 0) {
         break;
@@ -754,7 +772,13 @@ export async function collectGeneratedImageArtifacts(params: {
           params.expectedAccountDigest,
         );
       } catch (error) {
-        if (params.expectedConversationId || params.expectedAccountDigest) throw error;
+        if (
+          params.expectedConversationId ||
+          params.expectedConversationUrl ||
+          params.expectedAccountDigest
+        ) {
+          throw error;
+        }
         latestSnapshot = null;
       }
       await params.assertPageAffinity?.("generated image fallback answer read completion");
@@ -776,6 +800,7 @@ export async function collectGeneratedImageArtifacts(params: {
         targetPath,
         assertPageAffinity: params.assertPageAffinity,
         expectedConversationId: params.expectedConversationId,
+        expectedConversationUrl: params.expectedConversationUrl,
         expectedAccountDigest: params.expectedAccountDigest,
         downloadBehaviorLockScope: params.downloadBehaviorLockScope,
       });
@@ -815,6 +840,7 @@ export async function collectGeneratedImageArtifacts(params: {
     outputPath: targetPath,
     assertPageAffinity: params.assertPageAffinity,
     expectedConversationId: params.expectedConversationId,
+    expectedConversationUrl: params.expectedConversationUrl,
     expectedAccountDigest: params.expectedAccountDigest,
     logger: params.logger,
   });
@@ -829,6 +855,7 @@ export async function collectGeneratedImageArtifacts(params: {
         minTurnIndex: params.minTurnIndex,
         assertPageAffinity: params.assertPageAffinity,
         expectedConversationId: params.expectedConversationId,
+        expectedConversationUrl: params.expectedConversationUrl,
         expectedAccountDigest: params.expectedAccountDigest,
         targetPath: path.resolve(explicitTargetPath),
         downloadBehaviorLockScope: params.downloadBehaviorLockScope,

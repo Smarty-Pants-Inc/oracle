@@ -334,7 +334,11 @@ function readTextDownloadableFiles(value?: string | null): BrowserDownloadableFi
 
 function buildAssistantDownloadableFilesExpression(
   minTurnIndex?: number,
-  affinity: { expectedConversationId?: string; expectedAccountDigest?: string } = {},
+  affinity: {
+    expectedConversationId?: string;
+    expectedConversationUrl?: string;
+    expectedAccountDigest?: string;
+  } = {},
 ): string {
   const minTurnLiteral =
     typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex) && minTurnIndex >= 0
@@ -474,11 +478,13 @@ export async function readAssistantDownloadableFiles(
   assertPageAffinity?: (action: string) => Promise<void>,
   expectedConversationId?: string,
   expectedAccountDigest?: string,
+  expectedConversationUrl?: string,
 ): Promise<BrowserDownloadableFile[]> {
   await assertPageAffinity?.("downloadable file DOM read");
   const { result, exceptionDetails } = await Runtime.evaluate({
     expression: buildAssistantDownloadableFilesExpression(minTurnIndex, {
       expectedConversationId,
+      expectedConversationUrl,
       expectedAccountDigest,
     }),
     awaitPromise: true,
@@ -768,7 +774,11 @@ function buildClickAssistantDownloadButtonsExpression(
   expectedLabels: string[] = [],
   allowGenericDownloadLabels = true,
   options: { markClicked?: boolean; maxClicks?: number; returnDiagnostics?: boolean } = {},
-  affinity: { expectedConversationId?: string; expectedAccountDigest?: string } = {},
+  affinity: {
+    expectedConversationId?: string;
+    expectedConversationUrl?: string;
+    expectedAccountDigest?: string;
+  } = {},
 ): string {
   const minTurnLiteral =
     typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex) && minTurnIndex >= 0
@@ -1056,6 +1066,7 @@ async function clickAssistantDownloadButtons(params: {
   assertPageAffinity?: (action: string) => Promise<void>;
   expectedConversationId?: string;
   expectedAccountDigest?: string;
+  expectedConversationUrl?: string;
 }): Promise<ClickDownloadControlsResult> {
   const expression = buildClickAssistantDownloadButtonsExpression(
     params.minTurnIndex,
@@ -1065,6 +1076,7 @@ async function clickAssistantDownloadButtons(params: {
     {
       expectedConversationId: params.expectedConversationId,
       expectedAccountDigest: params.expectedAccountDigest,
+      expectedConversationUrl: params.expectedConversationUrl,
     },
   );
   const deadline = Date.now() + (params.timeoutMs ?? DOWNLOAD_BUTTON_WAIT_MS);
@@ -1138,12 +1150,14 @@ async function clickGeneratedDownloadUrl(params: {
   assertPageAffinity?: (action: string) => Promise<void>;
   expectedConversationId?: string;
   expectedAccountDigest?: string;
+  expectedConversationUrl?: string;
 }): Promise<ClickDownloadControlsResult> {
   await params.assertPageAffinity?.("generated file download click");
   const filename = expectedDownloadedFilename(params.file) ?? "download";
   const affinityGuard = buildEvaluatedChatGptPageAffinityGuard({
     expectedConversationId: params.expectedConversationId,
     expectedAccountDigest: params.expectedAccountDigest,
+    expectedConversationUrl: params.expectedConversationUrl,
   });
   const expression = `${affinityGuard ? "(async () => {" : "(() => {"}
     ${affinityGuard}
@@ -1230,6 +1244,7 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
   assertPageAffinity?: (action: string) => Promise<void>;
   expectedConversationId?: string;
   expectedAccountDigest?: string;
+  expectedConversationUrl?: string;
   onStagingRetained?: (stagingDir: string) => void;
 }): Promise<SavedAssistantDownloadButtonArtifacts> {
   const savedFiles: SavedAssistantDownloadButtonArtifacts = [];
@@ -1314,6 +1329,7 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
         assertPageAffinity: params.assertPageAffinity,
         expectedConversationId: params.expectedConversationId,
         expectedAccountDigest: params.expectedAccountDigest,
+        expectedConversationUrl: params.expectedConversationUrl,
       });
       if (clickedResult.clicked.length === 0) {
         params.logger?.(
@@ -1356,6 +1372,7 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
           assertPageAffinity: params.assertPageAffinity,
           expectedConversationId: params.expectedConversationId,
           expectedAccountDigest: params.expectedAccountDigest,
+          expectedConversationUrl: params.expectedConversationUrl,
         });
         params.logger?.(
           `[browser] Button fallback inspected ${clickResult.inspectedCount} control(s) for ${sanitizeCandidateFilename(
@@ -1386,6 +1403,7 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
               assertPageAffinity: params.assertPageAffinity,
               expectedConversationId: params.expectedConversationId,
               expectedAccountDigest: params.expectedAccountDigest,
+              expectedConversationUrl: params.expectedConversationUrl,
             });
           }
         }
@@ -1564,11 +1582,13 @@ async function fetchDownloadWithBrowser(
   assertPageAffinity?: (action: string) => Promise<void>,
   expectedConversationId?: string,
   expectedAccountDigest?: string,
+  expectedConversationUrl?: string,
 ): Promise<DownloadedFilePayload> {
   await assertPageAffinity?.("downloadable file browser download");
   const affinityGuard = buildEvaluatedChatGptPageAffinityGuard({
     expectedConversationId,
     expectedAccountDigest,
+    expectedConversationUrl,
   });
   const expression = `${affinityGuard ? "(async () => {" : "(() => {"}
     ${affinityGuard}
@@ -1652,6 +1672,7 @@ export async function saveChatGptDownloadableFiles(params: {
   assertPageAffinity?: (action: string) => Promise<void>;
   expectedConversationId?: string;
   expectedAccountDigest?: string;
+  expectedConversationUrl?: string;
 }): Promise<{
   saved: boolean;
   fileCount: number;
@@ -1711,6 +1732,7 @@ export async function saveChatGptDownloadableFiles(params: {
               params.assertPageAffinity,
               params.expectedConversationId,
               params.expectedAccountDigest,
+              params.expectedConversationUrl,
             )
           : await fetchDownloadWithNode(downloadUrl, getCookieHeader, params.assertPageAffinity);
       const contentType = downloaded.contentType;
@@ -1789,6 +1811,7 @@ export async function collectChatGptFileArtifacts(params: {
   logger?: BrowserLogger;
   minTurnIndex?: number | null;
   expectedConversationId?: string;
+  expectedConversationUrl?: string;
   assertPageAffinity?: (action: string) => Promise<void>;
   expectedAccountDigest?: string;
   sessionId?: string;
@@ -1805,6 +1828,7 @@ export async function collectChatGptFileArtifacts(params: {
     params.assertPageAffinity,
     params.expectedConversationId,
     params.expectedAccountDigest,
+    params.expectedConversationUrl,
   ).catch(async (error) => {
     await params.assertPageAffinity?.("downloadable file DOM read failure");
     const message = error instanceof Error ? error.message : String(error);
@@ -1843,6 +1867,7 @@ export async function collectChatGptFileArtifacts(params: {
     assertPageAffinity: params.assertPageAffinity,
     expectedConversationId: params.expectedConversationId,
     expectedAccountDigest: params.expectedAccountDigest,
+    expectedConversationUrl: params.expectedConversationUrl,
   });
   const buttonSavedFiles =
     saved.failedFiles.length > 0
@@ -1859,6 +1884,7 @@ export async function collectChatGptFileArtifacts(params: {
           assertPageAffinity: params.assertPageAffinity,
           expectedConversationId: params.expectedConversationId,
           expectedAccountDigest: params.expectedAccountDigest,
+          expectedConversationUrl: params.expectedConversationUrl,
           downloadBehaviorLockScope: params.downloadBehaviorLockScope,
         })
       : [];

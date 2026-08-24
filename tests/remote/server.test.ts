@@ -66,6 +66,10 @@ describe("remote browser service", () => {
               tookMs: 1000,
               answerTokens: 42,
               answerChars: 2,
+              chatGptAccountDigest: "A".repeat(64),
+              chromePid: 123,
+              chromePort: 9222,
+              userDataDir: "/private/browser-profile",
             };
             return result;
           },
@@ -96,6 +100,10 @@ describe("remote browser service", () => {
 
       expect(clientLogs.some((entry) => entry.includes("uploading attachment"))).toBe(true);
       expect(result.answerText).toBe("hi");
+      expect(result.chatGptAccountDigest).toBe("a".repeat(64));
+      expect(result.chromePid).toBeUndefined();
+      expect(result.chromePort).toBeUndefined();
+      expect(result.userDataDir).toBeUndefined();
       expect(runLog).toEqual(["remote"]);
 
       const healthUnauthorized = await httpGetJson({

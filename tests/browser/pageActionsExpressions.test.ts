@@ -12,6 +12,7 @@ import {
   CONVERSATION_TURN_SELECTOR,
   ASSISTANT_ROLE_SELECTOR,
 } from "../../src/browser/constants.ts";
+import { CHATGPT_ORIGINS } from "../../src/browser/conversationUrl.ts";
 
 describe("browser automation expressions", () => {
   test("assistant extractor references constants", () => {
@@ -114,6 +115,13 @@ describe("browser automation expressions", () => {
   test("assistant snapshot expression rejects a missing conversation id", () => {
     const expression = buildAssistantSnapshotExpressionForTest(4, "conv-123");
     expect(expression).not.toContain("currentConversationId &&");
+  });
+
+  test("assistant snapshot expression accepts every supported ChatGPT origin", () => {
+    const expression = buildAssistantSnapshotExpressionForTest(4, "conv-123");
+    expect(expression).toContain(
+      `const currentConversationId = ${JSON.stringify(CHATGPT_ORIGINS)}.includes(currentPageUrl?.origin)`,
+    );
   });
 
   test("markdown fallback filters user turns and respects assistant indicators", () => {

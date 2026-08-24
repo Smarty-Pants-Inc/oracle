@@ -66,6 +66,14 @@ describe("conversation cookie cleanup", () => {
         }),
       ),
     ).toBe("resumed-thread");
+    expect(
+      __test__.resolveInitialRunConversationUrl(
+        resolveBrowserConfig({
+          url: "https://chatgpt.com/g/project/c/configured-thread",
+          resumeConversationUrl: "https://chatgpt.com/g/project/c/resumed-thread",
+        }),
+      ),
+    ).toBe("https://chatgpt.com/g/project/c/resumed-thread");
   });
   test("accepts exact conversation affinity on the supported legacy ChatGPT host", () => {
     expect(
@@ -89,6 +97,43 @@ describe("conversation cookie cleanup", () => {
         "https://chatgpt.com/#https://chatgpt.com/c/private-thread",
       ),
     ).toBeUndefined();
+  });
+  test.each([
+    [
+      "root versus project route",
+      "https://chatgpt.com/g/project-a/project/c/same-thread",
+      "https://chatgpt.com/c/same-thread",
+    ],
+    [
+      "cross-project route",
+      "https://chatgpt.com/g/project-a/project/c/same-thread",
+      "https://chatgpt.com/g/project-b/project/c/same-thread",
+    ],
+    [
+      "cross-origin route",
+      "https://chatgpt.com/c/same-thread",
+      "https://chat.openai.com/c/same-thread",
+    ],
+  ])("rejects same-id %s affinity drift", (_case, expectedUrl, actualUrl) => {
+    expect(() =>
+      __test__.assertRunConversationId(
+        "same-thread",
+        expectedUrl,
+        actualUrl,
+        "strict affinity test",
+      ),
+    ).toThrow(/conversation changed/i);
+  });
+
+  test("accepts the exact conversation URL with a trailing slash", () => {
+    expect(() =>
+      __test__.assertRunConversationId(
+        "same-thread",
+        "https://chatgpt.com/g/project/project/c/same-thread",
+        "https://chatgpt.com/g/project/project/c/same-thread/",
+        "strict affinity test",
+      ),
+    ).not.toThrow();
   });
 });
 
@@ -759,6 +804,7 @@ describe("ChatGPT UI warning detection", () => {
         vi.fn() as never,
         undefined,
         "synthetic-recovery",
+        "https://chatgpt.com/c/synthetic-recovery",
       );
       await vi.advanceTimersByTimeAsync(10_000);
 
@@ -1174,13 +1220,21 @@ describe("image-only assistant turn detection", () => {
 });
 
 describe("redactBrowserConfigForDebugLogForTest", () => {
-  test("redacts inline cookie values while preserving count context", () => {
+  test("redacts inline cookies and private browser affinity while preserving safe context", () => {
     const redacted = redactBrowserConfigForDebugLogForTest({
       inlineCookies: [
         { name: "__Secure-next-auth.session-token", value: "secret-token" },
         { name: "_account", value: "secret-account" },
       ],
       inlineCookiesSource: "inline-file",
+      remoteChrome: { host: "127.0.0.1", port: 9222 },
+      remoteChromeBrowserWSEndpoint: "wss://private.example/devtools/browser/secret",
+      remoteChromeAccountDigest: "a".repeat(64),
+      expectedAccountDigest: "b".repeat(64),
+      expectedEmail: "owner@example.com",
+      remoteChromeProfileRoot: "/private/profile/root",
+      browserTabRef: "tab-secret",
+      resumeConversationUrl: "https://chatgpt.com/g/private/project/c/private-thread",
       debug: true,
     });
 
@@ -1188,10 +1242,27 @@ describe("redactBrowserConfigForDebugLogForTest", () => {
       inlineCookies: "[redacted:2 cookies]",
       inlineCookieCount: 2,
       inlineCookiesSource: "inline-file",
+      remoteChrome: true,
+      remoteChromeBrowserWSEndpoint: true,
+      remoteChromeAccountDigest: true,
+      expectedAccountDigest: true,
+      expectedEmail: true,
+      remoteChromeProfileRoot: true,
+      browserTabRef: true,
+      resumeConversationUrl: true,
       debug: true,
     });
-    expect(JSON.stringify(redacted)).not.toContain("secret-token");
-    expect(JSON.stringify(redacted)).not.toContain("secret-account");
+    const serialized = JSON.stringify(redacted);
+    for (const secret of [
+      "secret-token",
+      "secret-account",
+      "private.example",
+      "owner@example.com",
+      "/private/profile/root",
+      "private-thread",
+    ]) {
+      expect(serialized).not.toContain(secret);
+    }
   });
 
   test("leaves missing inline cookies unchanged", () => {

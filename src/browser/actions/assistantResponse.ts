@@ -17,6 +17,7 @@ import {
 } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
 import { buildEvaluatedChatGptPageAffinityGuard } from "../chatgptAccount.js";
+import { CHATGPT_ORIGINS } from "../conversationUrl.js";
 
 const ASSISTANT_POLL_TIMEOUT_ERROR = "assistant-response-watchdog-timeout";
 const STOP_CONTROL_SELECTOR = STOP_BUTTON_SELECTORS.join(", ");
@@ -902,7 +903,7 @@ function buildAssistantSnapshotExpression(
     try {
       currentPageUrl = new URL(typeof location === 'object' && location.href ? location.href : '');
     } catch {}
-    const currentConversationId = currentPageUrl?.origin === 'https://chatgpt.com'
+    const currentConversationId = ${JSON.stringify(CHATGPT_ORIGINS)}.includes(currentPageUrl?.origin)
       ? /^(?:[/]c|[/]g[/][^/?#]+[/](?:project[/])?c)[/]([a-zA-Z0-9-]+)[/]?$/.exec(currentPageUrl.pathname)?.[1] ?? null
       : null;
     if (EXPECTED_CONVERSATION_ID && currentConversationId !== EXPECTED_CONVERSATION_ID) {

@@ -20,12 +20,12 @@ type FakeClient = {
 };
 
 describe("resumeBrowserSession", () => {
-  test("selects target and captures markdown via stubs", async () => {
+  test("selects a legacy-origin target and captures markdown via stubs", async () => {
     const runtime = {
       chromePort: 51559,
       chromeHost: "127.0.0.1",
       chromeTargetId: "target-1",
-      tabUrl: "https://chatgpt.com/c/abc",
+      tabUrl: "https://chat.openai.com/c/abc",
     };
     const listTargets = vi.fn(
       async () =>

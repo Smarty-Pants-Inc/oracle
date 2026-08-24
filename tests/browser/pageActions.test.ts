@@ -769,7 +769,7 @@ describe("ensureChatMode", () => {
 });
 
 describe("waitForResumedConversationHydration", () => {
-  test("waits for stable prior turns and verifies the expected conversation", async () => {
+  test("waits for stable prior turns and verifies the exact conversation scope", async () => {
     vi.useFakeTimers();
     try {
       const runtime = {
@@ -780,7 +780,7 @@ describe("waitForResumedConversationHydration", () => {
           .mockResolvedValueOnce({ result: { value: 2 } })
           .mockResolvedValueOnce({ result: { value: 2 } })
           .mockResolvedValueOnce({
-            result: { value: "https://chatgpt.com/c/expected-thread" },
+            result: { value: "https://chatgpt.com/g/project/c/expected-thread" },
           }),
       } as unknown as ChromeClient["Runtime"];
       const ensurePromptReadyMock = vi.fn().mockResolvedValue(undefined);
@@ -845,7 +845,32 @@ describe("waitForResumedConversationHydration", () => {
     }
   });
 
-  test("fails closed when navigation lands on a different conversation", async () => {
+  test.each([
+    [
+      "different conversation id",
+      "https://chatgpt.com/c/expected-thread",
+      "https://chatgpt.com/c/other-thread",
+      "other-thread",
+    ],
+    [
+      "project route to root route with the same id",
+      "https://chatgpt.com/g/g-project-a/project/c/expected-thread",
+      "https://chatgpt.com/c/expected-thread",
+      "expected-thread",
+    ],
+    [
+      "different project route with the same id",
+      "https://chatgpt.com/g/g-project-a/project/c/expected-thread",
+      "https://chatgpt.com/g/g-project-b/project/c/expected-thread",
+      "expected-thread",
+    ],
+    [
+      "different supported origin with the same id",
+      "https://chatgpt.com/c/expected-thread",
+      "https://chat.openai.com/c/expected-thread",
+      "expected-thread",
+    ],
+  ])("fails closed on %s", async (_case, expectedUrl, actualUrl, actualConversationId) => {
     vi.useFakeTimers();
     try {
       const runtime = {
@@ -855,18 +880,19 @@ describe("waitForResumedConversationHydration", () => {
           .mockResolvedValueOnce({ result: { value: 1 } })
           .mockResolvedValueOnce({ result: { value: 1 } })
           .mockResolvedValueOnce({ result: { value: 1 } })
-          .mockResolvedValueOnce({ result: { value: "https://chatgpt.com/c/other-thread" } }),
+          .mockResolvedValueOnce({ result: { value: actualUrl } }),
       } as unknown as ChromeClient["Runtime"];
       const promise = waitForResumedConversationHydration(runtime, 5_000, logger, {
         ensurePromptReady: vi.fn().mockResolvedValue(undefined),
         requirePriorTurns: true,
-        expectedConversationUrl: "https://chatgpt.com/c/expected-thread",
+        expectedConversationUrl: expectedUrl,
       });
       const assertion = expect(promise).rejects.toMatchObject({
         details: {
           stage: "resume-conversation",
           expectedConversationId: "expected-thread",
-          actualConversationId: "other-thread",
+          actualConversationId,
+          actualUrl,
         },
       });
       await vi.runAllTimersAsync();

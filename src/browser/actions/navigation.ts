@@ -9,7 +9,11 @@ import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
 import { MAX_CHATGPT_ACCOUNT_ID_LENGTH } from "../chatgptAccount.js";
-import { CHATGPT_ORIGINS } from "../conversationUrl.js";
+import {
+  CHATGPT_ORIGINS,
+  isSameChatGptConversationUrl,
+  parseChatGptConversationScope,
+} from "../conversationUrl.js";
 const DEFAULT_ACCOUNT_DIGEST_TIMEOUT_MS = 10_000;
 const ACCOUNT_DIGEST_TIMEOUT_ERROR =
   "Timed out while reading authenticated ChatGPT account identity.";
@@ -786,15 +790,6 @@ export interface ResumedConversationHydrationDeps {
   expectedConversationUrl?: string;
 }
 
-function conversationIdFromUrl(value: string | undefined): string | null {
-  if (!value) return null;
-  try {
-    return new URL(value).pathname.match(/(?:^|\/)c\/([^/]+)/)?.[1] ?? null;
-  } catch {
-    return null;
-  }
-}
-
 /**
  * After navigating to a *resumed* ChatGPT conversation, its prior turns hydrate
  * asynchronously and ChatGPT can reset the composer mid-hydration — wiping a
@@ -865,15 +860,19 @@ export async function waitForResumedConversationHydration(
       returnByValue: true,
     });
     const actualUrl = typeof result?.value === "string" ? result.value : undefined;
-    const expectedConversationId = conversationIdFromUrl(deps.expectedConversationUrl);
-    const actualConversationId = conversationIdFromUrl(actualUrl);
-    if (!expectedConversationId || actualConversationId !== expectedConversationId) {
+    const expectedScope = parseChatGptConversationScope(deps.expectedConversationUrl);
+    const actualScope = parseChatGptConversationScope(actualUrl);
+    if (
+      !expectedScope ||
+      !actualScope ||
+      !isSameChatGptConversationUrl(actualUrl, deps.expectedConversationUrl)
+    ) {
       throw new BrowserAutomationError(
         "Saved ChatGPT conversation redirected to a different thread; refusing to submit follow-up.",
         {
           stage: "resume-conversation",
-          expectedConversationId,
-          actualConversationId,
+          expectedConversationId: expectedScope?.conversationId ?? null,
+          actualConversationId: actualScope?.conversationId ?? null,
           actualUrl,
         },
       );

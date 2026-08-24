@@ -232,9 +232,19 @@ describe("readAssistantGeneratedImages", () => {
       }),
     } as unknown as ChromeClient["Runtime"];
 
-    await readAssistantGeneratedImages(runtime, 1, undefined, "expected-thread", "a".repeat(64));
+    await readAssistantGeneratedImages(
+      runtime,
+      1,
+      undefined,
+      "expected-thread",
+      "a".repeat(64),
+      "https://chatgpt.com/g/g-p-test/project/c/expected-thread",
+    );
 
     expect(expression).toContain('const expectedConversationId = "expected-thread"');
+    expect(expression).toContain(
+      'const expectedConversationUrl = "https://chatgpt.com/g/g-p-test/project/c/expected-thread"',
+    );
     expect(expression.indexOf("await assertOracleChatGptPageAffinity();")).toBeLessThan(
       expression.indexOf("const turns ="),
     );

@@ -25,6 +25,7 @@ import {
 import { resolveBrowserConfig } from "./config.js";
 import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
 import { CHATGPT_URL } from "./constants.js";
+import { CHATGPT_ORIGINS } from "./conversationUrl.js";
 import { buildConversationTurnListExpression } from "./conversationTurns.js";
 import {
   browserIdFromWebSocketEndpoint,
@@ -92,7 +93,7 @@ async function assertReattachPageAffinity(
   } catch {
     throw new ReattachAffinityError(`ChatGPT page origin is unavailable before ${action}.`);
   }
-  if (currentUrl.origin !== new URL(CHATGPT_URL).origin) {
+  if (!(CHATGPT_ORIGINS as readonly string[]).includes(currentUrl.origin)) {
     throw new ReattachAffinityError(`ChatGPT page origin changed before ${action}.`);
   }
   if (expectedConversationId && extractConversationIdFromUrl(href) !== expectedConversationId) {

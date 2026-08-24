@@ -108,7 +108,6 @@ import {
   assertChatGptTabOrigin,
   connectToExistingChatGptTab,
   expectedConversationIdForRef,
-  isChatGptUrl,
 } from "./liveTabs.js";
 import { captureBrowserDiagnostics } from "./domDebug.js";
 import {
@@ -129,7 +128,9 @@ import {
 } from "./conversationUrlMonitor.js";
 import {
   extractStableConversationIdFromUrl as extractConversationIdFromUrl,
+  isSameChatGptConversationUrl,
   isStableConversationUrl as isConversationUrl,
+  parseChatGptConversationScope,
 } from "./conversationUrl.js";
 
 export type { BrowserAutomationConfig, BrowserRunOptions, BrowserRunResult } from "./types.js";
@@ -143,12 +144,76 @@ export {
   sanitizeThinkingText,
   startThinkingStatusMonitorForTest,
 } from "./actions/thinkingStatus.js";
+const PRIVATE_BROWSER_CONFIG_KEYS = new Set([
+  "url",
+  "chatgpturl",
+  "resumeconversationurl",
+  "remotechrome",
+  "remotechromebrowserid",
+  "remotechromebrowserwsendpoint",
+  "remotechromeaccountdigest",
+  "remotechromeprofileroot",
+  "expectedaccountdigest",
+  "expectedemail",
+  "accountidentity",
+  "identity",
+  "email",
+  "chatgptaccountdigest",
+  "browserwsendpoint",
+  "websocketendpoint",
+  "wsendpoint",
+  "browsertabref",
+  "browsertargetid",
+  "chrometargetid",
+  "targetid",
+  "tabid",
+  "chromeprofile",
+  "chromepath",
+  "chromecookiepath",
+  "manualloginprofiledir",
+  "copyprofilesource",
+  "userdatadir",
+  "profilepath",
+  "profileroot",
+  "profiledir",
+]);
+
+function isPrivateBrowserConfigKey(key: string): boolean {
+  const normalized = key.replace(/[-_]/g, "").toLowerCase();
+  if (PRIVATE_BROWSER_CONFIG_KEYS.has(normalized)) return true;
+  return (
+    /^(?:ws|websocket).*endpoint$/.test(normalized) ||
+    /(?:account|affinity|browser|chrome|conversation|identity|profile|target|tab|expected|remote|user).*(?:digest|email|endpoint|identity|id|path|root|url|ref|source|host)$/.test(
+      normalized,
+    )
+  );
+}
+
+function redactBrowserConfigValue(key: string, value: unknown): unknown {
+  if (key && isPrivateBrowserConfigKey(key)) return Boolean(value);
+  if (Array.isArray(value)) {
+    return value.map((item) => redactBrowserConfigValue("", item));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([childKey, childValue]) => [
+        childKey,
+        redactBrowserConfigValue(childKey, childValue),
+      ]),
+    );
+  }
+  return value;
+}
 
 function redactBrowserConfigForDebugLog(config: Record<string, unknown>): Record<string, unknown> {
-  const redacted = { ...config };
-  if (Array.isArray(config.inlineCookies)) {
-    redacted.inlineCookies = `[redacted:${config.inlineCookies.length} cookies]`;
-    redacted.inlineCookieCount = config.inlineCookies.length;
+  const redacted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(config)) {
+    if (key === "inlineCookies" && Array.isArray(value)) {
+      redacted[key] = `[redacted:${value.length} cookies]`;
+      redacted.inlineCookieCount = value.length;
+      continue;
+    }
+    redacted[key] = redactBrowserConfigValue(key, value);
   }
   return redacted;
 }
@@ -980,14 +1045,13 @@ function conversationCookieIdsToPreserve(
     .filter((id): id is string => Boolean(id));
 }
 
-function extractExactChatGptConversationId(url: string): string | undefined {
-  try {
-    if (!isChatGptUrl(url)) return undefined;
-    const parsed = new URL(url);
-    return /^(?:\/c|\/g\/[^/?#]+\/(?:project\/)?c)\/([a-zA-Z0-9-]+)\/?$/.exec(parsed.pathname)?.[1];
-  } catch {
-    return undefined;
-  }
+function extractExactChatGptConversationId(url: string | null | undefined): string | undefined {
+  return parseChatGptConversationScope(url)?.conversationId;
+}
+
+function extractExactChatGptConversationUrl(url: string | null | undefined): string | undefined {
+  const scope = parseChatGptConversationScope(url);
+  return scope ? `${scope.origin}${scope.pathname}` : undefined;
 }
 
 function resolveInitialRunConversationId(
@@ -996,11 +1060,27 @@ function resolveInitialRunConversationId(
   return extractExactChatGptConversationId(config.resumeConversationUrl ?? config.url);
 }
 
+function resolveInitialRunConversationUrl(
+  config: Pick<ResolvedBrowserConfig, "url" | "resumeConversationUrl">,
+): string | undefined {
+  return extractExactChatGptConversationUrl(config.resumeConversationUrl ?? config.url);
+}
+
 function assertRunConversationId(
   expectedConversationId: string | undefined,
+  expectedConversationUrl: string | undefined,
   url: string,
   action: string,
 ): void {
+  if (expectedConversationUrl) {
+    if (!isSameChatGptConversationUrl(url, expectedConversationUrl)) {
+      throw new BrowserAutomationError(`ChatGPT conversation changed before ${action}.`, {
+        stage: "conversation-affinity",
+        code: "conversation-mismatch",
+      });
+    }
+    return;
+  }
   if (!expectedConversationId) return;
   if (extractExactChatGptConversationId(url) !== expectedConversationId) {
     throw new BrowserAutomationError(`ChatGPT conversation changed before ${action}.`, {
@@ -1010,23 +1090,26 @@ function assertRunConversationId(
   }
 }
 
-function latchRunConversationId(
+function latchRunConversationAffinity(
   currentConversationId: string | undefined,
+  currentConversationUrl: string | undefined,
   url: string,
   action: string,
-): string {
-  const observedConversationId = extractExactChatGptConversationId(url);
-  if (!observedConversationId) {
+): { conversationId: string; conversationUrl: string } {
+  const observedScope = parseChatGptConversationScope(url);
+  if (!observedScope) {
     throw new BrowserAutomationError(
       `ChatGPT did not establish a stable conversation before ${action}.`,
       { stage: "conversation-affinity", code: "conversation-id-missing" },
     );
   }
-  if (currentConversationId) {
-    assertRunConversationId(currentConversationId, url, action);
-    return currentConversationId;
+  if (currentConversationId || currentConversationUrl) {
+    assertRunConversationId(currentConversationId, currentConversationUrl, url, action);
   }
-  return observedConversationId;
+  return {
+    conversationId: currentConversationId ?? observedScope.conversationId,
+    conversationUrl: currentConversationUrl ?? `${observedScope.origin}${observedScope.pathname}`,
+  };
 }
 async function closeRemoteConnectionAfterRun(options: {
   connectionClosedUnexpectedly: boolean;
@@ -1201,6 +1284,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   let lastTargetId: string | undefined;
   let lastUrl: string | undefined;
   let runConversationId = resolveInitialRunConversationId(config);
+  let runConversationUrl = resolveInitialRunConversationUrl(config);
   let postSubmitConversationUrlPromise: Promise<boolean> | null = null;
   let promptSubmitted = false;
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
@@ -1421,11 +1505,14 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           attached.tab,
         );
         if (attachedConversationId && attached.tab.url) {
-          runConversationId = latchRunConversationId(
+          const affinity = latchRunConversationAffinity(
             runConversationId,
+            runConversationUrl,
             attached.tab.url,
             "attached tab selection",
           );
+          runConversationId = affinity.conversationId;
+          runConversationUrl = affinity.conversationUrl;
         }
         client = attached.client;
         isolatedTargetId = attached.targetId ?? null;
@@ -1691,6 +1778,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
             ? async () => {
                 await navigateToChatGPT(Page, Runtime, config.url, logger);
                 runConversationId = undefined;
+                runConversationUrl = undefined;
                 await ensureNotBlocked(Runtime, config.headless, logger);
                 await ensureLoggedIn(Runtime, logger);
                 await verifyLocalChatGptAccount("chat mode reset");
@@ -1704,8 +1792,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     }
     const assertAttachedConversation = async (action: string): Promise<void> => {
       const url = await raceWithDisconnect(assertChatGptTabOrigin(Runtime, action));
-      if (runConversationId) {
-        assertRunConversationId(runConversationId, url, action);
+      if (runConversationId || runConversationUrl) {
+        assertRunConversationId(runConversationId, runConversationUrl, url, action);
       }
     };
     const assertPageAffinity = async (action: string): Promise<void> => {
@@ -1769,12 +1857,15 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         return typeof result?.value === "string" ? result.value : null;
       },
       persistUrl: async (url) => {
-        if (runConversationId) {
-          runConversationId = latchRunConversationId(
+        if (runConversationId || runConversationUrl) {
+          const affinity = latchRunConversationAffinity(
             runConversationId,
+            runConversationUrl,
             url,
             "conversation URL update",
           );
+          runConversationId = affinity.conversationId;
+          runConversationUrl = affinity.conversationUrl;
         }
         lastUrl = url;
         await emitRuntimeHint();
@@ -1792,16 +1883,23 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           { stage: "conversation-affinity", code: "conversation-commit-unverified" },
         );
       }
-      const committedConversationId = latchRunConversationId(
+      const committedConversationAffinity = latchRunConversationAffinity(
         runConversationId,
+        runConversationUrl,
         committedConversationUrl,
         "submitted prompt commit",
       );
       const initialUrl = await raceWithDisconnect(
         assertChatGptTabOrigin(Runtime, "post-submit conversation pin"),
       );
-      assertRunConversationId(committedConversationId, initialUrl, "response handling");
-      runConversationId = committedConversationId;
+      assertRunConversationId(
+        committedConversationAffinity.conversationId,
+        committedConversationAffinity.conversationUrl,
+        initialUrl,
+        "response handling",
+      );
+      runConversationId = committedConversationAffinity.conversationId;
+      runConversationUrl = committedConversationAffinity.conversationUrl;
       lastUrl = initialUrl;
       await emitRuntimeHint();
       await (postSubmitConversationUrlPromise ??
@@ -1809,7 +1907,12 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       const confirmedUrl = await raceWithDisconnect(
         assertChatGptTabOrigin(Runtime, "post-submit conversation confirmation"),
       );
-      assertRunConversationId(runConversationId, confirmedUrl, "response handling");
+      assertRunConversationId(
+        runConversationId,
+        runConversationUrl,
+        confirmedUrl,
+        "response handling",
+      );
       lastUrl = confirmedUrl;
       await emitRuntimeHint();
       await assertPageAffinity("post-submit response handling");
@@ -2245,8 +2348,13 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       await captureRuntimeSnapshot().catch(() => undefined);
       await assertPageAffinity("assistant conversation URL read");
       const conversationUrl = await readConversationUrl(Runtime);
-      if (conversationUrl && runConversationId) {
-        assertRunConversationId(runConversationId, conversationUrl, "assistant recheck");
+      if (conversationUrl && (runConversationId || runConversationUrl)) {
+        assertRunConversationId(
+          runConversationId,
+          runConversationUrl,
+          conversationUrl,
+          "assistant recheck",
+        );
       }
       if (conversationUrl && isConversationUrl(conversationUrl)) {
         logger(`[browser] Rechecking assistant response at ${conversationUrl}`);
@@ -2306,6 +2414,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
                 logger,
                 baselineTurns ?? undefined,
                 runConversationId,
+                runConversationUrl,
                 assertPageAffinity,
               ),
             timeoutMs,
@@ -2344,6 +2453,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
                   logger,
                   baselineTurns ?? undefined,
                   runConversationId,
+                  runConversationUrl,
                   assertPageAffinity,
                 ),
               timeoutMs: config.timeoutMs,
@@ -2635,6 +2745,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       answerText,
       waitTimeoutMs: options.config?.timeoutMs,
       expectedConversationId: runConversationId,
+      expectedConversationUrl: runConversationUrl,
       assertPageAffinity,
       expectedAccountDigest: chatGptAccountDigest ?? undefined,
       downloadBehaviorLockScope: localDownloadBehaviorLockScope,
@@ -2673,6 +2784,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       minTurnIndex: imageArtifactMinTurnIndex,
       sessionId: options.sessionId,
       expectedConversationId: runConversationId,
+      expectedConversationUrl: runConversationUrl,
       assertPageAffinity,
       expectedAccountDigest: chatGptAccountDigest ?? undefined,
       downloadBehaviorLockScope: localDownloadBehaviorLockScope,
@@ -3500,6 +3612,7 @@ async function runRemoteBrowserMode(
   let tabLease: BrowserTabLease | null = null;
   let lastUrl: string | undefined;
   let runConversationId = resolveInitialRunConversationId(config);
+  let runConversationUrl = resolveInitialRunConversationUrl(config);
   let postSubmitConversationUrlPromise: Promise<boolean> | null = null;
   let promptSubmitted = false;
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
@@ -3634,11 +3747,14 @@ async function runRemoteBrowserMode(
         attached.tab,
       );
       if (attachedConversationId && attached.tab.url) {
-        runConversationId = latchRunConversationId(
+        const affinity = latchRunConversationAffinity(
           runConversationId,
+          runConversationUrl,
           attached.tab.url,
           "attached tab selection",
         );
+        runConversationId = affinity.conversationId;
+        runConversationUrl = affinity.conversationUrl;
       }
       client = attached.client;
       remoteTargetId = attached.targetId ?? null;
@@ -3691,12 +3807,15 @@ async function runRemoteBrowserMode(
         return typeof result?.value === "string" ? result.value : null;
       },
       persistUrl: async (url) => {
-        if (runConversationId) {
-          runConversationId = latchRunConversationId(
+        if (runConversationId || runConversationUrl) {
+          const affinity = latchRunConversationAffinity(
             runConversationId,
+            runConversationUrl,
             url,
             "conversation URL update",
           );
+          runConversationId = affinity.conversationId;
+          runConversationUrl = affinity.conversationUrl;
         }
         lastUrl = url;
         await emitRuntimeHint();
@@ -3759,8 +3878,8 @@ async function runRemoteBrowserMode(
     config.remoteChromeAccountDigest = observedAccountDigest;
     const assertAttachedConversation = async (action: string): Promise<void> => {
       const url = await assertChatGptTabOrigin(Runtime, action);
-      if (runConversationId) {
-        assertRunConversationId(runConversationId, url, action);
+      if (runConversationId || runConversationUrl) {
+        assertRunConversationId(runConversationId, runConversationUrl, url, action);
       }
     };
     const assertPageAffinity = async (action: string): Promise<void> => {
@@ -3789,14 +3908,21 @@ async function runRemoteBrowserMode(
           { stage: "conversation-affinity", code: "conversation-commit-unverified" },
         );
       }
-      const committedConversationId = latchRunConversationId(
+      const committedConversationAffinity = latchRunConversationAffinity(
         runConversationId,
+        runConversationUrl,
         committedConversationUrl,
         "submitted prompt commit",
       );
       const initialUrl = await assertChatGptTabOrigin(Runtime, "post-submit conversation pin");
-      assertRunConversationId(committedConversationId, initialUrl, "response handling");
-      runConversationId = committedConversationId;
+      assertRunConversationId(
+        committedConversationAffinity.conversationId,
+        committedConversationAffinity.conversationUrl,
+        initialUrl,
+        "response handling",
+      );
+      runConversationId = committedConversationAffinity.conversationId;
+      runConversationUrl = committedConversationAffinity.conversationUrl;
       lastUrl = initialUrl;
       await emitRuntimeHint();
       await (postSubmitConversationUrlPromise ??
@@ -3805,7 +3931,12 @@ async function runRemoteBrowserMode(
         Runtime,
         "post-submit conversation confirmation",
       );
-      assertRunConversationId(runConversationId, confirmedUrl, "response handling");
+      assertRunConversationId(
+        runConversationId,
+        runConversationUrl,
+        confirmedUrl,
+        "response handling",
+      );
       lastUrl = confirmedUrl;
       await emitRuntimeHint();
       await assertPageAffinity("post-submit response handling");
@@ -3825,6 +3956,7 @@ async function runRemoteBrowserMode(
           ? async () => {
               await navigateToChatGPT(Page, Runtime, config.url, logger);
               runConversationId = undefined;
+              runConversationUrl = undefined;
               await ensureNotBlocked(Runtime, config.headless, logger);
               await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
             }
@@ -3843,8 +3975,13 @@ async function runRemoteBrowserMode(
         returnByValue: true,
       });
       if (typeof result?.value === "string") {
-        if (runConversationId) {
-          assertRunConversationId(runConversationId, result.value, "runtime hint capture");
+        if (runConversationId || runConversationUrl) {
+          assertRunConversationId(
+            runConversationId,
+            runConversationUrl,
+            result.value,
+            "runtime hint capture",
+          );
         }
         lastUrl = result.value;
       }
@@ -4195,8 +4332,13 @@ async function runRemoteBrowserMode(
       await assertPageAffinity("assistant recheck preparation");
       await assertPageAffinity("assistant conversation URL read");
       const conversationUrl = await readConversationUrl(Runtime);
-      if (conversationUrl && runConversationId) {
-        assertRunConversationId(runConversationId, conversationUrl, "assistant recheck");
+      if (conversationUrl && (runConversationId || runConversationUrl)) {
+        assertRunConversationId(
+          runConversationId,
+          runConversationUrl,
+          conversationUrl,
+          "assistant recheck",
+        );
       }
       if (conversationUrl && isConversationUrl(conversationUrl)) {
         lastUrl = conversationUrl;
@@ -4255,6 +4397,7 @@ async function runRemoteBrowserMode(
               logger,
               baselineTurns ?? undefined,
               runConversationId,
+              runConversationUrl,
               assertPageAffinity,
             ),
           timeoutMs,
@@ -4291,6 +4434,7 @@ async function runRemoteBrowserMode(
                 logger,
                 baselineTurns ?? undefined,
                 runConversationId,
+                runConversationUrl,
                 assertPageAffinity,
               ),
             timeoutMs: config.timeoutMs,
@@ -4535,6 +4679,7 @@ async function runRemoteBrowserMode(
       answerText,
       waitTimeoutMs: options.config?.timeoutMs,
       expectedConversationId: runConversationId,
+      expectedConversationUrl: runConversationUrl,
       assertPageAffinity,
       expectedAccountDigest: config.remoteChromeAccountDigest ?? undefined,
       downloadBehaviorLockScope: { browserId: expectedBrowserId, browserWSEndpoint },
@@ -4573,6 +4718,7 @@ async function runRemoteBrowserMode(
       minTurnIndex: imageArtifactMinTurnIndex,
       sessionId: options.sessionId,
       expectedConversationId: runConversationId,
+      expectedConversationUrl: runConversationUrl,
       assertPageAffinity,
       expectedAccountDigest: config.remoteChromeAccountDigest ?? undefined,
       downloadBehaviorLockScope: { browserId: expectedBrowserId, browserWSEndpoint },
@@ -4796,6 +4942,8 @@ export const __test__ = {
   normalizeAuthenticatedModelSelectionError,
   conversationCookieIdsToPreserve,
   extractExactChatGptConversationId,
+  resolveInitialRunConversationUrl,
+  assertRunConversationId,
   resolveInitialRunConversationId,
   resolveAttachmentUploadTimeoutMs,
   resolveManualLoginWaitMs,
@@ -4857,6 +5005,7 @@ async function waitForAssistantResponseWithReload(
   logger: BrowserLogger,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedConversationUrl?: string,
   assertPageAffinity?: (action: string) => Promise<void>,
 ) {
   try {
@@ -4877,9 +5026,10 @@ async function waitForAssistantResponseWithReload(
     if (!conversationUrl || !isConversationUrl(conversationUrl)) {
       throw error;
     }
-    if (expectedConversationId) {
+    if (expectedConversationId || expectedConversationUrl) {
       assertRunConversationId(
         expectedConversationId,
+        expectedConversationUrl,
         conversationUrl,
         "assistant conversation reload",
       );
@@ -4890,7 +5040,7 @@ async function waitForAssistantResponseWithReload(
     await waitForResumedConversationHydration(Runtime, timeoutMs, logger, {
       requirePriorTurns: true,
       requirePromptReady: false,
-      expectedConversationUrl: conversationUrl,
+      expectedConversationUrl: expectedConversationUrl ?? conversationUrl,
     });
     await assertPageAffinity?.("assistant response retry read");
     return await waitForAssistantResponse(

@@ -30,6 +30,7 @@ import {
   writeDevToolsActivePort,
 } from "../browser/profileState.js";
 import { normalizeChatgptUrl } from "../browser/utils.js";
+import { normalizeChatGptAccountDigest } from "../browser/chatgptAccount.js";
 import {
   computeFileSha256,
   sanitizeArtifactFilename,
@@ -738,6 +739,7 @@ function sanitizeResult(
     answerTokens: result.answerTokens,
     answerChars: result.answerChars,
     warnings: sanitizedWarnings.length > 0 ? sanitizedWarnings : undefined,
+    chatGptAccountDigest: normalizeChatGptAccountDigest(result.chatGptAccountDigest),
     chromePid: undefined,
     chromePort: undefined,
     userDataDir: undefined,

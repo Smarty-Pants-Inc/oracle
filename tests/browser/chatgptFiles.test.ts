@@ -159,8 +159,12 @@ describe("readAssistantDownloadableFiles", () => {
       undefined,
       "expected-thread",
       "a".repeat(64),
+      "https://chatgpt.com/g/g-p-test/project/c/expected-thread",
     );
     expect(expression).toContain('const expectedConversationId = "expected-thread"');
+    expect(expression).toContain(
+      'const expectedConversationUrl = "https://chatgpt.com/g/g-p-test/project/c/expected-thread"',
+    );
     expect(expression).toContain("pageUrl.pathname");
     expect(
       expression.match(/await assertOracleChatGptPageAffinity\(\);/g)?.length,
