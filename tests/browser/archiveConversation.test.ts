@@ -619,9 +619,10 @@ describe("archiveChatGptConversation", () => {
     expect(stableSuffixVariant.menuButton.dispatchEvent).toHaveBeenCalled();
   });
 
-  test("does not claim archive success after leaving the approved thread", async () => {
+  test("accepts a trusted archive redirect but rejects unrelated navigation", async () => {
     const expression = buildArchiveConversationExpressionForTest();
     let currentUrl = "https://chatgpt.com/c/abc";
+    let archiveRedirect = "https://chatgpt.com/";
     let menuOpen = false;
     let archiveItem: object | undefined;
     let menuButton: object | undefined;
@@ -631,7 +632,7 @@ describe("archiveChatGptConversation", () => {
       textContent: string;
       dispatchEvent = vi.fn((event: { type?: string }) => {
         if (event.type === "click" && this === archiveItem) {
-          currentUrl = "https://chatgpt.com/";
+          currentUrl = archiveRedirect;
         }
         if (event.type === "click" && this === menuButton) menuOpen = true;
         return true;
@@ -715,7 +716,7 @@ describe("archiveChatGptConversation", () => {
       setTimeout: (callback: () => void) => number,
     ) => Promise<{ status: string; reason?: string }>;
 
-    await expect(
+    const evaluateArchive = () =>
       evaluate(
         location,
         document,
@@ -729,9 +730,18 @@ describe("archiveChatGptConversation", () => {
           callback();
           return 0;
         },
-      ),
-    ).resolves.toMatchObject({ status: "skipped", reason: "affinity-mismatch" });
+      );
+
+    await expect(evaluateArchive()).resolves.toMatchObject({ status: "archived" });
     expect(archive.dispatchEvent).toHaveBeenCalled();
+
+    archiveRedirect = "https://chatgpt.com/c/other";
+    currentUrl = "https://chatgpt.com/c/abc";
+    menuOpen = false;
+    await expect(evaluateArchive()).resolves.toMatchObject({
+      status: "skipped",
+      reason: "affinity-mismatch",
+    });
   });
 
   test("keeps the archive expression scoped to Archive actions", () => {

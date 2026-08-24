@@ -262,6 +262,34 @@ function buildArchiveConversationExpression({
         return false;
       }
     };
+    const isExpectedArchiveRedirectRoute = () => {
+      const currentConversationUrl = typeof location === 'object' ? location.href : null;
+      try {
+        const currentUrl = new URL(currentConversationUrl);
+        if (
+          currentUrl.origin !== expectedOrigin ||
+          currentUrl.username ||
+          currentUrl.password ||
+          currentUrl.pathname.includes('%') ||
+          currentUrl.search ||
+          currentUrl.hash
+        ) return false;
+        if (expectedProjectKey === null) return currentUrl.pathname === '/';
+        const project = new RegExp('^/g/([^/?#]+)/project/?$').exec(currentUrl.pathname);
+        return Boolean(project?.[1] && stableProjectKey(project[1]) === expectedProjectKey);
+      } catch {
+        return false;
+      }
+    };
+    const hasExpectedArchiveRedirect = async () => {
+      if (!isExpectedArchiveRedirectRoute()) return false;
+      const identity = await readIdentityDigests();
+      return Boolean(
+        identity &&
+        (!expectedAccountDigest || identity.accountDigest === expectedAccountDigest) &&
+        (!expectedWorkspaceDigest || identity.workspaceDigest === expectedWorkspaceDigest),
+      );
+    };
     const isVisible = (element) => {
       if (!element || !(element instanceof HTMLElement)) return false;
       const rect = element.getBoundingClientRect();
@@ -428,11 +456,10 @@ function buildArchiveConversationExpression({
     const waitForArchiveConfirmation = async () => {
       const deadline = Date.now() + 10_000;
       while (Date.now() < deadline) {
-        if (
-          conversationUrl &&
-          location.href !== conversationUrl &&
-          !(await hasExpectedAffinity())
-        ) return false;
+        if (conversationUrl && location.href !== conversationUrl) {
+          if (await hasExpectedArchiveRedirect()) return true;
+          if (!(await hasExpectedAffinity())) return false;
+        }
         if (hasArchiveConfirmation()) return true;
         await sleep(150);
       }
