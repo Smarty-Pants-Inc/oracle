@@ -10,6 +10,7 @@ vi.mock("../../src/browser/chromeLifecycle.js", () => chromeMocks);
 
 import {
   buildChatGptInventoryAuthCaptureHook,
+  buildChatGptInventoryCleanupExpression,
   buildChatGptInventoryPageExpression,
   captureChatGptConversationInventory,
   paginateChatGptConversationList,
@@ -237,6 +238,44 @@ describe("ChatGPT conversation inventory", () => {
     run(windowStub, { now: () => pageNow }, setTimeoutStub, sessionStorage);
     expect(windowStub.__oracleChatGptInventory).toBeUndefined();
     expect(setTimeoutStub).not.toHaveBeenCalled();
+  });
+
+  test("accepts cleanup after ChatGPT replaces the page fetch function", () => {
+    const originalFetch = () => undefined;
+    const replacementFetch = () => undefined;
+    const windowStub = { fetch: originalFetch } as Record<string, unknown>;
+    const runHook = Function("window", buildChatGptInventoryAuthCaptureHook()) as (
+      window: Record<string, unknown>,
+    ) => void;
+    runHook(windowStub);
+    expect(windowStub.__oracleChatGptInventory).toBeDefined();
+
+    windowStub.fetch = replacementFetch;
+    const runCleanup = Function("window", `return ${buildChatGptInventoryCleanupExpression()}`) as (
+      window: Record<string, unknown>,
+    ) => boolean;
+    expect(runCleanup(windowStub)).toBe(true);
+    expect(windowStub.fetch).toBe(replacementFetch);
+    expect(windowStub.__oracleChatGptInventory).toBeUndefined();
+  });
+
+  test("rejects cleanup while the inventory fetch wrapper remains installed", () => {
+    const originalFetch = () => undefined;
+    const windowStub = { fetch: originalFetch } as Record<string, unknown>;
+    const runHook = Function("window", buildChatGptInventoryAuthCaptureHook()) as (
+      window: Record<string, unknown>,
+    ) => void;
+    runHook(windowStub);
+    Object.defineProperty(windowStub, "fetch", {
+      configurable: false,
+      value: windowStub.fetch,
+      writable: false,
+    });
+
+    const runCleanup = Function("window", `return ${buildChatGptInventoryCleanupExpression()}`) as (
+      window: Record<string, unknown>,
+    ) => boolean;
+    expect(runCleanup(windowStub)).toBe(false);
   });
   test("rejects a restarted browser before opening inventory", async () => {
     vi.stubGlobal(
