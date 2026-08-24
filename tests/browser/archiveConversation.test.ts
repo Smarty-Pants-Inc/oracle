@@ -606,6 +606,12 @@ describe("archiveChatGptConversation", () => {
       reason: "conversation-menu-not-found",
     });
     expect(differentProject.menuButton.dispatchEvent).not.toHaveBeenCalled();
+    const transientConversation = await evaluateCandidate("/c/abc", "/c/WEB:request-id");
+    expect(transientConversation.result).toMatchObject({
+      status: "skipped",
+      reason: "conversation-menu-not-found",
+    });
+    expect(transientConversation.menuButton.dispatchEvent).not.toHaveBeenCalled();
 
     const stableProjectId = "g-p-0123456789abcdef0123456789abcdef";
     const stableSuffixVariant = await evaluateCandidate(

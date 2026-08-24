@@ -5,6 +5,7 @@ import type {
   BrowserResearchMode,
   ChromeClient,
 } from "../types.js";
+import { chatGptConversationScopeFromUrl } from "../conversationUrl.js";
 
 export interface BrowserArchiveDecision {
   mode: BrowserArchiveMode;
@@ -70,31 +71,8 @@ export function resolveBrowserArchiveDecision({
 function resolveArchiveConversationAffinity(
   rawUrl?: string | null,
 ): { origin: string; conversationId: string; projectKey: string | null } | null {
-  try {
-    const parsed = new URL(rawUrl ?? "");
-    if (
-      parsed.origin !== "https://chatgpt.com" ||
-      parsed.username ||
-      parsed.password ||
-      parsed.pathname.includes("%")
-    ) {
-      return null;
-    }
-    const project = /^\/g\/([^/?#]+)\/c\/([a-zA-Z0-9-]+)\/?$/.exec(parsed.pathname);
-    if (project?.[1] && project[2]) {
-      return {
-        origin: parsed.origin,
-        conversationId: project[2],
-        projectKey: (
-          project[1].match(/^(g-p-[0-9a-f]{32})(?=-|$)/iu)?.[1] ?? project[1]
-        ).toLowerCase(),
-      };
-    }
-    const root = /^\/c\/([a-zA-Z0-9-]+)\/?$/.exec(parsed.pathname);
-    return root?.[1] ? { origin: parsed.origin, conversationId: root[1], projectKey: null } : null;
-  } catch {
-    return null;
-  }
+  const scope = rawUrl ? chatGptConversationScopeFromUrl(rawUrl) : undefined;
+  return scope ? { origin: "https://chatgpt.com", ...scope } : null;
 }
 
 export async function archiveChatGptConversation(
@@ -230,39 +208,15 @@ function buildArchiveConversationExpression({
         return null;
       }
     };
+    // Runtime.evaluate cannot import conversationUrl.ts. Keep this parser broad for conservative
+    // sidebar exclusion; only immutable canonical expected values cross the boundary.
     const stableProjectKey = (value) => {
       if (typeof value !== 'string' || !value) return null;
       return (value.match(/^(g-p-[0-9a-f]{32})(?=-|$)/i)?.[1] || value).toLowerCase();
     };
-    const hasExpectedAffinity = async () => {
-      const identity = await readIdentityDigests();
-      if (
-        !identity ||
-        (expectedAccountDigest && identity.accountDigest !== expectedAccountDigest) ||
-        (expectedWorkspaceDigest && identity.workspaceDigest !== expectedWorkspaceDigest)
-      ) return false;
-      const currentConversationUrl = typeof location === 'object' ? location.href : null;
-      try {
-        const currentUrl = new URL(currentConversationUrl);
-        const project = new RegExp('^/g/([^/?#]+)/c/([^/?#]+)/?$').exec(currentUrl.pathname);
-        const root = new RegExp('^/c/([^/?#]+)/?$').exec(currentUrl.pathname);
-        const conversationId = project?.[2] || root?.[1] || null;
-        const projectKey = project?.[1] ? stableProjectKey(project[1]) : null;
-        return (
-          currentUrl.origin === expectedOrigin &&
-          !currentUrl.username &&
-          !currentUrl.password &&
-          !currentUrl.pathname.includes('%') &&
-          !currentUrl.search &&
-          !currentUrl.hash &&
-          conversationId === expectedConversationId &&
-          projectKey === expectedProjectKey
-        );
-      } catch {
-        return false;
-      }
-    };
-    const isExpectedArchiveRedirectRoute = () => {
+    const projectConversationPath = new RegExp('^/g/([^/?#]+)/c/([^/?#]+)/?$');
+    const rootConversationPath = new RegExp('^/c/([^/?#]+)/?$');
+    const parseTrustedCurrentUrl = () => {
       const currentConversationUrl = typeof location === 'object' ? location.href : null;
       try {
         const currentUrl = new URL(currentConversationUrl);
@@ -273,23 +227,46 @@ function buildArchiveConversationExpression({
           currentUrl.pathname.includes('%') ||
           currentUrl.search ||
           currentUrl.hash
-        ) return false;
-        if (expectedProjectKey === null) return currentUrl.pathname === '/';
-        const project = new RegExp('^/g/([^/?#]+)/project/?$').exec(currentUrl.pathname);
-        return Boolean(project?.[1] && stableProjectKey(project[1]) === expectedProjectKey);
+        ) return null;
+        return currentUrl;
       } catch {
-        return false;
+        return null;
       }
     };
-    const hasExpectedArchiveRedirect = async () => {
-      if (!isExpectedArchiveRedirectRoute()) return false;
-      const identity = await readIdentityDigests();
-      return Boolean(
+    const matchesExpectedIdentity = (identity) =>
+      Boolean(
         identity &&
         (!expectedAccountDigest || identity.accountDigest === expectedAccountDigest) &&
         (!expectedWorkspaceDigest || identity.workspaceDigest === expectedWorkspaceDigest),
       );
+    const parseConversationPath = (pathname) => {
+      const project = projectConversationPath.exec(pathname);
+      const root = rootConversationPath.exec(pathname);
+      if (project?.[1] && project[2]) {
+        return { conversationId: project[2], projectKey: stableProjectKey(project[1]) };
+      }
+      return root?.[1] ? { conversationId: root[1], projectKey: null } : null;
     };
+    const hasExpectedAffinity = async () => {
+      if (!matchesExpectedIdentity(await readIdentityDigests())) return false;
+      const currentUrl = parseTrustedCurrentUrl();
+      const route = currentUrl ? parseConversationPath(currentUrl.pathname) : null;
+      return Boolean(
+        route &&
+        route.conversationId === expectedConversationId &&
+        route.projectKey === expectedProjectKey,
+      );
+    };
+    const isExpectedArchiveRedirectRoute = () => {
+      const currentUrl = parseTrustedCurrentUrl();
+      if (!currentUrl) return false;
+      if (expectedProjectKey === null) return currentUrl.pathname === '/';
+      const project = new RegExp('^/g/([^/?#]+)/project/?$').exec(currentUrl.pathname);
+      return Boolean(project?.[1] && stableProjectKey(project[1]) === expectedProjectKey);
+    };
+    const hasExpectedArchiveRedirect = async () =>
+      isExpectedArchiveRedirectRoute() &&
+      matchesExpectedIdentity(await readIdentityDigests());
     const isVisible = (element) => {
       if (!element || !(element instanceof HTMLElement)) return false;
       const rect = element.getBoundingClientRect();
@@ -327,15 +304,12 @@ function buildArchiveConversationExpression({
         if (href) {
           try {
             const linked = new URL(href, location.href);
-            const linkedProject = new RegExp('^/g/([^/?#]+)/c/([^/?#]+)/?$').exec(linked.pathname);
-            const linkedRoot = new RegExp('^/c/([^/?#]+)/?$').exec(linked.pathname);
-            const linkedConversationId = linkedProject?.[2] || linkedRoot?.[1];
-            const linkedProjectKey = linkedProject?.[1] ? stableProjectKey(linkedProject[1]) : null;
+            const linkedRoute = parseConversationPath(linked.pathname);
             if (
-              linkedConversationId &&
+              linkedRoute?.conversationId &&
               (linked.origin !== expectedOrigin ||
-                linkedConversationId !== expectedConversationId ||
-                linkedProjectKey !== expectedProjectKey)
+                linkedRoute.conversationId !== expectedConversationId ||
+                linkedRoute.projectKey !== expectedProjectKey)
             ) return true;
           } catch {}
         }
