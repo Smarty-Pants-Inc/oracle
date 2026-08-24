@@ -28,4 +28,5 @@ export {
   buildConversationDebugExpressionForTest,
   buildMarkdownFallbackExtractorForTest,
   buildCopyExpressionForTest,
+  buildResponseObserverExpressionForTest,
 } from "./actions/assistantResponse.js";

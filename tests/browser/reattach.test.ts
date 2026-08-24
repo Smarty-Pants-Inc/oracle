@@ -82,6 +82,7 @@ describe("resumeBrowserSession", () => {
       logger,
       expect.anything(),
       "abc",
+      runtime.tabUrl,
     );
     expect(captureAssistantMarkdown).toHaveBeenCalledWith(
       expect.anything(),
@@ -89,6 +90,7 @@ describe("resumeBrowserSession", () => {
       logger,
       "abc",
       expect.any(Function),
+      runtime.tabUrl,
     );
     expect(waitForConversationHydration).toHaveBeenCalledWith(expect.anything(), 2000, logger, {
       requirePriorTurns: true,
@@ -157,6 +159,7 @@ describe("resumeBrowserSession", () => {
       logger,
       3,
       "abc",
+      runtime.tabUrl,
     );
   });
 

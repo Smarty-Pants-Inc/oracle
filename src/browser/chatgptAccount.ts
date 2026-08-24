@@ -55,24 +55,56 @@ export function buildEvaluatedChatGptPageAffinityGuard({
         throw new Error('ChatGPT page origin is unavailable.');
       }
       const allowedOrigins = ${JSON.stringify(CHATGPT_ORIGINS)};
-      if (!allowedOrigins.includes(pageUrl.origin)) {
+      if (
+        pageUrl.protocol !== 'https:' ||
+        pageUrl.username ||
+        pageUrl.password ||
+        pageUrl.port ||
+        !allowedOrigins.includes(pageUrl.origin)
+      ) {
         throw new Error('ChatGPT page origin changed.');
       }
       const expectedConversationId = ${JSON.stringify(conversationId ?? null)};
       const expectedConversationUrl = ${JSON.stringify(conversationUrl ?? null)};
-      const conversationMatch = /^(?:\\/c|\\/g\\/[^/?#]+\\/(?:project\\/)?c)\\/([a-zA-Z0-9-]+)\\/?$/.exec(pageUrl.pathname);
+      const conversationPattern = /^(?:\\/c|\\/g\\/[^/?#]+\\/(?:project\\/)?c)\\/([a-zA-Z0-9-]+)\\/?$/;
+      const conversationMatch = conversationPattern.exec(pageUrl.pathname);
       const currentScope = pageUrl.origin + pageUrl.pathname.replace(/\\/$/, '');
       if (expectedConversationUrl) {
-        let approvedScope;
+        let approvedUrl;
         try {
-          const approvedUrl = new URL(expectedConversationUrl);
-          approvedScope = approvedUrl.origin + approvedUrl.pathname.replace(/\\/$/, '');
+          approvedUrl = new URL(expectedConversationUrl);
         } catch {
           throw new Error('Expected ChatGPT conversation scope is invalid.');
         }
+        if (
+          approvedUrl.protocol !== 'https:' ||
+          approvedUrl.username ||
+          approvedUrl.password ||
+          approvedUrl.port ||
+          approvedUrl.search ||
+          approvedUrl.hash ||
+          !allowedOrigins.includes(approvedUrl.origin) ||
+          !conversationPattern.test(approvedUrl.pathname)
+        ) {
+          throw new Error('Expected ChatGPT conversation scope is invalid.');
+        }
+        if (expectedConversationId && conversationMatch?.[1] !== expectedConversationId) {
+          throw new Error('Expected ChatGPT conversation scope is invalid.');
+        }
+        if (pageUrl.search || pageUrl.hash || !conversationMatch) {
+          throw new Error('ChatGPT conversation changed.');
+        }
+        const approvedScope = approvedUrl.origin + approvedUrl.pathname.replace(/\\/$/, '');
         if (currentScope !== approvedScope) throw new Error('ChatGPT conversation changed.');
-      } else if (expectedConversationId && conversationMatch?.[1] !== expectedConversationId) {
-        throw new Error('ChatGPT conversation changed.');
+      } else if (expectedConversationId) {
+        if (
+          pageUrl.search ||
+          pageUrl.hash ||
+          !conversationMatch ||
+          conversationMatch[1] !== expectedConversationId
+        ) {
+          throw new Error('ChatGPT conversation changed.');
+        }
       }
       const expectedAccountDigest = ${JSON.stringify(accountDigest ?? null)};
       if (!expectedAccountDigest) return;

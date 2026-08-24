@@ -379,6 +379,7 @@ export async function recoverPromptEcho(
   timeoutMs: number,
   options: {
     expectedConversationId?: string;
+    expectedConversationUrl?: string;
     assertPageAffinity?: (action: string) => Promise<void>;
   } = {},
 ): Promise<AssistantPayload> {
@@ -395,6 +396,8 @@ export async function recoverPromptEcho(
       Runtime,
       minTurnIndex ?? undefined,
       options.expectedConversationId,
+      undefined,
+      options.expectedConversationUrl,
     ).catch(() => null);
     const text = typeof snapshot?.text === "string" ? snapshot.text.trim() : "";
     if (!text || matcher.isEcho(text)) {

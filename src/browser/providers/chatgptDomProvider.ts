@@ -15,6 +15,8 @@ interface ChatgptDomProviderState {
   attachmentNames?: AttachmentReadyExpectation[];
   committedTurns?: number | null;
   committedConversationUrl?: string;
+  expectedConversationId?: string;
+  expectedConversationUrl?: string;
   onPromptSubmitted?: () => Promise<void> | void;
   assertPageAffinity: (action: string) => Promise<void>;
 }
@@ -71,6 +73,8 @@ async function waitForResponse(ctx: ProviderDomFlowContext): Promise<{
     state.timeoutMs,
     state.logger,
     state.baselineTurns ?? undefined,
+    state.expectedConversationId,
+    state.committedConversationUrl ?? state.expectedConversationUrl,
   );
   return {
     text: answer.text,

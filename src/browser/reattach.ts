@@ -325,10 +325,8 @@ export async function resumeBrowserSession(
     await assertPageAffinity("session reattach");
     const waitForHydration =
       deps.waitForConversationHydration ?? waitForResumedConversationHydration;
-    const expectedConversationUrl = buildConversationUrl(
-      runtime,
-      resolveBrowserConfig(config ?? {}).url,
-    );
+    const expectedConversationUrl =
+      buildConversationUrl(runtime, resolveBrowserConfig(config ?? {}).url) ?? undefined;
     await waitForHydration(Runtime, timeoutMs, logger, {
       requirePriorTurns: true,
       requirePromptReady: false,
@@ -345,6 +343,7 @@ export async function resumeBrowserSession(
         waitForDeepResearch(Runtime, logger, timeoutMs, minTurnIndex ?? undefined, Page, client, {
           requireScopedTargetOwner: true,
           expectedConversationId,
+          expectedConversationUrl,
           assertPageAffinity,
         }),
         timeoutMs + 5_000,
@@ -366,6 +365,7 @@ export async function resumeBrowserSession(
         logger,
         minTurnIndex ?? undefined,
         expectedConversationId,
+        expectedConversationUrl,
       ),
       timeoutMs + 5_000,
       "Reattach response timed out",
@@ -378,8 +378,9 @@ export async function resumeBrowserSession(
       logger,
       minTurnIndex,
       timeoutMs,
-      { expectedConversationId, assertPageAffinity },
+      { expectedConversationId, expectedConversationUrl, assertPageAffinity },
     );
+
     const markdown =
       (await withTimeout(
         captureMarkdown(
@@ -388,6 +389,7 @@ export async function resumeBrowserSession(
           logger,
           expectedConversationId,
           assertPageAffinity,
+          expectedConversationUrl,
         ),
         15_000,
         "Reattach markdown capture timed out",
@@ -631,6 +633,7 @@ async function resumeBrowserSessionViaNewChrome(
         {
           requireScopedTargetOwner: true,
           expectedConversationId,
+          expectedConversationUrl,
           assertPageAffinity,
         },
       );
@@ -649,6 +652,7 @@ async function resumeBrowserSessionViaNewChrome(
       logger,
       minTurnIndex ?? undefined,
       expectedConversationId,
+      expectedConversationUrl,
     );
     await assertPageAffinity("new Chrome reattach response capture");
     const recovered = await recoverPromptEcho(
@@ -658,7 +662,7 @@ async function resumeBrowserSessionViaNewChrome(
       logger,
       minTurnIndex,
       timeoutMs,
-      { expectedConversationId, assertPageAffinity },
+      { expectedConversationId, expectedConversationUrl, assertPageAffinity },
     );
     const markdown =
       (await captureMarkdown(
@@ -667,6 +671,7 @@ async function resumeBrowserSessionViaNewChrome(
         logger,
         expectedConversationId,
         assertPageAffinity,
+        expectedConversationUrl,
       )) ?? recovered.text;
     const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
 

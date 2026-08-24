@@ -12,8 +12,10 @@ import {
 import { buildConversationTurnListExpression } from "../conversationTurns.js";
 import { delay } from "../utils.js";
 import { isDeepResearchIncompleteText } from "../deepResearchResult.js";
+import { CHATGPT_ORIGINS } from "../conversationUrl.js";
 import { buildClickDispatcher } from "./domEvents.js";
 import { captureAssistantMarkdown, readAssistantSnapshot } from "./assistantResponse.js";
+import { buildEvaluatedChatGptPageAffinityGuard } from "../chatgptAccount.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
 
 type ActivateOutcome =
@@ -26,7 +28,29 @@ type ActivateOutcome =
 
 interface DeepResearchAffinityOptions {
   expectedConversationId?: string;
+  expectedConversationUrl?: string;
   assertPageAffinity?: (action: string) => Promise<void>;
+}
+function buildGuardedDeepResearchProbeExpression(
+  expression: string,
+  expectedConversationId?: string,
+  expectedConversationUrl?: string,
+): { expression: string; awaitPromise: boolean } {
+  const affinityGuard = buildEvaluatedChatGptPageAffinityGuard({
+    expectedConversationId,
+    expectedConversationUrl,
+  });
+  if (!affinityGuard) return { expression, awaitPromise: false };
+  return {
+    expression: `(async () => {
+      ${affinityGuard}
+      await assertOracleChatGptPageAffinity();
+      const value = await (${expression});
+      await assertOracleChatGptPageAffinity();
+      return value;
+    })()`,
+    awaitPromise: true,
+  };
 }
 /**
  * Activates Deep Research mode through ChatGPT's composer tools menu and
@@ -39,7 +63,10 @@ export async function activateDeepResearch(
   options: DeepResearchAffinityOptions = {},
 ): Promise<void> {
   await options.assertPageAffinity?.("Deep Research activation");
-  const expression = buildActivateDeepResearchExpression(options.expectedConversationId);
+  const expression = buildActivateDeepResearchExpression(
+    options.expectedConversationId,
+    options.expectedConversationUrl,
+  );
   const outcome = await Runtime.evaluate({
     expression,
     awaitPromise: true,
@@ -102,6 +129,7 @@ async function clickTrustedPoint(
   y: number,
   options: DeepResearchAffinityOptions,
 ): Promise<void> {
+  const affinityGuard = buildEvaluatedChatGptPageAffinityGuard(options);
   if (Input && typeof Input.dispatchMouseEvent === "function") {
     await Input.dispatchMouseEvent({ type: "mouseMoved", x, y });
     await options.assertPageAffinity?.("Deep Research trusted click");
@@ -110,21 +138,30 @@ async function clickTrustedPoint(
     await Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", clickCount: 1 });
     return;
   }
-  await options.assertPageAffinity?.("Deep Research trusted click");
-  await Runtime.evaluate({
-    expression: `(() => {
+  const expression = affinityGuard
+    ? `(async () => {
+      ${affinityGuard}
+      await assertOracleChatGptPageAffinity();
       const el = document.elementFromPoint(${JSON.stringify(x)}, ${JSON.stringify(y)});
-      const expectedConversationId = ${JSON.stringify(options.expectedConversationId ?? null)};
-      if (expectedConversationId) {
-        const currentConversationId = location.href.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] ?? null;
-        if (currentConversationId !== expectedConversationId) return false;
-      }
+      if (!(el instanceof HTMLElement)) return false;
+      el.click();
+      await assertOracleChatGptPageAffinity();
+      return true;
+    })()`
+    : `(() => {
+      const el = document.elementFromPoint(${JSON.stringify(x)}, ${JSON.stringify(y)});
       if (!(el instanceof HTMLElement)) return false;
       el.click();
       return true;
-    })()`,
+    })()`;
+  const outcome = await Runtime.evaluate({
+    expression,
+    ...(affinityGuard ? { awaitPromise: true } : {}),
     returnByValue: true,
   });
+  if (outcome.exceptionDetails || outcome.result?.value !== true) {
+    throw new Error("Deep Research trusted click failed.");
+  }
 }
 
 async function waitForDeepResearchPill(
@@ -134,7 +171,11 @@ async function waitForDeepResearchPill(
 ): Promise<boolean> {
   await options.assertPageAffinity?.("Deep Research pill read");
   const { result } = await Runtime.evaluate({
-    expression: buildWaitForDeepResearchPillExpression(timeoutMs, options.expectedConversationId),
+    expression: buildWaitForDeepResearchPillExpression(
+      timeoutMs,
+      options.expectedConversationId,
+      options.expectedConversationUrl,
+    ),
     awaitPromise: true,
     returnByValue: true,
   });
@@ -157,8 +198,8 @@ export async function waitForResearchPlanAutoConfirm(
 
   while (Date.now() < planDeadline) {
     await options.assertPageAffinity?.("Deep Research plan read");
-    const { result } = await Runtime.evaluate({
-      expression: `(() => {
+    const planProbe = buildGuardedDeepResearchProbeExpression(
+      `(() => {
         const iframes = document.querySelectorAll('iframe');
         const hasResearchIframe = Array.from(iframes).some(f => {
           const rect = f.getBoundingClientRect();
@@ -171,6 +212,12 @@ export async function waitForResearchPlanAutoConfirm(
           assistantText.includes('analyze');
         return { hasResearchIframe, hasResearchText };
       })()`,
+      options.expectedConversationId,
+      options.expectedConversationUrl,
+    );
+    const { result } = await Runtime.evaluate({
+      expression: planProbe.expression,
+      ...(planProbe.awaitPromise ? { awaitPromise: true } : {}),
       returnByValue: true,
     });
 
@@ -196,8 +243,8 @@ export async function waitForResearchPlanAutoConfirm(
   const confirmStart = Date.now();
   while (Date.now() - confirmStart < autoConfirmWaitMs) {
     await options.assertPageAffinity?.("Deep Research plan confirmation read");
-    const { result } = await Runtime.evaluate({
-      expression: `(() => {
+    const confirmationProbe = buildGuardedDeepResearchProbeExpression(
+      `(() => {
         const iframes = document.querySelectorAll('iframe');
         const hasLargeIframe = Array.from(iframes).some(f => {
           const rect = f.getBoundingClientRect();
@@ -209,6 +256,12 @@ export async function waitForResearchPlanAutoConfirm(
           text.includes('considering');
         return { hasLargeIframe, isResearching };
       })()`,
+      options.expectedConversationId,
+      options.expectedConversationUrl,
+    );
+    const { result } = await Runtime.evaluate({
+      expression: confirmationProbe.expression,
+      ...(confirmationProbe.awaitPromise ? { awaitPromise: true } : {}),
       returnByValue: true,
     });
     const val = result?.value as { hasLargeIframe?: boolean; isResearching?: boolean } | undefined;
@@ -240,6 +293,7 @@ export async function waitForDeepResearchCompletion(
     requireScopedTargetOwner?: boolean;
     targetBaselineCaptured?: boolean;
     expectedConversationId?: string;
+    expectedConversationUrl?: string;
     assertPageAffinity?: (action: string) => Promise<void>;
   },
 ): Promise<{
@@ -266,8 +320,14 @@ export async function waitForDeepResearchCompletion(
 
   while (Date.now() - start < timeoutMs) {
     await options?.assertPageAffinity?.("Deep Research progress read");
+    const completionProbe = buildDeepResearchCompletionPollExpressionWithAffinity(
+      minTurnLiteral,
+      options?.expectedConversationId,
+      options?.expectedConversationUrl,
+    );
     const { result } = await Runtime.evaluate({
-      expression: buildDeepResearchCompletionPollExpression(minTurnLiteral),
+      expression: completionProbe.expression,
+      ...(completionProbe.awaitPromise ? { awaitPromise: true } : {}),
       returnByValue: true,
     });
 
@@ -417,6 +477,8 @@ export async function extractDeepResearchResult(
     Runtime,
     minTurnIndex,
     options.expectedConversationId,
+    undefined,
+    options.expectedConversationUrl,
   );
   const meta = {
     turnId: snapshot?.turnId ?? null,
@@ -430,6 +492,7 @@ export async function extractDeepResearchResult(
     logger,
     options.expectedConversationId,
     options.assertPageAffinity,
+    options.expectedConversationUrl,
   );
   if (markdown && !isDeepResearchIncompleteText(markdown)) {
     return { text: markdown, html: snapshot?.html ?? undefined, meta };
@@ -1092,7 +1155,6 @@ function buildDeepResearchStatusExpression(): string {
     };
   })()`;
 }
-
 function buildDeepResearchCompletionPollExpression(minTurnIndex: number): string {
   const finishedSelector = JSON.stringify(FINISHED_ACTIONS_SELECTOR);
   const stopSelector = JSON.stringify(STOP_BUTTON_SELECTOR);
@@ -1158,12 +1220,32 @@ function buildDeepResearchCompletionPollExpression(minTurnIndex: number): string
   })()`;
 }
 
+function buildDeepResearchCompletionPollExpressionWithAffinity(
+  minTurnIndex: number,
+  expectedConversationId?: string,
+  expectedConversationUrl?: string,
+): { expression: string; awaitPromise: boolean } {
+  return buildGuardedDeepResearchProbeExpression(
+    buildDeepResearchCompletionPollExpression(minTurnIndex),
+    expectedConversationId,
+    expectedConversationUrl,
+  );
+}
+
 export function buildDeepResearchStatusExpressionForTest(): string {
   return buildDeepResearchStatusExpression();
 }
 
-export function buildDeepResearchCompletionPollExpressionForTest(minTurnIndex = -1): string {
-  return buildDeepResearchCompletionPollExpression(minTurnIndex);
+export function buildDeepResearchCompletionPollExpressionForTest(
+  minTurnIndex = -1,
+  expectedConversationId?: string,
+  expectedConversationUrl?: string,
+): string {
+  return buildGuardedDeepResearchProbeExpression(
+    buildDeepResearchCompletionPollExpression(minTurnIndex),
+    expectedConversationId,
+    expectedConversationUrl,
+  ).expression;
 }
 
 function buildFindDeepResearchPillExpression(functionName = "findDeepResearchPill"): string {
@@ -1203,14 +1285,49 @@ function buildFindDeepResearchPillExpression(functionName = "findDeepResearchPil
 function buildWaitForDeepResearchPillExpression(
   timeoutMs: number,
   expectedConversationId?: string,
+  expectedConversationUrl?: string,
 ): string {
+  const affinityGuard = buildEvaluatedChatGptPageAffinityGuard({
+    expectedConversationId,
+    expectedConversationUrl,
+  });
+  const expectedConversationIdLiteral = JSON.stringify(expectedConversationId?.trim() || null);
+  const expectedConversationUrlLiteral = JSON.stringify(expectedConversationUrl?.trim() || null);
   return `(async () => {
+    ${affinityGuard}
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     ${buildFindDeepResearchPillExpression()}
-    const EXPECTED_CONVERSATION_ID = ${JSON.stringify(expectedConversationId ?? null)};
+    const EXPECTED_CONVERSATION_ID = ${expectedConversationIdLiteral};
+    const EXPECTED_CONVERSATION_URL = ${expectedConversationUrlLiteral};
+    const CHATGPT_ORIGINS = ${JSON.stringify(CHATGPT_ORIGINS)};
+    const CONVERSATION_PATTERN = /^(?:\\/c|\\/g\\/[^/?#]+\\/(?:project\\/)?c)\\/([a-zA-Z0-9-]+)\\/?$/;
     const matchesExpectedConversation = () => {
-      if (!EXPECTED_CONVERSATION_ID) return true;
-      const href = typeof location === 'object' && location.href ? location.href : '';
-      return href.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] === EXPECTED_CONVERSATION_ID;
+      if (!EXPECTED_CONVERSATION_ID && !EXPECTED_CONVERSATION_URL) return true;
+      try {
+        const currentUrl = new URL(location.href);
+        if (
+          currentUrl.protocol !== 'https:' ||
+          currentUrl.username || currentUrl.password || currentUrl.port ||
+          !CHATGPT_ORIGINS.includes(currentUrl.origin) ||
+          currentUrl.search || currentUrl.hash
+        ) return false;
+        const currentMatch = CONVERSATION_PATTERN.exec(currentUrl.pathname);
+        if (!currentMatch) return false;
+        if (!EXPECTED_CONVERSATION_URL) {
+          return !EXPECTED_CONVERSATION_ID || currentMatch[1] === EXPECTED_CONVERSATION_ID;
+        }
+        const expectedUrl = new URL(EXPECTED_CONVERSATION_URL);
+        const expectedMatch = CONVERSATION_PATTERN.exec(expectedUrl.pathname);
+        return expectedUrl.protocol === 'https:' &&
+          !expectedUrl.username && !expectedUrl.password && !expectedUrl.port &&
+          CHATGPT_ORIGINS.includes(expectedUrl.origin) &&
+          !expectedUrl.search && !expectedUrl.hash && Boolean(expectedMatch) &&
+          (!EXPECTED_CONVERSATION_ID || expectedMatch[1] === EXPECTED_CONVERSATION_ID) &&
+          currentUrl.origin === expectedUrl.origin &&
+          currentUrl.pathname.replace(/\\/$/, '') === expectedUrl.pathname.replace(/\\/$/, '');
+      } catch {
+        return false;
+      }
     };
     const deadline = Date.now() + ${JSON.stringify(Math.max(timeoutMs, 0))};
     while (Date.now() < deadline) {
@@ -1218,22 +1335,60 @@ function buildWaitForDeepResearchPillExpression(
       if (findDeepResearchPill()) return true;
       await new Promise(resolve => setTimeout(resolve, 200));
     }
-    return matchesExpectedConversation() && Boolean(findDeepResearchPill());
+    if (!matchesExpectedConversation()) return false;
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
+    return Boolean(findDeepResearchPill());
   })()`;
 }
 
-function buildActivateDeepResearchExpression(expectedConversationId?: string): string {
+function buildActivateDeepResearchExpression(
+  expectedConversationId?: string,
+  expectedConversationUrl?: string,
+): string {
   const plusBtnSelector = JSON.stringify(DEEP_RESEARCH_PLUS_BUTTON);
   const targetText = JSON.stringify(DEEP_RESEARCH_DROPDOWN_ITEM_TEXT);
-  const expectedConversationLiteral = JSON.stringify(expectedConversationId ?? null);
+  const expectedConversationLiteral = JSON.stringify(expectedConversationId?.trim() || null);
+  const expectedConversationUrlLiteral = JSON.stringify(expectedConversationUrl?.trim() || null);
+  const affinityGuard = buildEvaluatedChatGptPageAffinityGuard({
+    expectedConversationId,
+    expectedConversationUrl,
+  });
   return `(async () => {
+    ${affinityGuard}
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     ${buildClickDispatcher()}
     ${buildFindDeepResearchPillExpression()}
     const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
+    const EXPECTED_CONVERSATION_URL = ${expectedConversationUrlLiteral};
+    const CHATGPT_ORIGINS = ${JSON.stringify(CHATGPT_ORIGINS)};
+    const CONVERSATION_PATTERN = /^(?:\\/c|\\/g\\/[^/?#]+\\/(?:project\\/)?c)\\/([a-zA-Z0-9-]+)\\/?$/;
     const matchesExpectedConversation = () => {
-      if (!EXPECTED_CONVERSATION_ID) return true;
-      const href = typeof location === 'object' && location.href ? location.href : '';
-      return href.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] === EXPECTED_CONVERSATION_ID;
+      if (!EXPECTED_CONVERSATION_ID && !EXPECTED_CONVERSATION_URL) return true;
+      try {
+        const currentUrl = new URL(location.href);
+        if (
+          currentUrl.protocol !== 'https:' ||
+          currentUrl.username || currentUrl.password || currentUrl.port ||
+          !CHATGPT_ORIGINS.includes(currentUrl.origin) ||
+          currentUrl.search || currentUrl.hash
+        ) return false;
+        const currentMatch = CONVERSATION_PATTERN.exec(currentUrl.pathname);
+        if (!currentMatch) return false;
+        if (!EXPECTED_CONVERSATION_URL) {
+          return !EXPECTED_CONVERSATION_ID || currentMatch[1] === EXPECTED_CONVERSATION_ID;
+        }
+        const expectedUrl = new URL(EXPECTED_CONVERSATION_URL);
+        const expectedMatch = CONVERSATION_PATTERN.exec(expectedUrl.pathname);
+        return expectedUrl.protocol === 'https:' &&
+          !expectedUrl.username && !expectedUrl.password && !expectedUrl.port &&
+          CHATGPT_ORIGINS.includes(expectedUrl.origin) &&
+          !expectedUrl.search && !expectedUrl.hash && Boolean(expectedMatch) &&
+          (!EXPECTED_CONVERSATION_ID || expectedMatch[1] === EXPECTED_CONVERSATION_ID) &&
+          currentUrl.origin === expectedUrl.origin &&
+          currentUrl.pathname.replace(/\\/$/, '') === expectedUrl.pathname.replace(/\\/$/, '');
+      } catch {
+        return false;
+      }
     };
 
     const waitForPill = () => new Promise((resolve) => {
@@ -1363,6 +1518,7 @@ function buildActivateDeepResearchExpression(expectedConversationId?: string): s
       );
     if (!plusBtn) return { status: 'plus-button-missing' };
     if (!matchesExpectedConversation()) return { status: 'conversation-mismatch' };
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     dispatchClickSequence(plusBtn);
 
     // Step 2: Wait for dropdown
@@ -1412,10 +1568,12 @@ function buildActivateDeepResearchExpression(expectedConversationId?: string): s
       ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
       : undefined;
     if (!matchesExpectedConversation()) return { status: 'conversation-mismatch' };
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     dispatchClickSequence(match);
 
     // Step 5: Verify pill appeared
     const pillConfirmed = await waitForPill();
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     if (!matchesExpectedConversation()) return { status: 'conversation-mismatch' };
     return pillConfirmed ? { status: 'activated' } : { status: 'pill-not-confirmed', clickPoint };
   })()`;
@@ -1423,6 +1581,7 @@ function buildActivateDeepResearchExpression(expectedConversationId?: string): s
 
 export function buildActivateDeepResearchExpressionForTest(
   expectedConversationId?: string,
+  expectedConversationUrl?: string,
 ): string {
-  return buildActivateDeepResearchExpression(expectedConversationId);
+  return buildActivateDeepResearchExpression(expectedConversationId, expectedConversationUrl);
 }

@@ -5,6 +5,7 @@ import {
   MENU_ITEM_SELECTOR,
   MODEL_BUTTON_SELECTOR,
 } from "../constants.js";
+import { buildEvaluatedChatGptPageAffinityGuard } from "../chatgptAccount.js";
 import { logDomFailure } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
 
@@ -62,6 +63,7 @@ export async function ensureThinkingTime(
   desiredModel?: string | null,
   options: {
     expectedConversationId?: string;
+    expectedConversationUrl?: string;
     assertPageAffinity?: (action: string) => Promise<void>;
   } = {},
 ) {
@@ -131,6 +133,7 @@ export async function ensureThinkingTimeIfAvailable(
   desiredModel?: string | null,
   options: {
     expectedConversationId?: string;
+    expectedConversationUrl?: string;
     assertPageAffinity?: (action: string) => Promise<void>;
   } = {},
 ): Promise<boolean> {
@@ -185,12 +188,18 @@ async function evaluateThinkingTimeSelection(
   desiredModel?: string | null,
   options: {
     expectedConversationId?: string;
+    expectedConversationUrl?: string;
     assertPageAffinity?: (action: string) => Promise<void>;
   } = {},
 ): Promise<ThinkingTimeOutcome | undefined> {
   await options.assertPageAffinity?.("thinking-time selection");
   const outcome = await Runtime.evaluate({
-    expression: buildThinkingTimeExpression(level, desiredModel, options.expectedConversationId),
+    expression: buildThinkingTimeExpression(
+      level,
+      desiredModel,
+      options.expectedConversationId,
+      options.expectedConversationUrl,
+    ),
     awaitPromise: true,
     returnByValue: true,
   });
@@ -202,6 +211,7 @@ function buildThinkingTimeExpression(
   level: ThinkingTimeLevel,
   desiredModel?: string | null,
   expectedConversationId?: string,
+  expectedConversationUrl?: string,
 ): string {
   const menuContainerLiteral = JSON.stringify(MENU_CONTAINER_SELECTOR);
   const menuItemLiteral = JSON.stringify(MENU_ITEM_SELECTOR);
@@ -215,8 +225,18 @@ function buildThinkingTimeExpression(
     typeof expectedConversationId === "string" && expectedConversationId.trim().length > 0
       ? JSON.stringify(expectedConversationId.trim())
       : "null";
+  const expectedConversationUrlLiteral =
+    typeof expectedConversationUrl === "string" && expectedConversationUrl.trim().length > 0
+      ? JSON.stringify(expectedConversationUrl.trim())
+      : "null";
+  const affinityGuard = buildEvaluatedChatGptPageAffinityGuard({
+    expectedConversationId,
+    expectedConversationUrl,
+  });
 
   return `(async () => {
+    ${affinityGuard}
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     ${buildClickDispatcher()}
 
     const MENU_CONTAINER_SELECTOR = ${menuContainerLiteral};
@@ -226,10 +246,35 @@ function buildThinkingTimeExpression(
     const TARGET_MODEL_KIND = ${targetModelKindLiteral};
     const TARGET_IS_GPT56_MODEL = ${targetIsGpt56ModelLiteral};
     const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
+    const EXPECTED_CONVERSATION_URL = ${expectedConversationUrlLiteral};
+    const CONVERSATION_PATTERN = /^(?:\\/c|\\/g\\/[^/?#]+\\/(?:project\\/)?c)\\/([a-zA-Z0-9-]+)\\/?$/;
     const matchesExpectedConversation = () => {
-      if (!EXPECTED_CONVERSATION_ID) return true;
-      const href = typeof location === 'object' && location.href ? location.href : '';
-      return href.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] === EXPECTED_CONVERSATION_ID;
+      if (!EXPECTED_CONVERSATION_ID && !EXPECTED_CONVERSATION_URL) return true;
+      try {
+        const currentUrl = new URL(location.href);
+        if (
+          currentUrl.protocol !== 'https:' ||
+          currentUrl.username || currentUrl.password || currentUrl.port ||
+          !CHATGPT_ORIGINS.includes(currentUrl.origin) ||
+          currentUrl.search || currentUrl.hash
+        ) return false;
+        const currentMatch = CONVERSATION_PATTERN.exec(currentUrl.pathname);
+        if (!currentMatch) return false;
+        if (!EXPECTED_CONVERSATION_URL) {
+          return !EXPECTED_CONVERSATION_ID || currentMatch[1] === EXPECTED_CONVERSATION_ID;
+        }
+        const expectedUrl = new URL(EXPECTED_CONVERSATION_URL);
+        const expectedMatch = CONVERSATION_PATTERN.exec(expectedUrl.pathname);
+        return expectedUrl.protocol === 'https:' &&
+          !expectedUrl.username && !expectedUrl.password && !expectedUrl.port &&
+          CHATGPT_ORIGINS.includes(expectedUrl.origin) &&
+          !expectedUrl.search && !expectedUrl.hash && Boolean(expectedMatch) &&
+          (!EXPECTED_CONVERSATION_ID || expectedMatch[1] === EXPECTED_CONVERSATION_ID) &&
+          currentUrl.origin === expectedUrl.origin &&
+          currentUrl.pathname.replace(/\\/$/, '') === expectedUrl.pathname.replace(/\\/$/, '');
+      } catch {
+        return false;
+      }
     };
 
     // Bilingual matchers: English level token + observed Chinese variants.
@@ -1126,8 +1171,14 @@ export function buildThinkingTimeExpressionForTest(
   level: ThinkingTimeLevel = "extended",
   desiredModel?: string | null,
   expectedConversationId?: string,
+  expectedConversationUrl?: string,
 ): string {
-  return buildThinkingTimeExpression(level, desiredModel, expectedConversationId);
+  return buildThinkingTimeExpression(
+    level,
+    desiredModel,
+    expectedConversationId,
+    expectedConversationUrl,
+  );
 }
 
 function inferThinkingTargetModelKind(

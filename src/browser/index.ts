@@ -189,8 +189,18 @@ function isPrivateBrowserConfigKey(key: string): boolean {
   );
 }
 
+function isSensitiveBrowserConfigKey(key: string): boolean {
+  const normalized = key.replace(/[-_]/g, "").toLowerCase();
+  if (normalized === "inlinecookiessource") return false;
+  return /(?:api[-_]?key|access[-_]?key|auth(?:orization)?|cookie|credential|password|passphrase|private[-_]?key|secret|session|token)/i.test(
+    key,
+  );
+}
+
 function redactBrowserConfigValue(key: string, value: unknown): unknown {
-  if (key && isPrivateBrowserConfigKey(key)) return Boolean(value);
+  if (key && (isPrivateBrowserConfigKey(key) || isSensitiveBrowserConfigKey(key))) {
+    return Boolean(value);
+  }
   if (Array.isArray(value)) {
     return value.map((item) => redactBrowserConfigValue("", item));
   }
@@ -617,6 +627,7 @@ async function waitForAssistantOrGeneratedImageResponse(params: {
   timeoutMs: number;
   minTurnIndex?: number;
   expectedConversationId?: string;
+  expectedConversationUrl?: string;
   imageOutputRequested: boolean;
   logger: BrowserLogger;
   assertPageAffinity?: (action: string) => Promise<void>;
@@ -631,6 +642,7 @@ async function waitForAssistantOrGeneratedImageResponse(params: {
     params.timeoutMs,
     params.minTurnIndex,
     params.expectedConversationId,
+    params.expectedConversationUrl,
     params.assertPageAffinity,
   );
   if (response) {
@@ -661,20 +673,27 @@ async function pollGeneratedImageOrTextAssistantResponse(
   timeoutMs: number,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedConversationUrl?: string,
   assertPageAffinity?: (action: string) => Promise<void>,
 ): Promise<AssistantAnswer | null> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     await assertPageAffinity?.("generated image response read");
-    let snapshot = await readAssistantSnapshot(Runtime, minTurnIndex, expectedConversationId).catch(
-      () => null,
-    );
+    let snapshot = await readAssistantSnapshot(
+      Runtime,
+      minTurnIndex,
+      expectedConversationId,
+      undefined,
+      expectedConversationUrl,
+    ).catch(() => null);
     if (!snapshot && typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex)) {
       await assertPageAffinity?.("generated image fallback response read");
       const relaxedSnapshot = await readAssistantSnapshot(
         Runtime,
         undefined,
         expectedConversationId,
+        undefined,
+        expectedConversationUrl,
       ).catch(() => null);
       const relaxedHtml = typeof relaxedSnapshot?.html === "string" ? relaxedSnapshot.html : "";
       if (relaxedHtml.includes("/backend-api/estuary/content?id=file_")) {
@@ -1969,6 +1988,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           () =>
             ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, {
               expectedConversationId: runConversationId,
+              expectedConversationUrl: runConversationUrl,
               assertPageAffinity,
             }),
           {
@@ -2006,6 +2026,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         Runtime,
         undefined,
         runConversationId,
+        undefined,
+        runConversationUrl,
       ).catch(() => null);
       const baselineAssistantText =
         typeof baselineSnapshot?.text === "string" ? baselineSnapshot.text.trim() : "";
@@ -2071,6 +2093,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
             () =>
               activateDeepResearch(Runtime, Input, logger, {
                 expectedConversationId: runConversationId,
+                expectedConversationUrl: runConversationUrl,
                 assertPageAffinity,
               }),
             {
@@ -2104,6 +2127,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         attachmentNames: attachmentExpectations,
         onPromptSubmitted: markPromptSubmitted,
         assertPageAffinity,
+        expectedConversationId: runConversationId,
+        expectedConversationUrl: runConversationUrl,
       };
       const deepResearchTargetBaseline =
         deepResearch && client
@@ -2206,6 +2231,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       await raceWithDisconnect(
         waitForResearchPlanAutoConfirm(Runtime, logger, undefined, {
           expectedConversationId: runConversationId,
+          expectedConversationUrl: runConversationUrl,
           assertPageAffinity,
         }),
       );
@@ -2221,6 +2247,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
             ignoredTargetKeys: deepResearchTargetKeys,
             targetBaselineCaptured: deepResearchTargetBaselineCaptured,
             expectedConversationId: runConversationId,
+            expectedConversationUrl: runConversationUrl,
             assertPageAffinity,
           },
         ),
@@ -2289,7 +2316,13 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       text.toLowerCase().replace(/\s+/g, " ").trim();
     const readRunAssistantSnapshot = async (minTurnIndex: number | undefined, action: string) => {
       await assertPageAffinity(action);
-      return readAssistantSnapshot(Runtime, minTurnIndex, runConversationId).catch(() => null);
+      return readAssistantSnapshot(
+        Runtime,
+        minTurnIndex,
+        runConversationId,
+        undefined,
+        runConversationUrl,
+      ).catch(() => null);
     };
     const waitForFreshAssistantResponse = async (baselineNormalized: string, timeoutMs: number) => {
       const baselinePrefix =
@@ -2421,6 +2454,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
             logger,
             minTurnIndex: baselineTurns ?? undefined,
             expectedConversationId: runConversationId,
+            expectedConversationUrl: runConversationUrl,
             assertPageAffinity,
             imageOutputRequested,
           }),
@@ -2460,6 +2494,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
               logger,
               minTurnIndex: baselineTurns ?? undefined,
               expectedConversationId: runConversationId,
+              expectedConversationUrl: runConversationUrl,
               assertPageAffinity,
               imageOutputRequested,
             }),
@@ -2539,6 +2574,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
               logger,
               runConversationId,
               assertPageAffinity,
+              runConversationUrl,
             );
             if (!attempt) {
               throw new Error("copy-missing");
@@ -2573,6 +2609,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           logger,
           allowMarkdownUpdate: !copiedMarkdown,
           expectedConversationId: runConversationId,
+          expectedConversationUrl: runConversationUrl,
           assertPageAffinity,
         }));
 
@@ -3260,6 +3297,7 @@ async function maybeRecoverLongAssistantResponse({
   logger,
   allowMarkdownUpdate,
   expectedConversationId,
+  expectedConversationUrl,
   assertPageAffinity,
 }: {
   runtime: ChromeClient["Runtime"];
@@ -3269,6 +3307,7 @@ async function maybeRecoverLongAssistantResponse({
   logger: BrowserLogger;
   allowMarkdownUpdate: boolean;
   expectedConversationId?: string;
+  expectedConversationUrl?: string;
   assertPageAffinity?: (action: string) => Promise<void>;
 }): Promise<{ answerText: string; answerMarkdown: string }> {
   // Learned: long streaming responses can still be rendering after initial capture.
@@ -3287,6 +3326,8 @@ async function maybeRecoverLongAssistantResponse({
       runtime,
       baselineTurns ?? undefined,
       expectedConversationId,
+      undefined,
+      expectedConversationUrl,
     ).catch(() => null);
     const laterText = typeof laterSnapshot?.text === "string" ? laterSnapshot.text.trim() : "";
     if (laterText.length > bestLength) {
@@ -4034,6 +4075,7 @@ async function runRemoteBrowserMode(
         () =>
           ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, {
             expectedConversationId: runConversationId,
+            expectedConversationUrl: runConversationUrl,
             assertPageAffinity,
           }),
         {
@@ -4056,6 +4098,8 @@ async function runRemoteBrowserMode(
         Runtime,
         undefined,
         runConversationId,
+        undefined,
+        runConversationUrl,
       ).catch(() => null);
       const baselineAssistantText =
         typeof baselineSnapshot?.text === "string" ? baselineSnapshot.text.trim() : "";
@@ -4103,6 +4147,7 @@ async function runRemoteBrowserMode(
           () =>
             activateDeepResearch(Runtime, Input, logger, {
               expectedConversationId: runConversationId,
+              expectedConversationUrl: runConversationUrl,
               assertPageAffinity,
             }),
           {
@@ -4134,6 +4179,8 @@ async function runRemoteBrowserMode(
         attachmentNames: attachmentExpectations,
         onPromptSubmitted: markPromptSubmitted,
         assertPageAffinity,
+        expectedConversationId: runConversationId,
+        expectedConversationUrl: runConversationUrl,
       };
       const deepResearchTargetBaseline =
         deepResearch && client
@@ -4195,6 +4242,7 @@ async function runRemoteBrowserMode(
     if (deepResearch) {
       await waitForResearchPlanAutoConfirm(Runtime, logger, undefined, {
         expectedConversationId: runConversationId,
+        expectedConversationUrl: runConversationUrl,
         assertPageAffinity,
       });
       const researchResult = await waitForDeepResearchCompletion(
@@ -4208,6 +4256,7 @@ async function runRemoteBrowserMode(
           ignoredTargetKeys: deepResearchTargetKeys,
           targetBaselineCaptured: deepResearchTargetBaselineCaptured,
           expectedConversationId: runConversationId,
+          expectedConversationUrl: runConversationUrl,
           assertPageAffinity,
         },
       );
@@ -4275,7 +4324,13 @@ async function runRemoteBrowserMode(
       text.toLowerCase().replace(/\s+/g, " ").trim();
     const readRunAssistantSnapshot = async (minTurnIndex: number | undefined, action: string) => {
       await assertPageAffinity(action);
-      return readAssistantSnapshot(Runtime, minTurnIndex, runConversationId).catch(() => null);
+      return readAssistantSnapshot(
+        Runtime,
+        minTurnIndex,
+        runConversationId,
+        undefined,
+        runConversationUrl,
+      ).catch(() => null);
     };
     const waitForFreshAssistantResponse = async (baselineNormalized: string, timeoutMs: number) => {
       const baselinePrefix =
@@ -4404,6 +4459,7 @@ async function runRemoteBrowserMode(
           logger,
           minTurnIndex: baselineTurns ?? undefined,
           expectedConversationId: runConversationId,
+          expectedConversationUrl: runConversationUrl,
           assertPageAffinity,
           imageOutputRequested,
         }),
@@ -4441,6 +4497,7 @@ async function runRemoteBrowserMode(
             logger,
             minTurnIndex: baselineTurns ?? undefined,
             expectedConversationId: runConversationId,
+            expectedConversationUrl: runConversationUrl,
             assertPageAffinity,
             imageOutputRequested,
           }),
@@ -4520,6 +4577,7 @@ async function runRemoteBrowserMode(
             logger,
             runConversationId,
             assertPageAffinity,
+            runConversationUrl,
           );
           if (!attempt) {
             throw new Error("copy-missing");
@@ -4552,6 +4610,7 @@ async function runRemoteBrowserMode(
           logger,
           allowMarkdownUpdate: !copiedMarkdown,
           expectedConversationId: runConversationId,
+          expectedConversationUrl: runConversationUrl,
           assertPageAffinity,
         }));
 
@@ -5016,6 +5075,7 @@ async function waitForAssistantResponseWithReload(
       logger,
       minTurnIndex,
       expectedConversationId,
+      expectedConversationUrl,
     );
   } catch (error) {
     if (!shouldReloadAfterAssistantError(error)) {
@@ -5049,6 +5109,7 @@ async function waitForAssistantResponseWithReload(
       logger,
       minTurnIndex,
       expectedConversationId,
+      expectedConversationUrl,
     );
   }
 }

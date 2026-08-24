@@ -58,6 +58,8 @@ describe("chatgptDomProvider", () => {
       5_000,
       logger,
       0,
+      undefined,
+      "https://chatgpt.com/c/fresh",
     );
   });
 });

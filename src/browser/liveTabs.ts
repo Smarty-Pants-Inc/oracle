@@ -614,6 +614,8 @@ export async function inspectChatGptTab(
       Runtime,
       undefined,
       options.expectedConversationId,
+      undefined,
+      options.expectedConversationUrl,
     ).catch(() => null);
     const finalUrl = await assertChatGptTabOrigin(Runtime, "live tab inspection completion");
     assertExpectedConversation(
@@ -1159,9 +1161,13 @@ export async function harvestChatGptTab(
       snapshotUrl,
       "live tab harvest snapshot",
     );
-    const snapshot = await readAssistantSnapshot(Runtime, undefined, expectedConversationId).catch(
-      () => null,
-    );
+    const snapshot = await readAssistantSnapshot(
+      Runtime,
+      undefined,
+      expectedConversationId,
+      undefined,
+      expectedConversationUrl,
+    ).catch(() => null);
     const nowSummary = await inspectChatGptTab({
       ...options,
       host,
@@ -1208,6 +1214,8 @@ export async function harvestChatGptTab(
         },
         noopLogger,
         expectedConversationId,
+        undefined,
+        expectedConversationUrl,
       ).catch(() => null);
     }
     const lastAssistantText =

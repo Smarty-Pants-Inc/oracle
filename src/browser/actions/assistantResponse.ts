@@ -187,6 +187,7 @@ export async function waitForAssistantResponse(
   logger: BrowserLogger,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedConversationUrl?: string,
 ): Promise<{
   text: string;
   html?: string;
@@ -201,6 +202,7 @@ export async function waitForAssistantResponse(
     timeoutMs,
     minTurnIndex,
     expectedConversationId,
+    expectedConversationUrl,
   );
   const evaluationPromise = Runtime.evaluate({
     expression,
@@ -221,6 +223,7 @@ export async function waitForAssistantResponse(
     timeoutMs,
     minTurnIndex,
     expectedConversationId,
+    expectedConversationUrl,
     pollerAbort.signal,
   ).then(
     (value) => ({ kind: "poll" as const, value }),
@@ -269,6 +272,7 @@ export async function waitForAssistantResponse(
           logger,
           minTurnIndex,
           expectedConversationId,
+          expectedConversationUrl,
         );
         if (recovered) {
           return recovered;
@@ -296,6 +300,7 @@ export async function waitForAssistantResponse(
         logger,
         minTurnIndex,
         expectedConversationId,
+        expectedConversationUrl,
       );
       if (recovered) {
         return recovered;
@@ -321,6 +326,7 @@ export async function waitForAssistantResponse(
     logger,
     minTurnIndex,
     expectedConversationId,
+    expectedConversationUrl,
   );
   const candidate = refreshed ?? parsed;
   if (isGeneratedImageAssistantAnswer(candidate)) {
@@ -343,6 +349,7 @@ export async function waitForAssistantResponse(
       remainingMs,
       minTurnIndex,
       expectedConversationId,
+      expectedConversationUrl,
     );
     if (completed) {
       return completed;
@@ -370,13 +377,17 @@ export async function readAssistantSnapshot(
   minTurnIndex?: number,
   expectedConversationId?: string,
   expectedAccountDigest?: string,
+  expectedConversationUrl?: string,
 ): Promise<AssistantSnapshot | null> {
-  const requiresAsyncAffinity = Boolean(expectedAccountDigest?.trim());
+  const requiresAsyncAffinity = Boolean(
+    expectedAccountDigest?.trim() || expectedConversationUrl?.trim(),
+  );
   const { result, exceptionDetails } = await Runtime.evaluate({
     expression: buildAssistantSnapshotExpression(
       minTurnIndex,
       expectedConversationId,
       expectedAccountDigest,
+      expectedConversationUrl,
     ),
     ...(requiresAsyncAffinity ? { awaitPromise: true } : {}),
     returnByValue: true,
@@ -407,10 +418,11 @@ export async function captureAssistantMarkdown(
   logger: BrowserLogger,
   expectedConversationId?: string,
   assertPageAffinity?: (action: string) => Promise<void>,
+  expectedConversationUrl?: string,
 ): Promise<string | null> {
   await assertPageAffinity?.("assistant markdown copy");
   const { result } = await Runtime.evaluate({
-    expression: buildCopyExpression(meta, expectedConversationId),
+    expression: buildCopyExpression(meta, expectedConversationId, expectedConversationUrl),
     returnByValue: true,
     awaitPromise: true,
   });
@@ -437,11 +449,13 @@ export function buildAssistantSnapshotExpressionForTest(
   minTurnIndex?: number,
   expectedConversationId?: string,
   expectedAccountDigest?: string,
+  expectedConversationUrl?: string,
 ): string {
   return buildAssistantSnapshotExpression(
     minTurnIndex,
     expectedConversationId,
     expectedAccountDigest,
+    expectedConversationUrl,
   );
 }
 
@@ -456,8 +470,22 @@ export function buildMarkdownFallbackExtractorForTest(minTurnLiteral = "0"): str
 export function buildCopyExpressionForTest(
   meta: { messageId?: string | null; turnId?: string | null } = {},
   expectedConversationId?: string,
+  expectedConversationUrl?: string,
 ): string {
-  return buildCopyExpression(meta, expectedConversationId);
+  return buildCopyExpression(meta, expectedConversationId, expectedConversationUrl);
+}
+export function buildResponseObserverExpressionForTest(
+  timeoutMs: number,
+  minTurnIndex?: number,
+  expectedConversationId?: string,
+  expectedConversationUrl?: string,
+): string {
+  return buildResponseObserverExpression(
+    timeoutMs,
+    minTurnIndex,
+    expectedConversationId,
+    expectedConversationUrl,
+  );
 }
 
 async function recoverAssistantResponse(
@@ -466,6 +494,7 @@ async function recoverAssistantResponse(
   logger: BrowserLogger,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedConversationUrl?: string,
 ): Promise<{
   text: string;
   html?: string;
@@ -478,7 +507,13 @@ async function recoverAssistantResponse(
   const recoveryStartedAt = Date.now();
   const recovered = await waitForCondition(
     async () => {
-      const snapshot = await readAssistantSnapshot(Runtime, minTurnIndex, expectedConversationId);
+      const snapshot = await readAssistantSnapshot(
+        Runtime,
+        minTurnIndex,
+        expectedConversationId,
+        undefined,
+        expectedConversationUrl,
+      );
       return normalizeAssistantSnapshot(snapshot);
     },
     recoveryTimeoutMs,
@@ -495,6 +530,7 @@ async function recoverAssistantResponse(
         remainingMs,
         minTurnIndex,
         expectedConversationId,
+        expectedConversationUrl,
       );
       if (confirmed) {
         logger("Recovered and confirmed assistant response via polling fallback");
@@ -570,6 +606,7 @@ async function refreshAssistantSnapshot(
   logger: BrowserLogger,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedConversationUrl?: string,
 ): Promise<{
   text: string;
   html?: string;
@@ -589,6 +626,8 @@ async function refreshAssistantSnapshot(
       Runtime,
       minTurnIndex,
       expectedConversationId,
+      undefined,
+      expectedConversationUrl,
     ).catch(() => null);
     const latest = normalizeAssistantSnapshot(latestSnapshot);
     if (latest) {
@@ -639,6 +678,7 @@ async function pollAssistantCompletion(
   timeoutMs: number,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedConversationUrl?: string,
   abortSignal?: AbortSignal,
 ): Promise<{
   text: string;
@@ -652,7 +692,13 @@ async function pollAssistantCompletion(
     if (abortSignal?.aborted) {
       return null;
     }
-    const snapshot = await readAssistantSnapshot(Runtime, minTurnIndex, expectedConversationId);
+    const snapshot = await readAssistantSnapshot(
+      Runtime,
+      minTurnIndex,
+      expectedConversationId,
+      undefined,
+      expectedConversationUrl,
+    );
     const normalized = normalizeAssistantSnapshot(snapshot);
     if (normalized) {
       // Generated-image answers stream no text and mount no action bar; accept immediately.
@@ -879,6 +925,7 @@ function buildAssistantSnapshotExpression(
   minTurnIndex?: number,
   expectedConversationId?: string,
   expectedAccountDigest?: string,
+  expectedConversationUrl?: string,
 ): string {
   const minTurnLiteral =
     typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex) && minTurnIndex >= 0
@@ -888,12 +935,14 @@ function buildAssistantSnapshotExpression(
     typeof expectedConversationId === "string" && expectedConversationId.trim().length > 0
       ? JSON.stringify(expectedConversationId.trim())
       : "null";
-  const affinityGuard = expectedAccountDigest
-    ? buildEvaluatedChatGptPageAffinityGuard({
-        expectedConversationId,
-        expectedAccountDigest,
-      })
-    : "";
+  const affinityGuard =
+    expectedConversationUrl || expectedAccountDigest
+      ? buildEvaluatedChatGptPageAffinityGuard({
+          expectedConversationId,
+          expectedConversationUrl,
+          expectedAccountDigest,
+        })
+      : "";
   return `${affinityGuard ? "(async () => {" : "(() => {"}
     ${affinityGuard}
     ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
@@ -903,9 +952,16 @@ function buildAssistantSnapshotExpression(
     try {
       currentPageUrl = new URL(typeof location === 'object' && location.href ? location.href : '');
     } catch {}
-    const currentConversationId = ${JSON.stringify(CHATGPT_ORIGINS)}.includes(currentPageUrl?.origin)
-      ? /^(?:[/]c|[/]g[/][^/?#]+[/](?:project[/])?c)[/]([a-zA-Z0-9-]+)[/]?$/.exec(currentPageUrl.pathname)?.[1] ?? null
-      : null;
+    const currentConversationId =
+      currentPageUrl?.protocol === 'https:' &&
+      !currentPageUrl.username &&
+      !currentPageUrl.password &&
+      !currentPageUrl.port &&
+      !currentPageUrl.search &&
+      !currentPageUrl.hash &&
+      ${JSON.stringify(CHATGPT_ORIGINS)}.includes(currentPageUrl.origin)
+        ? /^(?:[/]c|[/]g[/][^/?#]+[/](?:project[/])?c)[/]([a-zA-Z0-9-]+)[/]?$/.exec(currentPageUrl.pathname)?.[1] ?? null
+        : null;
     if (EXPECTED_CONVERSATION_ID && currentConversationId !== EXPECTED_CONVERSATION_ID) {
       return null;
     }
@@ -947,6 +1003,7 @@ function buildResponseObserverExpression(
   timeoutMs: number,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  expectedConversationUrl?: string,
 ): string {
   const selectorsLiteral = JSON.stringify(ANSWER_SELECTORS);
   const assistantLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
@@ -958,22 +1015,76 @@ function buildResponseObserverExpression(
     typeof expectedConversationId === "string" && expectedConversationId.trim().length > 0
       ? JSON.stringify(expectedConversationId.trim())
       : "null";
-  return `(() => {
+  const expectedConversationUrlLiteral =
+    typeof expectedConversationUrl === "string" && expectedConversationUrl.trim().length > 0
+      ? JSON.stringify(expectedConversationUrl.trim())
+      : "null";
+  const affinityGuard = buildEvaluatedChatGptPageAffinityGuard({
+    expectedConversationId,
+    expectedConversationUrl,
+  });
+  return `${affinityGuard ? "(async () => {" : "(() => {"}
+    ${affinityGuard}
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     ${buildClickDispatcher()}
     const SELECTORS = ${selectorsLiteral};
     const STOP_SELECTOR = ${JSON.stringify(STOP_CONTROL_SELECTOR)};
     const FINISHED_SELECTOR = '${FINISHED_ACTIONS_SELECTOR}';
     const ASSISTANT_SELECTOR = ${assistantLiteral};
     const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
-    // Learned: settling avoids capturing mid-stream HTML; keep short.
-    const settleDelayMs = 800;
-    const currentConversationId = () => {
-      const href = typeof location === 'object' && location.href ? location.href : '';
-      return href.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] ?? null;
+    const EXPECTED_CONVERSATION_URL = ${expectedConversationUrlLiteral};
+    const CHATGPT_ORIGINS = ${JSON.stringify(CHATGPT_ORIGINS)};
+    const CONVERSATION_PATTERN = /^(?:\\/c|\\/g\\/[^/?#]+\\/(?:project\\/)?c)\\/([a-zA-Z0-9-]+)\\/?$/;
+    const currentConversation = () => {
+      try {
+        const currentUrl = new URL(typeof location === 'object' && location.href ? location.href : '');
+        if (
+          currentUrl.protocol !== 'https:' ||
+          currentUrl.username ||
+          currentUrl.password ||
+          currentUrl.port ||
+          !CHATGPT_ORIGINS.includes(currentUrl.origin) ||
+          currentUrl.search ||
+          currentUrl.hash
+        ) return null;
+        const match = CONVERSATION_PATTERN.exec(currentUrl.pathname);
+        if (!match) return null;
+        return {
+          id: match[1],
+          scope: currentUrl.origin + currentUrl.pathname.replace(/\\/$/, ''),
+        };
+      } catch {
+        return null;
+      }
     };
+    const approvedConversationScope = (() => {
+      if (!EXPECTED_CONVERSATION_URL) return null;
+      try {
+        const approvedUrl = new URL(EXPECTED_CONVERSATION_URL);
+        const approvedMatch = CONVERSATION_PATTERN.exec(approvedUrl.pathname);
+        if (
+          !CHATGPT_ORIGINS.includes(approvedUrl.origin) ||
+          approvedUrl.protocol !== 'https:' ||
+          approvedUrl.username ||
+          approvedUrl.password ||
+          approvedUrl.port ||
+          approvedUrl.search ||
+          approvedUrl.hash ||
+          !approvedMatch ||
+          (EXPECTED_CONVERSATION_ID && approvedMatch[1] !== EXPECTED_CONVERSATION_ID)
+        ) return null;
+        return approvedUrl.origin + approvedUrl.pathname.replace(/\\/$/, '');
+      } catch {
+        return null;
+      }
+    })();
     const matchesExpectedConversation = () => {
+      const current = currentConversation();
+      if (EXPECTED_CONVERSATION_URL) {
+        return Boolean(current && approvedConversationScope && current.scope === approvedConversationScope);
+      }
       if (!EXPECTED_CONVERSATION_ID) return true;
-      return currentConversationId() === EXPECTED_CONVERSATION_ID;
+      return current?.id === EXPECTED_CONVERSATION_ID;
     };
     const isAnswerNowPlaceholder = (snapshot) => {
       const normalized = String(snapshot?.text ?? '').toLowerCase().trim();
@@ -1104,6 +1215,8 @@ function buildResponseObserverExpression(
 
     const waitForSettle = async (snapshot) => {
       if (String(snapshot?.html ?? '').includes('/backend-api/estuary/content?id=file_')) {
+        if (!matchesExpectedConversation()) throw new Error('ChatGPT conversation changed.');
+        ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
         return snapshot;
       }
       // Learned: short answers can be 1-2 tokens; enforce longer settle windows to avoid truncation.
@@ -1164,6 +1277,8 @@ function buildResponseObserverExpression(
           break;
         }
       }
+      if (!matchesExpectedConversation()) throw new Error('ChatGPT conversation changed.');
+      ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
       return latest ?? snapshot;
     };
 
@@ -1428,22 +1543,67 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
 function buildCopyExpression(
   meta: { messageId?: string | null; turnId?: string | null },
   expectedConversationId?: string,
+  expectedConversationUrl?: string,
 ): string {
   const expectedConversationLiteral =
     typeof expectedConversationId === "string" && expectedConversationId.trim().length > 0
       ? JSON.stringify(expectedConversationId.trim())
       : "null";
-  return `(() => {
+  const affinityGuard = buildEvaluatedChatGptPageAffinityGuard({
+    expectedConversationId,
+    expectedConversationUrl,
+  });
+  return `${affinityGuard ? "(async () => {" : "(() => {"}
+    ${affinityGuard}
+    ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
     ${buildClickDispatcher()}
     const BUTTON_SELECTOR = '${COPY_BUTTON_SELECTOR}';
     const TIMEOUT_MS = 10000;
     const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
-    const currentConversationId = () => {
-      const currentHref = typeof location === 'object' && location.href ? location.href : '';
-      return currentHref.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] ?? null;
+    const EXPECTED_CONVERSATION_URL = ${JSON.stringify(expectedConversationUrl?.trim() || null)};
+    const CHATGPT_ORIGINS = ${JSON.stringify(CHATGPT_ORIGINS)};
+    const CONVERSATION_PATTERN = /^(?:\\/c|\\/g\\/[^/?#]+\\/(?:project\\/)?c)\\/([a-zA-Z0-9-]+)\\/?$/;
+    const currentConversation = () => {
+      try {
+        const currentUrl = new URL(typeof location === 'object' && location.href ? location.href : '');
+        if (
+          currentUrl.protocol !== 'https:' ||
+          currentUrl.username || currentUrl.password || currentUrl.port ||
+          !CHATGPT_ORIGINS.includes(currentUrl.origin) || currentUrl.search || currentUrl.hash
+        ) return null;
+        const match = CONVERSATION_PATTERN.exec(currentUrl.pathname);
+        if (!match) return null;
+        return {
+          id: match[1],
+          scope: currentUrl.origin + currentUrl.pathname.replace(/\\/$/, ''),
+        };
+      } catch {
+        return null;
+      }
     };
-    const matchesExpectedConversation = () =>
-      !EXPECTED_CONVERSATION_ID || currentConversationId() === EXPECTED_CONVERSATION_ID;
+    const approvedConversationScope = (() => {
+      if (!EXPECTED_CONVERSATION_URL) return null;
+      try {
+        const expectedUrl = new URL(EXPECTED_CONVERSATION_URL);
+        const match = CONVERSATION_PATTERN.exec(expectedUrl.pathname);
+        if (
+          expectedUrl.protocol !== 'https:' ||
+          expectedUrl.username || expectedUrl.password || expectedUrl.port ||
+          !CHATGPT_ORIGINS.includes(expectedUrl.origin) || expectedUrl.search || expectedUrl.hash ||
+          !match || (EXPECTED_CONVERSATION_ID && match[1] !== EXPECTED_CONVERSATION_ID)
+        ) return null;
+        return expectedUrl.origin + expectedUrl.pathname.replace(/\\/$/, '');
+      } catch {
+        return null;
+      }
+    })();
+    const matchesExpectedConversation = () => {
+      const current = currentConversation();
+      if (EXPECTED_CONVERSATION_URL) {
+        return Boolean(current && approvedConversationScope && current.scope === approvedConversationScope);
+      }
+      return !EXPECTED_CONVERSATION_ID || current?.id === EXPECTED_CONVERSATION_ID;
+    };
     if (!matchesExpectedConversation()) {
       return { success: false, status: 'conversation-mismatch' };
     }

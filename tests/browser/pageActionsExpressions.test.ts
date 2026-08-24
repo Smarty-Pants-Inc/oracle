@@ -5,6 +5,7 @@ import {
   buildConversationDebugExpressionForTest,
   buildMarkdownFallbackExtractorForTest,
   buildCopyExpressionForTest,
+  buildResponseObserverExpressionForTest,
   buildUserTurnAttachmentExpressionForTest,
 } from "../../src/browser/pageActions.ts";
 import {
@@ -119,9 +120,30 @@ describe("browser automation expressions", () => {
 
   test("assistant snapshot expression accepts every supported ChatGPT origin", () => {
     const expression = buildAssistantSnapshotExpressionForTest(4, "conv-123");
-    expect(expression).toContain(
-      `const currentConversationId = ${JSON.stringify(CHATGPT_ORIGINS)}.includes(currentPageUrl?.origin)`,
+    expect(expression).toContain(JSON.stringify(CHATGPT_ORIGINS[0]));
+    expect(expression).toContain("currentPageUrl?.protocol === 'https:'");
+    expect(expression).toContain("currentPageUrl.pathname");
+  });
+
+  test("assistant expressions preserve exact conversation origin and project path", () => {
+    const conversationUrl = "https://chat.openai.com/g/team/project/c/conv-123";
+    const snapshot = buildAssistantSnapshotExpressionForTest(
+      4,
+      "conv-123",
+      undefined,
+      conversationUrl,
     );
+    const observer = buildResponseObserverExpressionForTest(5_000, 4, "conv-123", conversationUrl);
+    const copy = buildCopyExpressionForTest({}, "conv-123", conversationUrl);
+    for (const expression of [snapshot, observer, copy]) {
+      expect(expression).toContain(JSON.stringify(conversationUrl));
+      expect(expression).toContain("origin");
+      expect(expression).toContain("pathname");
+      expect(expression).toContain("search");
+      expect(expression).toContain("hash");
+    }
+    expect(observer).toContain("approvedConversationScope");
+    expect(copy).toContain("conversation-mismatch");
   });
 
   test("markdown fallback filters user turns and respects assistant indicators", () => {

@@ -770,15 +770,15 @@ describe("ChatGPT UI warning detection", () => {
           if (expression.includes("const selectors =")) {
             return { result: { value: true } };
           }
-          if (params.awaitPromise) {
+          if (params.awaitPromise && expression.includes("MutationObserver")) {
             responseProbeHydrationStates.push(hydrated);
             if (!reloaded) {
               return new Promise(() => undefined);
             }
             return { result: { type: "object", value: complete } };
           }
-          if (expression.includes("extractAssistantTurn")) {
-            return { result: { value: reloaded ? complete : partial } };
+          if (params.awaitPromise) {
+            return { result: { type: "object", value: reloaded ? complete : partial } };
           }
           if (expression.includes("Find the LAST assistant turn")) {
             return { result: { value: reloaded } };
@@ -1236,6 +1236,8 @@ describe("redactBrowserConfigForDebugLogForTest", () => {
       browserTabRef: "tab-secret",
       resumeConversationUrl: "https://chatgpt.com/g/private/project/c/private-thread",
       debug: true,
+      metadata: { sessionToken: "nested-session-secret", safe: "visible" },
+      nested: { cookies: { value: "nested-cookie-secret" }, token: "nested-token-secret" },
     });
 
     expect(redacted).toMatchObject({
@@ -1251,6 +1253,8 @@ describe("redactBrowserConfigForDebugLogForTest", () => {
       browserTabRef: true,
       resumeConversationUrl: true,
       debug: true,
+      metadata: { sessionToken: true, safe: "visible" },
+      nested: { cookies: true, token: true },
     });
     const serialized = JSON.stringify(redacted);
     for (const secret of [
@@ -1260,6 +1264,9 @@ describe("redactBrowserConfigForDebugLogForTest", () => {
       "owner@example.com",
       "/private/profile/root",
       "private-thread",
+      "nested-session-secret",
+      "nested-cookie-secret",
+      "nested-token-secret",
     ]) {
       expect(serialized).not.toContain(secret);
     }

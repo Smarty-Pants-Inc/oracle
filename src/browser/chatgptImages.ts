@@ -234,6 +234,7 @@ async function readAssistantGeneratedImagesWithFallback(
       undefined,
       expectedConversationId,
       expectedAccountDigest,
+      expectedConversationUrl,
     );
   } catch (error) {
     if (expectedConversationId || expectedConversationUrl || expectedAccountDigest) throw error;
@@ -318,7 +319,6 @@ function sanitizeGeneratedImageStem(value: string): string {
     .replace(/^-|-$/g, "")
     .slice(0, 48);
 }
-
 function resolveDefaultGeneratedImagePath(
   images: BrowserGeneratedImage[],
   sessionId?: string,
@@ -333,12 +333,73 @@ function resolveDefaultGeneratedImagePath(
   return path.join(baseDir, `${stem}${uniqueSuffix}.png`);
 }
 
-async function buildCookieHeader(Network: ChromeClient["Network"]): Promise<string> {
-  const response = await Network.getCookies({ urls: ["https://chatgpt.com/"] });
+const GENERATED_IMAGE_REDIRECT_LIMIT = 5;
+
+async function buildCookieHeader(
+  Network: ChromeClient["Network"],
+  downloadUrl: string,
+): Promise<string> {
+  const response = await Network.getCookies({ urls: [downloadUrl] });
   return (response.cookies ?? [])
     .filter((cookie) => cookie.name && typeof cookie.value === "string")
     .map((cookie) => `${cookie.name}=${cookie.value}`)
     .join("; ");
+}
+
+function shouldSendGeneratedImageCookies(url: URL): boolean {
+  return (
+    url.protocol === "https:" &&
+    !url.port &&
+    isAllowedChatGptHost(url.hostname) &&
+    url.pathname === "/backend-api/estuary/content" &&
+    (url.searchParams.get("id") ?? "").startsWith("file_")
+  );
+}
+
+function validateGeneratedImageFinalUrl(value: string): string {
+  const url = new URL(value);
+  if (url.protocol !== "https:" || url.username || url.password || url.port) {
+    throw new Error(`generated image redirect rejected: ${url.protocol}`);
+  }
+  return url.href;
+}
+
+async function fetchGeneratedImageWithNode(
+  imageUrl: string,
+  getCookieHeader: (url: string) => Promise<string>,
+  assertPageAffinity?: (action: string) => Promise<void>,
+): Promise<{ buffer: Buffer; contentType: string | null; finalUrl: string }> {
+  let currentUrl = new URL(imageUrl);
+  for (let redirects = 0; redirects <= GENERATED_IMAGE_REDIRECT_LIMIT; redirects += 1) {
+    const headers: Record<string, string> = { "user-agent": "Mozilla/5.0" };
+    if (shouldSendGeneratedImageCookies(currentUrl)) {
+      const cookieHeader = await getCookieHeader(currentUrl.href);
+      if (!cookieHeader) throw new Error("Missing ChatGPT cookies for image download.");
+      headers.cookie = cookieHeader;
+    }
+    await assertPageAffinity?.("generated image download");
+    const response = await fetch(currentUrl, { headers, redirect: "manual" });
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location) throw new Error("generated image redirect missing location");
+      const redirectedUrl = new URL(location, currentUrl);
+      if (redirectedUrl.protocol !== "https:") {
+        throw new Error(`generated image redirect rejected: ${redirectedUrl.protocol}`);
+      }
+      currentUrl = redirectedUrl;
+      continue;
+    }
+    if (!response.ok) {
+      throw new Error(`download failed: ${response.status} ${response.statusText}`);
+    }
+    const finalUrl = validateGeneratedImageFinalUrl(response.url || currentUrl.href);
+    return {
+      buffer: Buffer.from(await response.arrayBuffer()),
+      contentType: response.headers.get("content-type"),
+      finalUrl,
+    };
+  }
+  throw new Error(`generated image download exceeded ${GENERATED_IMAGE_REDIRECT_LIMIT} redirects`);
 }
 
 async function fetchGeneratedImageInBrowserContext(
@@ -358,8 +419,26 @@ async function fetchGeneratedImageInBrowserContext(
   const expression = `${affinityGuard ? "(async () => {" : "(async () => {"}
     ${affinityGuard}
     ${affinityGuard ? "await assertOracleChatGptPageAffinity();" : ""}
-    const url = ${JSON.stringify(url)};
-    const response = await fetch(url, { credentials: 'include', redirect: 'follow' });
+    const requestedUrl = new URL(url);
+    const response = await fetch(url, { credentials: 'include', redirect: 'manual' });
+    if (
+      (response.status >= 300 && response.status < 400) ||
+      response.type === 'opaqueredirect'
+    ) {
+      throw new Error('generated image redirect rejected');
+    }
+    const finalUrl = new URL(response.url || url);
+    if (
+      finalUrl.protocol !== 'https:' ||
+      finalUrl.username ||
+      finalUrl.password ||
+      finalUrl.port ||
+      finalUrl.origin !== requestedUrl.origin ||
+      finalUrl.pathname !== requestedUrl.pathname ||
+      finalUrl.search !== requestedUrl.search
+    ) {
+      throw new Error('generated image redirect rejected');
+    }
     const contentType = response.headers.get('content-type') || '';
     const buffer = await response.arrayBuffer();
     const bytes = new Uint8Array(buffer);
@@ -373,7 +452,7 @@ async function fetchGeneratedImageInBrowserContext(
       status: response.status,
       statusText: response.statusText,
       contentType,
-      finalUrl: response.url,
+      finalUrl: finalUrl.href,
       b64: btoa(binary),
     };
   })()`;
@@ -461,18 +540,16 @@ export async function saveChatGptGeneratedImages(params: {
   const { Network, Runtime, images, outputPath, logger } = params;
   if (!images.length) return { saved: false, imageCount: 0, savedImages: [], errors: [] };
 
-  await params.assertPageAffinity?.("generated image cookie read");
-
-  const cookieHeader = await buildCookieHeader(Network);
-  if (!cookieHeader) {
-    await params.assertPageAffinity?.("generated image artifact final return");
-    return {
-      saved: false,
-      imageCount: images.length,
-      savedImages: [],
-      errors: ["Missing ChatGPT cookies for image download."],
-    };
-  }
+  const cookieHeaders = new Map<string, string>();
+  const getCookieHeader = async (downloadUrl: string) => {
+    const origin = new URL(downloadUrl).origin;
+    const cached = cookieHeaders.get(origin);
+    if (cached !== undefined) return cached;
+    await params.assertPageAffinity?.("generated image cookie read");
+    const cookieHeader = await buildCookieHeader(Network, downloadUrl);
+    cookieHeaders.set(origin, cookieHeader);
+    return cookieHeader;
+  };
 
   const resolvedOutputPath = path.resolve(outputPath);
   const stagingDir = await createGeneratedImageStagingDir(resolvedOutputPath);
@@ -493,23 +570,16 @@ export async function saveChatGptGeneratedImages(params: {
         }
         finalUrl = imageUrl;
         try {
-          const response = await fetch(imageUrl, {
-            headers: {
-              cookie: cookieHeader,
-              "user-agent": "Mozilla/5.0",
-            },
-            redirect: "follow",
-          });
-          if (!response.ok) {
-            throw new Error(`download failed: ${response.status} ${response.statusText}`);
-          }
-          contentType = response.headers.get("content-type");
-          finalUrl = response.url;
-          buffer = Buffer.from(await response.arrayBuffer());
+          const nodeFetch = await fetchGeneratedImageWithNode(
+            imageUrl,
+            getCookieHeader,
+            params.assertPageAffinity,
+          );
+          contentType = nodeFetch.contentType;
+          finalUrl = nodeFetch.finalUrl;
+          buffer = nodeFetch.buffer;
         } catch (downloadError) {
-          if (!Runtime) {
-            throw downloadError;
-          }
+          if (!Runtime) throw downloadError;
           const message =
             downloadError instanceof Error ? downloadError.message : String(downloadError);
           logger?.(
@@ -524,7 +594,7 @@ export async function saveChatGptGeneratedImages(params: {
             params.expectedConversationUrl,
           );
           contentType = browserFetch.contentType;
-          finalUrl = browserFetch.finalUrl;
+          finalUrl = validateGeneratedImageFinalUrl(browserFetch.finalUrl);
           buffer = browserFetch.buffer;
         }
       } catch (error) {
@@ -770,6 +840,7 @@ export async function collectGeneratedImageArtifacts(params: {
           params.minTurnIndex ?? undefined,
           params.expectedConversationId,
           params.expectedAccountDigest,
+          params.expectedConversationUrl,
         );
       } catch (error) {
         if (

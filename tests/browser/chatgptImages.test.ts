@@ -316,6 +316,91 @@ describe("saveChatGptGeneratedImages", () => {
     );
   });
 
+  test("reads cookies for each ChatGPT origin instead of reusing the primary origin", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-images-origins-"));
+    const cookieUrls: string[] = [];
+    const network = {
+      getCookies: vi.fn(async ({ urls }: { urls?: string[] }) => {
+        cookieUrls.push(String(urls?.[0] ?? ""));
+        return { cookies: [{ name: "session", value: urls?.[0] ?? "" }] };
+      }),
+    } as unknown as ChromeClient["Network"];
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => ({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      url: String(input),
+      headers: { get: (name: string) => (name === "content-type" ? "image/png" : null) },
+      arrayBuffer: async () => Uint8Array.from([1, 2, 3]).buffer,
+    })) as unknown as typeof fetch;
+
+    try {
+      await expect(
+        saveChatGptGeneratedImages({
+          Network: network,
+          images: [
+            { url: "https://chat.openai.com/backend-api/estuary/content?id=file_legacy" },
+            { url: "https://chatgpt.com/backend-api/estuary/content?id=file_primary" },
+          ],
+          outputPath: path.join(tmpDir, "generated.png"),
+        }),
+      ).resolves.toMatchObject({ saved: true, imageCount: 2 });
+      expect(cookieUrls).toEqual([
+        "https://chat.openai.com/backend-api/estuary/content?id=file_legacy",
+        "https://chatgpt.com/backend-api/estuary/content?id=file_primary",
+      ]);
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("strips cookies after an image endpoint redirects to an external HTTPS CDN", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-images-redirect-"));
+    const requests: Array<{ url: string; cookie?: string }> = [];
+    const network = {
+      getCookies: vi.fn().mockResolvedValue({ cookies: [{ name: "session", value: "secret" }] }),
+    } as unknown as ChromeClient["Network"];
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push({
+        url: String(input),
+        cookie: (init?.headers as Record<string, string>)?.cookie,
+      });
+      if (requests.length === 1) {
+        return {
+          ok: false,
+          status: 302,
+          statusText: "Found",
+          url: String(input),
+          headers: {
+            get: (name: string) => (name === "location" ? "https://cdn.example/image.png" : null),
+          },
+        } as Response;
+      }
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        url: String(input),
+        headers: { get: (name: string) => (name === "content-type" ? "image/png" : null) },
+        arrayBuffer: async () => Uint8Array.from([4, 5, 6]).buffer,
+      } as Response;
+    }) as typeof fetch;
+
+    try {
+      await expect(
+        saveChatGptGeneratedImages({
+          Network: network,
+          images: [{ url: "https://chatgpt.com/backend-api/estuary/content?id=file_redirect" }],
+          outputPath: path.join(tmpDir, "generated.png"),
+        }),
+      ).resolves.toMatchObject({ saved: true });
+      expect(requests[0]?.cookie).toBe("session=secret");
+      expect(requests[1]?.cookie).toBeUndefined();
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   test("returns published images when a later image target cannot be replaced", async () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-images-partial-"));
     const outputPath = path.join(tmpDir, "generated.png");
