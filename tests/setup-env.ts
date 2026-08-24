@@ -11,3 +11,10 @@ process.env.ORACLE_HOME_DIR ||= path.join(os.tmpdir(), `oracle-tests-${process.p
 delete process.env.ORACLE_ENGINE;
 delete process.env.ORACLE_REMOTE_HOST;
 delete process.env.ORACLE_REMOTE_TOKEN;
+delete process.env.ORACLE_WRAPPER_REMOTE_ONLY;
+delete process.env.ORACLE_WRAPPER_INVOCATION_ORIGIN;
+delete process.env.ORACLE_WRAPPER_EXPECTED_ACCOUNT_EMAIL;
+delete process.env.ORACLE_WRAPPER_USER_ACCOUNT_EMAIL;
+delete process.env.ORACLE_WRAPPER_USER_WORKSPACE_NAME;
+delete process.env.ORACLE_WRAPPER_AGENT_ACCOUNT_EMAIL;
+delete process.env.ORACLE_WRAPPER_AGENT_WORKSPACE_NAME;

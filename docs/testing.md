@@ -1,8 +1,7 @@
 # Testing quickstart
 
 - Static and unit checks: `pnpm check` and `pnpm test`.
-- Deterministic main-Chrome router coverage:
-  `pnpm vitest run tests/browser/openBrowserUse.test.ts tests/browser/chatgptAccountRouter.test.ts tests/browser/conversationTurns.test.ts tests/browser/reattach.test.ts tests/browser/liveTabs.test.ts tests/cli/followup.test.ts tests/cli/chatgptExport.test.ts tests/cli/chatgptExportCommand.test.ts tests/cli/browserTabs.test.ts tests/cli/browserTabsObu.test.ts tests/cli/browserTabsRecover.test.ts tests/oracle/agentDiagnostics.test.ts`.
+  `pnpm vitest run tests/browser/openBrowserUse.test.ts tests/browser/profileState.test.ts tests/browser/chatgptAccountRouter.test.ts tests/browser/conversationTurns.test.ts tests/browser/reattach.test.ts tests/browser/liveTabs.test.ts tests/browser/chatgptExport.test.ts tests/browser/chromeLifecycle.test.ts tests/cli/followup.test.ts tests/cli/chatgptExport.test.ts tests/cli/chatgptExportCommand.test.ts tests/cli/browserTabs.test.ts tests/cli/browserTabsObu.test.ts tests/cli/browserTabsRecover.test.ts tests/oracle/agentDiagnostics.test.ts`.
 - `pnpm test:browser` is the legacy isolated Chrome/CDP smoke. It sends live
   ChatGPT prompts and does not validate the wrapper-routed main-Chrome path. Run
   it only with explicit approval for those model turns.

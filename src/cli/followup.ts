@@ -8,6 +8,8 @@ import {
   hasStoredOpenBrowserUseAffinity,
   resolveStoredOpenBrowserUseAffinity,
 } from "../browser/openBrowserUse.js";
+import { assertWrapperChatGptRoute } from "../wrapperRoute.js";
+
 import { DEFAULT_MODEL } from "../oracle/config.js";
 import type { ModelName } from "../oracle/types.js";
 import type { BrowserTurnBinding } from "../browser/types.js";
@@ -163,30 +165,34 @@ export async function resolveBrowserFollowupReference(
       typeof storedModel === "string" && storedModel.startsWith("gpt-")
         ? (storedModel as ModelName)
         : DEFAULT_MODEL;
+    const browserConfig: BrowserSessionConfig = {
+      ...storedBrowserConfig,
+      ...optionsBrowserConfig,
+      browserTransport: "obu",
+      obuSessionId: affinity.sessionId,
+      obuTabId: affinity.tabId,
+      chatGptAccountEmail: affinity.email,
+      chatGptWorkspaceName: affinity.workspaceName,
+      chatGptAccountDigest: affinity.accountDigest,
+      chatGptWorkspaceDigest: affinity.workspaceDigest,
+      remoteChrome: null,
+      remoteChromeBrowserId: null,
+      remoteChromeBrowserWSEndpoint: null,
+      browserTabRef: null,
+      resumeConversationUrl: affinity.conversationUrl,
+      researchMode: "off",
+      archiveConversations: "never",
+      resumeTurnBinding,
+    };
+    if (process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" && requestOrigin) {
+      assertWrapperChatGptRoute(requestOrigin, browserConfig);
+    }
     return {
       sessionId: metadata.id,
       resumeConversationUrl: affinity.conversationUrl,
       model,
       ...(requestOrigin ? { requestOrigin } : {}),
-      browserConfig: {
-        ...storedBrowserConfig,
-        ...optionsBrowserConfig,
-        browserTransport: "obu",
-        obuSessionId: affinity.sessionId,
-        obuTabId: affinity.tabId,
-        chatGptAccountEmail: affinity.email,
-        chatGptWorkspaceName: affinity.workspaceName,
-        chatGptAccountDigest: affinity.accountDigest,
-        chatGptWorkspaceDigest: affinity.workspaceDigest,
-        remoteChrome: null,
-        remoteChromeBrowserId: null,
-        remoteChromeBrowserWSEndpoint: null,
-        browserTabRef: null,
-        resumeConversationUrl: affinity.conversationUrl,
-        researchMode: "off",
-        archiveConversations: "never",
-        resumeTurnBinding,
-      },
+      browserConfig,
     };
   }
   const optionsTransport = optionsBrowserConfig?.browserTransport;
@@ -305,20 +311,28 @@ export async function resolveBrowserFollowupReference(
     typeof storedModel === "string" && storedModel.startsWith("gpt-")
       ? (storedModel as ModelName)
       : DEFAULT_MODEL;
+  const browserConfig: BrowserSessionConfig = {
+    ...parentBrowserConfig,
+    ...(remoteChromeBrowserId && remoteChromeBrowserWSEndpoint && remoteChromeAccountDigest
+      ? { remoteChromeBrowserId, remoteChromeBrowserWSEndpoint, remoteChromeAccountDigest }
+      : {}),
+    browserTabRef: null,
+    resumeConversationUrl,
+    researchMode: "off",
+    archiveConversations: "never",
+  };
+  if (
+    process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" &&
+    requestOrigin &&
+    browserConfig.browserTransport === "obu"
+  ) {
+    assertWrapperChatGptRoute(requestOrigin, browserConfig);
+  }
   return {
     sessionId: metadata.id,
     resumeConversationUrl,
     model,
     ...(requestOrigin ? { requestOrigin } : {}),
-    browserConfig: {
-      ...parentBrowserConfig,
-      ...(remoteChromeBrowserId && remoteChromeBrowserWSEndpoint && remoteChromeAccountDigest
-        ? { remoteChromeBrowserId, remoteChromeBrowserWSEndpoint, remoteChromeAccountDigest }
-        : {}),
-      browserTabRef: null,
-      resumeConversationUrl,
-      researchMode: "off",
-      archiveConversations: "never",
-    },
+    browserConfig,
   };
 }

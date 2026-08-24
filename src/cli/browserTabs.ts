@@ -642,9 +642,40 @@ async function openOpenBrowserUseHarvestContext(
   });
   let connection: Awaited<ReturnType<typeof connectOpenBrowserUseTab>> | null = null;
   let connectionReady: ReturnType<typeof connectOpenBrowserUseTab> | null = null;
+  let lockUncertain = false;
+  const markLockUncertain = async (reason: string, error?: unknown): Promise<void> => {
+    lockUncertain = true;
+    const details = error instanceof BrowserAutomationError ? error.details : undefined;
+    const candidate = details?.recoveryHandle;
+    const recoveryHandle =
+      candidate && typeof candidate === "object" && !Array.isArray(candidate)
+        ? (candidate as Record<string, unknown>)
+        : connection
+          ? {
+              transport: "obu",
+              sessionId: connection.sessionId,
+              tabId: connection.tabId,
+              conversationUrl: connection.tabUrl ?? null,
+            }
+          : undefined;
+    try {
+      await lock.markUncertain?.({
+        reason,
+        ...(recoveryHandle ? { recoveryHandle } : {}),
+      });
+    } catch (markError) {
+      logger(
+        `[browser] Failed to persist uncertain harvest lock state: ${markError instanceof Error ? markError.message : String(markError)}`,
+      );
+    }
+  };
   const removeTerminationHooks = registerOpenBrowserUseTerminationHooks({
     connection: () => connection ?? connectionReady,
+    preserveTab: () => {
+      connection?.requestKeepTab?.();
+    },
     releaseLock: () => lock.release(),
+    markLockUncertain: (details) => lock.markUncertain?.(details),
     logger,
   });
   try {
@@ -698,22 +729,30 @@ async function openOpenBrowserUseHarvestContext(
         freshMeta.options.browserConfig?.inputTimeoutMs ??
         30_000,
       close: async (keepTab: boolean) => {
-        removeTerminationHooks();
+        if (keepTab) connection?.requestKeepTab?.();
+        await removeTerminationHooks.waitForDrain();
         let finalizeFailure: unknown;
         try {
-          await connection?.finalize(keepTab);
+          await connection?.finalize(keepTab || removeTerminationHooks.isTerminating());
         } catch (error) {
           finalizeFailure = error;
+          await markLockUncertain("Main-Chrome harvest tab finalization was inconclusive.", error);
+        } finally {
+          await removeTerminationHooks.waitForDrain();
+          removeTerminationHooks();
+          if (!removeTerminationHooks.isLockUncertain() && !lockUncertain) {
+            await lock.release().catch(() => undefined);
+          }
         }
-        await lock.release().catch(() => undefined);
         if (finalizeFailure) throw finalizeFailure;
       },
     };
   } catch (error) {
-    removeTerminationHooks();
+    await removeTerminationHooks.waitForDrain();
     try {
-      await connection?.finalize(false);
+      await connection?.finalize(removeTerminationHooks.isTerminating());
     } catch (cleanupError) {
+      await markLockUncertain("Main-Chrome harvest cleanup was inconclusive.", cleanupError);
       if (error instanceof BrowserAutomationError && error.details) {
         (error.details as Record<string, unknown>).cleanupFailure =
           cleanupError instanceof BrowserAutomationError
@@ -723,8 +762,13 @@ async function openOpenBrowserUseHarvestContext(
                   cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
               };
       }
+    } finally {
+      await removeTerminationHooks.waitForDrain();
+      removeTerminationHooks();
+      if (!removeTerminationHooks.isLockUncertain() && !lockUncertain) {
+        await lock.release().catch(() => undefined);
+      }
     }
-    await lock.release().catch(() => undefined);
     throw error;
   }
 }

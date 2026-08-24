@@ -198,7 +198,7 @@ function buildArchiveConversationExpression({
     const expectedProjectKey = ${JSON.stringify(expectedProjectKey)};
     const expectedAccountDigest = ${JSON.stringify(expectedAccountDigest ?? null)};
     const expectedWorkspaceDigest = ${JSON.stringify(expectedWorkspaceDigest ?? null)};
-    let conversationUrl = typeof location === 'object' ? location.href : null;
+    const conversationUrl = typeof location === 'object' ? location.href : null;
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     const normalize = (value) =>
       String(value ?? '')
@@ -241,9 +241,9 @@ function buildArchiveConversationExpression({
         (expectedAccountDigest && identity.accountDigest !== expectedAccountDigest) ||
         (expectedWorkspaceDigest && identity.workspaceDigest !== expectedWorkspaceDigest)
       ) return false;
-      conversationUrl = typeof location === 'object' ? location.href : null;
+      const currentConversationUrl = typeof location === 'object' ? location.href : null;
       try {
-        const currentUrl = new URL(conversationUrl);
+        const currentUrl = new URL(currentConversationUrl);
         const project = new RegExp('^/g/([^/?#]+)/c/([^/?#]+)/?$').exec(currentUrl.pathname);
         const root = new RegExp('^/c/([^/?#]+)/?$').exec(currentUrl.pathname);
         const conversationId = project?.[2] || root?.[1] || null;
@@ -253,6 +253,8 @@ function buildArchiveConversationExpression({
           !currentUrl.username &&
           !currentUrl.password &&
           !currentUrl.pathname.includes('%') &&
+          !currentUrl.search &&
+          !currentUrl.hash &&
           conversationId === expectedConversationId &&
           projectKey === expectedProjectKey
         );
@@ -423,15 +425,19 @@ function buildArchiveConversationExpression({
 	        visibleText.includes('archiwum')
 	      );
 	    };
-	    const waitForArchiveConfirmation = async () => {
-	      const deadline = Date.now() + 10_000;
-	      while (Date.now() < deadline) {
-	        if (conversationUrl && location.href !== conversationUrl) return true;
-	        if (hasArchiveConfirmation()) return true;
-	        await sleep(150);
-	      }
-	      return false;
-	    };
+    const waitForArchiveConfirmation = async () => {
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        if (
+          conversationUrl &&
+          location.href !== conversationUrl &&
+          !(await hasExpectedAffinity())
+        ) return false;
+        if (hasArchiveConfirmation()) return true;
+        await sleep(150);
+      }
+      return false;
+    };
     const verifyArchivedStateFromMenu = async () => {
       const menuButton = findConversationMenuButton();
       if (!menuButton) return false;

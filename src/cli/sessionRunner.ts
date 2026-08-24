@@ -142,6 +142,7 @@ export async function performSessionRun({
         {
           runOptions: { ...runOptions, sessionId: runOptions.sessionId ?? sessionMeta.id },
           browserConfig,
+          requestOrigin: sessionMeta.requestOrigin,
           cwd,
           log,
         },

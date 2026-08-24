@@ -146,6 +146,41 @@ describe("runBrowserSessionExecution", () => {
       }),
     );
   });
+  test("passes stored request origin to executeBrowser", async () => {
+    const executeBrowser = vi.fn(async () => ({
+      answerText: "ok",
+      answerMarkdown: "ok",
+      tookMs: 1000,
+      answerTokens: 12,
+      answerChars: 20,
+    }));
+    await runBrowserSessionExecution(
+      {
+        runOptions: baseRunOptions,
+        browserConfig: {},
+        requestOrigin: "agent",
+        cwd: "/repo",
+        log: vi.fn(),
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 42,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser,
+      },
+    );
+    expect(executeBrowser).toHaveBeenCalledWith(
+      expect.objectContaining({ requestOrigin: "agent" }),
+    );
+  });
 
   test("logs and returns browser model selection evidence", async () => {
     const log = vi.fn();

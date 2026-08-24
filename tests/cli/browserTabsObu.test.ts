@@ -187,6 +187,51 @@ describe("main-Chrome harvest recovery", () => {
     });
     expect(meta.error?.message).toBe("primary run failed");
   });
+  test("retains the lock when harvest tab finalization is inconclusive", async () => {
+    const meta = obuSession();
+    const release = vi.fn(async () => {});
+    const markUncertain = vi.fn(async () => {});
+    const finalize = vi.fn().mockRejectedValue(
+      new BrowserAutomationError("Harvest tab finalization failed.", {
+        stage: "open-browser-use",
+        code: "tab-finalize-failed",
+        recoveryHandle: { transport: "obu", sessionId: "recovered-session", tabId: 8 },
+      }),
+    );
+    mocks.acquireOpenBrowserUseRunLock.mockResolvedValueOnce({
+      path: "/tmp/oracle.lock",
+      lockId: "lock-1",
+      release,
+      markUncertain,
+    });
+    mocks.readSession.mockResolvedValue(meta);
+    mocks.connectOpenBrowserUseTab.mockResolvedValue({
+      client: {},
+      obuClient: {},
+      sessionId: "recovered-session",
+      tabId: 8,
+      tabUrl: conversationUrl,
+      created: true,
+      finalize,
+    } as unknown as OpenBrowserUseConnection);
+
+    await expect(
+      harvestSessionBrowserOutput(meta.id, { quietOutput: true }),
+    ).resolves.toMatchObject({ conversationId: "obu-thread", state: "completed" });
+    expect(finalize).toHaveBeenCalledWith(false);
+    expect(markUncertain).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: expect.stringMatching(/finalization was inconclusive/i) }),
+    );
+    expect(release).not.toHaveBeenCalled();
+    expect(
+      mocks.updateSession.mock.calls.some(([, patch]) => {
+        const update = patch as Partial<SessionMetadata>;
+        return update.browser?.warnings?.some(
+          (warning) => warning.code === "obu-tab-finalize-failed",
+        );
+      }),
+    ).toBe(true);
+  });
 
   test("waits for a recovered conversation to hydrate before closing it", async () => {
     vi.useFakeTimers();

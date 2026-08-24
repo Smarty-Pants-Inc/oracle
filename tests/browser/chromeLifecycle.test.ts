@@ -492,6 +492,84 @@ describe("closeBlankChromeTabs", () => {
       }
     ).send("Target.setAutoAttach", { autoAttach: true }, "session-9");
     expect(send).toHaveBeenCalledWith("Target.setAutoAttach", { autoAttach: true }, "session-9");
+    await connection.close();
+    expect(browserClient.Target.detachFromTarget).toHaveBeenCalledWith({ sessionId: "session-9" });
+    expect(browserClient.Target.closeTarget).toHaveBeenCalledWith({ targetId: "target-9" });
+    expect(browserClient.close).toHaveBeenCalledTimes(1);
+  });
+
+  test("closes a newly created websocket target when attachment fails", async () => {
+    const browserClient = {
+      Target: {
+        createTarget: vi.fn(async () => ({ targetId: "target-failed-attach" })),
+        attachToTarget: vi.fn(async () => {
+          throw new Error("attach failed");
+        }),
+        closeTarget: vi.fn(async () => ({ success: true })),
+      },
+      close: vi.fn(async () => {}),
+      on: vi.fn(),
+      once: vi.fn(),
+      removeListener: vi.fn(),
+    };
+    const logger = vi.fn() as unknown as import("../../src/browser/types.js").BrowserLogger;
+    cdpMock.mockResolvedValue(browserClient);
+    const { connectToRemoteChromeTarget } = await import("../../src/browser/chromeLifecycle.js");
+
+    await expect(
+      connectToRemoteChromeTarget("127.0.0.1", 9222, logger, {
+        browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+        targetUrl: "https://chatgpt.com/",
+      }),
+    ).rejects.toThrow("attach failed");
+
+    expect(browserClient.Target.closeTarget).toHaveBeenCalledWith({
+      targetId: "target-failed-attach",
+    });
+    expect(browserClient.close).toHaveBeenCalledTimes(1);
+  });
+  test("surfaces remote target cleanup residue with a CDP recovery handle", async () => {
+    const browserClient = {
+      Target: {
+        createTarget: vi.fn(async () => ({ targetId: "target-cleanup-residue" })),
+        attachToTarget: vi.fn(async () => {
+          throw new Error("attach failed");
+        }),
+        closeTarget: vi.fn(async () => {
+          throw new Error("target close failed");
+        }),
+      },
+      close: vi.fn(async () => {
+        throw new Error("browser close failed");
+      }),
+      on: vi.fn(),
+      once: vi.fn(),
+      removeListener: vi.fn(),
+    };
+    cdpMock.mockResolvedValue(browserClient);
+    const { connectToRemoteChromeTarget } = await import("../../src/browser/chromeLifecycle.js");
+
+    await expect(
+      connectToRemoteChromeTarget("127.0.0.1", 9222, vi.fn() as never, {
+        browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+        targetUrl: "https://chatgpt.com/",
+      }),
+    ).rejects.toMatchObject({
+      name: "BrowserAutomationError",
+      details: {
+        stage: "chrome-lifecycle",
+        code: "remote-target-attach-cleanup-failed",
+        cleanupFailure: {
+          target: "target close failed",
+          browser: "browser close failed",
+        },
+        recoveryHandle: {
+          transport: "cdp",
+          browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+          targetId: "target-cleanup-residue",
+        },
+      },
+    });
   });
 
   test("waits on a single websocket connection attempt for Chrome approval", async () => {
@@ -743,5 +821,25 @@ describe("closeTab", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+describe("closeRemoteChromeTarget", () => {
+  beforeEach(() => {
+    cdpCloseMock.mockReset();
+  });
+
+  test("surfaces close failures in strict mode", async () => {
+    cdpCloseMock.mockRejectedValue(new Error("target close failed"));
+    const { closeRemoteChromeTarget } = await import("../../src/browser/chromeLifecycle.js");
+
+    await expect(
+      closeRemoteChromeTarget(
+        "127.0.0.1",
+        9222,
+        "recovery-target",
+        vi.fn<(message: string) => void>(),
+        { throwOnFailure: true },
+      ),
+    ).rejects.toThrow("target close failed");
   });
 });

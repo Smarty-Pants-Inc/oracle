@@ -121,8 +121,8 @@ describe("ChatGPT export endpoint affinity", () => {
     ).toThrow(/conflicting stored browser affinities/i);
   });
 
-  test("matches a root target URL to project conversation evidence", () => {
-    expect(
+  test("rejects a root target URL against project conversation evidence", () => {
+    expect(() =>
       resolveChatGptExportRemoteChrome("https://chatgpt.com/c/thread-1", [
         session("project", {
           config: {
@@ -131,7 +131,7 @@ describe("ChatGPT export endpoint affinity", () => {
           },
         }),
       ]),
-    ).toEqual(affinity("127.0.0.1", 9223, "browser-a"));
+    ).toThrow(/conversation affinity is conflicting/i);
   });
 
   test("matches stored conversation ids when no conversation URL is available", () => {
@@ -144,19 +144,32 @@ describe("ChatGPT export endpoint affinity", () => {
       ]),
     ).toEqual(affinity("127.0.0.1", 9228, "browser-a"));
   });
+  test("does not match a project target from root-scoped or id-only affinity", () => {
+    expect(() =>
+      resolveChatGptExportRemoteChrome("https://chatgpt.com/g/g-project/c/thread-id-only", [
+        session("root-or-id-only", {
+          runtime: { conversationId: "thread-id-only" },
+          config: {
+            ...config("127.0.0.1", 9228, "browser-a"),
+            url: "https://chatgpt.com/c/thread-id-only",
+          },
+        }),
+      ]),
+    ).toThrow(/no stored browser session matches/i);
+  });
 
   test("deduplicates a parent and follow-up stored on the same browser affinity", () => {
     const browserConfig = config("127.0.0.1", 9224, "browser-a");
     expect(
       resolveChatGptExportRemoteChrome("https://chatgpt.com/g/g-project/c/thread-2", [
         session("parent", {
-          harvest: { url: "https://chatgpt.com/c/thread-2" },
+          harvest: { url: "https://chatgpt.com/g/g-project/c/thread-2" },
           config: browserConfig,
         }),
         session(
           "follow-up",
           { config: browserConfig },
-          { browserResumeConversationUrl: "https://chatgpt.com/c/thread-2" },
+          { browserResumeConversationUrl: "https://chatgpt.com/g/g-project/c/thread-2" },
         ),
       ]),
     ).toEqual(affinity("127.0.0.1", 9224, "browser-a"));

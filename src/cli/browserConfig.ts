@@ -20,6 +20,8 @@ import {
   resolveRemoteChromeBrowserIdentity,
 } from "../browser/profileState.js";
 
+import { assertWrapperChatGptRouteFromEnvironment } from "../wrapperRoute.js";
+
 const DEFAULT_BROWSER_TIMEOUT_MS = 1_200_000;
 const DEFAULT_BROWSER_INPUT_TIMEOUT_MS = 60_000;
 const DEFAULT_BROWSER_ATTACHMENT_TIMEOUT_MS = 45_000;
@@ -204,6 +206,13 @@ export async function buildBrowserConfig(
     }
   } else if (obuOptionUsed) {
     throw new Error("Open Browser Use routing flags require --browser-transport obu.");
+  }
+  if (browserTransport === "obu") {
+    assertWrapperChatGptRouteFromEnvironment({
+      browserTransport,
+      chatGptAccountEmail,
+      chatGptWorkspaceName,
+    });
   }
   if (obuTabId != null && (!Number.isInteger(obuTabId) || obuTabId <= 0)) {
     throw new Error("--browser-obu-tab-id must be a positive integer.");

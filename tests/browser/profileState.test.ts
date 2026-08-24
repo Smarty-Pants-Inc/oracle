@@ -234,6 +234,28 @@ describe("profileState", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+  test("fences an uncertain profile lock from automatic recovery", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-uncertain-"));
+    try {
+      const lock = await profileState.acquireProfileRunLock(dir, { timeoutMs: 500, pollMs: 25 });
+      expect(lock?.markUncertain).toBeTypeOf("function");
+      const lockPath = path.join(dir, "oracle-automation.lock");
+      await lock?.markUncertain?.({
+        reason: "native host finalization timed out",
+        recoveryHandle: { transport: "obu", sessionId: "session-1", tabId: 7 },
+      });
+      const record = JSON.parse(await readFile(lockPath, "utf8")) as Record<string, unknown>;
+      expect(record).toMatchObject({ phase: "uncertain" });
+      await lock?.release();
+      expect(existsSync(lockPath)).toBe(true);
+      await expect(
+        profileState.acquireProfileRunLock(dir, { timeoutMs: 100, pollMs: 25 }),
+      ).rejects.toThrow(/remains uncertain.*recover it explicitly/i);
+      expect(existsSync(lockPath)).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 
   test("clears stale profile lock when pid is dead", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-"));
@@ -252,6 +274,31 @@ describe("profileState", () => {
       expect(lock).not.toBeNull();
       await lock?.release();
       expect(existsSync(lockPath)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+  test("refuses automatic recovery of a dead controller lock when transport state is unknown", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-profile-obu-dead-owner-"));
+    const lockPath = path.join(dir, "oracle-automation.lock");
+    const payload = {
+      pid: 2_147_000_000,
+      lockId: "obu-uncertain-owner",
+      createdAt: new Date().toISOString(),
+      phase: "active",
+      sessionId: "obu-session",
+    };
+    try {
+      await writeFile(lockPath, JSON.stringify(payload));
+      await expect(
+        profileState.acquireProfileRunLock(dir, {
+          timeoutMs: 100,
+          pollMs: 25,
+          reclaimDeadOwner: false,
+          sessionId: "replacement",
+        }),
+      ).rejects.toThrow(/dead controller owner.*refusing automatic recovery/i);
+      await expect(readFile(lockPath, "utf8")).resolves.toBe(JSON.stringify(payload));
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

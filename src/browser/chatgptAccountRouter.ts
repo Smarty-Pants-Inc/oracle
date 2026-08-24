@@ -153,7 +153,9 @@ export async function ensureChatGptIdentity(
     }
     const selectedIdentity = await waitForIdentity(
       Runtime,
-      (candidate) => candidate.email === email,
+      (candidate) =>
+        candidate.email === email &&
+        (!expectation.accountDigest || candidate.accountDigest === expectation.accountDigest),
     );
     if (!selectedIdentity) {
       throw loginRequiredError(email, workspaceName);
@@ -171,49 +173,72 @@ export async function ensureChatGptIdentity(
     });
   }
 
-  const workspaceAlreadyMatches = expectation.workspaceDigest
-    ? identity.workspaceDigest === expectation.workspaceDigest
-    : accountSelection === "clicked";
-  if (!workspaceAlreadyMatches) {
-    const previousWorkspaceDigest = identity.workspaceDigest;
-    logger(`[browser] Selecting the wrapper-routed ChatGPT workspace (${workspaceName})`);
-    const selection = await selectMenuIdentity(
+  const previousWorkspaceDigest = identity.workspaceDigest;
+  logger(`[browser] Selecting the wrapper-routed ChatGPT workspace (${workspaceName})`);
+  const selection = await selectMenuIdentity(
+    Runtime,
+    Input,
+    "workspace",
+    workspaceName,
+    expectation,
+    logger,
+  );
+  if (!selection) {
+    throw workspaceRequiredError(email, workspaceName);
+  }
+  let selectedIdentity: ChatGptSessionIdentity | null;
+  if (
+    selection === "clicked" &&
+    expectation.workspaceDigest &&
+    expectation.workspaceDigest === previousWorkspaceDigest
+  ) {
+    const settledRow = await selectMenuIdentity(
       Runtime,
       Input,
       "workspace",
       workspaceName,
-      expectation,
+      { ...expectation, workspaceDigest: expectation.workspaceDigest },
       logger,
+      false,
     );
-    if (!selection) {
+    if (settledRow !== "selected") {
       throw workspaceRequiredError(email, workspaceName);
     }
-    const selectedIdentity = await waitForIdentity(Runtime, (candidate) => {
+    selectedIdentity = await waitForIdentity(
+      Runtime,
+      (candidate) =>
+        candidate.email === email && candidate.workspaceDigest === expectation.workspaceDigest,
+    );
+  } else {
+    selectedIdentity = await waitForIdentity(Runtime, (candidate) => {
       if (candidate.email !== email || !candidate.workspaceDigest) return false;
-      if (expectation.workspaceDigest) {
-        return candidate.workspaceDigest === expectation.workspaceDigest;
+      if (
+        expectation.workspaceDigest &&
+        candidate.workspaceDigest !== expectation.workspaceDigest
+      ) {
+        return false;
       }
       return selection === "selected" || candidate.workspaceDigest !== previousWorkspaceDigest;
     });
-    if (!selectedIdentity) {
-      throw workspaceRequiredError(email, workspaceName);
-    }
-    if (
-      !expectation.workspaceDigest &&
-      (await selectMenuIdentity(
-        Runtime,
-        Input,
-        "workspace",
-        workspaceName,
-        { ...expectation, workspaceDigest: selectedIdentity.workspaceDigest },
-        logger,
-        false,
-      )) !== "selected"
-    ) {
-      throw workspaceRequiredError(email, workspaceName);
-    }
-    identity = selectedIdentity;
   }
+  if (!selectedIdentity) {
+    throw workspaceRequiredError(email, workspaceName);
+  }
+  if (
+    !expectation.workspaceDigest &&
+    (await selectMenuIdentity(
+      Runtime,
+      Input,
+      "workspace",
+      workspaceName,
+      { ...expectation, workspaceDigest: selectedIdentity.workspaceDigest },
+      logger,
+      false,
+    )) !== "selected"
+  ) {
+    throw workspaceRequiredError(email, workspaceName);
+  }
+  identity = selectedIdentity;
 
   if (
     identity.status !== "authenticated" ||
@@ -265,6 +290,7 @@ async function selectMenuIdentity(
           target,
           allowTargetClick,
           expectation.workspaceName,
+          kind === "workspace" ? expectation.email : "",
         ),
         awaitPromise: false,
         returnByValue: true,
@@ -312,16 +338,6 @@ async function selectMenuIdentity(
     const identity = await readChatGptSessionIdentity(Runtime).catch(() => null);
     if (kind === "email" && identity?.status === "authenticated" && identity.email === target) {
       return clickedTarget ? "clicked" : "selected";
-    }
-    if (
-      allowTargetClick &&
-      kind === "workspace" &&
-      expectation.workspaceDigest &&
-      identity?.status === "authenticated" &&
-      identity.email === expectation.email.trim().toLowerCase() &&
-      identity.workspaceDigest === expectation.workspaceDigest
-    ) {
-      return "selected";
     }
   }
   logger(`[browser] ChatGPT ${kind} selector stopped (${lastStatus})`);
@@ -445,18 +461,19 @@ function buildSessionIdentityExpression(): string {
     }
   })())()`;
 }
-
 function buildMenuActionExpression(
   kind: "email" | "workspace",
   target: string,
   allowTargetClick = true,
   accountWorkspace = "",
+  accountEmail = "",
 ): string {
   return `(() => {
     const kind = ${JSON.stringify(kind)};
     const target = ${JSON.stringify(target.trim().toLowerCase())};
     const allowTargetClick = ${JSON.stringify(allowTargetClick)};
     const accountWorkspace = ${JSON.stringify(accountWorkspace.trim().toLowerCase())};
+    const accountEmail = ${JSON.stringify(accountEmail.trim().toLowerCase())};
     const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
     const lower = (value) => normalize(value).toLowerCase();
     const visible = (node) => {
@@ -513,7 +530,30 @@ function buildMenuActionExpression(
         y: rect.top + rect.height / 2,
       };
     };
-    const targetMatches = menuActionable.filter(matchesTarget);
+    let targetMatches = menuActionable.filter(matchesTarget);
+    if (kind === 'workspace' && accountEmail) {
+      const accountMatches = menuActionable.filter((node) => matchesEmail(node, accountEmail));
+      const accountLeaves = accountMatches.filter((node) =>
+        !accountMatches.some((other) => other !== node && node.contains(other))
+      );
+      if (accountLeaves.length > 1) return { status: 'ambiguous' };
+      const account = accountLeaves[0];
+      if (!account) {
+        const currentAccount = menuActionable.find((node) =>
+          node.getAttribute('role') === 'menuitem' &&
+          ((node.getAttribute('aria-haspopup') === 'menu' && node.hasAttribute('data-has-submenu')) ||
+            /(?:personal|business|team|enterprise)\\s+account\\b/i.test(label(node)))
+        );
+        if (currentAccount) return clickPoint(currentAccount, 'switcher-opened');
+      }
+      const accountRows = [];
+      for (let index = menuActionable.indexOf(account) + 1; index < menuActionable.length; index += 1) {
+        const candidate = menuActionable[index];
+        if (emails(candidate).length) break;
+        accountRows.push(candidate);
+      }
+      targetMatches = accountRows.filter(matchesTarget);
+    }
     const leafMatches = targetMatches.filter((node) =>
       !targetMatches.some((other) => other !== node && node.contains(other))
     );
@@ -553,6 +593,9 @@ function buildMenuActionExpression(
     const profileSelectors = [
       '[data-testid="profile-button"]',
       '[data-testid="accounts-profile-button"]',
+      '[role="button"][aria-label*="open profile menu" i]',
+      '[role="button"][aria-label*="profile menu" i]',
+      '[role="button"][aria-label*="account menu" i]',
       'button[aria-label*="open profile menu" i]',
       'button[aria-label*="profile menu" i]',
       'button[aria-label*="account menu" i]',

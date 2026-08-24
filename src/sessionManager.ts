@@ -28,9 +28,13 @@ import { DEFAULT_MODEL } from "./oracle/config.js";
 import { formatElapsed } from "./oracle/format.js";
 import { safeModelSlug } from "./oracle/modelResolver.js";
 import { getOracleHomeDir } from "./oracleHome.js";
-
+import {
+  assertWrapperChatGptRoute,
+  parseWrapperRequestOrigin,
+  type WrapperRequestOrigin,
+} from "./wrapperRoute.js";
 export type SessionMode = "api" | "browser";
-export type RequestOrigin = "user" | "agent";
+export type RequestOrigin = WrapperRequestOrigin;
 export type BrowserTransport = "cdp" | "obu";
 
 export interface BrowserSessionConfig {
@@ -636,24 +640,14 @@ export async function readModelRunMetadata(
   return readModelRunFile(sessionId, model);
 }
 
-function parseRequestOrigin(value: unknown, label: string): RequestOrigin | undefined {
-  if (value === undefined || value === null || value === "") {
-    return undefined;
-  }
-  if (value === "user" || value === "agent") {
-    return value;
-  }
-  throw new Error(`${label} must be "user" or "agent".`);
-}
-
 function resolveSessionRequestOrigin(
   options: InitializeSessionOptions,
   mode: SessionMode,
 ): RequestOrigin | undefined {
-  const optionOrigin = parseRequestOrigin(options.requestOrigin, "Stored request origin");
+  const optionOrigin = parseWrapperRequestOrigin(options.requestOrigin, "Stored request origin");
   const wrapperBrowser = process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1" && mode === "browser";
   const environmentOrigin = wrapperBrowser
-    ? parseRequestOrigin(
+    ? parseWrapperRequestOrigin(
         process.env.ORACLE_WRAPPER_INVOCATION_ORIGIN?.trim(),
         "Wrapper request origin",
       )
@@ -679,10 +673,18 @@ export async function initializeSession(
   await ensureSessionStorage();
   const mode = options.mode ?? "api";
   const requestOrigin = resolveSessionRequestOrigin(options, mode);
+  const browserConfig = options.browserConfig;
+  if (mode === "browser" && process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1") {
+    if (!requestOrigin || !browserConfig) {
+      throw new Error(
+        "Wrapper-routed browser sessions require an exact account/workspace browser configuration.",
+      );
+    }
+    assertWrapperChatGptRoute(requestOrigin, browserConfig);
+  }
   const baseSlug =
     baseSlugOverride || createSessionId(options.prompt || DEFAULT_SLUG, options.slug);
   const sessionId = await reserveUniqueSessionDir(baseSlug);
-  const browserConfig = options.browserConfig;
   const modelList: ModelName[] =
     Array.isArray(options.models) && options.models.length > 0
       ? options.models

@@ -91,6 +91,35 @@ and a live browser run records strict GPT-5.6 selection evidence.
 4. If a run detaches or times out, reattach to the stored session instead of
    starting a duplicate.
 
+## Main-Chrome account routing
+
+For the shared signed-in Chrome route, use the installed wrapper rather than a
+checkout-local binary or caller-selected CDP endpoint:
+
+```bash
+oracle user --engine browser -p "<approved user request>"
+oracle agent --engine browser -p "<approved agent consult>"
+```
+
+The wrapper chooses `paul@smartypants.ai` for `user` and
+`dev1@smartypants.ai` for `agent`. The fork independently enforces those
+account/workspace bindings before session creation and browser access; it proves
+the exact named workspace row before trusting a stored OBU workspace digest, and
+hidden route flags cannot override the declared origin. Do not choose an account
+from prompt text, availability, quota, or fallback, and do not pass a
+main-Chrome OBU session or tab ID. Follow-up, reattach, harvest, live-tail, and
+approved export commands must reuse the stored account, workspace, task tab,
+project/thread scope, and turn lineage; missing or conflicting affinity is a
+blocker, not a reason to try another route. Transient `/c/WEB:<request-id>`
+routes are not conversation affinity; wait for the durable URL.
+
+If Oracle reports `login-required` or `workspace-required`, stop and ask Paul
+to restore the named account/workspace in the already-running main Chrome. Do
+not automate credentials, MFA, account creation, or login approval. A signal
+releases the shared routing lock only after positive cleanup. If cleanup is
+inconclusive, the exact recovery handle and durable lock are retained; verify
+native-host quiescence and recover that residue explicitly before retrying.
+
 ## Commands
 
 - Show help:
@@ -204,8 +233,10 @@ The exporter captures only that conversation's authenticated backend response
 during page load and writes raw JSON, normalized JSON, Markdown, a manifest,
 and SHA-256 checksums. It does not read cookies, local storage, browser profiles,
 or unrelated history. Exact archived conversations may be temporarily recovered
-and are re-archived after export; pass `--no-recover-archived` to disable that
-path. `--archive-after-export` intentionally archives an active conversation.
+and are re-archived after export by the legacy isolated-CDP exporter; pass
+`--no-recover-archived` to disable that legacy recovery path. Main-Chrome Open
+Browser Use exports do not recover archived conversations and reject that flag.
+`--archive-after-export` intentionally archives an active conversation.
 
 ## Prompt template
 

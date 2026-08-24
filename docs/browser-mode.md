@@ -55,18 +55,26 @@ oracle user --engine browser -p "Direct user-requested review" --file "src/**"
 oracle agent --engine browser -p "Agent-chosen second opinion" --file "src/**"
 ```
 
-The wrapper maps each request origin to an exact email and workspace. Oracle
+The wrapper maps each request origin to an exact email and workspace. The fork
+independently enforces `user` → `paul@smartypants.ai` / `Paul Bettner` and
+`agent` → `dev1@smartypants.ai` / `Smarty Dev` before session creation and again
+before browser access; a mismatch fails before any prompt can be sent. Oracle
 serializes the entire account-sensitive run, creates or reclaims only its
-task-owned tab, changes the active account/workspace when needed, and verifies
-the routed identity before every send or mutation. It persists only route labels,
+task-owned tab, changes the active account/workspace when needed, proves the
+exact named workspace row, and verifies the matching routed identity before every
+send or mutation. It persists only route labels,
 SHA-256 digests of the authenticated user/workspace IDs, and exact task lineage.
+
 Follow-up, reattachment, and harvest/live-tail reuse the stored account,
 workspace, tab, thread, committed user turn, and paired assistant branch. Export
 uses that stored route/thread/branch affinity in a fresh task-owned tab. If the
 saved physical tab is gone or the conversation URL is delayed, continuation
 recovers only from the exact stored tab or exact thread and records the verified
 replacement. Missing or conflicting affinity fails closed. A process signal
-preserves the exact task tab for reattach before it releases the routing lock.
+preserves the exact task tab before cleanup; it releases the global routing lock
+only after positive cleanup. If cleanup is inconclusive, Oracle records an exact
+recovery handle and retains the durable lock, so an operator must verify native-host
+quiescence and recover the lock explicitly before another route can run.
 
 `oracle accounts` proves that the Open Browser Use bridge is connected and that
 the extension/native host reports the SDK-compatible version `0.1.41`. It does
@@ -74,6 +82,21 @@ not prove either ChatGPT login. Every real route separately proves its
 login/workspace. When a login expires, the error names the exact account and
 workspace that the operator must restore in main Chrome. Oracle never falls
 back to another route.
+
+### Interrupted main-Chrome runs
+
+The main-Chrome routing lock lives under the Open Browser Use runtime directory
+next to the active native-host socket, at `oracle-main-chrome/oracle-automation.lock`.
+It is Oracle-owned runtime state, excluded from source control, and must never be
+copied into a profile or committed. A positive cleanup removes it. An uncertain
+termination or a dead controller owner leaves it in place with the stored
+recovery handle so another process cannot overlap the native host unknowingly.
+
+For explicit recovery, first run `open-browser-use ping` and
+`open-browser-use info`, verify that the native host and the exact session/tab
+from the recovery handle are quiescent, then remove only the exact lock path
+printed by Oracle. Do not delete the runtime directory, guess a different lock,
+or start another account route before that verification.
 
 ## Export an approved existing conversation
 
@@ -95,9 +118,11 @@ paired assistant message. Export selects the backend path that ends at that
 assistant message and verifies the prompt is its user ancestor; it does not
 follow a later child branch merely because ChatGPT marks it current. Capture
 uses a fresh task-owned OBU tab so it cannot close or mutate the originating
-handoff tab. Caller-supplied unbound OBU tab IDs are refused. After route
-verification, Oracle first watches for ChatGPT's exact page-load request. The
-poll returns only request counters and an opaque exact-response length; page
+handoff tab. Caller-supplied unbound OBU tab IDs are refused. Transient
+`/c/WEB:<request-id>` routes are never accepted as stored or export
+conversation affinity; Oracle waits for the durable canonical conversation URL.
+After route verification, Oracle first watches for ChatGPT's exact page-load
+request. The
 titles, URLs, response previews, and backend IDs remain in page context until
 Oracle revalidates the exact route and account/workspace. If a server-rendered
 page issues no request, the task-owned page makes one exact backend request only
@@ -435,7 +460,7 @@ This mode is ideal when you have a macOS VM (or spare Mac mini) logged into Chat
 
 ## Testing Notes
 
-- Deterministic Open Browser Use coverage: `pnpm vitest run tests/browser/openBrowserUse.test.ts tests/browser/chatgptAccountRouter.test.ts tests/browser/conversationTurns.test.ts tests/browser/reattach.test.ts tests/browser/liveTabs.test.ts tests/cli/followup.test.ts tests/cli/chatgptExport.test.ts tests/cli/chatgptExportCommand.test.ts tests/cli/browserTabs.test.ts tests/cli/browserTabsObu.test.ts tests/cli/browserTabsRecover.test.ts tests/oracle/agentDiagnostics.test.ts`.
+- Deterministic Open Browser Use and recovery coverage: `pnpm vitest run tests/browser/openBrowserUse.test.ts tests/browser/chatgptAccountRouter.test.ts tests/browser/conversationTurns.test.ts tests/browser/reattach.test.ts tests/browser/liveTabs.test.ts tests/browser/archiveConversation.test.ts tests/browser/chatgptExport.test.ts tests/browser/chromeLifecycle.test.ts tests/cli/followup.test.ts tests/cli/chatgptExport.test.ts tests/cli/chatgptExportCommand.test.ts tests/cli/browserTabs.test.ts tests/cli/browserTabsObu.test.ts tests/cli/browserTabsRecover.test.ts tests/oracle/agentDiagnostics.test.ts`.
 - Full static and unit checks: `pnpm check` and `pnpm test`.
 - Bridge-only preflight: `oracle accounts`; this verifies the SDK/native-host
   bridge and fixed route labels but does not send a ChatGPT prompt or prove that

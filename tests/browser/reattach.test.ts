@@ -1601,6 +1601,8 @@ describe("resumeBrowserSession", () => {
   test("returns the recovered affinity with redacted finalization warning details", async () => {
     const { connection } = createObuConnection("recovered-session", 8);
     const signedUrl = "https://chatgpt.com/c/recovered-thread?sig=reattach-secret#done";
+    const release = vi.fn(async () => {});
+    const markUncertain = vi.fn(async () => {});
     const finalize = vi.fn().mockRejectedValueOnce(
       new BrowserAutomationError(`Failed to finalize at ${signedUrl}`, {
         stage: "open-browser-use",
@@ -1633,7 +1635,8 @@ describe("resumeBrowserSession", () => {
         acquireOpenBrowserUseRunLock: vi.fn(async () => ({
           path: "/tmp/oracle.lock",
           lockId: "lock-1",
-          release: vi.fn(async () => {}),
+          release,
+          markUncertain,
         })),
         connectOpenBrowserUseTab: vi.fn(async () => connection),
         prepareOpenBrowserUseChatGptRoute: vi.fn(async () => ({
@@ -1673,6 +1676,10 @@ describe("resumeBrowserSession", () => {
     });
     expect(JSON.stringify(result.warnings)).not.toContain(signedUrl);
     expect(JSON.stringify(result.warnings)).not.toContain("reattach-secret");
+    expect(markUncertain).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: expect.stringMatching(/finalization was inconclusive/i) }),
+    );
+    expect(release).not.toHaveBeenCalled();
     expect(finalize).toHaveBeenCalledWith(false);
   });
 

@@ -9,6 +9,10 @@ import {
   conversationIdFromChatGptUrl,
   type ChatGptExportTurnAffinity,
 } from "../browser/chatgptExport.js";
+import {
+  chatGptConversationScopeFromUrl,
+  type ChatGptConversationScope,
+} from "../browser/conversationUrl.js";
 import { extractStableConversationIdFromUrl } from "../browser/conversationUrl.js";
 import { sessionStore, type SessionMetadata } from "../sessionStore.js";
 import { browserIdFromWebSocketEndpoint } from "../browser/profileState.js";
@@ -72,14 +76,85 @@ function storedConversationUrls(metadata: SessionMetadata): Array<string | null 
     browserConfig?.url,
   ];
 }
-function sessionMatchesConversation(metadata: SessionMetadata, conversationId: string): boolean {
+function storedConversationScopes(metadata: SessionMetadata): ChatGptConversationScope[] {
+  const scopes: ChatGptConversationScope[] = [];
+  for (const raw of storedConversationUrls(metadata)) {
+    const candidate = raw?.trim();
+    if (!candidate) continue;
+    const scope = chatGptConversationScopeFromUrl(candidate);
+    if (scope) {
+      scopes.push(scope);
+      continue;
+    }
+    if (extractStableConversationIdFromUrl(candidate)) {
+      throw new Error("Stored ChatGPT conversation URL is invalid.");
+    }
+  }
+  return scopes;
+}
+
+function sessionMatchesConversation(metadata: SessionMetadata, targetUrl: string): boolean {
+  const targetScope = chatGptConversationScopeFromUrl(targetUrl);
+  if (!targetScope) return false;
+  const scopes = storedConversationScopes(metadata);
+  if (scopes.length > 0) {
+    const matchingScopes = scopes.filter(
+      (scope) => scope.conversationId === targetScope.conversationId,
+    );
+    if (
+      targetScope.projectKey !== null &&
+      !matchingScopes.some((scope) => scope.projectKey === targetScope.projectKey)
+    ) {
+      return false;
+    }
+    const hasTargetEvidence =
+      matchingScopes.length > 0 ||
+      metadata.browser?.harvest?.conversationId === targetScope.conversationId ||
+      metadata.browser?.runtime?.conversationId === targetScope.conversationId;
+    if (!hasTargetEvidence) return false;
+    return true;
+  }
+  if (targetScope.projectKey !== null) return false;
   return (
-    metadata.browser?.harvest?.conversationId === conversationId ||
-    metadata.browser?.runtime?.conversationId === conversationId ||
-    storedConversationUrls(metadata).some(
-      (url) => extractStableConversationIdFromUrl(url ?? "") === conversationId,
-    )
+    metadata.browser?.harvest?.conversationId === targetScope.conversationId ||
+    metadata.browser?.runtime?.conversationId === targetScope.conversationId
   );
+}
+
+function assertConversationScopeAffinity(metadata: SessionMetadata, targetUrl: string): void {
+  const targetScope = chatGptConversationScopeFromUrl(targetUrl);
+  if (!targetScope) throw new Error("ChatGPT conversation target is invalid.");
+  const scopes = storedConversationScopes(metadata);
+  if (
+    targetScope.projectKey !== null &&
+    !scopes.some(
+      (scope) =>
+        scope.conversationId === targetScope.conversationId &&
+        scope.projectKey === targetScope.projectKey,
+    )
+  ) {
+    throw new Error("Stored ChatGPT project conversation affinity is unavailable.");
+  }
+  const distinctScopes = new Set(
+    scopes.map((scope) => `${scope.conversationId}\t${scope.projectKey ?? ""}`),
+  );
+  const recordedIds = [
+    metadata.browser?.harvest?.conversationId,
+    metadata.browser?.runtime?.conversationId,
+  ]
+    .filter((id): id is string => Boolean(id?.trim()))
+    .map((id) => id.trim());
+  if (
+    distinctScopes.size > 1 ||
+    scopes.some(
+      (scope) =>
+        scope.conversationId !== targetScope.conversationId ||
+        scope.projectKey !== targetScope.projectKey,
+    ) ||
+    recordedIds.some((id) => id !== targetScope.conversationId)
+  ) {
+    throw new Error("Stored ChatGPT conversation affinity is conflicting.");
+  }
 }
 
 function storedRemoteChromeAffinities(
@@ -180,12 +255,11 @@ function resolveStoredChatGptExportTarget(
   sessions: SessionMetadata[],
 ): ChatGptExportBrowserTarget {
   const conversationId = conversationIdFromChatGptUrl(targetUrl);
-  const matches = sessions.filter((metadata) =>
-    sessionMatchesConversation(metadata, conversationId),
-  );
+  const matches = sessions.filter((metadata) => sessionMatchesConversation(metadata, targetUrl));
   if (matches.length === 0) {
     throw new Error(`No stored browser session matches ChatGPT conversation ${conversationId}.`);
   }
+  for (const metadata of matches) assertConversationScopeAffinity(metadata, targetUrl);
   const targets = new Map<string, ChatGptExportBrowserTarget>();
   for (const metadata of matches) {
     const turnAffinity = storedExportTurnAffinity(metadata);
@@ -230,7 +304,7 @@ export function resolveChatGptExportBrowserTargetForSession(
 ): ChatGptExportBrowserTarget {
   const conversationId = conversationIdFromChatGptUrl(targetUrl);
   if (!metadata) throw new Error(`Stored Oracle session ${sessionId} was not found.`);
-  if (!sessionMatchesConversation(metadata, conversationId)) {
+  if (!sessionMatchesConversation(metadata, targetUrl)) {
     throw new Error(
       `Stored Oracle session ${sessionId} does not match ChatGPT conversation ${conversationId}.`,
     );
@@ -259,7 +333,8 @@ export function resolveChatGptExportRemoteChrome(
   let matchedSessionCount = 0;
 
   for (const metadata of sessions) {
-    if (!sessionMatchesConversation(metadata, conversationId)) continue;
+    if (!sessionMatchesConversation(metadata, targetUrl)) continue;
+    assertConversationScopeAffinity(metadata, targetUrl);
     matchedSessionCount += 1;
     const storedAffinities = storedRemoteChromeAffinities(metadata);
     if (storedAffinities.length === 0) {
@@ -301,7 +376,7 @@ export function resolveChatGptExportRemoteChromeForSession(
   if (!metadata) {
     throw new Error(`Stored Oracle session ${sessionId} was not found.`);
   }
-  if (!sessionMatchesConversation(metadata, conversationId)) {
+  if (!sessionMatchesConversation(metadata, targetUrl)) {
     throw new Error(
       `Stored Oracle session ${sessionId} does not match ChatGPT conversation ${conversationId}.`,
     );
@@ -397,15 +472,46 @@ export async function handleChatGptExportCommand(options: ChatGptExportCliOption
   if (options.timeout && (!Number.isFinite(timeoutMs) || Number(timeoutMs) <= 0)) {
     throw new Error("--timeout must be a duration like 45s, 2m, or 500ms.");
   }
-  const browserTarget: ChatGptExportBrowserTarget = explicitRemoteChrome
-    ? { transport: "cdp", affinity: explicitRemoteChrome }
-    : options.sessionId
-      ? resolveChatGptExportBrowserTargetForSession(
-          targetUrl,
-          options.sessionId,
-          await sessionStore.readSession(options.sessionId),
-        )
-      : resolveChatGptExportBrowserTarget(targetUrl, await sessionStore.listSessions());
+  const namedMetadata = options.sessionId
+    ? await sessionStore.readSession(options.sessionId)
+    : null;
+  let browserTarget: ChatGptExportBrowserTarget;
+  if (explicitRemoteChrome && options.sessionId) {
+    const storedTarget = resolveChatGptExportBrowserTargetForSession(
+      targetUrl,
+      options.sessionId,
+      namedMetadata,
+    );
+    if (storedTarget.transport === "obu") {
+      throw new Error(
+        "--remote-chrome cannot override a named main-Chrome session; use its stored OBU affinity.",
+      );
+    }
+    if (
+      storedTarget.affinity.host.toLowerCase() !== explicitRemoteChrome.host.toLowerCase() ||
+      storedTarget.affinity.port !== explicitRemoteChrome.port
+    ) {
+      throw new Error(
+        "--remote-chrome does not match the named session's stored browser endpoint; refusing an affinity bypass.",
+      );
+    }
+    browserTarget = storedTarget;
+  } else if (explicitRemoteChrome) {
+    browserTarget = { transport: "cdp", affinity: explicitRemoteChrome };
+  } else if (options.sessionId) {
+    browserTarget = resolveChatGptExportBrowserTargetForSession(
+      targetUrl,
+      options.sessionId,
+      namedMetadata,
+    );
+  } else {
+    browserTarget = resolveChatGptExportBrowserTarget(targetUrl, await sessionStore.listSessions());
+  }
+  if (browserTarget.transport === "obu" && options.browserTab?.trim()) {
+    throw new Error(
+      "Main-Chrome exports use their stored task-tab affinity; remove --browser-tab.",
+    );
+  }
   if (browserTarget.transport === "obu" && options.recoverArchived === false) {
     throw new Error(
       "--no-recover-archived is unavailable for main-Chrome exports; remove it or use the legacy CDP export path.",

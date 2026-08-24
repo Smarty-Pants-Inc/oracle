@@ -84,7 +84,11 @@ export async function readConversationUserTurns(
           ? node
           : node?.querySelector?.('[data-message-id]');
       const userTextRoot = (node) =>
-        node?.querySelector?.('[data-testid="collapsible-user-message-content"]') || node;
+        node?.querySelector?.('[data-testid="collapsible-user-message-content"]') ||
+        (node?.matches?.('[data-message-author-role="user"]')
+          ? node
+          : node?.querySelector?.('[data-message-author-role="user"]')) ||
+        node;
       const turns = ${buildConversationTurnListExpression()};
       return turns.flatMap((node, index) => {
         if (!isUser(node)) return [];
@@ -245,7 +249,11 @@ export async function readBoundConversationTurn(
           ? node
           : node?.querySelector?.('[data-message-id]');
       const userTextRoot = (node) =>
-        node?.querySelector?.('[data-testid="collapsible-user-message-content"]') || node;
+        node?.querySelector?.('[data-testid="collapsible-user-message-content"]') ||
+        (node?.matches?.('[data-message-author-role="user"]')
+          ? node
+          : node?.querySelector?.('[data-message-author-role="user"]')) ||
+        node;
       const turns = ${buildConversationTurnListExpression()};
       const candidates = [];
       for (let userIndex = 0; userIndex < turns.length; userIndex += 1) {

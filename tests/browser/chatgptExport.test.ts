@@ -30,6 +30,8 @@ import {
 } from "../../src/browser/chatgptExport.js";
 
 describe("ChatGPT conversation export helpers", () => {
+  const captureOwner = "capture-test-owner";
+  const archiveOwner = "archive-test-owner";
   test("accepts only exact chatgpt.com conversation URLs", () => {
     expect(conversationIdFromChatGptUrl("https://chatgpt.com/c/abc-123")).toBe("abc-123");
     expect(conversationIdFromChatGptUrl("https://chatgpt.com/c/abc-123/")).toBe("abc-123");
@@ -52,6 +54,11 @@ describe("ChatGPT conversation export helpers", () => {
     expect(() => conversationIdFromChatGptUrl("https://chatgpt.com/%63/abc")).toThrow(
       /chatgpt\.com\/c/,
     );
+    expect(() =>
+      conversationIdFromChatGptUrl(
+        "https://chatgpt.com/c/WEB:32229414-5afa-4478-890c-9ca80aa82430",
+      ),
+    ).toThrow(/specific/i);
   });
 
   test("rejects a browser swap before exact export attachment", async () => {
@@ -190,6 +197,27 @@ describe("ChatGPT conversation export helpers", () => {
       }
     },
   );
+  test.skipIf(process.platform === "win32")("refuses symlinked export output files", async () => {
+    const parentDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-export-symlink-"));
+    const outDir = path.join(parentDir, "bundle");
+    const outside = path.join(parentDir, "outside.json");
+    try {
+      await fs.mkdir(outDir, { recursive: true });
+      await fs.writeFile(outside, "must remain unchanged", "utf8");
+      await fs.symlink(outside, path.join(outDir, "backend-conversation.json"));
+      await expect(
+        writeChatGptExportBundleForTest({
+          outDir,
+          rawText: "{}",
+          payload: { target_url: "https://chatgpt.com/c/conv-1", stats: {} },
+          captureInfo: {},
+        }),
+      ).rejects.toBeDefined();
+      await expect(fs.readFile(outside, "utf8")).resolves.toBe("must remain unchanged");
+    } finally {
+      await fs.rm(parentDir, { recursive: true, force: true });
+    }
+  });
 
   test("derives exact backend conversation URL and project-aware scope check", () => {
     const rootUrl = "https://chatgpt.com/c/conv-1";
@@ -308,6 +336,7 @@ describe("ChatGPT conversation export helpers", () => {
       __oracleArchivedConversationRecovery?: Record<string, unknown>;
     };
     const runtimeGlobal = { crypto: globalThis.crypto };
+    const storage = { getItem: vi.fn(() => null) };
     const install = new Function(
       "window",
       "document",
@@ -318,6 +347,7 @@ describe("ChatGPT conversation export helpers", () => {
       "crypto",
       "TextEncoder",
       "globalThis",
+      "sessionStorage",
       buildArchivedConversationRecoveryHookForTest("conv-1", {
         targetUrl: "https://chatgpt.com/c/conv-1",
         accountDigest: digest(expectedUserId),
@@ -334,6 +364,7 @@ describe("ChatGPT conversation export helpers", () => {
       globalThis.crypto,
       TextEncoder,
       runtimeGlobal,
+      storage,
     );
     const archivedList = new Request(
       "https://chatgpt.com/backend-api/conversations?is_archived=true",
@@ -355,6 +386,183 @@ describe("ChatGPT conversation export helpers", () => {
       targetApiUrl,
       expect.objectContaining({ method: "PATCH" }),
     );
+  });
+
+  test("does not recover when the triggering archived-list request fails", async () => {
+    const expectedUserId = "account-a";
+    const workspaceId = "workspace-a";
+    const freshToken = "fresh-account-a-token";
+    const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const patch = vi.fn();
+    const pageFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url === "/api/auth/session") {
+        return new Response(
+          JSON.stringify({ user: { id: expectedUserId }, account: { id: workspaceId } }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.includes("/backend-api/conversations")) return new Response("{}", { status: 503 });
+      if (url === targetApiUrl && init?.method === "PATCH") {
+        patch();
+        return new Response("{}", { status: 200 });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    const page = {
+      fetch: pageFetch as unknown as typeof fetch,
+      document: {
+        getElementById: () => ({
+          textContent: JSON.stringify({
+            session: {
+              user: { id: expectedUserId },
+              account: { id: workspaceId },
+              accessToken: freshToken,
+            },
+          }),
+        }),
+      },
+    } as {
+      fetch: typeof fetch;
+      document: { getElementById: () => { textContent: string } };
+      __oracleArchivedConversationRecovery?: Record<string, unknown>;
+    };
+    const install = new Function(
+      "window",
+      "document",
+      "location",
+      "Request",
+      "Headers",
+      "URL",
+      "crypto",
+      "TextEncoder",
+      "globalThis",
+      "sessionStorage",
+      buildArchivedConversationRecoveryHookForTest("conv-1", {
+        targetUrl: "https://chatgpt.com/c/conv-1",
+        accountDigest: digest(expectedUserId),
+        workspaceDigest: digest(workspaceId),
+      }),
+    ) as (...args: unknown[]) => void;
+    install(
+      page,
+      page.document,
+      { href: "https://chatgpt.com/#settings/DataControls/ArchivedChats" },
+      Request,
+      Headers,
+      URL,
+      globalThis.crypto,
+      TextEncoder,
+      { crypto: globalThis.crypto },
+      { getItem: vi.fn(() => null) },
+    );
+
+    await page.fetch(
+      new Request("https://chatgpt.com/backend-api/conversations?is_archived=true", {
+        headers: { "ChatGPT-Account-Id": workspaceId },
+      }),
+    );
+
+    expect(patch).not.toHaveBeenCalled();
+    expect(page.__oracleArchivedConversationRecovery).toMatchObject({
+      status: "failed",
+      code: "archived-list-failed",
+      listStatus: 503,
+      recovered: false,
+    });
+  });
+
+  test("issues at most one recovery PATCH for overlapping archived-list requests", async () => {
+    const expectedUserId = "account-a";
+    const workspaceId = "workspace-a";
+    const freshToken = "fresh-account-a-token";
+    const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    let resolvePatch: (response: Response) => void = () => {};
+    const patch = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolvePatch = resolve;
+        }),
+    );
+    const pageFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url === "/api/auth/session") {
+        return new Response(
+          JSON.stringify({ user: { id: expectedUserId }, account: { id: workspaceId } }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.includes("/backend-api/conversations")) return new Response("{}", { status: 200 });
+      if (url === targetApiUrl && init?.method === "PATCH") return patch();
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    const page = {
+      fetch: pageFetch as unknown as typeof fetch,
+      document: {
+        getElementById: () => ({
+          textContent: JSON.stringify({
+            session: {
+              user: { id: expectedUserId },
+              account: { id: workspaceId },
+              accessToken: freshToken,
+            },
+          }),
+        }),
+      },
+    } as {
+      fetch: typeof fetch;
+      document: { getElementById: () => { textContent: string } };
+      __oracleArchivedConversationRecovery?: Record<string, unknown>;
+    };
+    const install = new Function(
+      "window",
+      "document",
+      "location",
+      "Request",
+      "Headers",
+      "URL",
+      "crypto",
+      "TextEncoder",
+      "globalThis",
+      "sessionStorage",
+      buildArchivedConversationRecoveryHookForTest("conv-1", {
+        targetUrl: "https://chatgpt.com/c/conv-1",
+        accountDigest: digest(expectedUserId),
+        workspaceDigest: digest(workspaceId),
+      }),
+    ) as (...args: unknown[]) => void;
+    install(
+      page,
+      page.document,
+      { href: "https://chatgpt.com/#settings/DataControls/ArchivedChats" },
+      Request,
+      Headers,
+      URL,
+      globalThis.crypto,
+      TextEncoder,
+      { crypto: globalThis.crypto },
+      { getItem: vi.fn(() => null) },
+    );
+    const request = () =>
+      page.fetch(
+        new Request("https://chatgpt.com/backend-api/conversations?is_archived=true", {
+          headers: { "ChatGPT-Account-Id": workspaceId },
+        }),
+      );
+
+    const first = request();
+    await vi.waitFor(() => expect(patch).toHaveBeenCalledOnce());
+    const second = request();
+    await second;
+    expect(patch).toHaveBeenCalledOnce();
+    resolvePatch(new Response("{}", { status: 200 }));
+    await first;
+    expect(page.__oracleArchivedConversationRecovery).toMatchObject({
+      status: "recovered",
+      recovered: true,
+    });
   });
 
   test("replaces stale archived-list authorization with the validated current token", async () => {
@@ -398,6 +606,7 @@ describe("ChatGPT conversation export helpers", () => {
       document: { getElementById: () => { textContent: string } };
       __oracleArchivedConversationRecovery?: Record<string, unknown>;
     };
+    const storage = { getItem: vi.fn(() => null) };
     const install = new Function(
       "window",
       "document",
@@ -408,6 +617,7 @@ describe("ChatGPT conversation export helpers", () => {
       "crypto",
       "TextEncoder",
       "globalThis",
+      "sessionStorage",
       buildArchivedConversationRecoveryHookForTest("conv-1", {
         targetUrl: "https://chatgpt.com/c/conv-1",
         accountDigest: digest(expectedUserId),
@@ -424,6 +634,7 @@ describe("ChatGPT conversation export helpers", () => {
       globalThis.crypto,
       TextEncoder,
       { crypto: globalThis.crypto },
+      storage,
     );
     await page.fetch(
       new Request("https://chatgpt.com/backend-api/conversations?is_archived=true", {
@@ -448,6 +659,7 @@ describe("ChatGPT conversation export helpers", () => {
     const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
     const archivedListUrl = "https://chatgpt.com/backend-api/conversations?is_archived=true";
     const settingsUrl = "https://chatgpt.com/#settings/DataControls/ArchivedChats";
+    const storage = { getItem: vi.fn(() => null) };
     const install = new Function(
       "window",
       "document",
@@ -458,6 +670,7 @@ describe("ChatGPT conversation export helpers", () => {
       "crypto",
       "TextEncoder",
       "globalThis",
+      "sessionStorage",
       buildArchivedConversationRecoveryHookForTest("conv-1", {
         targetUrl: "https://chatgpt.com/c/conv-1",
         accountDigest: digest(expectedUserId),
@@ -524,6 +737,7 @@ describe("ChatGPT conversation export helpers", () => {
         globalThis.crypto,
         TextEncoder,
         { crypto: globalThis.crypto },
+        storage,
       );
 
       const list = page.fetch(
@@ -548,6 +762,99 @@ describe("ChatGPT conversation export helpers", () => {
       });
     }
   });
+  test("records an ambiguous recovery PATCH and supports exact-target re-archive compensation", async () => {
+    const expectedUserId = "account-a";
+    const workspaceId = "workspace-a";
+    const freshToken = "fresh-account-a-token";
+    const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    let patchAttempt = 0;
+    const patchCalls: RequestInit[] = [];
+    const pageFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url === "/api/auth/session") {
+        return new Response(
+          JSON.stringify({ user: { id: expectedUserId }, account: { id: workspaceId } }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.includes("/backend-api/conversations")) return new Response("{}", { status: 200 });
+      if (url === targetApiUrl && init?.method === "PATCH") {
+        patchCalls.push(init);
+        patchAttempt += 1;
+        return patchAttempt === 1
+          ? new Response("server uncertain", { status: 503 })
+          : new Response("{}", { status: 200 });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    const page = {
+      fetch: pageFetch as unknown as typeof fetch,
+      document: {
+        getElementById: () => ({
+          textContent: JSON.stringify({
+            session: {
+              user: { id: expectedUserId },
+              account: { id: workspaceId },
+              accessToken: freshToken,
+            },
+          }),
+        }),
+      },
+    } as {
+      fetch: typeof fetch;
+      document: { getElementById: () => { textContent: string } };
+      __oracleArchivedConversationRecovery?: Record<string, unknown>;
+    };
+    const location = { href: "https://chatgpt.com/#settings/DataControls/ArchivedChats" };
+    const storage = { getItem: vi.fn(() => null) };
+    const install = new Function(
+      "window",
+      "document",
+      "location",
+      "Request",
+      "Headers",
+      "URL",
+      "crypto",
+      "TextEncoder",
+      "globalThis",
+      "sessionStorage",
+      buildArchivedConversationRecoveryHookForTest("conv-1", {
+        accountDigest: digest(expectedUserId),
+        workspaceDigest: digest(workspaceId),
+      }),
+    ) as (...args: unknown[]) => void;
+    install(
+      page,
+      page.document,
+      location,
+      Request,
+      Headers,
+      URL,
+      globalThis.crypto,
+      TextEncoder,
+      { crypto: globalThis.crypto },
+      storage,
+    );
+
+    await page.fetch(
+      new Request("https://chatgpt.com/backend-api/conversations?is_archived=true", {
+        headers: { "ChatGPT-Account-Id": workspaceId },
+      }),
+    );
+    expect(page.__oracleArchivedConversationRecovery).toMatchObject({
+      status: "failed",
+      patchOutcome: "unknown",
+      patchStatus: 503,
+    });
+    const restore = page.__oracleArchivedConversationRecovery?.restoreArchivedConversation as
+      | (() => Promise<{ ok: boolean; status?: number }>)
+      | undefined;
+    await expect(restore?.()).resolves.toMatchObject({ ok: true, status: 200 });
+    expect(patchCalls).toHaveLength(2);
+    expect(JSON.parse(String(patchCalls[0]?.body))).toEqual({ is_archived: false });
+    expect(JSON.parse(String(patchCalls[1]?.body))).toEqual({ is_archived: true });
+  });
 
   test("capture hook scopes recording and marks exact GETs before dispatch", () => {
     const hook = buildScopedBackendCaptureHook(
@@ -565,6 +872,51 @@ describe("ChatGPT conversation export helpers", () => {
     expect(hook).toContain("state.cleanup");
     expect(hook).not.toContain("localStorage");
     expect(hook).not.toContain("cookie");
+  });
+  test("does not leave an ownerless persisted body when owner storage fails", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const payloadKey = `__oracleChatGptBackendCapture:${targetApiUrl}`;
+    const ownerKey = `__oracleChatGptBackendCaptureOwner:${targetApiUrl}`;
+    const storageValues = new Map<string, string>();
+    const storage = {
+      getItem: vi.fn((key: string) => storageValues.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => {
+        if (key === ownerKey) throw new Error("owner storage unavailable");
+        storageValues.set(key, value);
+      }),
+      removeItem: vi.fn((key: string) => storageValues.delete(key)),
+    };
+    const originalFetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ conversation_id: "conv-1", title: "private" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    ) as unknown as typeof fetch;
+    class OriginalXhr {}
+    const page = { fetch: originalFetch, XMLHttpRequest: OriginalXhr } as {
+      fetch: typeof fetch;
+      XMLHttpRequest: typeof OriginalXhr;
+      __oracleChatGptBackendCapture?: {
+        hits: Array<{ chars?: number }>;
+      };
+    };
+    const install = new Function(
+      "window",
+      "location",
+      "sessionStorage",
+      buildScopedBackendCaptureHook(targetApiUrl, { owner: captureOwner }),
+    ) as (window: typeof page, location: { href: string }, sessionStorage: typeof storage) => void;
+    install(page, { href: "https://chatgpt.com/c/conv-1" }, storage);
+
+    await page.fetch(targetApiUrl);
+    await vi.waitFor(() => {
+      expect(page.__oracleChatGptBackendCapture?.hits).toHaveLength(1);
+    });
+
+    expect(storageValues.get(payloadKey)).toBeUndefined();
+    expect(storageValues.get(ownerKey)).toBeUndefined();
+    expect(page.__oracleChatGptBackendCapture?.hits[0]?.chars).toBeGreaterThan(0);
   });
 
   test("cleans scoped capture state, removes its registration, and disarms delayed responses", async () => {
@@ -586,18 +938,18 @@ describe("ChatGPT conversation export helpers", () => {
     const page = {
       fetch: originalFetch,
       XMLHttpRequest: OriginalXhr,
-      __oracleChatGptBackendCaptureSelection: { target: targetApiUrl },
+      __oracleChatGptBackendCaptureSelection: { target: targetApiUrl, owner: captureOwner },
     } as {
       fetch: typeof fetch;
       XMLHttpRequest: typeof OriginalXhr;
       __oracleChatGptBackendCapture?: unknown;
-      __oracleChatGptBackendCaptureSelection?: { target: string };
+      __oracleChatGptBackendCaptureSelection?: { target: string; owner: string };
     };
     const install = new Function(
       "window",
       "location",
       "sessionStorage",
-      buildScopedBackendCaptureHook(targetApiUrl),
+      buildScopedBackendCaptureHook(targetApiUrl, { owner: captureOwner }),
     ) as (window: typeof page, location: { href: string }, sessionStorage: typeof storage) => void;
     install(page, { href: "https://chatgpt.com/c/conv-1" }, storage);
 
@@ -616,15 +968,15 @@ describe("ChatGPT conversation export helpers", () => {
       Page as never,
       targetApiUrl,
       "scoped-capture-script",
+      captureOwner,
     );
 
     expect(page.fetch).toBe(originalFetch);
     expect(page.XMLHttpRequest).toBe(OriginalXhr);
     expect(page.__oracleChatGptBackendCapture).toBeUndefined();
     expect(page.__oracleChatGptBackendCaptureSelection).toBeUndefined();
-    expect(storage.removeItem).toHaveBeenCalledWith(
-      `__oracleChatGptBackendCapture:${targetApiUrl}`,
-    );
+    expect(storage.getItem(`__oracleChatGptBackendCapture:${targetApiUrl}`)).toBeNull();
+    expect(storage.getItem(`__oracleChatGptBackendCaptureOwner:${targetApiUrl}`)).toBeNull();
     expect(Page.removeScriptToEvaluateOnNewDocument).toHaveBeenCalledWith({
       identifier: "scoped-capture-script",
     });
@@ -639,15 +991,1150 @@ describe("ChatGPT conversation export helpers", () => {
     await pendingResponse;
     await Promise.resolve();
     await Promise.resolve();
+    expect(storage.setItem).not.toHaveBeenCalledWith(
+      `__oracleChatGptBackendCapture:${targetApiUrl}`,
+      expect.any(String),
+    );
+  });
+
+  test("accepts cleanup when another page wrapper superseded Oracle after capture", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const storageValues = new Map<string, string>();
+    const storage = {
+      getItem: vi.fn((key: string) => storageValues.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storageValues.set(key, value)),
+      removeItem: vi.fn((key: string) => storageValues.delete(key)),
+    };
+    const originalFetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ conversation_id: "conv-1" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    ) as unknown as typeof fetch;
+    class OriginalXhr {}
+    const page = { fetch: originalFetch, XMLHttpRequest: OriginalXhr } as {
+      fetch: typeof fetch;
+      XMLHttpRequest: typeof OriginalXhr;
+      __oracleChatGptBackendCapture?: unknown;
+      __oracleChatGptBackendCaptureSelection?: unknown;
+    };
+    const install = new Function(
+      "window",
+      "location",
+      "sessionStorage",
+      buildScopedBackendCaptureHook(targetApiUrl, { owner: captureOwner }),
+    ) as (window: typeof page, location: { href: string }, sessionStorage: typeof storage) => void;
+    install(page, { href: "https://chatgpt.com/c/conv-1" }, storage);
+    const oracleFetch = page.fetch;
+    const laterFetch = vi.fn((input: string | URL | Request, init?: RequestInit) =>
+      oracleFetch(input, init),
+    ) as unknown as typeof fetch;
+    page.fetch = laterFetch;
+    page.__oracleChatGptBackendCaptureSelection = {
+      target: targetApiUrl,
+      capture: page.__oracleChatGptBackendCapture,
+    };
+    const Runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: new Function("window", "sessionStorage", `return (${expression});`)(page, storage),
+        },
+      })),
+    };
+    const Page = { removeScriptToEvaluateOnNewDocument: vi.fn(async () => undefined) };
+
+    await expect(
+      cleanupScopedBackendCaptureForTest(
+        Runtime as never,
+        Page as never,
+        targetApiUrl,
+        "script",
+        captureOwner,
+      ),
+    ).resolves.toBeUndefined();
+    expect(page.fetch).toBe(laterFetch);
+    expect(page.XMLHttpRequest).toBe(OriginalXhr);
+    expect(page.__oracleChatGptBackendCapture).toBeUndefined();
+    expect(page.__oracleChatGptBackendCaptureSelection).toBeUndefined();
+
+    storage.setItem.mockClear();
+    await page.fetch(targetApiUrl);
+    await Promise.resolve();
     expect(storage.setItem).not.toHaveBeenCalled();
+  });
+
+  test("does not tear down a same-target capture owned by another run", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const foreignOwner = "foreign-capture-owner";
+    const storageValues = new Map<string, string>();
+    const storage = {
+      getItem: vi.fn((key: string) => storageValues.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storageValues.set(key, value)),
+      removeItem: vi.fn((key: string) => storageValues.delete(key)),
+    };
+    const originalFetch = vi.fn(async () => new Response("{}")) as unknown as typeof fetch;
+    class OriginalXhr {}
+    const page = {
+      fetch: originalFetch,
+      XMLHttpRequest: OriginalXhr,
+      __oracleChatGptBackendCaptureSelection: { target: targetApiUrl, owner: foreignOwner },
+    } as {
+      fetch: typeof fetch;
+      XMLHttpRequest: typeof OriginalXhr;
+      __oracleChatGptBackendCapture?: { owner?: string; active?: boolean };
+      __oracleChatGptBackendCaptureSelection?: { target: string; owner: string };
+    };
+    const install = new Function(
+      "window",
+      "location",
+      "sessionStorage",
+      buildScopedBackendCaptureHook(targetApiUrl, { owner: foreignOwner }),
+    ) as (window: typeof page, location: { href: string }, sessionStorage: typeof storage) => void;
+    install(page, { href: "https://chatgpt.com/c/conv-1" }, storage);
+    const foreignCapture = page.__oracleChatGptBackendCapture;
+    const Runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: new Function("window", "sessionStorage", `return (${expression});`)(page, storage),
+        },
+      })),
+    };
+    const Page = { removeScriptToEvaluateOnNewDocument: vi.fn(async () => undefined) };
+
+    await expect(
+      cleanupScopedBackendCaptureForTest(
+        Runtime as never,
+        Page as never,
+        targetApiUrl,
+        "capture-script",
+        captureOwner,
+      ),
+    ).resolves.toBeUndefined();
+    expect(page.__oracleChatGptBackendCapture).toBe(foreignCapture);
+    expect(page.__oracleChatGptBackendCapture).toMatchObject({ owner: foreignOwner, active: true });
+    expect(page.fetch).not.toBe(originalFetch);
+    expect(page.__oracleChatGptBackendCaptureSelection).toEqual({
+      target: targetApiUrl,
+      owner: foreignOwner,
+    });
+    expect(storage.getItem(`__oracleChatGptBackendCaptureDisabled:v2:${targetApiUrl}`)).toBeNull();
+    await expect(
+      cleanupScopedBackendCaptureForTest(
+        Runtime as never,
+        Page as never,
+        targetApiUrl,
+        "foreign-capture-script",
+        foreignOwner,
+      ),
+    ).resolves.toBeUndefined();
+    expect(page.__oracleChatGptBackendCapture).toBeUndefined();
+    expect(page.fetch).toBe(originalFetch);
+    expect(page.XMLHttpRequest).toBe(OriginalXhr);
+    expect(page.__oracleChatGptBackendCaptureSelection).toBeUndefined();
+    expect(storage.getItem(`__oracleChatGptBackendCaptureDisabled:v2:${targetApiUrl}`)).toBeNull();
+    expect(Page.removeScriptToEvaluateOnNewDocument).toHaveBeenCalledTimes(2);
+  });
+
+  test("retains a foreign orphan selection and payload during cleanup", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const foreignOwner = "foreign-orphan-owner";
+    const payloadKey = `__oracleChatGptBackendCapture:${targetApiUrl}`;
+    const ownerKey = `__oracleChatGptBackendCaptureOwner:${targetApiUrl}`;
+    const storageValues = new Map<string, string>([
+      [payloadKey, JSON.stringify({ conversation_id: "conv-1", title: "foreign" })],
+      [ownerKey, foreignOwner],
+    ]);
+    const storage = {
+      getItem: vi.fn((key: string) => storageValues.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storageValues.set(key, value)),
+      removeItem: vi.fn((key: string) => storageValues.delete(key)),
+    };
+    const page = {
+      fetch: vi.fn(async () => new Response("{}")),
+      XMLHttpRequest: class {},
+      __oracleChatGptBackendCaptureSelection: {
+        target: targetApiUrl,
+        owner: foreignOwner,
+        text: "foreign private body",
+      },
+    } as {
+      fetch: typeof fetch;
+      XMLHttpRequest: new () => object;
+      __oracleChatGptBackendCaptureSelection?: { target: string; owner: string; text: string };
+    };
+    const Runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: new Function("window", "sessionStorage", `return (${expression});`)(page, storage),
+        },
+      })),
+    };
+    const Page = { removeScriptToEvaluateOnNewDocument: vi.fn(async () => undefined) };
+
+    await expect(
+      cleanupScopedBackendCaptureForTest(
+        Runtime as never,
+        Page as never,
+        targetApiUrl,
+        "capture-script",
+        captureOwner,
+      ),
+    ).rejects.toMatchObject({
+      details: { code: "capture-cleanup-failed", cleanup: ["page cleanup"] },
+    });
+    expect(page.__oracleChatGptBackendCaptureSelection).toEqual({
+      target: targetApiUrl,
+      owner: foreignOwner,
+      text: "foreign private body",
+    });
+    expect(storage.getItem(payloadKey)).toContain('"title":"foreign"');
+    expect(storage.getItem(ownerKey)).toBe(foreignOwner);
+    expect(storage.getItem(`__oracleChatGptBackendCaptureDisabled:v2:${targetApiUrl}`)).toBe(
+      captureOwner,
+    );
+  });
+
+  test("rejects cleanup when Oracle's fetch wrapper remains current", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const storageValues = new Map<string, string>();
+    const storage = {
+      getItem: vi.fn((key: string) => storageValues.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storageValues.set(key, value)),
+      removeItem: vi.fn((key: string) => storageValues.delete(key)),
+    };
+    const originalFetch = vi.fn(async () => new Response("{}")) as unknown as typeof fetch;
+    class OriginalXhr {}
+    const page = { fetch: originalFetch, XMLHttpRequest: OriginalXhr } as {
+      fetch: typeof fetch;
+      XMLHttpRequest: typeof OriginalXhr;
+      __oracleChatGptBackendCapture?: {
+        active: boolean;
+        hits: Array<{ text?: string }>;
+      };
+    };
+    const install = new Function(
+      "window",
+      "location",
+      "sessionStorage",
+      buildScopedBackendCaptureHook(targetApiUrl, { owner: captureOwner }),
+    ) as (window: typeof page, location: { href: string }, sessionStorage: typeof storage) => void;
+    install(page, { href: "https://chatgpt.com/c/conv-1" }, storage);
+    page.__oracleChatGptBackendCapture!.hits.push({ text: "private body" });
+    const oracleFetch = page.fetch;
+    Object.defineProperty(page, "fetch", {
+      configurable: true,
+      get: () => oracleFetch,
+      set: () => undefined,
+    });
+    const Runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: new Function("window", "sessionStorage", `return (${expression});`)(page, storage),
+        },
+      })),
+    };
+    const Page = { removeScriptToEvaluateOnNewDocument: vi.fn(async () => undefined) };
+
+    await expect(
+      cleanupScopedBackendCaptureForTest(
+        Runtime as never,
+        Page as never,
+        targetApiUrl,
+        "script",
+        captureOwner,
+      ),
+    ).rejects.toMatchObject({
+      details: { code: "capture-cleanup-failed", cleanup: ["page cleanup"] },
+    });
+    expect(page.__oracleChatGptBackendCapture?.hits).toEqual([]);
+    expect(page.__oracleChatGptBackendCapture?.active).toBe(false);
+  });
+
+  test("accepts missing new-document registration as already removed", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const Runtime = {
+      evaluate: vi
+        .fn()
+        .mockResolvedValueOnce({
+          result: { value: { owned: true, preExisting: false, retained: true } },
+        })
+        .mockResolvedValueOnce({
+          result: { value: { owned: true, preExisting: true, retained: true } },
+        })
+        .mockResolvedValueOnce({
+          result: {
+            value: {
+              markerOwned: true,
+              ownerMatched: true,
+              matched: true,
+              deactivated: true,
+              restoredFetch: true,
+              restoredXMLHttpRequest: true,
+              stateRemoved: true,
+              selectionRemoved: true,
+              storageRemoved: true,
+              payloadCleared: true,
+            },
+          },
+        })
+        .mockResolvedValueOnce({ result: { value: true } }),
+    };
+    const Page = {
+      removeScriptToEvaluateOnNewDocument: vi
+        .fn()
+        .mockRejectedValue(new Error('{"code":-32000,"message":"Script not found"}')),
+    };
+
+    await expect(
+      cleanupScopedBackendCaptureForTest(
+        Runtime as never,
+        Page as never,
+        targetApiUrl,
+        "script",
+        captureOwner,
+      ),
+    ).resolves.toBeUndefined();
+  });
+  test("rejects cleanup when the new-document registration outcome is unknown", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const disabledKey = `__oracleChatGptBackendCaptureDisabled:v2:${targetApiUrl}`;
+    const storageValues = new Map<string, string>();
+    const storage = {
+      getItem: vi.fn((key: string) => storageValues.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storageValues.set(key, value)),
+      removeItem: vi.fn((key: string) => storageValues.delete(key)),
+    };
+    const originalFetch = vi.fn(async () => new Response("{}")) as unknown as typeof fetch;
+    class OriginalXhr {}
+    const page = {
+      fetch: originalFetch,
+      XMLHttpRequest: OriginalXhr,
+    } as {
+      fetch: typeof fetch;
+      XMLHttpRequest: typeof OriginalXhr;
+      __oracleChatGptBackendCapture?: unknown;
+    };
+    const install = new Function(
+      "window",
+      "location",
+      "sessionStorage",
+      buildScopedBackendCaptureHook(targetApiUrl, { owner: captureOwner }),
+    ) as (window: typeof page, location: { href: string }, sessionStorage: typeof storage) => void;
+    install(page, { href: "https://chatgpt.com/c/conv-1" }, storage);
+    const Runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: new Function("window", "sessionStorage", `return (${expression});`)(page, storage),
+        },
+      })),
+    };
+    const Page = { removeScriptToEvaluateOnNewDocument: vi.fn(async () => undefined) };
+
+    await expect(
+      cleanupScopedBackendCaptureForTest(
+        Runtime as never,
+        Page as never,
+        targetApiUrl,
+        undefined,
+        captureOwner,
+        true,
+      ),
+    ).rejects.toMatchObject({
+      details: {
+        code: "capture-cleanup-failed",
+        cleanup: expect.arrayContaining(["script registration unverified"]),
+      },
+    });
+    expect(Page.removeScriptToEvaluateOnNewDocument).not.toHaveBeenCalled();
+    expect(storage.getItem(disabledKey)).toBe(captureOwner);
+    expect(page.__oracleChatGptBackendCapture).toBeUndefined();
+  });
+
+  test.each([
+    ["message only", new Error("Script not found")],
+    ["wrong code", new Error('{"code":-32001,"message":"Script not found"}')],
+    ["wrong message", new Error('{"code":-32000,"message":"script not found"}')],
+  ])("rejects a non-exact missing-registration error: %s", async (_label, removalError) => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const Runtime = {
+      evaluate: vi
+        .fn()
+        .mockResolvedValueOnce({
+          result: { value: { owned: true, preExisting: false, retained: true } },
+        })
+        .mockResolvedValueOnce({
+          result: { value: { owned: true, preExisting: true, retained: true } },
+        })
+        .mockResolvedValueOnce({
+          result: {
+            value: {
+              markerOwned: true,
+              ownerMatched: true,
+              matched: true,
+              deactivated: true,
+              restoredFetch: true,
+              restoredXMLHttpRequest: true,
+              stateRemoved: true,
+              selectionRemoved: true,
+              storageRemoved: true,
+              payloadCleared: true,
+            },
+          },
+        })
+        .mockResolvedValueOnce({
+          result: { value: { owned: true, preExisting: true, retained: true } },
+        }),
+    };
+    const Page = {
+      removeScriptToEvaluateOnNewDocument: vi.fn().mockRejectedValue(removalError),
+    };
+
+    await expect(
+      cleanupScopedBackendCaptureForTest(
+        Runtime as never,
+        Page as never,
+        targetApiUrl,
+        "script",
+        captureOwner,
+      ),
+    ).rejects.toMatchObject({
+      details: {
+        code: "capture-cleanup-failed",
+        cleanup: expect.arrayContaining(["script removal"]),
+      },
+    });
+  });
+
+  test("recovers a transient page cleanup failure after registration removal", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const captureResult = (stateRemoved: boolean, matched = true) => ({
+      result: {
+        value: {
+          markerOwned: true,
+          ownerMatched: true,
+          matched,
+          deactivated: true,
+          restoredFetch: true,
+          restoredXMLHttpRequest: true,
+          stateRemoved,
+          selectionRemoved: true,
+          storageRemoved: true,
+          payloadCleared: true,
+        },
+      },
+    });
+    const Runtime = {
+      evaluate: vi
+        .fn()
+        .mockResolvedValueOnce({
+          result: { value: { owned: true, preExisting: false, retained: true } },
+        })
+        .mockResolvedValueOnce({
+          result: { value: { owned: true, preExisting: true, retained: true } },
+        })
+        .mockResolvedValueOnce(captureResult(false))
+        .mockResolvedValueOnce({
+          result: { value: { owned: true, preExisting: true, retained: true } },
+        })
+        .mockResolvedValueOnce(captureResult(true))
+        .mockResolvedValueOnce({ result: { value: true } }),
+    };
+    let registered = true;
+    const Page = {
+      removeScriptToEvaluateOnNewDocument: vi.fn(async () => {
+        if (!registered) {
+          throw Object.assign(new Error("Script not found"), {
+            response: { code: -32_000, message: "Script not found" },
+          });
+        }
+        registered = false;
+      }),
+    };
+
+    await expect(
+      cleanupScopedBackendCaptureForTest(
+        Runtime as never,
+        Page as never,
+        targetApiUrl,
+        "script",
+        captureOwner,
+      ),
+    ).resolves.toBeUndefined();
+    expect(registered).toBe(false);
+    expect(Page.removeScriptToEvaluateOnNewDocument).toHaveBeenCalledTimes(1);
+    expect(Runtime.evaluate).toHaveBeenCalledTimes(6);
+  });
+
+  test("clears its marker when an already-removed registration has no current capture state", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const storageValues = new Map<string, string>();
+    const storage = {
+      getItem: vi.fn((key: string) => storageValues.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storageValues.set(key, value)),
+      removeItem: vi.fn((key: string) => storageValues.delete(key)),
+    };
+    const page = { XMLHttpRequest: class {}, fetch: vi.fn() };
+    const Runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: new Function("window", "sessionStorage", `return (${expression});`)(page, storage),
+        },
+      })),
+    };
+    const Page = {
+      removeScriptToEvaluateOnNewDocument: vi
+        .fn()
+        .mockRejectedValue(new Error('{"code":-32000,"message":"Script not found"}')),
+    };
+
+    await cleanupScopedBackendCaptureForTest(
+      Runtime as never,
+      Page as never,
+      targetApiUrl,
+      "capture-id",
+      captureOwner,
+    );
+
+    expect(Runtime.evaluate).toHaveBeenCalledTimes(4);
+  });
+
+  test("does not tear down page state when marker ownership and registration removal both fail", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const Runtime = { evaluate: vi.fn().mockRejectedValue(new Error("marker unavailable")) };
+    const Page = {
+      removeScriptToEvaluateOnNewDocument: vi.fn().mockRejectedValue(new Error("remove failed")),
+    };
+
+    await expect(
+      cleanupScopedBackendCaptureForTest(
+        Runtime as never,
+        Page as never,
+        targetApiUrl,
+        "capture-id",
+        captureOwner,
+      ),
+    ).rejects.toMatchObject({
+      details: { cleanup: expect.arrayContaining(["fail-closed marker", "script removal"]) },
+    });
+    expect(Runtime.evaluate).toHaveBeenCalledTimes(3);
+  });
+  test("contains capture state after registration removal when marker storage cannot be armed", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const storageValues = new Map<string, string>();
+    const storage = {
+      getItem: vi.fn((key: string) => storageValues.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storageValues.set(key, value)),
+      removeItem: vi.fn((key: string) => storageValues.delete(key)),
+    };
+    const originalFetch = vi.fn(async () => new Response("{}")) as unknown as typeof fetch;
+    class OriginalXhr {}
+    const page = {
+      fetch: originalFetch,
+      XMLHttpRequest: OriginalXhr,
+    } as {
+      fetch: typeof fetch;
+      XMLHttpRequest: typeof OriginalXhr;
+      __oracleChatGptBackendCapture?: unknown;
+    };
+    const install = new Function(
+      "window",
+      "location",
+      "sessionStorage",
+      buildScopedBackendCaptureHook(targetApiUrl, { owner: captureOwner }),
+    ) as (window: typeof page, location: { href: string }, sessionStorage: typeof storage) => void;
+    install(page, { href: "https://chatgpt.com/c/conv-1" }, storage);
+    let evaluateCalls = 0;
+    const Runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        evaluateCalls += 1;
+        if ([1, 2, 4].includes(evaluateCalls)) {
+          throw new Error("marker unavailable");
+        }
+        return {
+          result: {
+            value: new Function("window", "sessionStorage", `return (${expression});`)(
+              page,
+              storage,
+            ),
+          },
+        };
+      }),
+    };
+    const Page = { removeScriptToEvaluateOnNewDocument: vi.fn(async () => undefined) };
+
+    await expect(
+      cleanupScopedBackendCaptureForTest(
+        Runtime as never,
+        Page as never,
+        targetApiUrl,
+        "capture-id",
+        captureOwner,
+      ),
+    ).rejects.toMatchObject({
+      details: { cleanup: expect.arrayContaining(["fail-closed marker"]) },
+    });
+    expect(page.fetch).toBe(originalFetch);
+    expect(page.XMLHttpRequest).toBe(OriginalXhr);
+    expect(page.__oracleChatGptBackendCapture).toBeUndefined();
+    expect(storage.getItem(`__oracleChatGptBackendCapture:${targetApiUrl}`)).toBeNull();
+    expect(evaluateCalls).toBe(5);
   });
 
   test("cleans archived recovery state and removes its registration", async () => {
     const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const storageValues = new Map<string, string>();
     const originalFetch = vi.fn(async () => new Response("{}")) as unknown as typeof fetch;
-    const storage = { getItem: () => null };
+    const storage = {
+      getItem: vi.fn((key: string) => storageValues.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storageValues.set(key, value)),
+      removeItem: vi.fn((key: string) => storageValues.delete(key)),
+    };
     const page = {
       fetch: originalFetch,
+      document: { getElementById: () => ({ textContent: "{}" }) },
+    } as {
+      fetch: typeof fetch;
+      document: { getElementById: () => { textContent: string } };
+      __oracleArchivedConversationRecovery?: unknown;
+    };
+    const install = new Function(
+      "window",
+      "document",
+      "location",
+      "Request",
+      "Headers",
+      "URL",
+      "crypto",
+      "TextEncoder",
+      "globalThis",
+      "sessionStorage",
+      buildArchivedConversationRecoveryHookForTest("conv-1", { owner: archiveOwner }),
+    ) as (...args: unknown[]) => void;
+    install(
+      page,
+      page.document,
+      { href: "https://chatgpt.com/#settings/DataControls/ArchivedChats" },
+      Request,
+      Headers,
+      URL,
+      globalThis.crypto,
+      TextEncoder,
+      { crypto: globalThis.crypto },
+      storage,
+    );
+    const Runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: new Function("window", "sessionStorage", `return (${expression});`)(page, storage),
+        },
+      })),
+    };
+    const Page = { removeScriptToEvaluateOnNewDocument: vi.fn(async () => undefined) };
+
+    await cleanupArchivedConversationRecoveryForTest(
+      Runtime as never,
+      Page as never,
+      targetApiUrl,
+      "archive-recovery-script",
+      archiveOwner,
+    );
+
+    expect(page.fetch).toBe(originalFetch);
+    expect(page.__oracleArchivedConversationRecovery).toBeUndefined();
+    expect(storage.removeItem).toHaveBeenCalledWith(
+      `__oracleArchivedConversationRecoveryDisabled:v2:${targetApiUrl}`,
+    );
+    expect(Page.removeScriptToEvaluateOnNewDocument).toHaveBeenCalledWith({
+      identifier: "archive-recovery-script",
+    });
+  });
+  test("preserves legacy marker sentinels while using v2 cleanup markers", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const legacyKey = `__oracleChatGptBackendCaptureDisabled:${targetApiUrl}`;
+    const v2Key = `__oracleChatGptBackendCaptureDisabled:v2:${targetApiUrl}`;
+    const storageValues = new Map<string, string>([[legacyKey, "1"]]);
+    const storage = {
+      getItem: vi.fn((key: string) => storageValues.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storageValues.set(key, value)),
+      removeItem: vi.fn((key: string) => storageValues.delete(key)),
+    };
+    const originalFetch = vi.fn(async () => new Response("{}")) as unknown as typeof fetch;
+    class OriginalXhr {}
+    const page = { fetch: originalFetch, XMLHttpRequest: OriginalXhr } as {
+      fetch: typeof fetch;
+      XMLHttpRequest: typeof OriginalXhr;
+      __oracleChatGptBackendCapture?: { version?: number; owner?: string; active?: boolean };
+    };
+    const install = new Function(
+      "window",
+      "location",
+      "sessionStorage",
+      buildScopedBackendCaptureHook(targetApiUrl, { owner: captureOwner }),
+    ) as (window: typeof page, location: { href: string }, sessionStorage: typeof storage) => void;
+    install(page, { href: "https://chatgpt.com/c/conv-1" }, storage);
+    expect(page.__oracleChatGptBackendCapture).toMatchObject({
+      version: 2,
+      owner: captureOwner,
+      active: true,
+    });
+    expect(storage.getItem(legacyKey)).toBe("1");
+    expect(storage.getItem(v2Key)).toBeNull();
+    const Runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: new Function("window", "sessionStorage", `return (${expression});`)(page, storage),
+        },
+      })),
+    };
+    const Page = { removeScriptToEvaluateOnNewDocument: vi.fn(async () => undefined) };
+    await cleanupScopedBackendCaptureForTest(
+      Runtime as never,
+      Page as never,
+      targetApiUrl,
+      "capture-v2-script",
+      captureOwner,
+    );
+    expect(page.__oracleChatGptBackendCapture).toBeUndefined();
+    expect(page.fetch).toBe(originalFetch);
+    expect(storage.getItem(legacyKey)).toBe("1");
+    expect(storage.getItem(v2Key)).toBeNull();
+  });
+  test("preserves the legacy archive marker sentinel while using its v2 cleanup marker", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const legacyKey = `__oracleArchivedConversationRecoveryDisabled:${targetApiUrl}`;
+    const v2Key = `__oracleArchivedConversationRecoveryDisabled:v2:${targetApiUrl}`;
+    const storageValues = new Map<string, string>([[legacyKey, "1"]]);
+    const storage = {
+      getItem: vi.fn((key: string) => storageValues.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storageValues.set(key, value)),
+      removeItem: vi.fn((key: string) => storageValues.delete(key)),
+    };
+    const originalFetch = vi.fn(async () => new Response("{}")) as unknown as typeof fetch;
+    const page = {
+      fetch: originalFetch,
+      document: { getElementById: () => ({ textContent: "{}" }) },
+    } as {
+      fetch: typeof fetch;
+      document: { getElementById: () => { textContent: string } };
+      __oracleArchivedConversationRecovery?: unknown;
+    };
+    const install = new Function(
+      "window",
+      "document",
+      "location",
+      "Request",
+      "Headers",
+      "URL",
+      "crypto",
+      "TextEncoder",
+      "globalThis",
+      "sessionStorage",
+      buildArchivedConversationRecoveryHookForTest("conv-1", { owner: archiveOwner }),
+    ) as (...args: unknown[]) => void;
+    install(
+      page,
+      page.document,
+      { href: "https://chatgpt.com/#settings/DataControls/ArchivedChats" },
+      Request,
+      Headers,
+      URL,
+      globalThis.crypto,
+      TextEncoder,
+      { crypto: globalThis.crypto },
+      storage,
+    );
+    const Runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: new Function("window", "sessionStorage", `return (${expression});`)(page, storage),
+        },
+      })),
+    };
+    const Page = { removeScriptToEvaluateOnNewDocument: vi.fn(async () => undefined) };
+
+    await cleanupArchivedConversationRecoveryForTest(
+      Runtime as never,
+      Page as never,
+      targetApiUrl,
+      "archive-v2-script",
+      archiveOwner,
+    );
+
+    expect(page.__oracleArchivedConversationRecovery).toBeUndefined();
+    expect(page.fetch).toBe(originalFetch);
+    expect(storage.getItem(legacyKey)).toBe("1");
+    expect(storage.getItem(v2Key)).toBeNull();
+    expect(storage.setItem).toHaveBeenCalledWith(legacyKey, "1");
+    expect(storage.removeItem).not.toHaveBeenCalledWith(legacyKey);
+  });
+
+  test("replaces legacy same-target capture state without consuming its hit", () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const legacyKey = `__oracleChatGptBackendCaptureDisabled:${targetApiUrl}`;
+    const storageValues = new Map<string, string>([[legacyKey, "1"]]);
+    const storage = {
+      getItem: vi.fn((key: string) => storageValues.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storageValues.set(key, value)),
+      removeItem: vi.fn((key: string) => storageValues.delete(key)),
+    };
+    const legacyOriginalFetch = vi.fn() as unknown as typeof fetch;
+    const legacyFetchWrapper = vi.fn() as unknown as typeof fetch;
+    class LegacyOriginalXhr {}
+    class LegacyXhrWrapper {}
+    const legacyState = {
+      target: targetApiUrl,
+      active: true,
+      originalFetch: legacyOriginalFetch,
+      fetchWrapper: legacyFetchWrapper,
+      originalXMLHttpRequest: LegacyOriginalXhr,
+      xmlHttpRequestWrapper: LegacyXhrWrapper,
+      hits: [
+        { url: targetApiUrl, status: 200, text: JSON.stringify({ conversation_id: "conv-1" }) },
+      ],
+      cleanup: vi.fn(),
+    };
+    const page = {
+      fetch: legacyFetchWrapper,
+      XMLHttpRequest: LegacyXhrWrapper,
+      __oracleChatGptBackendCapture: legacyState,
+      __oracleChatGptBackendCaptureSelection: {
+        target: targetApiUrl,
+        capture: legacyState,
+        text: "legacy private body",
+      },
+    } as {
+      fetch: typeof fetch;
+      XMLHttpRequest: typeof LegacyXhrWrapper;
+      __oracleChatGptBackendCapture?: typeof legacyState;
+      __oracleChatGptBackendCaptureSelection?: {
+        target: string;
+        capture: typeof legacyState;
+        text: string;
+      };
+    };
+    const install = new Function(
+      "window",
+      "location",
+      "sessionStorage",
+      buildScopedBackendCaptureHook(targetApiUrl, { owner: captureOwner }),
+    ) as (window: typeof page, location: { href: string }, sessionStorage: typeof storage) => void;
+
+    install(page, { href: "https://chatgpt.com/c/conv-1" }, storage);
+
+    expect(legacyState.cleanup).not.toHaveBeenCalled();
+    expect(legacyState.active).toBe(false);
+    expect(legacyState.hits).toEqual([]);
+    expect(page.__oracleChatGptBackendCapture).toMatchObject({
+      version: 2,
+      owner: captureOwner,
+      target: targetApiUrl,
+      active: true,
+    });
+    expect(page.__oracleChatGptBackendCapture).not.toBe(legacyState);
+    expect(page.__oracleChatGptBackendCaptureSelection).toBeUndefined();
+    expect(storage.getItem(legacyKey)).toBe("1");
+  });
+
+  test("replaces legacy same-target archive state without trusting its recovery result", () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const legacyKey = `__oracleArchivedConversationRecoveryDisabled:${targetApiUrl}`;
+    const storageValues = new Map<string, string>([[legacyKey, "1"]]);
+    const storage = {
+      getItem: vi.fn((key: string) => storageValues.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storageValues.set(key, value)),
+      removeItem: vi.fn((key: string) => storageValues.delete(key)),
+    };
+    const legacyOriginalFetch = vi.fn() as unknown as typeof fetch;
+    const legacyFetchWrapper = vi.fn() as unknown as typeof fetch;
+    const legacyState = {
+      target: targetApiUrl,
+      active: true,
+      originalFetch: legacyOriginalFetch,
+      fetchWrapper: legacyFetchWrapper,
+      status: "recovered",
+      recovered: true,
+      cleanup: vi.fn(),
+    };
+    const page = {
+      fetch: legacyFetchWrapper,
+      document: { getElementById: () => ({ textContent: "{}" }) },
+      __oracleArchivedConversationRecovery: legacyState,
+    } as {
+      fetch: typeof fetch;
+      document: { getElementById: () => { textContent: string } };
+      __oracleArchivedConversationRecovery?: typeof legacyState;
+    };
+    const install = new Function(
+      "window",
+      "document",
+      "location",
+      "Request",
+      "Headers",
+      "URL",
+      "crypto",
+      "TextEncoder",
+      "globalThis",
+      "sessionStorage",
+      buildArchivedConversationRecoveryHookForTest("conv-1", { owner: archiveOwner }),
+    ) as (...args: unknown[]) => void;
+
+    install(
+      page,
+      page.document,
+      { href: "https://chatgpt.com/#settings/DataControls/ArchivedChats" },
+      Request,
+      Headers,
+      URL,
+      globalThis.crypto,
+      TextEncoder,
+      { crypto: globalThis.crypto },
+      storage,
+    );
+
+    expect(legacyState.cleanup).not.toHaveBeenCalled();
+    expect(legacyState.active).toBe(false);
+    expect(page.__oracleArchivedConversationRecovery).toMatchObject({
+      version: 2,
+      owner: archiveOwner,
+      target: targetApiUrl,
+      active: true,
+    });
+    expect(page.__oracleArchivedConversationRecovery).not.toBe(legacyState);
+    expect(storage.getItem(legacyKey)).toBe("1");
+  });
+
+  test("rejects legacy and foreign capture state before polling or retrieving its body", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const approved = JSON.stringify({ conversation_id: "conv-1", title: "private" });
+    for (const state of [
+      { version: 1, owner: "legacy-owner" },
+      { version: 2, owner: "foreign-owner" },
+    ]) {
+      const evaluator = vi.fn(
+        async (expression: string) =>
+          new Function("window", "sessionStorage", `return (${expression})`)(
+            {
+              __oracleChatGptBackendCapture: {
+                target: targetApiUrl,
+                version: state.version,
+                owner: state.owner,
+                hits: [{ url: targetApiUrl, status: 200, text: approved }],
+                requests: { started: 1, pending: 0, completed: 1 },
+              },
+            },
+            { getItem: () => approved },
+          ) as never,
+      );
+      const fallback = vi.fn(async () => true);
+
+      await expect(
+        pollCaptureWithPassiveFallbackForTest(
+          evaluator,
+          targetApiUrl,
+          1_000,
+          0,
+          fallback,
+          undefined,
+          captureOwner,
+        ),
+      ).rejects.toThrow(/capture hook owner or version changed/i);
+      expect(fallback).not.toHaveBeenCalled();
+      await expect(
+        retrieveCapturedTextWithEvaluator(
+          evaluator,
+          targetApiUrl,
+          approved.length,
+          approved.length,
+          Date.now() + 25,
+          captureOwner,
+        ),
+      ).rejects.toThrow(
+        /timed out waiting for backend conversation capture|missing captured text chunk/i,
+      );
+      expect(evaluator).toHaveBeenCalled();
+    }
+  });
+
+  test("reports marker and registration failures without unguarded page teardown", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const Runtime = { evaluate: vi.fn().mockRejectedValue(new Error("page disconnected")) };
+    const Page = {
+      removeScriptToEvaluateOnNewDocument: vi.fn().mockRejectedValue(new Error("remove failed")),
+    };
+
+    await expect(
+      cleanupScopedBackendCaptureForTest(
+        Runtime as never,
+        Page as never,
+        targetApiUrl,
+        "script-id",
+        captureOwner,
+      ),
+    ).rejects.toMatchObject({
+      name: "BrowserAutomationError",
+      details: {
+        code: "capture-cleanup-failed",
+        cleanup: expect.arrayContaining(["script removal", "fail-closed marker"]),
+      },
+    });
+    expect(Page.removeScriptToEvaluateOnNewDocument).toHaveBeenCalledWith({
+      identifier: "script-id",
+    });
+    expect(Runtime.evaluate).toHaveBeenCalledTimes(3);
+  });
+
+  test("blocks hook installation while removing the new-document registration", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const storageValues = new Map<string, string>();
+    const storage = {
+      getItem: vi.fn((key: string) => storageValues.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storageValues.set(key, value)),
+      removeItem: vi.fn((key: string) => storageValues.delete(key)),
+    };
+    const originalFetch = vi.fn(async () => new Response("{}")) as unknown as typeof fetch;
+    class OriginalXhr {}
+    const page = { fetch: originalFetch, XMLHttpRequest: OriginalXhr } as {
+      fetch: typeof fetch;
+      XMLHttpRequest: typeof OriginalXhr;
+      __oracleChatGptBackendCapture?: unknown;
+    };
+    const install = new Function(
+      "window",
+      "location",
+      "sessionStorage",
+      buildScopedBackendCaptureHook(targetApiUrl, { owner: captureOwner }),
+    ) as (window: typeof page, location: { href: string }, sessionStorage: typeof storage) => void;
+    install(page, { href: "https://chatgpt.com/c/conv-1" }, storage);
+    let currentPage = page;
+    const events: string[] = [];
+    const Runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        events.push(Runtime.evaluate.mock.calls.length === 1 ? "marker" : "page-or-clear");
+        return {
+          result: {
+            value: new Function("window", "sessionStorage", `return (${expression});`)(
+              currentPage,
+              storage,
+            ),
+          },
+        };
+      }),
+    };
+    let navigatedPage: typeof page | undefined;
+    const Page = {
+      removeScriptToEvaluateOnNewDocument: vi.fn(async () => {
+        events.push("remove");
+        navigatedPage = { fetch: originalFetch, XMLHttpRequest: OriginalXhr };
+        currentPage = navigatedPage;
+        install(currentPage, { href: "https://chatgpt.com/c/conv-1" }, storage);
+      }),
+    };
+
+    await cleanupScopedBackendCaptureForTest(
+      Runtime as never,
+      Page as never,
+      targetApiUrl,
+      "capture-id",
+      captureOwner,
+    );
+
+    expect(events).toEqual(["marker", "remove", "page-or-clear", "page-or-clear", "page-or-clear"]);
+    expect(navigatedPage?.__oracleChatGptBackendCapture).toBeUndefined();
+    expect(storage.getItem(`__oracleChatGptBackendCaptureDisabled:v2:${targetApiUrl}`)).toBeNull();
+  });
+
+  test("retains a stale marker when the original registration cannot be removed", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const disabledKey = `__oracleChatGptBackendCaptureDisabled:v2:${targetApiUrl}`;
+    const storageValues = new Map<string, string>();
+    const storage = {
+      getItem: vi.fn((key: string) => storageValues.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storageValues.set(key, value)),
+      removeItem: vi.fn((key: string) => storageValues.delete(key)),
+    };
+    const originalFetch = vi.fn(async () => new Response("{}")) as unknown as typeof fetch;
+    class OriginalXhr {}
+    const page = {
+      fetch: originalFetch,
+      XMLHttpRequest: OriginalXhr,
+    } as {
+      fetch: typeof fetch;
+      XMLHttpRequest: typeof OriginalXhr;
+      __oracleChatGptBackendCapture?: unknown;
+      __oracleChatGptBackendCaptureSelection?: unknown;
+    };
+    const install = new Function(
+      "window",
+      "location",
+      "sessionStorage",
+      buildScopedBackendCaptureHook(targetApiUrl, { owner: "id-a" }),
+    ) as (window: typeof page, location: { href: string }, sessionStorage: typeof storage) => void;
+    install(page, { href: "https://chatgpt.com/c/conv-1" }, storage);
+    let removeCalls = 0;
+    const Page = {
+      removeScriptToEvaluateOnNewDocument: vi.fn(async () => {
+        removeCalls += 1;
+        if (removeCalls === 1) throw new Error("registration removal failed");
+      }),
+    };
+    const Runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: new Function("window", "sessionStorage", `return (${expression});`)(page, storage),
+        },
+      })),
+    };
+
+    await expect(
+      cleanupScopedBackendCaptureForTest(
+        Runtime as never,
+        Page as never,
+        targetApiUrl,
+        "id-a",
+        "id-a",
+      ),
+      "id-a",
+    ).rejects.toMatchObject({
+      details: { cleanup: expect.arrayContaining(["script removal"]) },
+    });
+    expect(storage.getItem(disabledKey)).toBe("id-a");
+    expect(
+      storage.getItem(`__oracleArchivedConversationRecoveryDisabled:v2:${targetApiUrl}`),
+    ).toBeNull();
+
+    install(page, { href: "https://chatgpt.com/c/conv-1" }, storage);
+    expect(page.__oracleChatGptBackendCapture).toBeUndefined();
+
+    await expect(
+      cleanupScopedBackendCaptureForTest(
+        Runtime as never,
+        Page as never,
+        targetApiUrl,
+        "id-b",
+        "id-b",
+      ),
+    ).rejects.toMatchObject({
+      details: { cleanup: expect.arrayContaining(["pre-existing fail-closed marker"]) },
+    });
+    expect(storage.getItem(disabledKey)).toBe("id-a");
+    install(page, { href: "https://chatgpt.com/c/conv-1" }, storage);
+    expect(page.__oracleChatGptBackendCapture).toBeUndefined();
+  });
+
+  test("does not let a capture marker disable archived recovery", () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const storageValues = new Map<string, string>([
+      [`__oracleChatGptBackendCaptureDisabled:v2:${targetApiUrl}`, "capture-id"],
+      [`__oracleArchivedConversationRecoveryDisabled:${targetApiUrl}`, "1"],
+    ]);
+    const storage = {
+      getItem: (key: string) => storageValues.get(key) ?? null,
+      setItem: (key: string, value: string) => storageValues.set(key, value),
+      removeItem: (key: string) => storageValues.delete(key),
+    };
+    const page = {
+      fetch: vi.fn(async () => new Response("{}")),
       document: { getElementById: () => ({ textContent: "{}" }) },
     } as {
       fetch: typeof fetch;
@@ -679,52 +2166,88 @@ describe("ChatGPT conversation export helpers", () => {
       { crypto: globalThis.crypto },
       storage,
     );
+    expect(page.__oracleArchivedConversationRecovery).toBeDefined();
+  });
+
+  test("blocks archived recovery installation while removing its registration", async () => {
+    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
+    const storageValues = new Map<string, string>();
+    const storage = {
+      getItem: vi.fn((key: string) => storageValues.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storageValues.set(key, value)),
+      removeItem: vi.fn((key: string) => storageValues.delete(key)),
+    };
+    const originalFetch = vi.fn(async () => new Response("{}")) as unknown as typeof fetch;
+    const page = {
+      fetch: originalFetch,
+      document: { getElementById: () => ({ textContent: "{}" }) },
+    } as {
+      fetch: typeof fetch;
+      document: { getElementById: () => { textContent: string } };
+      __oracleArchivedConversationRecovery?: unknown;
+    };
+    const install = new Function(
+      "window",
+      "document",
+      "location",
+      "Request",
+      "Headers",
+      "URL",
+      "crypto",
+      "TextEncoder",
+      "globalThis",
+      "sessionStorage",
+      buildArchivedConversationRecoveryHookForTest("conv-1", { owner: archiveOwner }),
+    ) as (...args: unknown[]) => void;
+    const installOn = (target: typeof page) =>
+      install(
+        target,
+        target.document,
+        { href: "https://chatgpt.com/#settings/DataControls/ArchivedChats" },
+        Request,
+        Headers,
+        URL,
+        globalThis.crypto,
+        TextEncoder,
+        { crypto: globalThis.crypto },
+        storage,
+      );
+    installOn(page);
+    let currentPage = page;
     const Runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
-        result: { value: new Function("window", `return (${expression});`)(page) },
+        result: {
+          value: new Function("window", "sessionStorage", `return (${expression});`)(
+            currentPage,
+            storage,
+          ),
+        },
       })),
     };
-    const Page = { removeScriptToEvaluateOnNewDocument: vi.fn(async () => undefined) };
+    let navigatedPage: typeof page | undefined;
+    const Page = {
+      removeScriptToEvaluateOnNewDocument: vi.fn(async () => {
+        navigatedPage = {
+          fetch: originalFetch,
+          document: page.document,
+        };
+        currentPage = navigatedPage;
+        installOn(currentPage);
+      }),
+    };
 
     await cleanupArchivedConversationRecoveryForTest(
       Runtime as never,
       Page as never,
       targetApiUrl,
-      "archive-recovery-script",
+      "archive-id",
+      archiveOwner,
     );
 
-    expect(page.fetch).toBe(originalFetch);
-    expect(page.__oracleArchivedConversationRecovery).toBeUndefined();
-    expect(Page.removeScriptToEvaluateOnNewDocument).toHaveBeenCalledWith({
-      identifier: "archive-recovery-script",
-    });
-  });
-
-  test("reports page and registration teardown failures after attempting both", async () => {
-    const targetApiUrl = "https://chatgpt.com/backend-api/conversation/conv-1";
-    const Runtime = { evaluate: vi.fn().mockRejectedValue(new Error("page disconnected")) };
-    const Page = {
-      removeScriptToEvaluateOnNewDocument: vi.fn().mockRejectedValue(new Error("remove failed")),
-    };
-
-    await expect(
-      cleanupScopedBackendCaptureForTest(
-        Runtime as never,
-        Page as never,
-        targetApiUrl,
-        "script-id",
-      ),
-    ).rejects.toMatchObject({
-      name: "BrowserAutomationError",
-      details: {
-        code: "capture-cleanup-failed",
-        cleanup: expect.arrayContaining(["page cleanup", "script removal", "fail-closed marker"]),
-      },
-    });
-    expect(Page.removeScriptToEvaluateOnNewDocument).toHaveBeenCalledWith({
-      identifier: "script-id",
-    });
-    expect(Runtime.evaluate).toHaveBeenCalledTimes(2);
+    expect(navigatedPage?.__oracleArchivedConversationRecovery).toBeUndefined();
+    expect(
+      storage.getItem(`__oracleArchivedConversationRecoveryDisabled:v2:${targetApiUrl}`),
+    ).toBeNull();
   });
 
   test("captures approved JSON XHR responses without reading responseText", async () => {
@@ -764,7 +2287,7 @@ describe("ChatGPT conversation export helpers", () => {
       fetch: vi.fn(),
       XMLHttpRequest: FakeXhr,
     };
-    const storage = { setItem: vi.fn() };
+    const storage = { getItem: vi.fn(() => null), setItem: vi.fn() };
     const install = new Function(
       "window",
       "location",
@@ -848,7 +2371,7 @@ describe("ChatGPT conversation export helpers", () => {
         requests: { started: number; pending: number; completed: number };
       };
     };
-    const storage = { setItem: vi.fn() };
+    const storage = { getItem: vi.fn(() => null), setItem: vi.fn() };
     const install = new Function(
       "window",
       "location",
@@ -933,7 +2456,7 @@ describe("ChatGPT conversation export helpers", () => {
           requests: { started: number; pending: number; completed: number };
         };
       };
-      const storage = { setItem: vi.fn() };
+      const storage = { getItem: vi.fn(() => null), setItem: vi.fn() };
       const runtimeGlobal = { crypto: globalThis.crypto };
       const install = new Function(
         "window",
@@ -984,12 +2507,14 @@ describe("ChatGPT conversation export helpers", () => {
       authUserId = userId,
       authWorkspaceId = workspaceId,
       passiveRequestStarted = 0,
+      captureOwner: expectedCaptureOwner,
     }: {
       targetUrl?: string;
       href?: string;
       authUserId?: string;
       authWorkspaceId?: string;
       passiveRequestStarted?: number;
+      captureOwner?: string;
     } = {}) => {
       const expression = buildApprovedBackendFetchExpression({
         targetUrl,
@@ -997,6 +2522,7 @@ describe("ChatGPT conversation export helpers", () => {
         email,
         accountDigest: digest(userId),
         workspaceDigest: digest(workspaceId),
+        captureOwner: expectedCaptureOwner,
       });
       const evaluate = new Function(
         "location",
@@ -1074,6 +2600,12 @@ describe("ChatGPT conversation export helpers", () => {
       code: "passive-request-observed",
     });
     expect(passiveObserved.pageFetch).not.toHaveBeenCalled();
+    const legacyPending = await run({ passiveRequestStarted: 1, captureOwner });
+    expect(legacyPending.result).toEqual({
+      status: "refused",
+      code: "capture-owner-mismatch",
+    });
+    expect(legacyPending.pageFetch).not.toHaveBeenCalled();
 
     for (const mismatch of [{ authUserId: "other-user" }, { authWorkspaceId: "other-workspace" }]) {
       const wrongIdentity = await run(mismatch);

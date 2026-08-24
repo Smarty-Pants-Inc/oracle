@@ -204,6 +204,11 @@ describe("session lifecycle", () => {
         prompt: "Persist request origin",
         model: "gpt-5.6-sol-pro",
         mode: "browser",
+        browserConfig: {
+          browserTransport: "obu",
+          chatGptAccountEmail: "paul@smartypants.ai",
+          chatGptWorkspaceName: "Paul Bettner",
+        },
       },
       "/tmp/cwd",
     );
@@ -214,6 +219,27 @@ describe("session lifecycle", () => {
     expect(metadata.requestOrigin).toBe("user");
     expect(stored.requestOrigin).toBe("user");
     expect(stored.options.requestOrigin).toBe("user");
+  });
+
+  test("rejects a browser route bound to the opposite wrapper origin before reserving a session", async () => {
+    vi.stubEnv("ORACLE_WRAPPER_REMOTE_ONLY", "1");
+    vi.stubEnv("ORACLE_WRAPPER_INVOCATION_ORIGIN", "user");
+    await expect(
+      sessionModule.initializeSession(
+        {
+          prompt: "Reject swapped route",
+          model: "gpt-5.6-sol-pro",
+          mode: "browser",
+          browserConfig: {
+            browserTransport: "obu",
+            chatGptAccountEmail: "dev1@smartypants.ai",
+            chatGptWorkspaceName: "Smarty Dev",
+          },
+        },
+        "/tmp/cwd",
+      ),
+    ).rejects.toThrow(/bound to paul@smartypants\.ai/i);
+    await expect(readdir(sessionModule.getSessionsDir())).resolves.toEqual([]);
   });
 
   test("fails closed for missing or conflicting wrapper request origins", async () => {

@@ -572,12 +572,43 @@ async function resumeBrowserSessionViaObu(
   let connectionReady: Promise<OpenBrowserUseConnection> | null = null;
   const removeTerminationHooks = registerOpenBrowserUseTerminationHooks({
     connection: () => connection ?? connectionReady,
+    preserveTab: () => {
+      connection?.requestKeepTab?.();
+    },
     releaseLock: () => lock.release(),
+    markLockUncertain: (details) => lock.markUncertain?.(details),
     logger,
   });
   let completed = false;
   let routeRetained = false;
   let thrownError: BrowserAutomationError | null = null;
+  let lockUncertain = false;
+  const markLockUncertain = async (reason: string, error?: unknown): Promise<void> => {
+    lockUncertain = true;
+    const details = error instanceof BrowserAutomationError ? error.details : undefined;
+    const candidate = details?.recoveryHandle;
+    const recoveryHandle =
+      candidate && typeof candidate === "object" && !Array.isArray(candidate)
+        ? (candidate as Record<string, unknown>)
+        : connection
+          ? {
+              transport: "obu",
+              sessionId: connection.sessionId,
+              tabId: connection.tabId,
+              conversationUrl: connection.tabUrl ?? conversationUrl ?? null,
+            }
+          : undefined;
+    try {
+      await lock.markUncertain?.({
+        reason,
+        ...(recoveryHandle ? { recoveryHandle } : {}),
+      });
+    } catch (markError) {
+      logger(
+        `[browser] Failed to persist uncertain reattach lock state: ${markError instanceof Error ? markError.message : String(markError)}`,
+      );
+    }
+  };
   let assistantBinding: Pick<
     BrowserRuntimeMetadata,
     "assistantTurnIndex" | "assistantTurnId" | "assistantMessageId"
@@ -611,6 +642,7 @@ async function resumeBrowserSessionViaObu(
       await connection.finalize(false);
       return undefined;
     } catch (error) {
+      await markLockUncertain("Main-Chrome reattach tab finalization was inconclusive.", error);
       const message = error instanceof Error ? error.message : String(error);
       const details = error instanceof BrowserAutomationError ? error.details : undefined;
       const warning = sanitizeErrorForPersistence(message, details);
@@ -818,10 +850,13 @@ async function resumeBrowserSessionViaObu(
     );
     throw thrownError;
   } finally {
-    removeTerminationHooks();
+    await removeTerminationHooks.waitForDrain();
     try {
-      await connection?.finalize(!completed && routeRetained);
+      await connection?.finalize(
+        removeTerminationHooks.isTerminating() || (!completed && routeRetained),
+      );
     } catch (error) {
+      await markLockUncertain("Main-Chrome reattach cleanup was inconclusive.", error);
       if (thrownError?.details) {
         (thrownError.details as Record<string, unknown>).cleanupFailure =
           error instanceof BrowserAutomationError
@@ -832,8 +867,13 @@ async function resumeBrowserSessionViaObu(
           `[browser] Failed to finalize main-Chrome reattach tab: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
+    } finally {
+      await removeTerminationHooks.waitForDrain();
+      removeTerminationHooks();
+      if (!removeTerminationHooks.isLockUncertain() && !lockUncertain) {
+        await lock.release().catch(() => undefined);
+      }
     }
-    await lock.release().catch(() => undefined);
   }
 }
 

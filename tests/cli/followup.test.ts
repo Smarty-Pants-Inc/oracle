@@ -220,6 +220,43 @@ describe("browser follow-up resolution", () => {
       });
     },
   );
+  test("rejects stored main-Chrome metadata whose origin names the wrong account", async () => {
+    vi.stubEnv("ORACLE_WRAPPER_REMOTE_ONLY", "1");
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      mode: "browser",
+      requestOrigin: "agent",
+      options: { requestOrigin: "agent" },
+      browser: {
+        config: {
+          browserTransport: "obu",
+          chatGptAccountEmail: "paul@smartypants.ai",
+          chatGptWorkspaceName: "Paul Bettner",
+          chatGptAccountDigest: "a".repeat(64),
+          chatGptWorkspaceDigest: "b".repeat(64),
+        },
+        runtime: {
+          browserTransport: "obu",
+          obuSessionId: "oracle-agent",
+          obuTabId: 8,
+          chatGptAccountEmail: "paul@smartypants.ai",
+          chatGptWorkspaceName: "Paul Bettner",
+          chatGptAccountDigest: "a".repeat(64),
+          chatGptWorkspaceDigest: "b".repeat(64),
+          conversationId: "agent-thread",
+          promptTurnIndex: 0,
+          promptTurnId: "user-agent",
+          assistantTurnIndex: 1,
+          assistantTurnId: "assistant-agent",
+        },
+      },
+    };
+    await expect(
+      resolveBrowserFollowupReference("session-1", {
+        readSession: vi.fn(async () => metadata),
+      }),
+    ).rejects.toThrow(/bound to dev1@smartypants\.ai/i);
+  });
 
   test("rejects a main-Chrome follow-up without exact prompt and assistant affinity", async () => {
     const metadata: SessionMetadata = {

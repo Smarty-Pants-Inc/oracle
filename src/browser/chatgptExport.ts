@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { BrowserAutomationError, sanitizeErrorForPersistence } from "../oracle/errors.js";
 import type { BrowserArchiveResult, ChromeClient } from "./types.js";
 import type { BrowserRunWarning } from "../sessionStore.js";
@@ -11,16 +12,17 @@ import {
   DEFAULT_REMOTE_CHROME_PORT,
   openChatGptTarget,
 } from "./liveTabs.js";
+import { closeRemoteChromeTarget, connectToRemoteChromeTarget } from "./chromeLifecycle.js";
 import { delay } from "./utils.js";
+import {
+  chatGptConversationScopeFromUrl,
+  isSameChatGptConversationScope,
+} from "./conversationUrl.js";
 import {
   browserIdFromWebSocketEndpoint,
   resolveRemoteChromeBrowserIdentity,
 } from "./profileState.js";
-import {
-  isChatGptScopeRetained,
-  readChatGptAccountDigest,
-  readChatGptIdentityDigests,
-} from "./pageActions.js";
+import { readChatGptAccountDigest, readChatGptIdentityDigests } from "./pageActions.js";
 import { assertChatGptIdentity } from "./chatgptAccountRouter.js";
 import {
   acquireOpenBrowserUseRunLock,
@@ -133,6 +135,7 @@ export interface ChatGptArchiveRecoveryResult {
   settingsUrl?: string;
   patchStatus?: number;
 }
+type ArchivedPatchOutcome = "not-started" | "in-flight" | "succeeded" | "failed" | "unknown";
 
 interface CaptureHitSummary {
   kind?: string;
@@ -145,6 +148,7 @@ interface CaptureHitSummary {
 
 export interface CapturePollResult {
   hit?: CaptureHitSummary | null;
+  ownerMatched?: boolean;
   requests?: {
     started: number;
     pending: number;
@@ -220,43 +224,25 @@ const SECRET_MARKER_MENTIONS = [
 ];
 
 export function conversationIdFromChatGptUrl(rawUrl: string): string {
-  let parsed: URL;
-  try {
-    parsed = new URL(rawUrl);
-  } catch {
-    throw new Error(
-      "target-url must be https://chatgpt.com/c/<conversation-id> or https://chatgpt.com/g/<project>/c/<conversation-id>",
-    );
-  }
-  if (
-    parsed.protocol !== "https:" ||
-    parsed.hostname !== "chatgpt.com" ||
-    Boolean(parsed.port) ||
-    Boolean(parsed.username || parsed.password) ||
-    parsed.pathname.includes("%")
-  ) {
-    throw new Error(
-      "target-url must be https://chatgpt.com/c/<conversation-id> or https://chatgpt.com/g/<project>/c/<conversation-id>",
-    );
-  }
-  const match = /^(?:\/c|\/g\/[^/?#]+\/c)\/([^/?#]+)\/?$/.exec(parsed.pathname);
-  if (!match?.[1]) {
+  const scope = chatGptConversationScopeFromUrl(rawUrl);
+  if (!scope) {
     throw new Error(
       "target-url must be a specific ChatGPT conversation URL: https://chatgpt.com/c/<conversation-id> or https://chatgpt.com/g/<project>/c/<conversation-id>",
     );
   }
-  return match[1];
+  return scope.conversationId;
 }
 function chatGptConversationScope(rawUrl: string): {
   conversationId: string;
   projectKey: string | null;
 } {
-  const conversationId = conversationIdFromChatGptUrl(rawUrl);
-  const project = /^\/g\/([^/?#]+)\/c\//.exec(new URL(rawUrl).pathname)?.[1];
-  const projectKey = project
-    ? (project.match(/^(g-p-[0-9a-f]{32})(?=-|$)/iu)?.[1] ?? project).toLowerCase()
-    : null;
-  return { conversationId, projectKey };
+  const scope = chatGptConversationScopeFromUrl(rawUrl);
+  if (!scope) {
+    throw new Error(
+      "target-url must be https://chatgpt.com/c/<conversation-id> or https://chatgpt.com/g/<project>/c/<conversation-id>",
+    );
+  }
+  return scope;
 }
 
 export function buildBackendConversationUrl(conversationId: string): string {
@@ -274,7 +260,7 @@ export function isSameConversationUrl(actualUrl: string, expectedUrl: string): b
   try {
     conversationIdFromChatGptUrl(actualUrl);
     conversationIdFromChatGptUrl(expectedUrl);
-    return isChatGptScopeRetained(actualUrl, expectedUrl);
+    return isSameChatGptConversationScope(actualUrl, expectedUrl);
   } catch {
     return false;
   }
@@ -398,19 +384,31 @@ export function buildScopedBackendCaptureHook(
     targetUrl?: string;
     accountDigest?: string;
     workspaceDigest?: string;
+    owner?: string;
   } = {},
 ): string {
   const routeCheck = options.targetUrl
     ? buildExpectedConversationScopeCheckExpression(options.targetUrl)
     : "true";
+  const owner = options.owner?.trim() || randomUUID();
   return `
 (() => {
   const TARGET = ${jsString(targetApiUrl)};
+  const VERSION = 2;
+  const OWNER = ${jsString(owner)};
   const STORAGE_KEY = "__oracleChatGptBackendCapture:" + TARGET;
-  const DISABLED_KEY = "__oracleChatGptBackendCaptureDisabled:" + TARGET;
+  const STORAGE_OWNER_KEY = "__oracleChatGptBackendCaptureOwner:" + TARGET;
+  const DISABLED_KEY = "__oracleChatGptBackendCaptureDisabled:v2:" + TARGET;
   try {
-    if (sessionStorage.getItem(DISABLED_KEY) === "1") return;
-  } catch {}
+    if (sessionStorage.getItem(DISABLED_KEY) !== null) return;
+  } catch {
+    return;
+  }
+  try {
+    if (new URL(location.href).origin !== "https://chatgpt.com") return;
+  } catch {
+    return;
+  }
   const EXPECTED_ACCOUNT_DIGEST = ${jsString(options.accountDigest?.trim() ?? "")};
   const EXPECTED_WORKSPACE_DIGEST = ${jsString(options.workspaceDigest?.trim() ?? "")};
   const EXPECTED_CONVERSATION_ID = TARGET.slice(TARGET.lastIndexOf("/") + 1);
@@ -423,10 +421,38 @@ export function buildScopedBackendCaptureHook(
   };
   const routeMatches = () => Boolean(${routeCheck});
   const existing = window.__oracleChatGptBackendCapture;
-  if (existing?.target === TARGET && existing?.active) return;
+  if (existing?.target === TARGET && existing?.active) {
+    if (existing.version === VERSION) return;
+    try {
+      existing.active = false;
+      if (window.fetch === existing.fetchWrapper) {
+        if (typeof existing.originalFetch !== "function") return;
+        window.fetch = existing.originalFetch;
+      }
+      if (window.XMLHttpRequest === existing.xmlHttpRequestWrapper) {
+        if (!existing.originalXMLHttpRequest) return;
+        window.XMLHttpRequest = existing.originalXMLHttpRequest;
+      }
+      if (Array.isArray(existing.hits)) existing.hits.length = 0;
+      const selection = window.__oracleChatGptBackendCaptureSelection;
+      if (selection?.capture === existing) {
+        try {
+          if (selection && typeof selection === "object" && "text" in selection) selection.text = "";
+        } catch {}
+        try { delete window.__oracleChatGptBackendCaptureSelection; } catch {}
+      }
+      if (window.__oracleChatGptBackendCapture === existing) {
+        delete window.__oracleChatGptBackendCapture;
+      }
+    } catch {
+      return;
+    }
+  }
   const originalFetch = window.fetch;
   const OriginalXHR = window.XMLHttpRequest;
   const state = window.__oracleChatGptBackendCapture = {
+    version: VERSION,
+    owner: OWNER,
     target: TARGET,
     active: true,
     originalFetch,
@@ -537,6 +563,18 @@ export function buildScopedBackendCaptureHook(
       capturedAt: new Date().toISOString()
     });
   };
+  const persist = (capturedText) => {
+    try {
+      const storedOwner = sessionStorage.getItem(STORAGE_OWNER_KEY);
+      const storedPayload = sessionStorage.getItem(STORAGE_KEY);
+      if (
+        (storedOwner !== null && storedOwner !== OWNER) ||
+        (storedOwner === null && storedPayload !== null)
+      ) return;
+      sessionStorage.setItem(STORAGE_OWNER_KEY, OWNER);
+      sessionStorage.setItem(STORAGE_KEY, capturedText);
+    } catch {}
+  };
   const record = async (request, response) => {
     try {
       if (!isActive()) return;
@@ -547,11 +585,7 @@ export function buildScopedBackendCaptureHook(
         await captureAffinityMatches();
       if (!isActive()) return;
       const capturedText = affinityMatched ? text : "";
-      if (affinityMatched) {
-        try {
-          sessionStorage.setItem(STORAGE_KEY, capturedText);
-        } catch {}
-      }
+      if (affinityMatched) persist(capturedText);
       state.hits.push({
         kind: request.kind,
         url: request.url,
@@ -659,11 +693,7 @@ export function buildScopedBackendCaptureHook(
           await captureAffinityMatches();
         if (!isActive()) return;
         const capturedText = affinityMatched ? text : "";
-        if (affinityMatched) {
-          try {
-            sessionStorage.setItem(STORAGE_KEY, capturedText);
-          } catch {}
-        }
+        if (affinityMatched) persist(capturedText);
         state.hits.push({
           kind: tracked.kind,
           url: tracked.url,
@@ -686,35 +716,88 @@ export function buildScopedBackendCaptureHook(
   state.cleanup = () => {
     const wasActive = state.active;
     state.active = false;
+    let payloadCleared = false;
+    try {
+      state.hits.length = 0;
+      payloadCleared = state.hits.length === 0;
+    } catch {}
     let storageRemoved = true;
     try {
-      sessionStorage.removeItem(STORAGE_KEY);
+      const storedOwner = sessionStorage.getItem(STORAGE_OWNER_KEY);
+      const storedPayload = sessionStorage.getItem(STORAGE_KEY);
+      if (storedOwner !== null && storedOwner !== OWNER) {
+        storageRemoved = false;
+      } else if (storedOwner === OWNER) {
+        sessionStorage.removeItem(STORAGE_KEY);
+        sessionStorage.removeItem(STORAGE_OWNER_KEY);
+        storageRemoved =
+          sessionStorage.getItem(STORAGE_KEY) === null &&
+          sessionStorage.getItem(STORAGE_OWNER_KEY) === null;
+      } else {
+        storageRemoved = storedPayload === null;
+      }
     } catch {
       storageRemoved = false;
     }
-    let disabledRemoved = true;
-    try {
-      sessionStorage.removeItem(DISABLED_KEY);
-    } catch {
-      disabledRemoved = false;
+    const fetchOwned = window.fetch === state.fetchWrapper;
+    let restoredFetch = !fetchOwned;
+    if (fetchOwned) {
+      try {
+        window.fetch = originalFetch;
+        restoredFetch = window.fetch === originalFetch;
+      } catch {}
     }
-    const restoredFetch = window.fetch === state.fetchWrapper;
-    if (restoredFetch) window.fetch = originalFetch;
-    const restoredXMLHttpRequest = window.XMLHttpRequest === state.xmlHttpRequestWrapper;
-    if (restoredXMLHttpRequest) window.XMLHttpRequest = OriginalXHR;
+    const xhrOwned = window.XMLHttpRequest === state.xmlHttpRequestWrapper;
+    let restoredXMLHttpRequest = !xhrOwned;
+    if (xhrOwned) {
+      try {
+        window.XMLHttpRequest = OriginalXHR;
+        restoredXMLHttpRequest = window.XMLHttpRequest === OriginalXHR;
+      } catch {}
+    }
     const selection = window.__oracleChatGptBackendCaptureSelection;
-    if (selection?.target === TARGET || selection?.capture === state) {
-      delete window.__oracleChatGptBackendCaptureSelection;
+    const ownsSelection =
+      selection?.capture === state || (selection?.target === TARGET && selection?.owner === OWNER);
+    let selectionPayloadCleared = true;
+    if (ownsSelection) {
+      try {
+        if (selection && typeof selection === "object" && "text" in selection) {
+          try {
+            selection.text = "";
+          } catch {
+            selectionPayloadCleared = false;
+          }
+          if (selection.text !== "") selectionPayloadCleared = false;
+        }
+      } catch {
+        selectionPayloadCleared = false;
+      }
+      try {
+        delete window.__oracleChatGptBackendCaptureSelection;
+      } catch {}
     }
-    if (window.__oracleChatGptBackendCapture === state) {
+    const remainingSelection = window.__oracleChatGptBackendCaptureSelection;
+    const selectionRemoved = remainingSelection?.target !== TARGET;
+    const cleanupComplete =
+      payloadCleared &&
+      restoredFetch &&
+      restoredXMLHttpRequest &&
+      storageRemoved &&
+      selectionPayloadCleared &&
+      selectionRemoved;
+    if (cleanupComplete && window.__oracleChatGptBackendCapture === state) {
       delete window.__oracleChatGptBackendCapture;
     }
     return {
       status: wasActive ? "cleaned" : "already-cleaned",
+      deactivated: state.active === false,
+      ownerMatched: state.version === VERSION && state.owner === OWNER,
       restoredFetch,
       restoredXMLHttpRequest,
+      stateRemoved: window.__oracleChatGptBackendCapture !== state,
+      selectionRemoved,
       storageRemoved,
-      disabledRemoved,
+      payloadCleared,
     };
   };
 
@@ -729,6 +812,7 @@ export function buildApprovedBackendFetchExpression(options: {
   accountDigest: string;
   workspaceDigest: string;
   timeoutMs?: number;
+  captureOwner?: string;
 }): string {
   const expectedScope = chatGptConversationScope(options.targetUrl);
   const timeoutMs = Math.max(1, Math.floor(options.timeoutMs ?? 45_000));
@@ -742,6 +826,7 @@ export function buildApprovedBackendFetchExpression(options: {
     const expectedEmail = ${jsString(options.email.trim().toLowerCase())};
     const expectedAccountDigest = ${jsString(options.accountDigest)};
     const expectedWorkspaceDigest = ${jsString(options.workspaceDigest)};
+    const expectedCaptureOwner = ${jsString(options.captureOwner?.trim() ?? "")};
     const stableProjectKey = (value) => {
       if (typeof value !== "string" || !value) return null;
       return (value.match(/^(g-p-[0-9a-f]{32})(?=-|$)/i)?.[1] || value).toLowerCase();
@@ -774,10 +859,24 @@ export function buildApprovedBackendFetchExpression(options: {
         return false;
       }
     };
+    const captureOwnerMatches = () => {
+      const capture = globalThis.__oracleChatGptBackendCapture;
+      return (
+        !expectedCaptureOwner ||
+        (capture?.target === targetApiUrl &&
+          capture?.version === 2 &&
+          capture?.owner === expectedCaptureOwner)
+      );
+    };
     const passiveRequestObserved = () => {
       const capture = globalThis.__oracleChatGptBackendCapture;
-      return capture?.target === targetApiUrl && Number(capture?.requests?.pending || 0) > 0;
+      return (
+        captureOwnerMatches() &&
+        capture?.target === targetApiUrl &&
+        Number(capture?.requests?.pending || 0) > 0
+      );
     };
+    if (!captureOwnerMatches()) return { status: "refused", code: "capture-owner-mismatch" };
     if (!scopeMatches()) return { status: "refused", code: "scope-mismatch" };
     if (passiveRequestObserved()) {
       return { status: "refused", code: "passive-request-observed" };
@@ -830,6 +929,7 @@ export function buildApprovedBackendFetchExpression(options: {
       return { status: "refused", code: "bootstrap-identity-mismatch" };
     }
     if (!scopeMatches()) return { status: "refused", code: "scope-mismatch" };
+    if (!captureOwnerMatches()) return { status: "refused", code: "capture-owner-mismatch" };
     if (passiveRequestObserved()) {
       return { status: "refused", code: "passive-request-observed" };
     }
@@ -870,6 +970,7 @@ export async function requestApprovedBackendCapture(options: {
   accountDigest: string;
   workspaceDigest: string;
   timeoutMs: number;
+  captureOwner?: string;
 }): Promise<boolean> {
   const evaluated = await options.Runtime.evaluate({
     expression: buildApprovedBackendFetchExpression(options),
@@ -906,12 +1007,14 @@ export function buildArchivedConversationRecoveryHookForTest(
     targetUrl?: string;
     accountDigest?: string;
     workspaceDigest?: string;
+    owner?: string;
   } = {},
 ): string {
   return buildArchivedConversationRecoveryHook({
     targetUrl: options.targetUrl ?? `https://chatgpt.com/c/${conversationId}`,
     accountDigest: options.accountDigest ?? "a".repeat(64),
     workspaceDigest: options.workspaceDigest ?? "b".repeat(64),
+    owner: options.owner,
   });
 }
 
@@ -919,30 +1022,59 @@ function buildArchivedConversationRecoveryHook(options: {
   targetUrl: string;
   accountDigest: string;
   workspaceDigest: string;
+  owner?: string;
 }): string {
   const scope = chatGptConversationScope(options.targetUrl);
   const targetApiUrl = buildBackendConversationUrl(scope.conversationId);
+  const owner = options.owner?.trim() || randomUUID();
   return `
 (() => {
   const TARGET = ${jsString(targetApiUrl)};
+  const VERSION = 2;
+  const OWNER = ${jsString(owner)};
+  const EXPECTED_CONVERSATION_ID = ${jsString(scope.conversationId)};
   const EXPECTED_PROJECT_KEY = ${JSON.stringify(scope.projectKey)};
   const EXPECTED_ACCOUNT_DIGEST = ${jsString(options.accountDigest)};
   const EXPECTED_WORKSPACE_DIGEST = ${jsString(options.workspaceDigest)};
   const KEY = "__oracleArchivedConversationRecovery";
-  const DISABLED_KEY = "__oracleArchivedConversationRecoveryDisabled:" + TARGET;
+  const DISABLED_KEY = "__oracleArchivedConversationRecoveryDisabled:v2:" + TARGET;
   try {
-    if (sessionStorage.getItem(DISABLED_KEY) === "1") return;
-  } catch {}
+    if (sessionStorage.getItem(DISABLED_KEY) !== null) return;
+  } catch {
+    return;
+  }
+  try {
+    if (new URL(location.href).origin !== "https://chatgpt.com") return;
+  } catch {
+    return;
+  }
   const SETTINGS_HASH = "#settings/DataControls/ArchivedChats";
-  if (window[KEY]?.target === TARGET && window[KEY]?.active) return;
+  const existing = window[KEY];
+  if (existing?.target === TARGET && existing?.active) {
+    if (existing.version === VERSION) return;
+    try {
+      existing.active = false;
+      if (window.fetch === existing.fetchWrapper) {
+        if (typeof existing.originalFetch !== "function") return;
+        window.fetch = existing.originalFetch;
+      }
+      if (window[KEY] === existing) delete window[KEY];
+    } catch {
+      return;
+    }
+  }
   const originalFetch = window.fetch;
   const state = window[KEY] = {
+    version: VERSION,
+    owner: OWNER,
     target: TARGET,
     active: true,
     originalFetch,
     status: "pending",
     attempted: false,
-    recovered: false
+    recovered: false,
+    patchOutcome: "not-started",
+    patchPromise: null
   };
   const isActive = () => state.active && window[KEY] === state;
   const digest = async (value) => {
@@ -974,8 +1106,29 @@ function buildArchivedConversationRecoveryHook(options: {
       return false;
     }
   };
+  const conversationRouteMatches = () => {
+    try {
+      const current = new URL(location.href);
+      if (
+        current.origin !== "https://chatgpt.com" ||
+        current.username ||
+        current.password ||
+        current.pathname.includes("%") ||
+        current.search !== "" ||
+        current.hash !== ""
+      ) return false;
+      const project = new RegExp("^/g/([^/?#]+)/c/([^/?#]+)/?$").exec(current.pathname);
+      const root = new RegExp("^/c/([^/?#]+)/?$").exec(current.pathname);
+      const conversationId = project?.[2] || root?.[1] || null;
+      const projectKey = project?.[1] ? stableProjectKey(project[1]) : null;
+      return conversationId === EXPECTED_CONVERSATION_ID && projectKey === EXPECTED_PROJECT_KEY;
+    } catch {
+      return false;
+    }
+  };
+  const restoreRouteMatches = () => routeMatches() || conversationRouteMatches();
   const identityMatches = async () => {
-    if (!routeMatches()) return false;
+    if (!restoreRouteMatches()) return false;
     try {
       const response = await originalFetch.call(window, "/api/auth/session", {
         cache: "no-store",
@@ -986,27 +1139,53 @@ function buildArchivedConversationRecoveryHook(options: {
       return (
         await digest(body?.user?.id) === EXPECTED_ACCOUNT_DIGEST &&
         await digest(body?.account?.id) === EXPECTED_WORKSPACE_DIGEST &&
-        routeMatches()
+        restoreRouteMatches()
       );
     } catch {
       return false;
     }
   };
-  const currentPageCredentials = async () => {
-    if (!routeMatches()) return null;
+  const currentPageCredentials = async (allowConversationRoute = false) => {
+    const routeOk = allowConversationRoute ? restoreRouteMatches() : routeMatches();
+    if (!routeOk) return null;
     try {
       const bootstrap = JSON.parse(document.getElementById("client-bootstrap")?.textContent || "{}");
       const session = bootstrap?.session;
       const accessToken = typeof session?.accessToken === "string" ? session.accessToken : "";
-      const accountId = typeof session?.account?.id === "string" ? session.account.id : "";
+      const accountId = typeof session?.account?.id === "string" ? session.account?.id : "";
       if (!accessToken || !accountId) return null;
       if (await digest(session?.user?.id) !== EXPECTED_ACCOUNT_DIGEST) return null;
       if (await digest(accountId) !== EXPECTED_WORKSPACE_DIGEST) return null;
-      return routeMatches() ? { accessToken, accountId } : null;
+      return (allowConversationRoute ? restoreRouteMatches() : routeMatches())
+        ? { accessToken, accountId }
+        : null;
     } catch {
       return null;
     }
   };
+  let restorePromise = null;
+  const restoreArchivedConversation = async () => {
+    if (!isActive() || !restoreRouteMatches()) return { ok: false, code: "scope-mismatch" };
+    if (state.patchPromise && state.patchOutcome === "in-flight") {
+      await state.patchPromise.catch(() => undefined);
+    }
+    if (!isActive() || !restoreRouteMatches()) return { ok: false, code: "scope-mismatch" };
+    const credentials = await currentPageCredentials(true);
+    if (!credentials || !await identityMatches()) return { ok: false, code: "affinity-mismatch" };
+    if (restorePromise) return restorePromise;
+    const headers = new Headers();
+    headers.set("Authorization", "Bearer " + credentials.accessToken);
+    headers.set("ChatGPT-Account-Id", credentials.accountId);
+    headers.set("content-type", "application/json");
+    restorePromise = originalFetch.call(window, TARGET, {
+      method: "PATCH",
+      headers,
+      credentials: "include",
+      body: JSON.stringify({ is_archived: true })
+    }).then((response) => ({ ok: response.ok, status: response.status }));
+    return restorePromise;
+  };
+  state.restoreArchivedConversation = restoreArchivedConversation;
   state.fetchWrapper = window.fetch = async function(input, init) {
     const request = input instanceof Request ? input : new Request(input, init);
     const url = new URL(request.url, location.href);
@@ -1024,8 +1203,14 @@ function buildArchivedConversationRecoveryHook(options: {
     if (!isActive()) return response;
     try {
       if (isActive() && state.status === "pending" && isArchivedListRequest) {
+        state.status = "processing";
         state.attempted = true;
         state.listStatus = response.status;
+        if (!response.ok) {
+          state.status = "failed";
+          state.code = "archived-list-failed";
+          return response;
+        }
         const headers = new Headers(request.headers);
         const initialCredentials = requestCredentials ? await requestCredentials : null;
         const currentCredentials = await currentPageCredentials();
@@ -1044,6 +1229,7 @@ function buildArchivedConversationRecoveryHook(options: {
           state.code = "affinity-mismatch";
           return response;
         }
+        if (!isActive()) return response;
         headers.set("Authorization", "Bearer " + currentCredentials.accessToken);
         headers.set("ChatGPT-Account-Id", currentCredentials.accountId);
         headers.set("content-type", "application/json");
@@ -1055,30 +1241,76 @@ function buildArchivedConversationRecoveryHook(options: {
           state.code = "scope-mismatch";
           return response;
         }
-        const patch = await originalFetch.call(window, TARGET, {
-          method: "PATCH",
-          headers,
-          credentials: "include",
-          body: JSON.stringify({ is_archived: false })
-        });
+        state.patchOutcome = "in-flight";
+        state.patchPromise = (async () => {
+          try {
+            return await originalFetch.call(window, TARGET, {
+              method: "PATCH",
+              headers,
+              credentials: "include",
+              body: JSON.stringify({ is_archived: false })
+            });
+          } catch {
+            return null;
+          }
+        })();
+        const patch = await state.patchPromise;
+        if (!patch) {
+          state.patchOutcome = "unknown";
+          state.recovered = false;
+          state.status = "failed";
+          state.code = "patch-outcome-unknown";
+          return response;
+        }
         state.patchStatus = patch.status;
+        state.patchOutcome = patch.ok ? "succeeded" : "unknown";
         state.recovered = patch.ok;
         state.status = patch.ok ? "recovered" : "failed";
         if (!patch.ok) state.code = "patch-failed";
       }
     } catch {
+      if (state.patchOutcome === "in-flight") state.patchOutcome = "unknown";
       state.status = "failed";
-      state.code = "recovery-failed";
+      state.code = state.patchOutcome === "unknown" ? "patch-outcome-unknown" : "recovery-failed";
     }
     return response;
   };
   state.cleanup = () => {
+    if (state.patchOutcome === "in-flight") {
+      return {
+        status: "pending-patch",
+        pending: true,
+        patchOutcome: state.patchOutcome,
+        patchStatus: state.patchStatus,
+        recovered: state.recovered,
+        deactivated: false,
+        ownerMatched: state.version === VERSION && state.owner === OWNER,
+        restoredFetch: false,
+        stateRemoved: false,
+      };
+    }
     const wasActive = state.active;
     state.active = false;
-    const restoredFetch = window.fetch === state.fetchWrapper;
-    if (restoredFetch) window.fetch = originalFetch;
-    if (window[KEY] === state) delete window[KEY];
-    return { status: wasActive ? "cleaned" : "already-cleaned", restoredFetch };
+    const fetchOwned = window.fetch === state.fetchWrapper;
+    let restoredFetch = !fetchOwned;
+    if (fetchOwned) {
+      try {
+        window.fetch = originalFetch;
+        restoredFetch = window.fetch === originalFetch;
+      } catch {}
+    }
+    if (restoredFetch && window[KEY] === state) delete window[KEY];
+    return {
+      status: wasActive ? "cleaned" : "already-cleaned",
+      pending: false,
+      patchOutcome: state.patchOutcome,
+      patchStatus: state.patchStatus,
+      recovered: state.recovered,
+      deactivated: state.active === false,
+      ownerMatched: state.version === VERSION && state.owner === OWNER,
+      restoredFetch,
+      stateRemoved: window[KEY] !== state,
+    };
   };
 })();
 `.trim();
@@ -1126,29 +1358,150 @@ async function recoverArchivedConversation({
   workspaceDigest: string;
   timeoutMs: number;
 }): Promise<{
-  client: Awaited<ReturnType<typeof connectToExistingChatGptTab>>["client"];
+  client: ChromeClient;
   targetId: string;
   tabUrl: string;
   recovery: ChatGptArchiveRecoveryResult;
+  close: () => Promise<void>;
 }> {
   const settingsUrl = archivedSettingsUrlFromConversationUrl(targetUrl);
   const targetApiUrl = buildBackendConversationUrl(conversationIdFromChatGptUrl(targetUrl));
-  const targetId = await openChatGptTarget({
-    host,
-    port,
-    browserWSEndpoint,
-    url: "https://chatgpt.com/",
-  });
-  const { client } = await connectToExistingChatGptTab({
-    host,
-    port,
-    browserWSEndpoint,
-    ref: targetId,
-  });
+  let client: ChromeClient;
+  let targetId: string;
+  let close: () => Promise<void>;
+  if (browserWSEndpoint) {
+    const connection = await connectToRemoteChromeTarget(host, port, () => {}, {
+      browserWSEndpoint,
+      targetUrl: "https://chatgpt.com/",
+      closeTargetOnDispose: true,
+    });
+    if (!connection.targetId) {
+      await connection.close().catch(() => undefined);
+      throw new Error("Remote Chrome did not return a target id for archived recovery.");
+    }
+    client = connection.client;
+    targetId = connection.targetId;
+    close = connection.close;
+  } else {
+    targetId = await openChatGptTarget({ host, port, url: "https://chatgpt.com/" });
+    try {
+      ({ client } = await connectToExistingChatGptTab({ host, port, ref: targetId }));
+    } catch (error) {
+      await closeRemoteChromeTarget(host, port, targetId, () => {}).catch(() => undefined);
+      throw error;
+    }
+    close = async () => {
+      let cleanupError: unknown;
+      try {
+        await client.close();
+      } catch (error) {
+        cleanupError = error;
+      }
+      try {
+        await closeRemoteChromeTarget(host, port, targetId, () => {}, {
+          throwOnFailure: true,
+        });
+      } catch (error) {
+        cleanupError ??= error;
+      }
+      if (cleanupError !== undefined) throw cleanupError;
+    };
+  }
   const { Page, Runtime } = client;
   let recoveryHookInstalled = false;
   let recoveryScriptIdentifier: string | undefined;
+  let recoveryRegistrationAttempted = false;
   let completed = false;
+  let preserveTargetOnFailure = false;
+  let archiveRestored = false;
+  let mutationOutcome: ArchivedPatchOutcome = "not-started";
+  let mutationStatus: number | undefined;
+  let state: JsonRecord = {};
+  let surfacedError: unknown;
+  let finalCleanupError: unknown;
+  const recoveryOwner = randomUUID();
+  const updateMutationState = (candidate: JsonRecord) => {
+    const outcome = candidate.patchOutcome;
+    if (
+      outcome === "not-started" ||
+      outcome === "in-flight" ||
+      outcome === "succeeded" ||
+      outcome === "failed" ||
+      outcome === "unknown"
+    ) {
+      mutationOutcome = outcome;
+    }
+    if (typeof candidate.patchStatus === "number" && Number.isFinite(candidate.patchStatus)) {
+      mutationStatus = candidate.patchStatus;
+    }
+  };
+  const compensateArchiveMutation = async (): Promise<boolean> => {
+    if (archiveRestored) return true;
+    if (
+      !new Set<ArchivedPatchOutcome>(["succeeded", "unknown", "in-flight"]).has(mutationOutcome)
+    ) {
+      return true;
+    }
+    try {
+      const result = await evaluateByValue<{
+        ok?: boolean;
+        status?: number;
+        code?: string;
+      }>(
+        Runtime,
+        `(() => {
+          const state = window.__oracleArchivedConversationRecovery;
+          if (
+            !state ||
+            state.version !== 2 ||
+            state.owner !== ${jsString(recoveryOwner)} ||
+            state.target !== ${jsString(targetApiUrl)}
+          ) return { ok: false, code: "recovery-state-mismatch" };
+          return typeof state.restoreArchivedConversation === "function"
+            ? state.restoreArchivedConversation()
+            : { ok: false, code: "restore-helper-unavailable" };
+        })()`,
+        "archive restore",
+        true,
+      );
+      if (result?.ok === true) {
+        archiveRestored = true;
+        return true;
+      }
+    } catch {
+      // Preserve the exact target when the conservative compensation cannot be verified.
+    }
+    preserveTargetOnFailure = true;
+    return false;
+  };
+  const archiveRecoveryDetails = () => ({
+    attempted: true,
+    recovered: mutationOutcome === "succeeded",
+    status: mutationOutcome === "succeeded" ? "recovered" : "not-needed",
+    patchOutcome: mutationOutcome,
+    archiveRestored,
+    settingsUrl,
+    ...(mutationStatus === undefined ? {} : { patchStatus: mutationStatus }),
+  });
+  const buildResidueError = (error: unknown, cause = error): BrowserAutomationError => {
+    const details = error instanceof BrowserAutomationError ? error.details : undefined;
+    return new BrowserAutomationError(
+      error instanceof Error ? error.message : String(error),
+      {
+        ...(details ?? {}),
+        stage: details?.stage ?? "chatgpt-export",
+        code: details?.code ?? "archive-recovery-residue",
+        archiveRecovery: archiveRecoveryDetails(),
+        recoveryHandle: {
+          transport: "cdp",
+          ...(browserWSEndpoint ? { browserWSEndpoint } : {}),
+          targetId,
+          conversationUrl: targetUrl,
+        },
+      },
+      cause,
+    );
+  };
   try {
     await Page.enable();
     await waitForDocument(Runtime, timeoutMs);
@@ -1160,73 +1513,145 @@ async function recoverArchivedConversation({
       targetUrl,
       accountDigest,
       workspaceDigest,
+      owner: recoveryOwner,
     });
+    recoveryHookInstalled = true;
     await Runtime.evaluate({
       expression: recoveryHook,
       awaitPromise: false,
       returnByValue: true,
     });
-    recoveryHookInstalled = true;
+    recoveryRegistrationAttempted = true;
     recoveryScriptIdentifier = (
-      await Page.addScriptToEvaluateOnNewDocument({
-        source: recoveryHook,
-      })
+      await Page.addScriptToEvaluateOnNewDocument({ source: recoveryHook })
     ).identifier;
     await Page.navigate({ url: settingsUrl });
     const deadline = Date.now() + timeoutMs;
-    let state: JsonRecord = {};
     while (Date.now() < deadline) {
       state = await evaluateByValue<JsonRecord>(
         Runtime,
         "window.__oracleArchivedConversationRecovery || {}",
         "archive recovery",
       );
-      if (state.status === "recovered") break;
-      if (state.status === "failed") {
-        throw new Error("Archived conversation recovery failed.");
+      updateMutationState(state);
+      const stateBelongsToRun =
+        state.target === targetApiUrl && state.version === 2 && state.owner === recoveryOwner;
+      if (typeof state.target === "string" && !stateBelongsToRun) {
+        throw new Error("Archived conversation recovery hook owner or version changed.");
       }
+      if (state.status === "recovered") break;
+      if (state.status === "failed") break;
       await delay(200);
     }
-    if (state.status !== "recovered") {
-      throw new Error("Timed out recovering the archived ChatGPT conversation.");
+    updateMutationState(state);
+    if (
+      state.status !== "recovered" ||
+      state.target !== targetApiUrl ||
+      state.version !== 2 ||
+      state.owner !== recoveryOwner
+    ) {
+      throw new Error(
+        state.patchOutcome === "unknown"
+          ? "Archived ChatGPT recovery PATCH outcome is unknown; exact-target compensation is required."
+          : "Timed out recovering the archived ChatGPT conversation.",
+      );
     }
-    await cleanupArchivedConversationRecovery(
-      Runtime,
-      Page,
-      targetApiUrl,
-      recoveryScriptIdentifier,
-    );
-    recoveryHookInstalled = false;
-    recoveryScriptIdentifier = undefined;
-    await Page.navigate({ url: targetUrl });
-    const tabUrl = await waitForConversationUrl(Runtime, targetUrl, timeoutMs);
-    await waitForDocument(Runtime, timeoutMs);
-    completed = true;
-    return {
-      client,
-      targetId,
-      tabUrl,
-      recovery: {
-        attempted: true,
-        recovered: true,
-        status: "recovered",
-        settingsUrl,
-        patchStatus: Number(state.patchStatus),
-      },
-    };
+    try {
+      await Page.navigate({ url: targetUrl });
+      const tabUrl = await waitForConversationUrl(Runtime, targetUrl, timeoutMs);
+      await waitForDocument(Runtime, timeoutMs);
+      await cleanupArchivedConversationRecovery(
+        Runtime,
+        Page,
+        targetApiUrl,
+        recoveryScriptIdentifier,
+        recoveryOwner,
+        recoveryRegistrationAttempted,
+      );
+      recoveryHookInstalled = false;
+      recoveryScriptIdentifier = undefined;
+      recoveryRegistrationAttempted = false;
+      completed = true;
+      return {
+        client,
+        targetId,
+        tabUrl,
+        recovery: {
+          attempted: true,
+          recovered: true,
+          status: "recovered",
+          settingsUrl,
+          patchStatus: mutationStatus,
+        },
+        close,
+      };
+    } catch (error) {
+      const compensated = await compensateArchiveMutation();
+      if (!compensated) preserveTargetOnFailure = true;
+      throw error;
+    }
+  } catch (error) {
+    updateMutationState(state);
+    if (!completed && mutationOutcome !== "not-started") {
+      await compensateArchiveMutation();
+    }
+    if (preserveTargetOnFailure) {
+      const residueError = buildResidueError(error);
+      surfacedError = residueError;
+      throw residueError;
+    }
+    surfacedError = error;
+    throw error;
   } finally {
     try {
-      if (recoveryHookInstalled) {
-        await cleanupArchivedConversationRecovery(
-          Runtime,
-          Page,
-          targetApiUrl,
-          recoveryScriptIdentifier,
-        );
+      if (recoveryHookInstalled || recoveryRegistrationAttempted) {
+        try {
+          await cleanupArchivedConversationRecovery(
+            Runtime,
+            Page,
+            targetApiUrl,
+            recoveryScriptIdentifier,
+            recoveryOwner,
+            recoveryRegistrationAttempted,
+          );
+          recoveryHookInstalled = false;
+          recoveryScriptIdentifier = undefined;
+          recoveryRegistrationAttempted = false;
+        } catch (error) {
+          preserveTargetOnFailure = true;
+          finalCleanupError = error;
+        }
       }
     } finally {
-      if (!completed) {
-        await client.close().catch(() => undefined);
+      if (!completed && !preserveTargetOnFailure) {
+        try {
+          await close();
+        } catch (error) {
+          preserveTargetOnFailure = true;
+          finalCleanupError = error;
+        }
+      }
+      if (preserveTargetOnFailure) {
+        const residueError =
+          surfacedError instanceof BrowserAutomationError && surfacedError.details?.recoveryHandle
+            ? surfacedError
+            : buildResidueError(
+                surfacedError ?? new Error("Archived recovery left target residue."),
+              );
+        if (finalCleanupError !== undefined) {
+          const details = (residueError.details ?? {}) as Record<string, unknown>;
+          details.cleanupFailure =
+            finalCleanupError instanceof BrowserAutomationError
+              ? { message: finalCleanupError.message, details: finalCleanupError.details }
+              : {
+                  message:
+                    finalCleanupError instanceof Error
+                      ? finalCleanupError.message
+                      : String(finalCleanupError),
+                };
+        }
+        // oxlint-disable-next-line no-unsafe-finally -- cleanup residue must remain visible with its exact recovery handle.
+        throw residueError;
       }
     }
   }
@@ -1236,10 +1661,11 @@ async function evaluateByValue<T>(
   Runtime: ChromeClient["Runtime"],
   expression: string,
   timeoutLabel = "Runtime.evaluate",
+  awaitPromise = false,
 ): Promise<T> {
   const result = await Runtime.evaluate({
     expression,
-    awaitPromise: false,
+    awaitPromise,
     returnByValue: true,
   });
   if (result.exceptionDetails) {
@@ -1248,11 +1674,23 @@ async function evaluateByValue<T>(
   return result.result?.value as T;
 }
 
+function isMissingNewDocumentScriptError(error: unknown): boolean {
+  const response = asRecord(asRecord(error).response);
+  if (response.code === -32_000 && response.message === "Script not found") return true;
+  const message = error instanceof Error ? error.message : String(error);
+  try {
+    const parsed = asRecord(JSON.parse(message));
+    return parsed.code === -32_000 && parsed.message === "Script not found";
+  } catch {
+    return false;
+  }
+}
+
 async function removeNewDocumentScript(
   Page: ChromeClient["Page"],
   identifier: string | undefined,
-): Promise<void> {
-  if (!identifier) return;
+): Promise<boolean> {
+  if (!identifier) throw new Error("new-document script identifier is unavailable");
   const remove = (
     Page as unknown as {
       removeScriptToEvaluateOnNewDocument?: (params: { identifier: string }) => Promise<void>;
@@ -1261,81 +1699,423 @@ async function removeNewDocumentScript(
   if (typeof remove !== "function") {
     throw new Error("removeScriptToEvaluateOnNewDocument is unavailable");
   }
-  await remove.call(Page, { identifier });
+  try {
+    await remove.call(Page, { identifier });
+  } catch (error) {
+    if (!isMissingNewDocumentScriptError(error)) throw error;
+  }
+  return true;
 }
 
-async function markCaptureDisabled(
+type CleanupHookKind = "capture" | "archive-recovery";
+
+function cleanupDisabledMarkerKey(kind: CleanupHookKind, targetApiUrl: string): string {
+  const prefix =
+    kind === "capture"
+      ? "__oracleChatGptBackendCaptureDisabled:v2:"
+      : "__oracleArchivedConversationRecoveryDisabled:v2:";
+  return `${prefix}${targetApiUrl}`;
+}
+function cleanupLegacyDisabledMarkerKey(kind: CleanupHookKind, targetApiUrl: string): string {
+  const prefix =
+    kind === "capture"
+      ? "__oracleChatGptBackendCaptureDisabled:"
+      : "__oracleArchivedConversationRecoveryDisabled:";
+  return `${prefix}${targetApiUrl}`;
+}
+
+async function armCleanupDisabledMarker(
   Runtime: ChromeClient["Runtime"],
+  kind: CleanupHookKind,
   targetApiUrl: string,
-): Promise<void> {
-  await evaluateByValue(
+  owner: string,
+): Promise<{ owned: boolean; preExisting: boolean; foreignActive?: boolean }> {
+  const key = cleanupDisabledMarkerKey(kind, targetApiUrl);
+  const legacyKey = cleanupLegacyDisabledMarkerKey(kind, targetApiUrl);
+  const stateExpression =
+    kind === "capture"
+      ? "window.__oracleChatGptBackendCapture"
+      : "window.__oracleArchivedConversationRecovery";
+  const result = await evaluateByValue<{
+    owned?: boolean;
+    preExisting?: boolean;
+    foreignActive?: boolean;
+    retained?: boolean;
+  }>(
     Runtime,
     `(() => {
-      for (const key of [
-        "__oracleChatGptBackendCaptureDisabled:" + ${jsString(targetApiUrl)},
-        "__oracleArchivedConversationRecoveryDisabled:" + ${jsString(targetApiUrl)},
-      ]) {
-        try { sessionStorage.setItem(key, "1"); } catch {}
+      const key = ${jsString(key)};
+      const legacyKey = ${jsString(legacyKey)};
+      const owner = ${jsString(owner)};
+      try {
+        const existing = sessionStorage.getItem(key);
+        sessionStorage.setItem(legacyKey, "1");
+        if (sessionStorage.getItem(legacyKey) !== "1") {
+          return { owned: false, preExisting: true, retained: false };
+        }
+        const state = ${stateExpression};
+        const sameOwnerActive = Boolean(
+          state?.target === ${jsString(targetApiUrl)} &&
+          state?.active &&
+          state?.version === 2 &&
+          state?.owner === owner
+        );
+        const foreignActive = Boolean(
+          state?.target === ${jsString(targetApiUrl)} &&
+          state?.active &&
+          !sameOwnerActive
+        );
+        if (foreignActive) {
+          return {
+            owned: false,
+            preExisting: existing !== null,
+            foreignActive: true,
+            retained: sessionStorage.getItem(key) === existing,
+          };
+        }
+        if (existing !== null && existing !== owner && !sameOwnerActive) {
+          return {
+            owned: false,
+            preExisting: true,
+            retained: sessionStorage.getItem(key) === existing,
+          };
+        }
+        sessionStorage.setItem(key, owner);
+        return {
+          owned: true,
+          preExisting: existing !== null,
+          retained: sessionStorage.getItem(key) === owner,
+        };
+      } catch {
+        return { owned: false, preExisting: true, retained: false };
       }
     })()`,
-    "capture fail-closed marker",
+    `${kind} cleanup fail-closed marker`,
   );
+  if (result?.retained !== true) {
+    throw new Error("ChatGPT cleanup fail-closed marker was not retained.");
+  }
+  return {
+    owned: result.owned === true,
+    preExisting: result.preExisting === true,
+    foreignActive: result.foreignActive === true,
+  };
 }
 
+async function clearCleanupDisabledMarker(
+  Runtime: ChromeClient["Runtime"],
+  kind: CleanupHookKind,
+  targetApiUrl: string,
+  owner: string,
+): Promise<void> {
+  const key = cleanupDisabledMarkerKey(kind, targetApiUrl);
+  const cleared = await evaluateByValue<boolean>(
+    Runtime,
+    `(() => {
+      const key = ${jsString(key)};
+      const owner = ${jsString(owner)};
+      try {
+        if (sessionStorage.getItem(key) !== owner) return false;
+        sessionStorage.removeItem(key);
+        return sessionStorage.getItem(key) === null;
+      } catch {
+        return false;
+      }
+    })()`,
+    `${kind} cleanup marker clear`,
+  );
+  if (cleared !== true) throw new Error("ChatGPT cleanup marker was not cleared.");
+}
+
+function recordCleanupFailure(failures: string[], failure: string): void {
+  if (!failures.includes(failure)) failures.push(failure);
+}
 async function cleanupScopedBackendCapture(
   Runtime: ChromeClient["Runtime"],
   Page: ChromeClient["Page"],
   targetApiUrl: string,
   identifier: string | undefined,
+  owner: string | undefined,
+  registrationAttempted = identifier !== undefined,
 ): Promise<void> {
   const failures: string[] = [];
-  try {
-    const result = await evaluateByValue<{
-      restoredFetch?: boolean;
-      restoredXMLHttpRequest?: boolean;
-      storageRemoved?: boolean;
-    } | null>(
-      Runtime,
-      `(() => {
-        const target = ${jsString(targetApiUrl)};
-        const capture = window.__oracleChatGptBackendCapture;
-        if (!capture || capture.target !== target) {
-          let storageRemoved = true;
-          try {
-            sessionStorage.removeItem("__oracleChatGptBackendCapture:" + target);
-          } catch {
-            storageRemoved = false;
-          }
-          const selection = window.__oracleChatGptBackendCaptureSelection;
-          if (selection?.target === target) delete window.__oracleChatGptBackendCaptureSelection;
-          return { restoredFetch: true, restoredXMLHttpRequest: true, storageRemoved };
-        }
-        return capture.cleanup?.() || null;
-      })()`,
-      "capture cleanup",
-    );
-    if (
-      !result ||
-      result.restoredFetch !== true ||
-      result.restoredXMLHttpRequest !== true ||
-      result.storageRemoved !== true
-    ) {
-      failures.push("page cleanup");
+  const markerOwner = owner?.trim();
+  if (!markerOwner) {
+    try {
+      await removeNewDocumentScript(Page, identifier);
+    } catch {
+      recordCleanupFailure(failures, "script removal");
     }
+    recordCleanupFailure(failures, "hook owner");
+    throw new BrowserAutomationError("ChatGPT capture cleanup failed.", {
+      stage: "chatgpt-export",
+      code: "capture-cleanup-failed",
+      cleanup: failures,
+    });
+  }
+  const markerKey = cleanupDisabledMarkerKey("capture", targetApiUrl);
+  let marker: { owned: boolean; preExisting: boolean; foreignActive?: boolean } | undefined;
+  let markerArmFailed = false;
+  try {
+    marker = await armCleanupDisabledMarker(Runtime, "capture", targetApiUrl, markerOwner);
   } catch {
-    failures.push("page cleanup");
+    markerArmFailed = true;
+  }
+
+  const cleanupPage = async (
+    allowOrphanCleanup: boolean,
+    allowUnmarkedCleanup: boolean = false,
+  ): Promise<{ ok: boolean; matched: boolean }> => {
+    try {
+      const result = await evaluateByValue<{
+        markerOwned?: boolean;
+        ownerMatched?: boolean;
+        matched?: boolean;
+        deactivated?: boolean;
+        restoredFetch?: boolean;
+        restoredXMLHttpRequest?: boolean;
+        stateRemoved?: boolean;
+        selectionRemoved?: boolean;
+        storageRemoved?: boolean;
+        payloadCleared?: boolean;
+      } | null>(
+        Runtime,
+        `(() => {
+          const target = ${jsString(targetApiUrl)};
+          const markerKey = ${jsString(markerKey)};
+          const markerOwner = ${jsString(markerOwner)};
+          const allowOrphanCleanup = ${String(allowOrphanCleanup)};
+          const allowUnmarkedCleanup = ${String(allowUnmarkedCleanup)};
+          let markerValue = null;
+          let markerReadable = false;
+          try {
+            markerValue = sessionStorage.getItem(markerKey);
+            markerReadable = true;
+          } catch {}
+          const markerOwned = markerValue === markerOwner;
+          const markerSatisfied =
+            markerOwned || (allowUnmarkedCleanup && markerReadable && markerValue === null);
+          if (!markerSatisfied) {
+            return {
+              markerOwned: false,
+              ownerMatched: false,
+              matched: false,
+              deactivated: false,
+              restoredFetch: false,
+              restoredXMLHttpRequest: false,
+              stateRemoved: false,
+              selectionRemoved: false,
+              storageRemoved: false,
+              payloadCleared: false,
+            };
+          }
+          const capture = window.__oracleChatGptBackendCapture;
+          if (
+            capture?.target === target &&
+            (capture?.version !== 2 || capture?.owner !== markerOwner)
+          ) {
+            return {
+              markerOwned: markerSatisfied,
+              ownerMatched: false,
+              matched: true,
+              deactivated: false,
+              restoredFetch: false,
+              restoredXMLHttpRequest: false,
+              stateRemoved: false,
+              selectionRemoved: false,
+              storageRemoved: false,
+              payloadCleared: false,
+            };
+          }
+          if (!capture || capture.target !== target) {
+            const storageKey = "__oracleChatGptBackendCapture:" + target;
+            const storageOwnerKey = "__oracleChatGptBackendCaptureOwner:" + target;
+            const selection = window.__oracleChatGptBackendCaptureSelection;
+            const selectionOwned =
+              selection?.target === target &&
+              selection?.capture?.version === 2 &&
+              selection?.capture?.owner === markerOwner;
+            let selectionRemoved = selection?.target !== target;
+            let payloadCleared = selection?.target !== target;
+            let storageRemoved = true;
+            let storedPayload = null;
+            let storedOwner = null;
+            try {
+              storedPayload = sessionStorage.getItem(storageKey);
+              storedOwner = sessionStorage.getItem(storageOwnerKey);
+            } catch {
+              storageRemoved = false;
+            }
+            if (storedPayload !== null || storedOwner !== null) {
+              storageRemoved = storedOwner === markerOwner;
+            }
+            if (!allowOrphanCleanup) {
+              return {
+                markerOwned: markerSatisfied,
+                ownerMatched: true,
+                matched: false,
+                deactivated: true,
+                restoredFetch: true,
+                restoredXMLHttpRequest: true,
+                stateRemoved: true,
+                selectionRemoved,
+                storageRemoved,
+                payloadCleared,
+              };
+            }
+            if (selection?.target === target) {
+              if (!selectionOwned) {
+                selectionRemoved = false;
+                payloadCleared = false;
+              } else {
+                try {
+                  if (selection && typeof selection === "object" && "text" in selection) {
+                    selection.text = "";
+                    payloadCleared = selection.text === "";
+                  }
+                } catch {
+                  payloadCleared = false;
+                }
+                try {
+                  delete window.__oracleChatGptBackendCaptureSelection;
+                } catch {}
+                selectionRemoved = window.__oracleChatGptBackendCaptureSelection?.target !== target;
+              }
+            }
+            if (storedOwner === markerOwner) {
+              try {
+                sessionStorage.removeItem(storageKey);
+                sessionStorage.removeItem(storageOwnerKey);
+                storageRemoved =
+                  sessionStorage.getItem(storageKey) === null &&
+                  sessionStorage.getItem(storageOwnerKey) === null;
+              } catch {
+                storageRemoved = false;
+              }
+            }
+            return {
+              markerOwned: markerSatisfied,
+              ownerMatched: true,
+              matched: false,
+              deactivated: true,
+              restoredFetch: true,
+              restoredXMLHttpRequest: true,
+              stateRemoved: true,
+              selectionRemoved,
+              storageRemoved,
+              payloadCleared,
+            };
+          }
+          const cleanup = capture.cleanup?.() || {};
+          return {
+            markerOwned: markerSatisfied,
+            ownerMatched:
+              capture.version === 2 &&
+              capture.owner === markerOwner &&
+              cleanup.ownerMatched !== false,
+            matched: true,
+            ...cleanup,
+          };
+        })()`,
+        "capture cleanup",
+      );
+      const ok = Boolean(
+        result &&
+        result.markerOwned === true &&
+        result.ownerMatched === true &&
+        result.deactivated === true &&
+        result.restoredFetch === true &&
+        result.restoredXMLHttpRequest === true &&
+        result.stateRemoved === true &&
+        result.selectionRemoved === true &&
+        result.storageRemoved === true &&
+        result.payloadCleared === true,
+      );
+      return { ok, matched: result?.matched === true };
+    } catch {
+      return { ok: false, matched: false };
+    }
+  };
+
+  let pageResult: { ok: boolean; matched: boolean } | undefined;
+  let registrationRemoved = !registrationAttempted;
+  if (identifier !== undefined) {
+    try {
+      registrationRemoved = await removeNewDocumentScript(Page, identifier);
+    } catch {
+      recordCleanupFailure(failures, "script removal");
+    }
+  } else if (registrationAttempted) {
+    recordCleanupFailure(failures, "script registration unverified");
   }
   try {
-    await removeNewDocumentScript(Page, identifier);
+    marker = await armCleanupDisabledMarker(Runtime, "capture", targetApiUrl, markerOwner);
+    markerArmFailed = false;
   } catch {
-    failures.push("script removal");
+    marker = undefined;
+    markerArmFailed = true;
+  }
+  if (marker?.foreignActive === true && registrationRemoved) return;
+  if (markerArmFailed) recordCleanupFailure(failures, "fail-closed marker");
+  if (marker?.preExisting === true && marker.owned !== true) {
+    recordCleanupFailure(failures, "pre-existing fail-closed marker");
+  }
+  if (marker?.owned === true) {
+    pageResult = await cleanupPage(registrationRemoved);
+  } else if (marker === undefined && registrationRemoved) {
+    pageResult = await cleanupPage(true, true);
+  }
+
+  const pageFailure = !pageResult?.ok || (!pageResult.matched && !registrationRemoved);
+  if (pageFailure) recordCleanupFailure(failures, "page cleanup");
+  const matchingCleanup =
+    pageResult?.ok === true && (pageResult.matched || (!pageResult.matched && registrationRemoved));
+  if (failures.length === 0 && registrationRemoved && matchingCleanup && marker?.owned === true) {
+    try {
+      await clearCleanupDisabledMarker(Runtime, "capture", targetApiUrl, markerOwner);
+    } catch {
+      recordCleanupFailure(failures, "fail-closed marker");
+    }
   }
   if (failures.length > 0) {
+    let containmentResult: { ok: boolean; matched: boolean } | undefined;
     try {
-      await markCaptureDisabled(Runtime, targetApiUrl);
+      marker = await armCleanupDisabledMarker(Runtime, "capture", targetApiUrl, markerOwner);
+      if (marker.owned) {
+        containmentResult = await cleanupPage(registrationRemoved);
+        if (!containmentResult.ok) recordCleanupFailure(failures, "page cleanup");
+      } else if (marker.foreignActive && registrationRemoved) {
+        return;
+      } else if (marker.preExisting && !marker.owned) {
+        recordCleanupFailure(failures, "pre-existing fail-closed marker");
+      }
     } catch {
-      failures.push("fail-closed marker");
+      recordCleanupFailure(failures, "fail-closed marker");
+      if (marker === undefined && registrationRemoved) {
+        try {
+          containmentResult = await cleanupPage(true, true);
+          if (!containmentResult.ok) recordCleanupFailure(failures, "page cleanup");
+        } catch {
+          recordCleanupFailure(failures, "page cleanup");
+        }
+      }
     }
+    if (containmentResult?.ok === true && pageFailure) {
+      const pageIndex = failures.indexOf("page cleanup");
+      if (pageIndex >= 0) failures.splice(pageIndex, 1);
+    }
+    if (
+      failures.every((failure) => failure === "fail-closed marker") &&
+      containmentResult?.ok === true &&
+      registrationRemoved &&
+      marker?.owned === true
+    ) {
+      try {
+        await clearCleanupDisabledMarker(Runtime, "capture", targetApiUrl, markerOwner);
+        failures.length = 0;
+      } catch {}
+    }
+    if (failures.length === 0) return;
     throw new BrowserAutomationError("ChatGPT capture cleanup failed.", {
       stage: "chatgpt-export",
       code: "capture-cleanup-failed",
@@ -1343,14 +2123,22 @@ async function cleanupScopedBackendCapture(
     });
   }
 }
-
 export async function cleanupScopedBackendCaptureForTest(
   Runtime: ChromeClient["Runtime"],
   Page: ChromeClient["Page"],
   targetApiUrl: string,
-  identifier?: string,
+  identifier: string | undefined,
+  owner: string | undefined,
+  registrationAttempted = identifier !== undefined,
 ): Promise<void> {
-  await cleanupScopedBackendCapture(Runtime, Page, targetApiUrl, identifier);
+  await cleanupScopedBackendCapture(
+    Runtime,
+    Page,
+    targetApiUrl,
+    identifier,
+    owner,
+    registrationAttempted,
+  );
 }
 
 async function cleanupArchivedConversationRecovery(
@@ -1358,34 +2146,224 @@ async function cleanupArchivedConversationRecovery(
   Page: ChromeClient["Page"],
   targetApiUrl: string,
   identifier: string | undefined,
+  owner: string | undefined,
+  registrationAttempted = identifier !== undefined,
 ): Promise<void> {
   const failures: string[] = [];
+  const markerOwner = owner?.trim();
+  if (!markerOwner) {
+    if (identifier !== undefined) {
+      try {
+        await removeNewDocumentScript(Page, identifier);
+      } catch {
+        recordCleanupFailure(failures, "script removal");
+      }
+    }
+    recordCleanupFailure(failures, "hook owner");
+    throw new BrowserAutomationError("Archived ChatGPT recovery cleanup failed.", {
+      stage: "chatgpt-export",
+      code: "archive-recovery-cleanup-failed",
+      cleanup: failures,
+    });
+  }
+  const markerKey = cleanupDisabledMarkerKey("archive-recovery", targetApiUrl);
+  let marker: { owned: boolean; preExisting: boolean; foreignActive?: boolean } | undefined;
+  let markerArmFailed = false;
   try {
-    const result = await evaluateByValue<{ restoredFetch?: boolean } | null>(
-      Runtime,
-      `(() => {
-        const target = ${jsString(targetApiUrl)};
-        const state = window.__oracleArchivedConversationRecovery;
-        if (!state || state.target !== target) return { restoredFetch: true };
-        return state.cleanup?.() || null;
-      })()`,
-      "archive recovery cleanup",
-    );
-    if (!result || result.restoredFetch !== true) failures.push("page cleanup");
+    marker = await armCleanupDisabledMarker(Runtime, "archive-recovery", targetApiUrl, markerOwner);
   } catch {
-    failures.push("page cleanup");
+    markerArmFailed = true;
+  }
+
+  const cleanupPage = async (
+    allowOrphanCleanup: boolean,
+    allowUnmarkedCleanup: boolean = false,
+  ): Promise<{ ok: boolean; matched: boolean }> => {
+    try {
+      let result: {
+        markerOwned?: boolean;
+        ownerMatched?: boolean;
+        matched?: boolean;
+        pending?: boolean;
+        deactivated?: boolean;
+        restoredFetch?: boolean;
+        stateRemoved?: boolean;
+      } | null = null;
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        result = await evaluateByValue<{
+          markerOwned?: boolean;
+          ownerMatched?: boolean;
+          matched?: boolean;
+          pending?: boolean;
+          deactivated?: boolean;
+          restoredFetch?: boolean;
+          stateRemoved?: boolean;
+        } | null>(
+          Runtime,
+          `(() => {
+            const target = ${jsString(targetApiUrl)};
+            const markerKey = ${jsString(markerKey)};
+            const markerOwner = ${jsString(markerOwner)};
+            const allowOrphanCleanup = ${String(allowOrphanCleanup)};
+            const allowUnmarkedCleanup = ${String(allowUnmarkedCleanup)};
+            let markerValue = null;
+            let markerReadable = false;
+            try {
+              markerValue = sessionStorage.getItem(markerKey);
+              markerReadable = true;
+            } catch {}
+            const markerOwned = markerValue === markerOwner;
+            const markerSatisfied =
+              markerOwned || (allowUnmarkedCleanup && markerReadable && markerValue === null);
+            if (!markerSatisfied) {
+              return {
+                markerOwned: false,
+                ownerMatched: false,
+                matched: false,
+                pending: false,
+                deactivated: false,
+                restoredFetch: false,
+                stateRemoved: false,
+              };
+            }
+            const state = window.__oracleArchivedConversationRecovery;
+            if (
+              state?.target === target &&
+              (state?.version !== 2 || state?.owner !== markerOwner)
+            ) {
+              return {
+                markerOwned: markerSatisfied,
+                ownerMatched: false,
+                matched: true,
+                pending: false,
+                deactivated: false,
+                restoredFetch: false,
+                stateRemoved: false,
+              };
+            }
+            if (!state || state.target !== target) {
+              return {
+                markerOwned: markerSatisfied,
+                ownerMatched: true,
+                matched: false,
+                pending: false,
+                deactivated: true,
+                restoredFetch: true,
+                stateRemoved: true,
+              };
+            }
+            const cleanup = state.cleanup?.() || {};
+            return {
+              markerOwned: markerSatisfied,
+              ownerMatched:
+                state.version === 2 && state.owner === markerOwner && cleanup.ownerMatched !== false,
+              matched: true,
+              ...cleanup,
+            };
+          })()`,
+          "archive recovery cleanup",
+        );
+        if (!result?.pending) break;
+        await delay(50);
+      }
+      const ok = Boolean(
+        result &&
+        result.markerOwned === true &&
+        result.ownerMatched === true &&
+        result.pending !== true &&
+        result.deactivated === true &&
+        result.restoredFetch === true &&
+        result.stateRemoved === true &&
+        (result.matched === true || allowOrphanCleanup),
+      );
+      return { ok, matched: result?.matched === true };
+    } catch {
+      return { ok: false, matched: false };
+    }
+  };
+
+  let pageResult: { ok: boolean; matched: boolean } | undefined;
+  let registrationRemoved = !registrationAttempted;
+  if (identifier !== undefined) {
+    try {
+      registrationRemoved = await removeNewDocumentScript(Page, identifier);
+    } catch {
+      recordCleanupFailure(failures, "script removal");
+    }
+  } else if (registrationAttempted) {
+    recordCleanupFailure(failures, "script registration unverified");
   }
   try {
-    await removeNewDocumentScript(Page, identifier);
+    marker = await armCleanupDisabledMarker(Runtime, "archive-recovery", targetApiUrl, markerOwner);
+    markerArmFailed = false;
   } catch {
-    failures.push("script removal");
+    marker = undefined;
+    markerArmFailed = true;
+  }
+  if (marker?.foreignActive === true && registrationRemoved) return;
+  if (markerArmFailed) recordCleanupFailure(failures, "fail-closed marker");
+  if (marker?.preExisting === true && marker.owned !== true) {
+    recordCleanupFailure(failures, "pre-existing fail-closed marker");
+  }
+  if (marker?.owned === true) {
+    pageResult = await cleanupPage(registrationRemoved);
+  } else if (marker === undefined && registrationRemoved) {
+    pageResult = await cleanupPage(true, true);
+  }
+
+  const pageFailure = !pageResult?.ok || (!pageResult.matched && !registrationRemoved);
+  if (pageFailure) recordCleanupFailure(failures, "page cleanup");
+  if (failures.length === 0 && registrationRemoved && marker?.owned === true && pageResult?.ok) {
+    try {
+      await clearCleanupDisabledMarker(Runtime, "archive-recovery", targetApiUrl, markerOwner);
+    } catch {
+      recordCleanupFailure(failures, "fail-closed marker");
+    }
   }
   if (failures.length > 0) {
+    let containmentResult: { ok: boolean; matched: boolean } | undefined;
     try {
-      await markCaptureDisabled(Runtime, targetApiUrl);
+      marker = await armCleanupDisabledMarker(
+        Runtime,
+        "archive-recovery",
+        targetApiUrl,
+        markerOwner,
+      );
+      if (marker.owned) {
+        containmentResult = await cleanupPage(registrationRemoved);
+        if (!containmentResult.ok) recordCleanupFailure(failures, "page cleanup");
+      } else if (marker.foreignActive && registrationRemoved) {
+        return;
+      } else if (marker.preExisting && !marker.owned) {
+        recordCleanupFailure(failures, "pre-existing fail-closed marker");
+      }
     } catch {
-      failures.push("fail-closed marker");
+      recordCleanupFailure(failures, "fail-closed marker");
+      if (marker === undefined && registrationRemoved) {
+        try {
+          containmentResult = await cleanupPage(true, true);
+          if (!containmentResult.ok) recordCleanupFailure(failures, "page cleanup");
+        } catch {
+          recordCleanupFailure(failures, "page cleanup");
+        }
+      }
     }
+    if (containmentResult?.ok === true && pageFailure) {
+      const pageIndex = failures.indexOf("page cleanup");
+      if (pageIndex >= 0) failures.splice(pageIndex, 1);
+    }
+    if (
+      failures.every((failure) => failure === "fail-closed marker") &&
+      containmentResult?.ok === true &&
+      registrationRemoved &&
+      marker?.owned === true
+    ) {
+      try {
+        await clearCleanupDisabledMarker(Runtime, "archive-recovery", targetApiUrl, markerOwner);
+        failures.length = 0;
+      } catch {}
+    }
+    if (failures.length === 0) return;
     throw new BrowserAutomationError("Archived ChatGPT recovery cleanup failed.", {
       stage: "chatgpt-export",
       code: "archive-recovery-cleanup-failed",
@@ -1398,15 +2376,25 @@ export async function cleanupArchivedConversationRecoveryForTest(
   Runtime: ChromeClient["Runtime"],
   Page: ChromeClient["Page"],
   targetApiUrl: string,
-  identifier?: string,
+  identifier: string | undefined,
+  owner: string | undefined,
+  registrationAttempted = identifier !== undefined,
 ): Promise<void> {
-  await cleanupArchivedConversationRecovery(Runtime, Page, targetApiUrl, identifier);
+  await cleanupArchivedConversationRecovery(
+    Runtime,
+    Page,
+    targetApiUrl,
+    identifier,
+    owner,
+    registrationAttempted,
+  );
 }
 
 interface CapturePollOptions {
   passiveWindowMs?: number;
   passiveDeadline?: number;
   requestFallback?: (remainingMs: number) => Promise<boolean>;
+  expectedOwner?: string;
 }
 
 async function pollCaptureWithEvaluator(
@@ -1462,14 +2450,21 @@ async function pollCaptureWithEvaluator(
     }
   };
   const capture = window.__oracleChatGptBackendCapture;
-  const hits = capture?.hits || [];
+  const expectedOwner = ${jsString(options.expectedOwner ?? "")};
+  const ownerMismatch = Boolean(
+    expectedOwner &&
+    capture?.target === target &&
+    (capture?.version !== 2 || capture?.owner !== expectedOwner),
+  );
+  const hits = ownerMismatch ? [] : (capture?.hits || []);
   const match = hits.find((hit) =>
     hit.url === target &&
     hit.status === 200 &&
     isApprovedText(hit.text)
   );
-  const requests = capture?.requests || {};
+  const requests = ownerMismatch ? {} : (capture?.requests || {});
   return {
+    ownerMatched: !ownerMismatch,
     hit: match ? {
       kind: match.kind,
       url: target,
@@ -1488,6 +2483,9 @@ async function pollCaptureWithEvaluator(
 `;
   while (Date.now() < deadline) {
     last = await runBeforeDeadline(() => evaluate<CapturePollResult>(expression, "capture poll"));
+    if (last.ownerMatched === false) {
+      throw new Error("ChatGPT capture hook owner or version changed before export.");
+    }
     if (Date.now() >= deadline) break;
     if (last.hit) return last;
 
@@ -1523,13 +2521,14 @@ export async function pollCaptureWithPassiveFallbackForTest(
   passiveWindowMs: number,
   requestFallback: (remainingMs: number) => Promise<boolean>,
   passiveDeadline?: number,
+  expectedOwner?: string,
 ): Promise<CapturePollResult> {
   return pollCaptureWithEvaluator(
     <T>(expression: string, timeoutLabel?: string) =>
       evaluate(expression, timeoutLabel) as Promise<T>,
     targetApiUrl,
     timeoutMs,
-    { passiveWindowMs, passiveDeadline, requestFallback },
+    { passiveWindowMs, passiveDeadline, requestFallback, expectedOwner },
   );
 }
 
@@ -1554,17 +2553,40 @@ export async function retrieveCapturedTextWithEvaluator(
   chars: number,
   chunkSize: number,
   deadline?: number,
+  expectedOwner?: string,
+  affinityCheck?: (deadline: number) => Promise<void>,
 ): Promise<string> {
   const absoluteDeadline = deadline ?? Date.now() + 15_000;
   const parts: string[] = [];
   let selectionReady = false;
   for (let start = 0; start < chars; start += chunkSize) {
     const end = Math.min(start + chunkSize, chars);
+    const chunkDeadline = Math.min(absoluteDeadline, Date.now() + 15_000);
+    if (affinityCheck) {
+      await runBeforeCaptureDeadline(chunkDeadline, () => affinityCheck(chunkDeadline));
+    }
     const expression = `
 (() => {
   const target = ${jsString(targetApiUrl)};
   const capture = window.__oracleChatGptBackendCapture;
-  const selected = ${selectionReady ? "window.__oracleChatGptBackendCaptureSelection" : "null"};
+  const expectedOwner = ${jsString(expectedOwner ?? "")};
+  const ownerMismatch = Boolean(
+    expectedOwner &&
+    (capture?.target !== target || capture?.version !== 2 || capture?.owner !== expectedOwner),
+  );
+  if (ownerMismatch) return null;
+  const existingSelection = window.__oracleChatGptBackendCaptureSelection;
+  const selectionBelongsToCapture = Boolean(
+    existingSelection?.target === target && existingSelection?.capture === capture,
+  );
+  const selectionOwnerMatches = Boolean(
+    existingSelection?.target === target &&
+    existingSelection?.capture?.target === target &&
+    existingSelection?.capture?.version === 2 &&
+    existingSelection?.capture?.owner === expectedOwner,
+  );
+  if (expectedOwner && existingSelection?.target === target && !selectionOwnerMatches) return null;
+  const selected = ${selectionReady ? "existingSelection" : "selectionBelongsToCapture ? existingSelection : null"};
   if (
     selected?.target === target &&
     selected?.capture === capture &&
@@ -1580,28 +2602,37 @@ export async function retrieveCapturedTextWithEvaluator(
   };
   const hits = capture?.hits || [];
   const hit = hits.find((item) => item.url === target && item.status === 200 && isApprovedText(item.text));
-  const persisted = sessionStorage.getItem("__oracleChatGptBackendCapture:" + target);
+  const persistedOwner = sessionStorage.getItem("__oracleChatGptBackendCaptureOwner:" + target);
+  const persisted =
+    persistedOwner === capture?.owner
+      ? sessionStorage.getItem("__oracleChatGptBackendCapture:" + target)
+      : null;
   const text = hit ? String(hit.text) : (isApprovedText(persisted) ? persisted : null);
   if (!text) return null;
-  window.__oracleChatGptBackendCaptureSelection = { target, capture, text };
+  window.__oracleChatGptBackendCaptureSelection = {
+    target,
+    capture,
+    owner: capture?.owner,
+    text,
+  };
   return text.slice(${start}, ${end});
 })()
 `;
     let part: string | null = null;
-    const chunkDeadline = Math.min(absoluteDeadline, Date.now() + 15_000);
     while (Date.now() < chunkDeadline) {
       part = await runBeforeCaptureDeadline(chunkDeadline, () =>
         evaluate<string | null>(expression, "capture chunk"),
       );
-      if (typeof part === "string") {
-        break;
-      }
+      if (typeof part === "string") break;
       await runBeforeCaptureDeadline(chunkDeadline, (remainingMs) =>
         delay(Math.min(250, remainingMs)),
       );
     }
     if (typeof part !== "string") {
       throw new Error(`Missing captured text chunk ${start}:${end}`);
+    }
+    if (affinityCheck) {
+      await runBeforeCaptureDeadline(chunkDeadline, () => affinityCheck(chunkDeadline));
     }
     selectionReady = true;
     parts.push(part);
@@ -1615,6 +2646,8 @@ async function retrieveCapturedText(
   chars: number,
   chunkSize: number,
   deadline?: number,
+  expectedOwner?: string,
+  affinityCheck?: (deadline: number) => Promise<void>,
 ): Promise<string> {
   return retrieveCapturedTextWithEvaluator(
     <T>(expression: string, timeoutLabel?: string) =>
@@ -1623,6 +2656,8 @@ async function retrieveCapturedText(
     chars,
     chunkSize,
     deadline,
+    expectedOwner,
+    affinityCheck,
   );
 }
 
@@ -1907,9 +2942,11 @@ function markdownForPayload(payload: JsonRecord): string {
 
 const PRIVATE_BUNDLE_DIRECTORY_MODE = 0o700;
 const PRIVATE_BUNDLE_FILE_MODE = 0o600;
+const PRIVATE_BUNDLE_FILE_FLAGS =
+  fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | (fsConstants.O_NOFOLLOW ?? 0);
 
 async function writePrivateBundleFile(filePath: string, contents: string): Promise<void> {
-  const handle = await fs.open(filePath, "w", PRIVATE_BUNDLE_FILE_MODE);
+  const handle = await fs.open(filePath, PRIVATE_BUNDLE_FILE_FLAGS, PRIVATE_BUNDLE_FILE_MODE);
   try {
     if (process.platform !== "win32") {
       await handle.chmod(PRIVATE_BUNDLE_FILE_MODE);
@@ -2175,6 +3212,7 @@ export async function captureApprovedChatGptConversationBackend(
     tabUrl: string;
     tabTitle: string;
     recovery: ChatGptArchiveRecoveryResult;
+    close: () => Promise<void>;
   };
   try {
     const connected = await connectToExistingChatGptTab({
@@ -2201,6 +3239,9 @@ export async function captureApprovedChatGptConversationBackend(
       tabUrl: options.targetUrl,
       tabTitle: connected.tab.title,
       recovery: { attempted: false, recovered: false, status: "not-needed" },
+      close: async () => {
+        await connected.client.close().catch(() => undefined);
+      },
     };
   } catch (error) {
     if (options.recoverArchived === false) throw error;
@@ -2224,13 +3265,17 @@ export async function captureApprovedChatGptConversationBackend(
       tabUrl: recovered.tabUrl,
       tabTitle: "",
       recovery: recovered.recovery,
+      close: recovered.close,
     };
   }
-  const { client, targetId, tabUrl, tabTitle, recovery } = resolved;
+  const { client, targetId, tabUrl, tabTitle, recovery, close } = resolved;
   const { Page, Runtime } = client;
   let archiveRestored = false;
   let captureHookInstalled = false;
   let captureScriptIdentifier: string | undefined;
+  let captureRegistrationAttempted = false;
+  let operationFailure: unknown;
+  const captureOwner = randomUUID();
   try {
     if (expectedWorkspaceDigest) {
       const observed = await readChatGptIdentityDigests(Runtime);
@@ -2248,16 +3293,18 @@ export async function captureApprovedChatGptConversationBackend(
         throw new Error("Remote Chrome account identity changed before ChatGPT export.");
       }
     }
+    captureHookInstalled = true;
+    captureRegistrationAttempted = true;
     captureScriptIdentifier = (
       await Page.addScriptToEvaluateOnNewDocument({
         source: buildScopedBackendCaptureHook(targetApiUrl, {
           targetUrl: options.targetUrl,
           accountDigest: expectedAccountDigest,
           workspaceDigest: expectedWorkspaceDigest,
+          owner: captureOwner,
         }),
       })
     ).identifier;
-    captureHookInstalled = true;
     await Page.enable();
     const captureDeadline = Date.now() + timeoutMs;
     await runBeforeCaptureDeadline(captureDeadline, () => Page.reload({ ignoreCache: true }));
@@ -2265,6 +3312,7 @@ export async function captureApprovedChatGptConversationBackend(
       Runtime,
       targetApiUrl,
       remainingCaptureBudget(captureDeadline),
+      { expectedOwner: captureOwner },
     );
     await assertChatGptExportMutationAffinity(
       Runtime,
@@ -2284,14 +3332,40 @@ export async function captureApprovedChatGptConversationBackend(
       hit.chars,
       chunkSize,
       captureDeadline,
+      captureOwner,
+      (deadline) =>
+        assertChatGptExportMutationAffinity(
+          Runtime,
+          expectedAccountDigest,
+          options.targetUrl,
+          "export retrieval",
+          expectedWorkspaceDigest,
+          deadline,
+        ),
+    );
+    await assertChatGptExportMutationAffinity(
+      Runtime,
+      expectedAccountDigest,
+      options.targetUrl,
+      "export finalization",
+      expectedWorkspaceDigest,
+      captureDeadline,
     );
     const backend = JSON.parse(rawText) as BackendConversation;
     if (backend.conversation_id !== conversationId) {
       throw new Error("Capture did not return the approved conversation id.");
     }
-    await cleanupScopedBackendCapture(Runtime, Page, targetApiUrl, captureScriptIdentifier);
+    await cleanupScopedBackendCapture(
+      Runtime,
+      Page,
+      targetApiUrl,
+      captureScriptIdentifier,
+      captureOwner,
+      captureRegistrationAttempted,
+    );
     captureHookInstalled = false;
     captureScriptIdentifier = undefined;
+    captureRegistrationAttempted = false;
     const result = await finalizeCapturedExport({
       backend,
       rawText,
@@ -2343,6 +3417,7 @@ export async function captureApprovedChatGptConversationBackend(
     }
     return { ...result, archiveRecovery: recovery, postExportArchive };
   } catch (error) {
+    operationFailure = error;
     if (recovery.recovered && !archiveRestored) {
       const restore = await (async () => {
         await assertChatGptExportMutationAffinity(
@@ -2360,30 +3435,81 @@ export async function captureApprovedChatGptConversationBackend(
         });
       })().catch(() => null);
       if (!restore?.archived) {
-        throw new Error(
+        const restoreError = new Error(
           `${error instanceof Error ? error.message : String(error)}; archive restore also failed`,
         );
+        operationFailure = restoreError;
+        throw restoreError;
       }
     }
     throw error;
   } finally {
     try {
-      if (captureHookInstalled) {
-        await cleanupScopedBackendCapture(Runtime, Page, targetApiUrl, captureScriptIdentifier);
+      if (captureHookInstalled || captureRegistrationAttempted) {
+        await cleanupScopedBackendCapture(
+          Runtime,
+          Page,
+          targetApiUrl,
+          captureScriptIdentifier,
+          captureOwner,
+          captureRegistrationAttempted,
+        );
       }
     } finally {
-      await client.close().catch(() => undefined);
+      captureRegistrationAttempted = false;
+      try {
+        await close();
+      } catch (error) {
+        if (recovery.recovered) {
+          const cleanup = sanitizeErrorForPersistence(
+            error instanceof Error ? error.message : String(error),
+            error instanceof BrowserAutomationError ? error.details : undefined,
+          );
+          const operation =
+            operationFailure === undefined
+              ? undefined
+              : sanitizeErrorForPersistence(
+                  operationFailure instanceof Error
+                    ? operationFailure.message
+                    : String(operationFailure),
+                  operationFailure instanceof BrowserAutomationError
+                    ? operationFailure.details
+                    : undefined,
+                );
+          // oxlint-disable-next-line no-unsafe-finally -- a recovered target close failure must prevent a false export success.
+          throw new BrowserAutomationError(
+            operation
+              ? `${operation.message}; archived recovery target cleanup was inconclusive.`
+              : "Archived recovery target cleanup was inconclusive; export result was not returned.",
+            {
+              stage: "chatgpt-export",
+              code: "archive-recovery-target-close-failed",
+              recoveryHandle: {
+                transport: "cdp",
+                ...(browserWSEndpoint ? { browserWSEndpoint } : {}),
+                targetId,
+                conversationUrl: options.targetUrl,
+              },
+              cleanupFailure: cleanup,
+              ...(operation ? { operationFailure: operation } : {}),
+            },
+            operationFailure ?? error,
+          );
+        }
+      }
     }
   }
 }
 
 export async function finalizeCompletedOpenBrowserUseExport(
   connection: Pick<OpenBrowserUseConnection, "finalize">,
+  onFailure?: (error: unknown) => Promise<void> | void,
 ): Promise<BrowserRunWarning[] | undefined> {
   try {
     await connection.finalize(false);
     return undefined;
   } catch (error) {
+    await onFailure?.(error);
     const detailMessage = error instanceof Error ? error.message : String(error);
     const details = error instanceof BrowserAutomationError ? error.details : undefined;
     const sanitized = sanitizeErrorForPersistence(detailMessage, details);
@@ -2420,9 +3546,86 @@ export async function captureApprovedChatGptConversationBackendViaObu(
   let routeRetained = false;
   let captureHookInstalled = false;
   let captureScriptIdentifier: string | undefined;
+  let captureRegistrationAttempted = false;
+  const captureOwner = randomUUID();
+  let terminationRequested = false;
+  let exportFailure: BrowserAutomationError | undefined;
+  let captureCleanupPromise: Promise<void> | null = null;
+  let captureRegistrationPromise: Promise<void> | null = null;
+  let exportCleanupUncertain = false;
+  const markExportCleanupUncertain = async (reason: string, error?: unknown): Promise<void> => {
+    exportCleanupUncertain = true;
+    const details = error instanceof BrowserAutomationError ? error.details : undefined;
+    const candidate = details?.recoveryHandle;
+    const recoveryHandle =
+      candidate && typeof candidate === "object" && !Array.isArray(candidate)
+        ? (candidate as Record<string, unknown>)
+        : connection
+          ? {
+              transport: "obu",
+              sessionId: connection.sessionId,
+              tabId: connection.tabId,
+              conversationUrl: options.targetUrl,
+            }
+          : undefined;
+    try {
+      await lock.markUncertain?.({
+        reason,
+        ...(recoveryHandle ? { recoveryHandle } : {}),
+      });
+    } catch {
+      // Keep the in-memory uncertainty flag set; never release after an unverified transition.
+    }
+  };
+  const cleanupCapture = async (): Promise<void> => {
+    if (captureRegistrationPromise) {
+      try {
+        await captureRegistrationPromise;
+      } catch {
+        // The cleanup path records the unresolved registration as residue below.
+      }
+    }
+    if (!connection || (!captureHookInstalled && !captureRegistrationAttempted)) return;
+    const cleanupPromise =
+      captureCleanupPromise ??
+      (captureCleanupPromise = (async () => {
+        await cleanupScopedBackendCapture(
+          connection!.client.Runtime,
+          connection!.client.Page,
+          targetApiUrl,
+          captureScriptIdentifier,
+          captureOwner,
+          captureRegistrationAttempted,
+        );
+        captureHookInstalled = false;
+        captureScriptIdentifier = undefined;
+        captureRegistrationAttempted = false;
+      })());
+    try {
+      await cleanupPromise;
+    } finally {
+      if (captureCleanupPromise === cleanupPromise) captureCleanupPromise = null;
+    }
+  };
   const removeTerminationHooks = registerOpenBrowserUseTerminationHooks({
     connection: () => connection ?? connectionReady,
+    preserveTab: () => {
+      terminationRequested = true;
+      connection?.requestKeepTab?.();
+    },
+    beforeFinalize: async () => {
+      terminationRequested = true;
+      if (!connection && connectionReady) {
+        try {
+          connection = await connectionReady;
+        } catch {
+          return;
+        }
+      }
+      await cleanupCapture();
+    },
     releaseLock: () => lock.release(),
+    markLockUncertain: (details) => lock.markUncertain?.(details),
     logger,
   });
   try {
@@ -2430,30 +3633,54 @@ export async function captureApprovedChatGptConversationBackendViaObu(
       oracleSessionId: options.oracleSessionId
         ? `export-${options.oracleSessionId}`
         : `export-${conversationId}`,
+      obuSessionId: options.obuSessionId,
+      obuTabId: options.obuTabId,
       conversationUrl: options.targetUrl,
       timeoutMs,
       logger,
     });
     connection = await connectionReady;
+    const { Page, Runtime } = connection.client;
+    if (terminationRequested)
+      throw new Error("Oracle export interrupted before route preparation.");
     await prepareOpenBrowserUseConversationRoute({
       connection,
       expectation,
       targetUrl: options.targetUrl,
       logger,
     });
+    if (terminationRequested)
+      throw new Error("Oracle export interrupted before capture hook installation.");
     routeRetained = true;
-    const { Page, Runtime } = connection.client;
-    captureScriptIdentifier = (
-      await Page.addScriptToEvaluateOnNewDocument({
+    captureHookInstalled = true;
+    captureRegistrationAttempted = true;
+    const registration = (async () => {
+      const addedCaptureScript = await Page.addScriptToEvaluateOnNewDocument({
         source: buildScopedBackendCaptureHook(targetApiUrl, {
           targetUrl: options.targetUrl,
           accountDigest: options.accountDigest,
           workspaceDigest: options.workspaceDigest,
+          owner: captureOwner,
         }),
-      })
-    ).identifier;
-    captureHookInstalled = true;
+      });
+      captureScriptIdentifier = addedCaptureScript.identifier;
+    })();
+    captureRegistrationPromise = registration;
+    try {
+      await registration;
+    } finally {
+      if (captureRegistrationPromise === registration) captureRegistrationPromise = null;
+    }
+    if (terminationRequested) {
+      await cleanupCapture();
+      throw new Error("Oracle export interrupted during capture hook installation.");
+    }
+    if (terminationRequested) throw new Error("Oracle export interrupted before capture reload.");
     await Page.enable();
+    if (terminationRequested) {
+      await cleanupCapture();
+      throw new Error("Oracle export interrupted before capture reload.");
+    }
     const captureStartedAt = Date.now();
     const captureDeadline = captureStartedAt + timeoutMs;
     const passiveCaptureDeadline = Math.min(
@@ -2469,6 +3696,7 @@ export async function captureApprovedChatGptConversationBackendViaObu(
       targetApiUrl,
       remainingCaptureBudget(captureDeadline),
       {
+        expectedOwner: captureOwner,
         passiveDeadline: passiveCaptureDeadline,
         requestFallback: (remainingMs) =>
           requestApprovedBackendCapture({
@@ -2479,6 +3707,7 @@ export async function captureApprovedChatGptConversationBackendViaObu(
             accountDigest: options.accountDigest,
             workspaceDigest: options.workspaceDigest,
             timeoutMs: remainingMs,
+            captureOwner,
           }),
       },
     );
@@ -2503,19 +3732,37 @@ export async function captureApprovedChatGptConversationBackendViaObu(
       hit.chars,
       chunkSize,
       captureDeadline,
+      captureOwner,
+      (deadline) =>
+        assertChatGptExportMutationAffinity(
+          Runtime,
+          options.accountDigest,
+          options.targetUrl,
+          "export retrieval",
+          options.workspaceDigest,
+          deadline,
+        ),
+    );
+    await assertChatGptExportMutationAffinity(
+      Runtime,
+      options.accountDigest,
+      options.targetUrl,
+      "export finalization",
+      options.workspaceDigest,
+      captureDeadline,
     );
     const backend = JSON.parse(rawText) as BackendConversation;
     if (backend.conversation_id !== conversationId) {
       throw new Error("Capture did not return the approved conversation id.");
     }
     try {
-      await cleanupScopedBackendCapture(Runtime, Page, targetApiUrl, captureScriptIdentifier);
-      captureHookInstalled = false;
-      captureScriptIdentifier = undefined;
+      await cleanupCapture();
     } catch (error) {
       routeRetained = false;
       throw error;
     }
+    if (terminationRequested)
+      throw new Error("Oracle export interrupted before local finalization.");
     const result = await finalizeCapturedExport({
       backend,
       rawText,
@@ -2544,8 +3791,12 @@ export async function captureApprovedChatGptConversationBackendViaObu(
         ],
       },
     });
+    if (terminationRequested)
+      throw new Error("Oracle export interrupted after local finalization.");
     let postExportArchive: BrowserArchiveResult | undefined;
     if (options.archiveAfterExport === true) {
+      if (terminationRequested)
+        throw new Error("Oracle export interrupted before post-export archive.");
       await assertChatGptIdentity(Runtime, expectation);
       await assertChatGptExportMutationAffinity(
         Runtime,
@@ -2554,6 +3805,8 @@ export async function captureApprovedChatGptConversationBackendViaObu(
         "post-export archive",
         options.workspaceDigest,
       );
+      if (terminationRequested)
+        throw new Error("Oracle export interrupted before post-export archive.");
       postExportArchive = await archiveChatGptConversation(Runtime, logger, {
         mode: "always",
         conversationUrl: options.targetUrl,
@@ -2564,7 +3817,10 @@ export async function captureApprovedChatGptConversationBackendViaObu(
         throw new Error(`Post-export archive failed: ${JSON.stringify(postExportArchive)}`);
       }
     }
-    const warnings = await finalizeCompletedOpenBrowserUseExport(connection);
+    if (terminationRequested) throw new Error("Oracle export interrupted before tab finalization.");
+    const warnings = await finalizeCompletedOpenBrowserUseExport(connection, (error) =>
+      markExportCleanupUncertain("Main-Chrome export tab finalization was inconclusive.", error),
+    );
     completed = true;
     return {
       ...result,
@@ -2587,7 +3843,7 @@ export async function captureApprovedChatGptConversationBackendViaObu(
     }
     if (!connection) throw error;
     const details = error instanceof BrowserAutomationError ? error.details : undefined;
-    throw new BrowserAutomationError(
+    exportFailure = new BrowserAutomationError(
       error instanceof Error ? error.message : String(error),
       {
         ...details,
@@ -2603,28 +3859,57 @@ export async function captureApprovedChatGptConversationBackendViaObu(
       },
       error,
     );
+    throw exportFailure;
   } finally {
     let cleanupError: unknown;
     try {
-      if (connection && captureHookInstalled) {
-        await cleanupScopedBackendCapture(
-          connection.client.Runtime,
-          connection.client.Page,
-          targetApiUrl,
-          captureScriptIdentifier,
-        );
-      }
+      await cleanupCapture();
     } catch (error) {
       routeRetained = false;
       cleanupError = error;
+      await markExportCleanupUncertain(
+        "Main-Chrome export capture cleanup was inconclusive.",
+        error,
+      );
     }
+    await removeTerminationHooks.waitForDrain();
     try {
-      removeTerminationHooks();
+      if (!removeTerminationHooks.isTerminating()) {
+        try {
+          await connection?.finalize(!completed && (routeRetained || cleanupError !== undefined));
+        } catch (error) {
+          await markExportCleanupUncertain(
+            "Main-Chrome export task-tab finalization was inconclusive.",
+            error,
+          );
+          if (exportFailure?.details) {
+            (exportFailure.details as Record<string, unknown>).cleanupFailure =
+              error instanceof BrowserAutomationError
+                ? { message: error.message, details: error.details }
+                : { message: error instanceof Error ? error.message : String(error) };
+          }
+        }
+      }
     } finally {
-      await connection?.finalize(!completed && routeRetained).catch(() => undefined);
-      await lock.release().catch(() => undefined);
+      await removeTerminationHooks.waitForDrain();
+      if (!exportCleanupUncertain && !removeTerminationHooks.isLockUncertain()) {
+        await lock.release().catch(() => undefined);
+      }
+      removeTerminationHooks();
     }
-    // oxlint-disable-next-line no-unsafe-finally -- cleanup failure must remain visible after release.
-    if (cleanupError !== undefined) throw cleanupError;
+    if (cleanupError !== undefined) {
+      if (exportFailure?.details) {
+        (exportFailure.details as Record<string, unknown>).cleanupFailure =
+          cleanupError instanceof BrowserAutomationError
+            ? { message: cleanupError.message, details: cleanupError.details }
+            : {
+                message:
+                  cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+              };
+      } else {
+        // oxlint-disable-next-line no-unsafe-finally -- cleanup residue must remain visible after release.
+        throw cleanupError;
+      }
+    }
   }
 }

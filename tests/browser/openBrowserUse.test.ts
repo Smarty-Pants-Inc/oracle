@@ -3,6 +3,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { BrowserAutomationError } from "../../src/oracle/errors.js";
 import { describe, expect, test, vi } from "vitest";
 import type {
   BrowserUseRequestParams,
@@ -253,6 +254,78 @@ describe("Open Browser Use transport", () => {
 
     expect(obu.finalizeTabs).toHaveBeenCalledWith([{ tabId: 7, status: "handoff" }]);
   });
+  test("fails closed when termination arrives during task-tab handoff", async () => {
+    const obu = new FakeObuClient();
+    let resolveFinalize: ((value: JsonValue) => void) | undefined;
+    obu.getTabs
+      .mockResolvedValueOnce([{ id: 7, url: "https://chatgpt.com/c/current-thread" }])
+      .mockResolvedValueOnce([{ id: 7, url: "https://chatgpt.com/c/current-thread" }])
+      .mockResolvedValueOnce([]);
+    obu.finalizeTabs.mockImplementationOnce(
+      () =>
+        new Promise<JsonValue>((resolve) => {
+          resolveFinalize = resolve;
+        }),
+    );
+    const connection = await connectOpenBrowserUseTab({
+      obuSessionId: "session-1",
+      obuTabId: 7,
+      conversationUrl: "https://chatgpt.com/c/current-thread",
+      logger: vi.fn() as BrowserLogger,
+      socketPath: "/tmp/test.sock",
+      clientFactory: () => obu,
+    });
+
+    const finalization = connection.finalize(false);
+    await vi.waitFor(() => expect(obu.finalizeTabs).toHaveBeenCalledOnce());
+    connection.requestKeepTab?.();
+    resolveFinalize?.({});
+
+    await expect(finalization).rejects.toMatchObject({
+      details: {
+        stage: "open-browser-use",
+        code: "late-tab-preservation-race",
+        recoveryHandle: {
+          transport: "obu",
+          sessionId: "session-1",
+          tabId: 7,
+          conversationUrl: "https://chatgpt.com/c/current-thread",
+        },
+      },
+    });
+    expect(obu.finalizeTabs).toHaveBeenCalledWith([]);
+    expect(obu.close).toHaveBeenCalledOnce();
+  });
+  test("fails closed when termination arrives after task-tab handoff completes", async () => {
+    const obu = new FakeObuClient("session-1");
+    obu.getTabs.mockResolvedValue([{ id: 7, url: "https://chatgpt.com/c/current-thread" }]);
+    const connection = await connectOpenBrowserUseTab({
+      obuSessionId: "session-1",
+      obuTabId: 7,
+      conversationUrl: "https://chatgpt.com/c/current-thread",
+      logger: vi.fn() as BrowserLogger,
+      socketPath: "/tmp/test.sock",
+      clientFactory: () => obu,
+    });
+
+    await connection.finalize(false);
+    connection.requestKeepTab?.();
+
+    await expect(connection.finalize(true)).rejects.toMatchObject({
+      details: {
+        stage: "open-browser-use",
+        code: "late-tab-preservation-race",
+        recoveryHandle: {
+          transport: "obu",
+          sessionId: "session-1",
+          tabId: 7,
+          conversationUrl: "https://chatgpt.com/c/current-thread",
+        },
+      },
+    });
+    expect(obu.finalizeTabs).toHaveBeenCalledOnce();
+    expect(obu.close).toHaveBeenCalledOnce();
+  });
 
   test("refuses to finalize from a malformed tab inventory", async () => {
     const obu = new FakeObuClient();
@@ -367,6 +440,32 @@ describe("Open Browser Use transport", () => {
       await rm(runtimeDir, { recursive: true, force: true });
     }
   });
+  test("accepts a pid-zero registry when its private socket is reachable", async () => {
+    const runtimeDir = await mkdtemp(path.join(os.tmpdir(), "oracle-obu-pid-zero-"));
+    const socketPath = path.join(runtimeDir, "native-host.sock");
+    const registryPath = path.join(runtimeDir, "active.json");
+    const server = createServer((socket) => socket.destroy());
+    try {
+      await chmod(runtimeDir, 0o700);
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(socketPath, resolve);
+      });
+      await chmod(socketPath, 0o600);
+      await writeFile(registryPath, JSON.stringify({ pid: 0, socketPath }), { mode: 0o600 });
+
+      const lock = await acquireOpenBrowserUseRunLock({
+        timeoutMs: 500,
+        logger: vi.fn() as BrowserLogger,
+        registryPath,
+      });
+      expect(lock.path).toBe(path.join(runtimeDir, "oracle-main-chrome", "oracle-automation.lock"));
+      await lock.release();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(runtimeDir, { recursive: true, force: true });
+    }
+  });
 
   test("recovers a missing stored tab in a fresh OBU session", async () => {
     const clients: FakeObuClient[] = [];
@@ -404,6 +503,29 @@ describe("Open Browser Use transport", () => {
         clientFactory: () => obu,
       }),
     ).rejects.toThrow(/no longer points to the expected ChatGPT conversation/i);
+    expect(obu.finalizeTabs).not.toHaveBeenCalled();
+  });
+  test.each([
+    ["https://chatgpt.com/c/shared-thread", "https://chatgpt.com/g/project-a/c/shared-thread"],
+    [
+      "https://chatgpt.com/g/project-a/c/shared-thread",
+      "https://chatgpt.com/g/project-b/c/shared-thread",
+    ],
+  ])("rejects a tab whose project scope changes (%s -> %s)", async (expectedUrl, actualUrl) => {
+    const obu = new FakeObuClient();
+    obu.getTabs.mockResolvedValue([{ id: 7, url: actualUrl }]);
+    await expect(
+      connectOpenBrowserUseTab({
+        obuSessionId: "stored-session",
+        obuTabId: 7,
+        conversationUrl: expectedUrl,
+        logger: vi.fn() as BrowserLogger,
+        socketPath: "/tmp/test.sock",
+        clientFactory: () => obu,
+      }),
+    ).rejects.toMatchObject({
+      details: { stage: "open-browser-use", code: "tab-affinity-mismatch" },
+    });
     expect(obu.finalizeTabs).not.toHaveBeenCalled();
   });
 
@@ -481,6 +603,9 @@ describe("Open Browser Use transport", () => {
       const workspaceDigest = "b".repeat(64);
       const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
         if (expression === "document.readyState") return { result: { value: "complete" } };
+        if (expression.includes('const kind = "workspace"')) {
+          return { result: { value: { status: "selected" } } };
+        }
         if (expression.includes("/api/auth/session")) {
           return {
             result: {
@@ -543,18 +668,26 @@ describe("Open Browser Use transport", () => {
       vi.useRealTimers();
     }
   });
-  test("preserves the exact task tab and releases the lock on termination", async () => {
+  test("cleans the capture hook before preserving the exact task tab on termination", async () => {
     const previousExitCode = process.exitCode;
+    const events: string[] = [];
     let resolveReleased: (() => void) | undefined;
     const released = new Promise<void>((resolve) => {
       resolveReleased = resolve;
     });
-    const finalize = vi.fn(async (_keepTab: boolean) => {});
+    const beforeFinalize = vi.fn(async () => {
+      events.push("cleanup");
+    });
+    const finalize = vi.fn(async (_keepTab: boolean) => {
+      events.push("finalize");
+    });
     const releaseLock = vi.fn(async () => {
+      events.push("release");
       resolveReleased?.();
     });
     const removeHooks = registerOpenBrowserUseTerminationHooks({
       connection: () => ({ finalize }),
+      beforeFinalize,
       releaseLock,
       logger: vi.fn() as BrowserLogger,
     });
@@ -563,8 +696,10 @@ describe("Open Browser Use transport", () => {
       await released;
       await Promise.resolve();
       await Promise.resolve();
+      expect(beforeFinalize).toHaveBeenCalledOnce();
       expect(finalize).toHaveBeenCalledWith(true);
       expect(releaseLock).toHaveBeenCalledOnce();
+      expect(events).toEqual(["cleanup", "finalize", "release"]);
       expect(process.exitCode).toBe(130);
     } finally {
       removeHooks();
@@ -580,6 +715,7 @@ describe("Open Browser Use transport", () => {
     const connectionReady = new Promise<Pick<OpenBrowserUseConnection, "finalize">>((resolve) => {
       resolveConnection = resolve;
     });
+    const getConnection = vi.fn(() => connectionReady);
     let resolveReleased: (() => void) | undefined;
     const released = new Promise<void>((resolve) => {
       resolveReleased = resolve;
@@ -587,7 +723,7 @@ describe("Open Browser Use transport", () => {
     const finalize = vi.fn(async (_keepTab: boolean) => {});
     const releaseLock = vi.fn(async () => resolveReleased?.());
     const removeHooks = registerOpenBrowserUseTerminationHooks({
-      connection: () => connectionReady,
+      connection: getConnection,
       releaseLock,
       logger: vi.fn() as BrowserLogger,
     });
@@ -597,11 +733,218 @@ describe("Open Browser Use transport", () => {
       expect(releaseLock).not.toHaveBeenCalled();
       resolveConnection?.({ finalize });
       await released;
+      expect(getConnection).toHaveBeenCalledOnce();
       expect(finalize).toHaveBeenCalledWith(true);
       expect(releaseLock).toHaveBeenCalledOnce();
     } finally {
       removeHooks();
       process.exitCode = previousExitCode;
+    }
+  });
+  test("marks the routing lock uncertain when signal-time release fails", async () => {
+    const previousExitCode = process.exitCode;
+    const finalize = vi.fn(async (_keepTab: boolean) => undefined);
+    const releaseLock = vi.fn(async () => {
+      throw new Error("release failed");
+    });
+    const markLockUncertain = vi.fn(async () => undefined);
+    const removeHooks = registerOpenBrowserUseTerminationHooks({
+      connection: () => ({
+        finalize,
+        sessionId: "session-1",
+        tabId: 7,
+        tabUrl: "https://chatgpt.com/c/thread-1",
+      }),
+      releaseLock,
+      markLockUncertain,
+      logger: vi.fn() as BrowserLogger,
+    });
+    try {
+      process.emit("SIGTERM");
+      await removeHooks.waitForDrain();
+      expect(finalize).toHaveBeenCalledWith(true);
+      expect(releaseLock).toHaveBeenCalledOnce();
+      expect(markLockUncertain).toHaveBeenCalledWith({
+        reason: expect.stringContaining("lock release failed"),
+        recoveryHandle: {
+          transport: "obu",
+          sessionId: "session-1",
+          tabId: 7,
+          conversationUrl: "https://chatgpt.com/c/thread-1",
+        },
+      });
+      expect(removeHooks.isLockUncertain()).toBe(true);
+    } finally {
+      removeHooks();
+      process.exitCode = previousExitCode;
+    }
+  });
+  test("retains the routing lock when task-tab finalization times out", async () => {
+    vi.useFakeTimers();
+    const previousExitCode = process.exitCode;
+    let resolveFinalize: (() => void) | undefined;
+    const finalize = vi.fn(
+      (_keepTab: boolean) =>
+        new Promise<void>((resolve) => {
+          resolveFinalize = resolve;
+        }),
+    );
+    const releaseLock = vi.fn(async () => undefined);
+    const markLockUncertain = vi.fn(async () => undefined);
+    const logger = vi.fn() as BrowserLogger;
+    const removeHooks = registerOpenBrowserUseTerminationHooks({
+      connection: () => ({ finalize }),
+      releaseLock,
+      markLockUncertain,
+      logger,
+      drainTimeoutMs: 50,
+    });
+    try {
+      process.emit("SIGTERM");
+      await vi.advanceTimersByTimeAsync(100);
+      await removeHooks.waitForDrain();
+      expect(finalize).toHaveBeenCalledWith(true);
+      expect(releaseLock).not.toHaveBeenCalled();
+      expect(markLockUncertain).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: expect.stringContaining("finalization") }),
+      );
+      expect(removeHooks.isLockUncertain()).toBe(true);
+      resolveFinalize?.();
+    } finally {
+      removeHooks();
+      process.exitCode = previousExitCode;
+      vi.useRealTimers();
+    }
+  });
+  test("retains the routing lock when the native host never resolves a task tab", async () => {
+    vi.useFakeTimers();
+    const previousExitCode = process.exitCode;
+    const connection = new Promise<Pick<OpenBrowserUseConnection, "finalize">>(() => {});
+    const releaseLock = vi.fn(async () => undefined);
+    const markLockUncertain = vi.fn(async () => undefined);
+    const logger = vi.fn() as BrowserLogger;
+    const removeHooks = registerOpenBrowserUseTerminationHooks({
+      connection: () => connection,
+      releaseLock,
+      markLockUncertain,
+      logger,
+      drainTimeoutMs: 50,
+    });
+    try {
+      process.emit("SIGTERM");
+      await vi.advanceTimersByTimeAsync(100);
+      await removeHooks.waitForDrain();
+      expect(releaseLock).not.toHaveBeenCalled();
+      expect(markLockUncertain).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: expect.stringContaining("connection") }),
+      );
+      expect(removeHooks.isLockUncertain()).toBe(true);
+      expect(logger).toHaveBeenCalledWith(
+        expect.stringContaining("Open Browser Use SIGTERM connection resolution timed out"),
+      );
+      expect(process.exitCode).toBe(1);
+    } finally {
+      removeHooks();
+      process.exitCode = previousExitCode;
+      vi.useRealTimers();
+    }
+  });
+  test("persists a recovery handle when task-tab connection fails", async () => {
+    const previousExitCode = process.exitCode;
+    const releaseLock = vi.fn(async () => undefined);
+    const markLockUncertain = vi.fn(async () => undefined);
+    const recoveryHandle = {
+      transport: "obu",
+      sessionId: "session-1",
+      tabId: 7,
+      conversationUrl: "https://chatgpt.com/c/thread-1",
+    };
+    const connectionError = new BrowserAutomationError("connection failed", {
+      stage: "open-browser-use",
+      code: "tab-connection-failed",
+      recoveryHandle,
+    });
+    const removeHooks = registerOpenBrowserUseTerminationHooks({
+      connection: () => Promise.reject(connectionError),
+      releaseLock,
+      markLockUncertain,
+      logger: vi.fn() as BrowserLogger,
+    });
+    try {
+      process.emit("SIGTERM");
+      await removeHooks.waitForDrain();
+      expect(releaseLock).not.toHaveBeenCalled();
+      expect(markLockUncertain).toHaveBeenCalledWith(expect.objectContaining({ recoveryHandle }));
+    } finally {
+      removeHooks();
+      process.exitCode = previousExitCode;
+    }
+  });
+
+  test("persists the exact recovery handle when a timed-out connection resolves late", async () => {
+    vi.useFakeTimers();
+    const previousExitCode = process.exitCode;
+    let resolveConnection:
+      | ((
+          connection: Pick<
+            OpenBrowserUseConnection,
+            "finalize" | "requestKeepTab" | "sessionId" | "tabId" | "tabUrl"
+          >,
+        ) => void)
+      | undefined;
+    const connection = new Promise<
+      Pick<
+        OpenBrowserUseConnection,
+        "finalize" | "requestKeepTab" | "sessionId" | "tabId" | "tabUrl"
+      >
+    >((resolve) => {
+      resolveConnection = resolve;
+    });
+    const finalize = vi.fn(async (_keepTab: boolean) => undefined);
+    const requestKeepTab = vi.fn();
+    const releaseLock = vi.fn(async () => undefined);
+    const markLockUncertain = vi.fn(async () => undefined);
+    const removeHooks = registerOpenBrowserUseTerminationHooks({
+      connection: () => connection,
+      releaseLock,
+      markLockUncertain,
+      logger: vi.fn() as BrowserLogger,
+      drainTimeoutMs: 50,
+    });
+    try {
+      process.emit("SIGTERM");
+      await vi.advanceTimersByTimeAsync(100);
+      await removeHooks.waitForDrain();
+      expect(markLockUncertain).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: expect.stringContaining("connection resolution") }),
+      );
+      resolveConnection?.({
+        finalize,
+        requestKeepTab,
+        sessionId: "session-late",
+        tabId: 9,
+        tabUrl: "https://chatgpt.com/g/project/c/thread-1",
+      });
+      await vi.runAllTimersAsync();
+      await vi.waitFor(() =>
+        expect(markLockUncertain).toHaveBeenCalledWith(
+          expect.objectContaining({
+            recoveryHandle: {
+              transport: "obu",
+              sessionId: "session-late",
+              tabId: 9,
+              conversationUrl: "https://chatgpt.com/g/project/c/thread-1",
+            },
+          }),
+        ),
+      );
+      expect(requestKeepTab).toHaveBeenCalledOnce();
+      expect(finalize).toHaveBeenCalledWith(true);
+      expect(releaseLock).not.toHaveBeenCalled();
+    } finally {
+      removeHooks();
+      process.exitCode = previousExitCode;
+      vi.useRealTimers();
     }
   });
 
@@ -677,6 +1020,28 @@ describe("Open Browser Use transport", () => {
         configs: [{ ...runtime }],
         conversationUrl: "https://chatgpt.com/c/thread-1",
         conversationUrls: ["https://chatgpt.com/c/thread-2"],
+      }),
+    ).toThrow(/conversation affinity is conflicting/i);
+  });
+  test("rejects root/project scope conflicts with the same conversation id", () => {
+    const digest = "a".repeat(64);
+    const workspaceDigest = "b".repeat(64);
+    const runtime = {
+      browserTransport: "obu" as const,
+      obuSessionId: "oracle-session",
+      obuTabId: 7,
+      chatGptAccountEmail: "paul@smartypants.ai",
+      chatGptWorkspaceName: "Paul Bettner",
+      chatGptAccountDigest: digest,
+      chatGptWorkspaceDigest: workspaceDigest,
+      tabUrl: "https://chatgpt.com/g/project-a/c/thread-1",
+      conversationId: "thread-1",
+    };
+    expect(() =>
+      resolveStoredOpenBrowserUseAffinity({
+        runtime,
+        configs: [{ ...runtime }],
+        conversationUrl: "https://chatgpt.com/c/thread-1",
       }),
     ).toThrow(/conversation affinity is conflicting/i);
   });

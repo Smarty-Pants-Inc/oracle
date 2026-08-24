@@ -7,8 +7,10 @@ import type {
   BrowserRunWarning,
   BrowserSessionConfig,
   BrowserRuntimeMetadata,
+  RequestOrigin,
   SessionArtifact,
 } from "../sessionStore.js";
+
 import { runBrowserMode } from "../browserMode.js";
 import type { BrowserRunResult } from "../browserMode.js";
 import { assembleBrowserPrompt } from "./prompt.js";
@@ -44,6 +46,7 @@ export interface BrowserExecutionResult {
 interface RunBrowserSessionArgs {
   runOptions: RunOracleOptions;
   browserConfig: BrowserSessionConfig;
+  requestOrigin?: RequestOrigin;
   cwd: string;
   log: (message?: string) => void;
 }
@@ -131,7 +134,7 @@ function buildBrowserRunWarnings(args: {
 }
 
 export async function runBrowserSessionExecution(
-  { runOptions, browserConfig, cwd, log }: RunBrowserSessionArgs,
+  { runOptions, browserConfig, requestOrigin, cwd, log }: RunBrowserSessionArgs,
   deps: BrowserSessionRunnerDeps = {},
 ): Promise<BrowserExecutionResult> {
   const assemblePrompt = deps.assemblePrompt ?? assembleBrowserPrompt;
@@ -213,6 +216,7 @@ export async function runBrowserSessionExecution(
           }
         : undefined,
       config: executionBrowserConfig,
+      ...(requestOrigin ? { requestOrigin } : {}),
       log: automationLogger,
       heartbeatIntervalMs: runOptions.heartbeatIntervalMs,
       verbose: runOptions.verbose,

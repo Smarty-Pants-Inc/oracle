@@ -1,3 +1,5 @@
+import type { WrapperRequestOrigin } from "../wrapperRoute.js";
+
 export type TokenizerFn = (input: unknown, options?: Record<string, unknown>) => number;
 
 export type KnownModelName =
@@ -211,6 +213,8 @@ export interface RunOracleOptions {
   baseUrl?: string;
   azure?: AzureOptions;
   sessionId?: string;
+  /** Immutable wrapper origin bound to the browser account/workspace route. */
+  requestOrigin?: WrapperRequestOrigin;
   /** User-config per-model overrides (apiModel/reasoning/inputLimit/pricing) applied over known model configs. */
   modelOverrides?: ModelOverridesConfig;
   effectiveModelId?: string;

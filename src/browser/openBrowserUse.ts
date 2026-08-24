@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
+import net from "node:net";
 import path from "node:path";
 import {
   OpenBrowserUseClient,
@@ -15,7 +16,10 @@ import type {
   ChatGptIdentityEvidence,
   ChatGptIdentityExpectation,
 } from "./chatgptAccountRouter.js";
-import { extractStableConversationIdFromUrl } from "./conversationUrl.js";
+import {
+  chatGptConversationScopeFromUrl,
+  isSameChatGptConversationScope,
+} from "./conversationUrl.js";
 import {
   ensureChatGptScopeRetained,
   ensureNotBlocked,
@@ -24,6 +28,7 @@ import {
 import { acquireProfileRunLock, isProcessAlive, type ProfileRunLock } from "./profileState.js";
 import { delay } from "./utils.js";
 import type { BrowserLogger, ChromeClient } from "./types.js";
+import { withTimeout } from "./reattachHelpers.js";
 
 const ACTIVE_REGISTRY_PATH = "/tmp/open-browser-use/active.json";
 const ACTIVE_SOCKET_ROOT = "/tmp/open-browser-use";
@@ -63,6 +68,7 @@ export interface OpenBrowserUseConnection {
   tabUrl?: string;
   created: boolean;
   finalize(keepTab: boolean): Promise<void>;
+  requestKeepTab?: () => void;
 }
 export interface StoredOpenBrowserUseTabAffinity {
   sessionId: string;
@@ -77,46 +83,281 @@ export interface StoredOpenBrowserUseAffinity extends StoredOpenBrowserUseTabAff
   conversationUrl: string;
 }
 
+export type OpenBrowserUseTerminationHooks = (() => void) & {
+  waitForDrain: () => Promise<void>;
+  isTerminating: () => boolean;
+  isLockUncertain: () => boolean;
+};
+
+type TerminationConnection = Pick<OpenBrowserUseConnection, "finalize" | "requestKeepTab"> &
+  Partial<Pick<OpenBrowserUseConnection, "sessionId" | "tabId" | "tabUrl">>;
+
 export function registerOpenBrowserUseTerminationHooks(options: {
-  connection: () =>
-    | Pick<OpenBrowserUseConnection, "finalize">
-    | Promise<Pick<OpenBrowserUseConnection, "finalize"> | null>
-    | null;
+  connection: () => TerminationConnection | Promise<TerminationConnection | null> | null;
+  beforeFinalize?: () => Promise<void>;
+  preserveTab?: () => void;
   releaseLock: () => Promise<void>;
+  markLockUncertain?: (details: {
+    reason: string;
+    recoveryHandle?: Record<string, unknown>;
+  }) => Promise<void> | void;
   logger: BrowserLogger;
-}): () => void {
+  drainTimeoutMs?: number;
+}): OpenBrowserUseTerminationHooks {
   const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGQUIT"];
   const listeners = new Map<NodeJS.Signals, () => void>();
   let handling = false;
   let removed = false;
-  const remove = () => {
+  let terminating = false;
+  let lockUncertain = false;
+  const configuredDrainTimeoutMs = options.drainTimeoutMs;
+  const drainTimeoutMs =
+    typeof configuredDrainTimeoutMs === "number" && Number.isFinite(configuredDrainTimeoutMs)
+      ? Math.max(1, configuredDrainTimeoutMs)
+      : 30_000;
+  let signalTask: Promise<void> | null = null;
+  let connectionPromise: Promise<TerminationConnection | null> | null = null;
+  let connectionSettled = false;
+  let beforeFinalizePromise: Promise<void> | null = null;
+  let beforeFinalizeSettled = false;
+  let finalizePromise: Promise<void> | null = null;
+  let latePreservationScheduled = false;
+  let uncertaintyDetails: {
+    reason: string;
+    recoveryHandle?: Record<string, unknown>;
+  } | null = null;
+  let uncertaintyPersistPromise: Promise<void> | null = null;
+  const resolveConnection = (): Promise<TerminationConnection | null> => {
+    connectionPromise ??= Promise.resolve()
+      .then(() => options.connection())
+      .finally(() => {
+        connectionSettled = true;
+      });
+    void connectionPromise.catch(() => undefined);
+    return connectionPromise;
+  };
+  const runBeforeFinalize = (): Promise<void> => {
+    beforeFinalizePromise ??= Promise.resolve()
+      .then(() => options.beforeFinalize?.())
+      .then(() => undefined)
+      .finally(() => {
+        beforeFinalizeSettled = true;
+      });
+    void beforeFinalizePromise.catch(() => undefined);
+    return beforeFinalizePromise;
+  };
+  const runFinalize = (connection: TerminationConnection): Promise<void> => {
+    finalizePromise ??= Promise.resolve()
+      .then(() => connection.finalize(true))
+      .then(() => undefined);
+    void finalizePromise.catch(() => undefined);
+    return finalizePromise;
+  };
+  const buildRecoveryHandle = (connection: TerminationConnection | null) => {
+    if (!connection || connection.sessionId === undefined || connection.tabId === undefined) {
+      return undefined;
+    }
+    return {
+      transport: "obu",
+      sessionId: connection.sessionId,
+      tabId: connection.tabId,
+      conversationUrl: connection.tabUrl ?? null,
+    };
+  };
+  const recoveryHandleFromError = (error: unknown): Record<string, unknown> | undefined => {
+    if (!(error instanceof BrowserAutomationError)) return undefined;
+    const candidate = error.details?.recoveryHandle;
+    return candidate && typeof candidate === "object" && !Array.isArray(candidate)
+      ? (candidate as Record<string, unknown>)
+      : undefined;
+  };
+  const persistUncertainty = async (): Promise<void> => {
+    lockUncertain = true;
+    if (!uncertaintyDetails) {
+      uncertaintyDetails = { reason: "Open Browser Use termination cleanup was inconclusive." };
+    }
+    const pending = uncertaintyPersistPromise
+      ? uncertaintyPersistPromise.catch(() => undefined)
+      : Promise.resolve();
+    uncertaintyPersistPromise = pending.then(async () => {
+      await withTimeout(
+        Promise.resolve().then(() => options.markLockUncertain?.(uncertaintyDetails!)),
+        Math.min(5_000, drainTimeoutMs),
+        "Open Browser Use uncertain-lock persistence timed out",
+      );
+    });
+    void uncertaintyPersistPromise.catch(() => undefined);
+    try {
+      await uncertaintyPersistPromise;
+    } catch (error) {
+      options.logger(
+        `[browser] Failed to persist the uncertain main-Chrome routing lock: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
+  const noteUncertainty = async (
+    reason: string,
+    connection: TerminationConnection | null = null,
+    recoveryHandle?: Record<string, unknown>,
+  ): Promise<void> => {
+    const handle = recoveryHandle ?? buildRecoveryHandle(connection);
+    uncertaintyDetails = {
+      ...(uncertaintyDetails ?? { reason }),
+      ...(handle ? { recoveryHandle: handle } : {}),
+    };
+    await persistUncertainty();
+  };
+  const scheduleLatePreservation = (): void => {
+    if (latePreservationScheduled) return;
+    latePreservationScheduled = true;
+    const lateTask = (async () => {
+      let connection: TerminationConnection | null = null;
+      try {
+        connection = await resolveConnection();
+        if (!connection) return;
+        const recoveryHandle = buildRecoveryHandle(connection);
+        if (recoveryHandle) {
+          uncertaintyDetails = {
+            ...(uncertaintyDetails ?? {
+              reason: "Open Browser Use termination cleanup was inconclusive.",
+            }),
+            recoveryHandle,
+          };
+          await persistUncertainty();
+        }
+        connection.requestKeepTab?.();
+        try {
+          await runBeforeFinalize();
+        } catch (error) {
+          options.logger(
+            `[browser] Late main-Chrome cleanup failed before tab preservation: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        await connection.finalize(true);
+      } catch (error) {
+        const recoveryHandle = recoveryHandleFromError(error);
+        if (recoveryHandle) {
+          await noteUncertainty(
+            "Open Browser Use late tab preservation failed.",
+            connection,
+            recoveryHandle,
+          );
+        }
+        options.logger(
+          `[browser] Late main-Chrome tab preservation failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    })();
+    void lateTask.catch(() => undefined);
+  };
+  const remove = (() => {
     if (removed) return;
     removed = true;
     for (const [signal, listener] of listeners) process.removeListener(signal, listener);
+  }) as OpenBrowserUseTerminationHooks;
+  remove.waitForDrain = async () => {
+    await signalTask;
   };
+  remove.isTerminating = () => terminating;
+  remove.isLockUncertain = () => lockUncertain;
   const handleSignal = (signal: NodeJS.Signals) => {
     if (handling) return;
     handling = true;
+    terminating = true;
+    options.preserveTab?.();
     options.logger(`[browser] Received ${signal}; preserving the exact main-Chrome task tab.`);
-    void (async () => {
+    const exitCode = signal === "SIGINT" ? 130 : 1;
+    process.exitCode = exitCode;
+    const deadline = Date.now() + drainTimeoutMs;
+    const runWithDeadline = async <T>(task: () => Promise<T> | T, label: string): Promise<T> => {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) throw new Error(label);
+      return withTimeout(Promise.resolve().then(task), remainingMs, label);
+    };
+    const task = (async () => {
+      let connection: TerminationConnection | null = null;
       try {
-        const connection = await options.connection();
-        await connection?.finalize(true);
-      } catch (error) {
-        options.logger(
-          `[browser] Failed to preserve the main-Chrome task tab during ${signal}: ${error instanceof Error ? error.message : String(error)}`,
+        connection = await runWithDeadline(
+          () => resolveConnection(),
+          `Open Browser Use ${signal} connection resolution timed out`,
         );
+        if (!connection) {
+          await noteUncertainty("Open Browser Use did not return a task-tab connection.");
+        } else {
+          connection.requestKeepTab?.();
+        }
+      } catch (error) {
+        await noteUncertainty(
+          `Open Browser Use ${signal} connection resolution failed: ${error instanceof Error ? error.message : String(error)}`,
+          connection,
+          recoveryHandleFromError(error),
+        );
+        options.logger(
+          `[browser] Failed to resolve the main-Chrome task tab before ${signal}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        if (!connectionSettled) scheduleLatePreservation();
+      }
+      if (connection && connectionSettled) {
+        try {
+          await runWithDeadline(
+            () => runBeforeFinalize(),
+            `Open Browser Use ${signal} pre-finalization cleanup timed out`,
+          );
+        } catch (error) {
+          await noteUncertainty(
+            `Open Browser Use ${signal} pre-finalization cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+            connection,
+          );
+          options.logger(
+            `[browser] Failed to clean up the main-Chrome task tab before ${signal}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          if (!beforeFinalizeSettled) {
+            scheduleLatePreservation();
+            return;
+          }
+        }
+        try {
+          await runWithDeadline(
+            () => runFinalize(connection!),
+            `Open Browser Use ${signal} tab finalization timed out`,
+          );
+        } catch (error) {
+          await noteUncertainty(
+            `Open Browser Use ${signal} tab finalization failed: ${error instanceof Error ? error.message : String(error)}`,
+            connection,
+          );
+          options.logger(
+            `[browser] Failed to preserve the main-Chrome task tab during ${signal}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      } else if (connection && !connectionSettled) {
+        scheduleLatePreservation();
+      }
+      if (lockUncertain) {
+        await persistUncertainty();
+        options.logger(
+          `[browser] Retaining the main-Chrome routing lock after ${signal}; cleanup ownership is uncertain.`,
+        );
+        return;
       }
       try {
-        await options.releaseLock();
+        await withTimeout(
+          Promise.resolve().then(() => options.releaseLock()),
+          Math.min(5_000, drainTimeoutMs),
+          `Open Browser Use ${signal} lock release timed out`,
+        );
       } catch (error) {
+        await noteUncertainty(
+          `Open Browser Use ${signal} lock release failed: ${error instanceof Error ? error.message : String(error)}`,
+          connection,
+        );
         options.logger(
           `[browser] Failed to release the main-Chrome routing lock during ${signal}: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
-    })().finally(() => {
+    })();
+    signalTask = task.finally(() => {
       remove();
-      const exitCode = signal === "SIGINT" ? 130 : 1;
       process.exitCode = exitCode;
       const isTestRun = process.env.VITEST === "1" || process.env.NODE_ENV === "test";
       if (!isTestRun) process.exit(exitCode);
@@ -234,6 +475,10 @@ function resolveStoredConversationUrl(input: StoredOpenBrowserUseAffinityInput):
   if (!selected) {
     throw new Error("Stored main-Chrome conversation affinity is incomplete.");
   }
+  const selectedScope = chatGptConversationScopeFromUrl(selected);
+  if (!selectedScope) {
+    throw new Error("Stored main-Chrome conversation affinity is invalid.");
+  }
   const urlCandidates = [
     selected,
     ...(input.conversationUrls ?? []),
@@ -244,8 +489,6 @@ function resolveStoredConversationUrl(input: StoredOpenBrowserUseAffinityInput):
       config?.url,
     ]),
   ];
-  const ids = new Set<string>();
-  let selectedUrl: URL | null = null;
   for (const raw of urlCandidates) {
     const candidate = raw?.trim();
     if (!candidate) continue;
@@ -264,12 +507,16 @@ function resolveStoredConversationUrl(input: StoredOpenBrowserUseAffinityInput):
     ) {
       throw new Error("Stored main-Chrome conversation affinity is invalid.");
     }
-    const conversationId = extractStableConversationIdFromUrl(parsed.pathname);
-    if (parsed.pathname.includes("/c/") && !conversationId) {
-      throw new Error("Stored main-Chrome conversation affinity is invalid.");
+    const scope = chatGptConversationScopeFromUrl(candidate);
+    if (!scope) {
+      if (parsed.pathname.includes("/c/")) {
+        throw new Error("Stored main-Chrome conversation affinity is invalid.");
+      }
+      continue;
     }
-    if (conversationId) ids.add(conversationId);
-    if (candidate === selected) selectedUrl = parsed;
+    if (!isSameChatGptConversationScope(candidate, selected)) {
+      throw new Error("Stored main-Chrome conversation affinity is conflicting.");
+    }
   }
   for (const raw of [input.runtime?.conversationId, ...(input.conversationIds ?? [])]) {
     const conversationId = raw?.trim();
@@ -277,15 +524,11 @@ function resolveStoredConversationUrl(input: StoredOpenBrowserUseAffinityInput):
     if (!/^[a-zA-Z0-9-]+$/.test(conversationId)) {
       throw new Error("Stored main-Chrome conversation affinity is invalid.");
     }
-    ids.add(conversationId);
+    if (conversationId !== selectedScope.conversationId) {
+      throw new Error("Stored main-Chrome conversation affinity is conflicting.");
+    }
   }
-  if (!selectedUrl || !extractStableConversationIdFromUrl(selectedUrl.pathname)) {
-    throw new Error("Stored main-Chrome conversation affinity is incomplete.");
-  }
-  if (ids.size > 1) {
-    throw new Error("Stored main-Chrome conversation affinity is conflicting.");
-  }
-  return selectedUrl.href;
+  return new URL(selected).href;
 }
 
 function singleStoredValue<T>(
@@ -485,6 +728,22 @@ export async function waitForOpenBrowserUseConversationUrl(options: {
   );
 }
 
+async function isUnixSocketReachable(socketPath: string): Promise<boolean> {
+  return await new Promise((resolve) => {
+    const socket = net.createConnection({ path: socketPath });
+    let settled = false;
+    const finish = (reachable: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(reachable);
+    };
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+    socket.setTimeout(500, () => finish(false));
+  });
+}
+
 export async function resolveOpenBrowserUseSocketPath(
   registryPath = ACTIVE_REGISTRY_PATH,
 ): Promise<string> {
@@ -516,14 +775,18 @@ export async function resolveOpenBrowserUseSocketPath(
     ) {
       throw new Error("active socket is outside the Open Browser Use runtime directory");
     }
-    if (!Number.isInteger(pid) || pid <= 0 || !isProcessAlive(pid)) {
-      throw new Error("active native-host process is not running");
-    }
     const socketStat = await lstat(resolvedSocket);
     if (!socketStat.isSocket() || socketStat.isSymbolicLink()) {
       throw new Error("active socket is not a Unix socket");
     }
     assertPrivateRuntimePath(socketStat, "active socket");
+    if (pid === 0) {
+      if (!(await isUnixSocketReachable(resolvedSocket))) {
+        throw new Error("active native-host socket is not reachable");
+      }
+    } else if (!Number.isInteger(pid) || pid <= 0 || !isProcessAlive(pid)) {
+      throw new Error("active native-host process is not running");
+    }
     return resolvedSocket;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -543,7 +806,12 @@ export async function acquireOpenBrowserUseRunLock(options: {
 }): Promise<ProfileRunLock> {
   const socketPath = await resolveOpenBrowserUseSocketPath(options.registryPath);
   const lockRoot = path.join(path.dirname(socketPath), "oracle-main-chrome");
-  const lock = await acquireProfileRunLock(lockRoot, options);
+  const lock = await acquireProfileRunLock(lockRoot, {
+    timeoutMs: options.timeoutMs,
+    logger: options.logger,
+    sessionId: options.sessionId,
+    reclaimDeadOwner: false,
+  });
   if (!lock) {
     throw new BrowserAutomationError("Main Chrome account routing lock is disabled.", {
       stage: "open-browser-use",
@@ -597,9 +865,15 @@ export async function connectOpenBrowserUseTab(options: {
   let created = false;
   try {
     const tabs = await initializeClient(obuClient, sessionId);
-    const expectedConversationId = extractStableConversationIdFromUrl(
-      options.conversationUrl ?? "",
-    );
+    const expectedConversationScope = options.conversationUrl
+      ? chatGptConversationScopeFromUrl(options.conversationUrl)
+      : undefined;
+    if (options.conversationUrl && !expectedConversationScope) {
+      throw new BrowserAutomationError("Stored main-Chrome conversation affinity is invalid.", {
+        stage: "open-browser-use",
+        code: "conversation-affinity-invalid",
+      });
+    }
     tab = options.obuTabId
       ? tabs.find((candidate) => candidate.id === options.obuTabId)
       : undefined;
@@ -611,8 +885,9 @@ export async function connectOpenBrowserUseTab(options: {
     }
     if (
       tab &&
-      expectedConversationId &&
-      extractStableConversationIdFromUrl(tab.url ?? "") !== expectedConversationId
+      options.conversationUrl &&
+      (!chatGptConversationScopeFromUrl(tab.url ?? "") ||
+        !isSameChatGptConversationScope(tab.url ?? "", options.conversationUrl))
     ) {
       throw new BrowserAutomationError(
         "Stored Open Browser Use tab no longer points to the expected ChatGPT conversation.",
@@ -641,8 +916,33 @@ export async function connectOpenBrowserUseTab(options: {
     const adapter = createOpenBrowserUseChromeClient(obuClient, attachedTab.id);
     let keepRequested = false;
     let finalizePromise: Promise<void> | null = null;
+    let finalizationStarted = false;
+    let finalizationKeepTab = false;
+    let finalizationCompleted = false;
+    let lateKeepRequested = false;
+    const lateTabPreservationError = () =>
+      new BrowserAutomationError(
+        "A termination signal arrived after the main-Chrome tab handoff committed; the exact task tab could not be verified for reattach.",
+        {
+          stage: "open-browser-use",
+          code: "late-tab-preservation-race",
+          recoveryHandle: {
+            transport: "obu",
+            sessionId,
+            tabId: attachedTab.id,
+            conversationUrl: options.conversationUrl ?? attachedTab.url ?? null,
+          },
+        },
+      );
+    const requestKeepTab = () => {
+      if (finalizationStarted && !finalizationKeepTab) lateKeepRequested = true;
+      keepRequested = true;
+    };
     const finalize = (keepTab: boolean): Promise<void> => {
-      keepRequested ||= keepTab;
+      if (keepTab) requestKeepTab();
+      if (keepTab && finalizationCompleted && !finalizationKeepTab) {
+        return Promise.reject(lateTabPreservationError());
+      }
       finalizePromise ??= (async () => {
         let finalizeFailure: unknown;
         try {
@@ -657,9 +957,25 @@ export async function connectOpenBrowserUseTab(options: {
               const keep = liveTabs
                 .filter((candidate) => candidate.id !== attachedTab.id || shouldKeepTab)
                 .map((candidate) => ({ tabId: candidate.id, status: "handoff" }) as JsonValue);
+              finalizationStarted = true;
+              finalizationKeepTab = shouldKeepTab;
               await obuClient.finalizeTabs(keep);
+              if (lateKeepRequested && !shouldKeepTab) {
+                const after = parseTabs(await obuClient.getTabs());
+                if (!after.some((candidate) => candidate.id === attachedTab.id)) {
+                  throw lateTabPreservationError();
+                }
+                finalizationKeepTab = true;
+              }
+              finalizationCompleted = true;
               return;
             } catch (error) {
+              if (
+                error instanceof BrowserAutomationError &&
+                error.details?.code === "late-tab-preservation-race"
+              ) {
+                throw error;
+              }
               finalizeFailure = error;
             }
           }
@@ -692,6 +1008,7 @@ export async function connectOpenBrowserUseTab(options: {
       tabUrl: attachedTab.url,
       created,
       finalize,
+      requestKeepTab,
     };
   } catch (error) {
     let cleanupFailed = false;

@@ -5,6 +5,7 @@ import type {
   BrowserRunWarning,
   BrowserRuntimeMetadata,
   BrowserTransport,
+  RequestOrigin,
 } from "../sessionStore.js";
 import type { SessionArtifact } from "../sessionStore.js";
 import type { ThinkingTimeLevel } from "../oracle/types.js";
@@ -154,11 +155,13 @@ export interface BrowserRunOptions {
    */
   fallbackSubmission?: { prompt: string; attachments: BrowserAttachment[] };
   config?: BrowserAutomationConfig;
+  /** Immutable origin recorded when this wrapper-routed session was created. */
+  requestOrigin?: RequestOrigin;
+  /** Session id used for cross-process browser slot diagnostics. */
+  sessionId?: string;
   log?: BrowserLogger;
   heartbeatIntervalMs?: number;
   verbose?: boolean;
-  /** Session id used for cross-process browser slot diagnostics. */
-  sessionId?: string;
   /** Browser-only image generation output path. */
   generateImagePath?: string;
   /** Optional output path for image operations. */

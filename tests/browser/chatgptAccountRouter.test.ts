@@ -83,6 +83,12 @@ describe("ChatGPT account router", () => {
   test("binds an account switch to its exact workspace row", async () => {
     vi.useFakeTimers();
     try {
+      const oldIdentity = {
+        status: "authenticated",
+        email: expectation.email,
+        accountDigest,
+        workspaceDigest: oldWorkspaceDigest,
+      };
       const selectedIdentity = {
         status: "authenticated",
         email: expectation.email,
@@ -98,8 +104,13 @@ describe("ChatGPT account router", () => {
         },
         { status: "clicked", x: 100, y: 200 },
         true,
+        oldIdentity,
+        oldIdentity,
+        { status: "clicked", x: 120, y: 220 },
+        true,
+        oldIdentity,
         selectedIdentity,
-        selectedIdentity,
+        { status: "selected" },
       ]);
       const Input = inputRecorder();
       const assertion = expect(
@@ -116,8 +127,45 @@ describe("ChatGPT account router", () => {
       });
       await vi.runAllTimersAsync();
       await assertion;
-      expect(Runtime.evaluate).toHaveBeenCalledTimes(5);
-      expect(Input.dispatchMouseEvent).toHaveBeenCalledOnce();
+      expect(Runtime.evaluate).toHaveBeenCalledTimes(10);
+      expect(Input.dispatchMouseEvent).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  test("does not promote the account switcher's selected workspace without a settled workspace proof", async () => {
+    vi.useFakeTimers();
+    try {
+      const targetAccountOldWorkspace = {
+        status: "authenticated",
+        email: expectation.email,
+        accountDigest,
+        workspaceDigest: oldWorkspaceDigest,
+      };
+      const Runtime = runtimeFromValues([
+        {
+          status: "authenticated",
+          email: "other@example.com",
+          accountDigest: "d".repeat(64),
+          workspaceDigest: "e".repeat(64),
+        },
+        { status: "selected" },
+        targetAccountOldWorkspace,
+        ...Array.from({ length: 50 }, () => ({ status: "not-found" })),
+      ]);
+
+      const assertion = expect(
+        ensureChatGptIdentity(
+          Runtime,
+          inputRecorder(),
+          { ...expectation, accountDigest: null, workspaceDigest: null },
+          vi.fn() as BrowserLogger,
+        ),
+      ).rejects.toMatchObject({
+        details: { stage: "main-chrome-account-router", code: "workspace-required" },
+      });
+      await vi.runAllTimersAsync();
+      await assertion;
     } finally {
       vi.useRealTimers();
     }
@@ -155,6 +203,97 @@ describe("ChatGPT account router", () => {
     });
     expect((Runtime.evaluate as ReturnType<typeof vi.fn>).mock.calls.length).toBe(6);
     expect(Input.dispatchMouseEvent).toHaveBeenCalledOnce();
+  });
+  test("accepts a first-use route when the exact workspace row is already selected", async () => {
+    const Runtime = runtimeFromValues([
+      {
+        status: "authenticated",
+        email: expectation.email,
+        accountDigest,
+        workspaceDigest: expectedWorkspaceDigest,
+      },
+      { status: "selected" },
+      {
+        status: "authenticated",
+        email: expectation.email,
+        accountDigest,
+        workspaceDigest: expectedWorkspaceDigest,
+      },
+      { status: "selected" },
+    ]);
+    const Input = inputRecorder();
+    await expect(
+      ensureChatGptIdentity(
+        Runtime,
+        Input,
+        { ...expectation, workspaceDigest: null },
+        vi.fn() as BrowserLogger,
+      ),
+    ).resolves.toMatchObject({
+      email: expectation.email,
+      workspaceDigest: expectedWorkspaceDigest,
+    });
+    expect(Input.dispatchMouseEvent).not.toHaveBeenCalled();
+  });
+  test("does not accept a stale digest after clicking a differently named workspace", async () => {
+    vi.useFakeTimers();
+    try {
+      const Runtime = runtimeFromValues([
+        {
+          status: "authenticated",
+          email: expectation.email,
+          accountDigest,
+          workspaceDigest: expectedWorkspaceDigest,
+        },
+        { status: "clicked", x: 100, y: 200 },
+        true,
+        ...Array.from({ length: 50 }, () => ({
+          status: "authenticated",
+          email: expectation.email,
+          accountDigest,
+          workspaceDigest: expectedWorkspaceDigest,
+        })),
+      ]);
+      const assertion = expect(
+        ensureChatGptIdentity(Runtime, inputRecorder(), expectation, vi.fn() as BrowserLogger),
+      ).rejects.toMatchObject({
+        details: { stage: "main-chrome-account-router", code: "workspace-required" },
+      });
+      await vi.runAllTimersAsync();
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  test("does not accept a matching digest without the named workspace row", async () => {
+    vi.useFakeTimers();
+    try {
+      const Runtime = runtimeFromValues([
+        {
+          status: "authenticated",
+          email: expectation.email,
+          accountDigest,
+          workspaceDigest: expectedWorkspaceDigest,
+        },
+        { status: "menu-opened", x: 100, y: 200 },
+        true,
+        ...Array.from({ length: 50 }, () => ({
+          status: "authenticated",
+          email: expectation.email,
+          accountDigest,
+          workspaceDigest: expectedWorkspaceDigest,
+        })),
+      ]);
+      const assertion = expect(
+        ensureChatGptIdentity(Runtime, inputRecorder(), expectation, vi.fn() as BrowserLogger),
+      ).rejects.toMatchObject({
+        details: { stage: "main-chrome-account-router", code: "workspace-required" },
+      });
+      await vi.runAllTimersAsync();
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
   });
   test("rejects a clicked workspace whose active identity never changes", async () => {
     vi.useFakeTimers();
@@ -204,7 +343,7 @@ describe("ChatGPT account router", () => {
       expectation.workspaceName,
     );
     expect(expression).toContain("const menuActionable");
-    expect(expression).toContain("const targetMatches = menuActionable.filter(matchesTarget)");
+    expect(expression).toContain("let targetMatches = menuActionable.filter(matchesTarget)");
     expect(expression).toContain("const leafMatches = targetMatches.filter");
     expect(expression).toContain("if (leafMatches.length > 1) return { status: 'ambiguous' }");
     expect(expression).toContain("found.length === 1 && found[0] === expected");
@@ -212,6 +351,19 @@ describe("ChatGPT account router", () => {
       "accountRows.filter((node) => matchesWorkspace(node, accountWorkspace))",
     );
     expect(expression).not.toContain("const match = actionable.find(matchesTarget)");
+  });
+
+  test("scopes workspace rows to the settled target account", () => {
+    const expression = __test__.buildMenuActionExpression(
+      "workspace",
+      expectation.workspaceName,
+      true,
+      expectation.workspaceName,
+      expectation.email,
+    );
+    expect(expression).toContain(`const accountEmail = "${expectation.email}"`);
+    expect(expression).toContain("const accountMatches = menuActionable.filter");
+    expect(expression).toContain("targetMatches = accountRows.filter(matchesTarget)");
   });
 
   test("opens the nested current-account switcher with hover then a full pointer sequence", () => {
@@ -224,6 +376,21 @@ describe("ChatGPT account router", () => {
     expect(clickExpression).toContain("document.elementFromPoint(x, y)");
     expect(clickExpression).toContain("new PointerEvent('pointerdown'");
     expect(clickExpression).toContain("new MouseEvent('click'");
+  });
+  test("finds a profile control implemented as a role button", () => {
+    const expression = __test__.buildMenuActionExpression("workspace", expectation.workspaceName);
+    expect(expression).toContain('[role="button"][aria-label*="open profile menu" i]');
+  });
+  test("opens the current-account switcher for workspace routing", () => {
+    const expression = __test__.buildMenuActionExpression(
+      "workspace",
+      expectation.workspaceName,
+      true,
+      expectation.workspaceName,
+      expectation.email,
+    );
+    expect(expression).toContain("if (!account) {");
+    expect(expression).toContain("clickPoint(currentAccount, 'switcher-opened')");
   });
 
   test("fails closed when more than one account row matches", async () => {

@@ -41,8 +41,26 @@ describe("background-only browser policy", () => {
       }
     }
   });
+  test("rejects a direct browser request-origin conflict before bridge access", async () => {
+    vi.stubEnv("ORACLE_WRAPPER_REMOTE_ONLY", "1");
+    vi.stubEnv("ORACLE_WRAPPER_INVOCATION_ORIGIN", "agent");
+    try {
+      await expect(
+        runBrowserMode({
+          prompt: "must not send",
+          requestOrigin: "user",
+          config: {
+            browserTransport: "obu",
+            chatGptAccountEmail: "paul@smartypants.ai",
+            chatGptWorkspaceName: "Paul Bettner",
+          },
+        }),
+      ).rejects.toMatchObject({ details: { code: "request-origin-mismatch" } });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
 });
-
 describe("conversation cookie cleanup", () => {
   test("preserves an exact conversation configured as the browser URL", () => {
     const config = resolveBrowserConfig({

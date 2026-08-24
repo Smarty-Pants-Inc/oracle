@@ -619,6 +619,121 @@ describe("archiveChatGptConversation", () => {
     expect(stableSuffixVariant.menuButton.dispatchEvent).toHaveBeenCalled();
   });
 
+  test("does not claim archive success after leaving the approved thread", async () => {
+    const expression = buildArchiveConversationExpressionForTest();
+    let currentUrl = "https://chatgpt.com/c/abc";
+    let menuOpen = false;
+    let archiveItem: object | undefined;
+    let menuButton: object | undefined;
+    class FakeElement {
+      tagName: string;
+      parentElement: FakeElement | null;
+      textContent: string;
+      dispatchEvent = vi.fn((event: { type?: string }) => {
+        if (event.type === "click" && this === archiveItem) {
+          currentUrl = "https://chatgpt.com/";
+        }
+        if (event.type === "click" && this === menuButton) menuOpen = true;
+        return true;
+      });
+
+      constructor(tagName: string, textContent: string, parentElement: FakeElement | null = null) {
+        this.tagName = tagName;
+        this.textContent = textContent;
+        this.parentElement = parentElement;
+      }
+
+      getAttribute(name: string) {
+        return name === "aria-label" ? this.textContent : null;
+      }
+
+      getBoundingClientRect() {
+        return { left: 1160, right: 1180, top: 10, width: 20, height: 20 };
+      }
+
+      querySelectorAll(selector: string) {
+        if (
+          this === menuRoot &&
+          selector === '[role="menuitem"],[role="option"],button,div[tabindex],a'
+        ) {
+          return archiveItem ? [archiveItem] : [];
+        }
+        return [];
+      }
+    }
+    const body = new FakeElement("BODY", "");
+    const menuRoot = new FakeElement("DIV", "", body);
+    const moreButton = new FakeElement("BUTTON", "More", body);
+    const archive = new FakeElement("DIV", "Archive", menuRoot);
+    menuButton = moreButton;
+    archiveItem = archive;
+    const location = {
+      get href() {
+        return currentUrl;
+      },
+    };
+    const document = {
+      body,
+      dispatchEvent: vi.fn(),
+      querySelectorAll: vi.fn((selector: string) => {
+        if (selector === 'button,[role="button"]') return [moreButton];
+        if (selector === '[role="menu"],[role="listbox"]') return menuOpen ? [menuRoot] : [];
+        return [];
+      }),
+    };
+    class EventStub {
+      type?: string;
+      constructor(type?: string) {
+        this.type = type;
+      }
+    }
+    const evaluate = new Function(
+      "location",
+      "document",
+      "HTMLElement",
+      "getComputedStyle",
+      "window",
+      "PointerEvent",
+      "MouseEvent",
+      "KeyboardEvent",
+      "setTimeout",
+      `return ${expression};`,
+    ) as (
+      location: { href: string },
+      document: object,
+      HTMLElement: typeof FakeElement,
+      getComputedStyle: () => {
+        visibility: string;
+        display: string;
+        opacity: string;
+        pointerEvents: string;
+      },
+      window: { innerWidth: number },
+      PointerEvent: typeof EventStub,
+      MouseEvent: typeof EventStub,
+      KeyboardEvent: typeof EventStub,
+      setTimeout: (callback: () => void) => number,
+    ) => Promise<{ status: string; reason?: string }>;
+
+    await expect(
+      evaluate(
+        location,
+        document,
+        FakeElement,
+        () => ({ visibility: "visible", display: "block", opacity: "1", pointerEvents: "auto" }),
+        { innerWidth: 1200 },
+        EventStub,
+        EventStub,
+        EventStub,
+        (callback) => {
+          callback();
+          return 0;
+        },
+      ),
+    ).resolves.toMatchObject({ status: "skipped", reason: "affinity-mismatch" });
+    expect(archive.dispatchEvent).toHaveBeenCalled();
+  });
+
   test("keeps the archive expression scoped to Archive actions", () => {
     const expression = buildArchiveConversationExpressionForTest();
     expect(expression).toContain("findConversationMenuButton");

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   acquireOpenBrowserUseRunLock: vi.fn(),
@@ -90,7 +90,13 @@ describe("main-Chrome pre-affinity recovery metadata", () => {
       lockId: "lock-1",
       release: vi.fn(async () => undefined),
     });
-    mocks.registerOpenBrowserUseTerminationHooks.mockReturnValue(vi.fn());
+    mocks.registerOpenBrowserUseTerminationHooks.mockReturnValue(
+      Object.assign(vi.fn(), {
+        waitForDrain: vi.fn(async () => undefined),
+        isTerminating: vi.fn(() => false),
+        isLockUncertain: vi.fn(() => false),
+      }),
+    );
     mocks.installJavaScriptDialogAutoDismissal.mockReturnValue(vi.fn());
     mocks.connectOpenBrowserUseTab.mockImplementation(async () => ({
       client: fakeChromeClient(),
@@ -101,6 +107,9 @@ describe("main-Chrome pre-affinity recovery metadata", () => {
       created: false,
       finalize: vi.fn(async () => undefined),
     }));
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   test("ignores the unverified attached URL but retains an approved resume URL", async () => {

@@ -1,4 +1,5 @@
 import path from "node:path";
+import { renameSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
@@ -217,10 +218,16 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 
+export interface ProfileRunLockUncertainty {
+  reason: string;
+  recoveryHandle?: Record<string, unknown>;
+}
+
 export interface ProfileRunLock {
   path: string;
   lockId: string;
   release: () => Promise<void>;
+  markUncertain?: (details: ProfileRunLockUncertainty) => Promise<void>;
 }
 
 interface ProfileRunLockRecord {
@@ -228,6 +235,8 @@ interface ProfileRunLockRecord {
   lockId: string;
   createdAt: string;
   sessionId?: string;
+  phase?: "active" | "uncertain";
+  uncertainty?: ProfileRunLockUncertainty & { markedAt: string };
 }
 
 function parseProfileRunLock(payload: string | null): ProfileRunLockRecord | null {
@@ -236,9 +245,51 @@ function parseProfileRunLock(payload: string | null): ProfileRunLockRecord | nul
     const parsed = JSON.parse(payload) as ProfileRunLockRecord;
     if (!Number.isFinite(parsed.pid) || parsed.pid <= 0) return null;
     if (!parsed.lockId || typeof parsed.lockId !== "string") return null;
-    return parsed;
+    if (parsed.phase !== undefined && parsed.phase !== "active" && parsed.phase !== "uncertain") {
+      return null;
+    }
+    return { ...parsed, phase: parsed.phase ?? "active" };
   } catch {
     return null;
+  }
+}
+
+function markProfileRunLockUncertain(
+  lockPath: string,
+  lockId: string,
+  details: ProfileRunLockUncertainty,
+  logger?: ProfileStateLogger,
+): void {
+  const existing = parseProfileRunLock(readFileSync(lockPath, "utf8"));
+  if (!existing || existing.lockId !== lockId) {
+    throw new Error(`Oracle profile lock ownership changed at ${lockPath}`);
+  }
+  const record: ProfileRunLockRecord = {
+    ...existing,
+    phase: "uncertain",
+    uncertainty: { ...details, markedAt: new Date().toISOString() },
+  };
+  const temporaryPath = `${lockPath}.${lockId}.uncertain.tmp`;
+  try {
+    writeFileSync(temporaryPath, JSON.stringify(record), {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    renameSync(temporaryPath, lockPath);
+    const verified = parseProfileRunLock(readFileSync(lockPath, "utf8"));
+    if (verified?.lockId !== lockId || verified.phase !== "uncertain") {
+      throw new Error(
+        `Oracle profile lock uncertainty transition could not be verified at ${lockPath}`,
+      );
+    }
+    logger?.(`Marked Oracle profile lock uncertain at ${lockPath}; manual recovery is required`);
+  } finally {
+    try {
+      unlinkSync(temporaryPath);
+    } catch {
+      // The temporary path is absent after a successful rename.
+    }
   }
 }
 
@@ -249,6 +300,8 @@ export async function acquireProfileRunLock(
     pollMs?: number;
     logger?: ProfileStateLogger;
     sessionId?: string;
+    /** Reclaim dead owners only when the transport can prove no work survives the controller. */
+    reclaimDeadOwner?: boolean;
   },
 ): Promise<ProfileRunLock | null> {
   const timeoutMs = options.timeoutMs;
@@ -263,6 +316,7 @@ export async function acquireProfileRunLock(
   const lockId = randomUUID();
   const startedAt = Date.now();
   let warned = false;
+  let uncertain = false;
 
   for (;;) {
     try {
@@ -271,6 +325,7 @@ export async function acquireProfileRunLock(
         lockId,
         createdAt: new Date().toISOString(),
         sessionId: options.sessionId,
+        phase: "active",
       };
       await mkdir(path.dirname(lockPath), { recursive: true });
       await writeFile(lockPath, JSON.stringify(payload), { encoding: "utf8", flag: "wx" });
@@ -278,7 +333,17 @@ export async function acquireProfileRunLock(
       return {
         path: lockPath,
         lockId,
-        release: async () => releaseProfileRunLock(lockPath, lockId, options.logger),
+        markUncertain: async (details) => {
+          uncertain = true;
+          markProfileRunLockUncertain(lockPath, lockId, details, options.logger);
+        },
+        release: async () => {
+          if (uncertain) {
+            options.logger?.(`Retaining uncertain Oracle profile lock at ${lockPath}`);
+            return;
+          }
+          await releaseProfileRunLock(lockPath, lockId, options.logger);
+        },
       };
     } catch (error) {
       const code = (error as { code?: string }).code;
@@ -296,7 +361,28 @@ export async function acquireProfileRunLock(
           );
         }
       }
-      if (!existing || !isProcessAlive(existing.pid)) {
+      if (existing.phase === "uncertain") {
+        if (!warned) {
+          options.logger?.(
+            `Oracle profile lock at ${lockPath} is uncertain; refusing automatic recovery or overlap`,
+          );
+          warned = true;
+        }
+        const elapsed = Date.now() - startedAt;
+        if (elapsed >= timeoutMs) {
+          throw new Error(
+            `Oracle profile lock at ${lockPath} remains uncertain after ${Math.round(elapsed / 1000)}s; verify native-host quiescence and recover it explicitly`,
+          );
+        }
+        await delay(Math.min(pollMs, timeoutMs - elapsed));
+        continue;
+      }
+      if (!isProcessAlive(existing.pid)) {
+        if (options.reclaimDeadOwner === false) {
+          throw new Error(
+            `Oracle profile lock at ${lockPath} has a dead controller owner; refusing automatic recovery without explicit transport quiescence verification`,
+          );
+        }
         await rm(lockPath, { force: true }).catch(() => undefined);
         continue;
       }
@@ -326,6 +412,10 @@ export async function releaseProfileRunLock(
   try {
     const existing = parseProfileRunLock(await readFile(lockPath, "utf8").catch(() => null));
     if (!existing || existing.lockId !== lockId) {
+      return;
+    }
+    if (existing.phase === "uncertain") {
+      logger?.(`Retaining uncertain Oracle profile lock at ${lockPath}`);
       return;
     }
     await rm(lockPath, { force: true });

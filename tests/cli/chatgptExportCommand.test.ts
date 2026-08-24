@@ -199,4 +199,70 @@ describe("ChatGPT export operation errors", () => {
     expect(mocks.captureViaObu).not.toHaveBeenCalled();
     expect(mocks.captureViaCdp).not.toHaveBeenCalled();
   });
+  test("rejects an explicit remote endpoint that would bypass a named OBU session", async () => {
+    const meta = obuSession();
+    mocks.readSession.mockResolvedValue(meta);
+
+    await expect(
+      handleChatGptExportCommand({
+        targetUrl,
+        sessionId: meta.id,
+        remoteChrome: "127.0.0.1:9223",
+        json: true,
+      }),
+    ).rejects.toThrow(/cannot override a named main-Chrome session/i);
+    expect(mocks.captureViaObu).not.toHaveBeenCalled();
+    expect(mocks.captureViaCdp).not.toHaveBeenCalled();
+  });
+
+  test("rejects a caller-selected browser tab for a named OBU session", async () => {
+    const meta = obuSession();
+    mocks.readSession.mockResolvedValue(meta);
+
+    await expect(
+      handleChatGptExportCommand({
+        targetUrl,
+        sessionId: meta.id,
+        browserTab: "tab-7",
+        json: true,
+      }),
+    ).rejects.toThrow(/stored task-tab affinity.*remove --browser-tab/i);
+    expect(mocks.captureViaObu).not.toHaveBeenCalled();
+  });
+
+  test("rejects an explicit endpoint that differs from a named CDP session", async () => {
+    const browserWSEndpoint = "ws://127.0.0.1:9223/devtools/browser/browser-a";
+    const config = {
+      remoteChrome: { host: "127.0.0.1", port: 9223 },
+      remoteChromeBrowserId: "browser-a",
+      remoteChromeBrowserWSEndpoint: browserWSEndpoint,
+      remoteChromeAccountDigest: "a".repeat(64),
+    };
+    const meta: SessionMetadata = {
+      id: "cdp-session",
+      createdAt: "2026-08-22T00:00:00.000Z",
+      status: "completed",
+      options: { browserConfig: config },
+      browser: {
+        config,
+        runtime: {
+          chromeBrowserWSEndpoint: browserWSEndpoint,
+          chatGptAccountDigest: "a".repeat(64),
+          tabUrl: targetUrl,
+          conversationId: "export-thread",
+        },
+      },
+    };
+    mocks.readSession.mockResolvedValue(meta);
+
+    await expect(
+      handleChatGptExportCommand({
+        targetUrl,
+        sessionId: meta.id,
+        remoteChrome: "127.0.0.1:9333",
+        json: true,
+      }),
+    ).rejects.toThrow(/does not match the named session's stored browser endpoint/i);
+    expect(mocks.captureViaCdp).not.toHaveBeenCalled();
+  });
 });

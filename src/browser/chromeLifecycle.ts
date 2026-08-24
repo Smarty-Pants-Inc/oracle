@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 import CDP from "chrome-remote-interface";
 import { launch, Launcher, type LaunchedChrome } from "chrome-launcher";
 import type { BrowserLogger, ResolvedBrowserConfig, ChromeClient } from "./types.js";
+import { BrowserAutomationError } from "../oracle/errors.js";
 import {
   cleanupStaleProfileState,
   findRunningChromeDebugTargetForProfile,
@@ -266,6 +267,7 @@ export async function closeRemoteChromeTarget(
   port: number,
   targetId: string | undefined,
   logger: BrowserLogger,
+  options?: { throwOnFailure?: boolean },
 ): Promise<void> {
   if (!targetId) {
     return;
@@ -278,6 +280,7 @@ export async function closeRemoteChromeTarget(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logger(`Failed to close remote Chrome tab ${targetId}: ${message}`);
+    if (options?.throwOnFailure) throw error;
   }
 }
 
@@ -359,6 +362,7 @@ export async function connectToRemoteChromeTarget(
     options.approvalWaitMs,
   );
   let targetId = options.targetId;
+  const createdTarget = !targetId;
   try {
     if (!targetId) {
       const created = await browser.Target.createTarget({
@@ -374,17 +378,59 @@ export async function connectToRemoteChromeTarget(
       targetId,
       browserWSEndpoint: options.browserWSEndpoint,
       close: async () => {
-        await browser.Target.detachFromTarget({ sessionId: attached.sessionId }).catch(
-          () => undefined,
-        );
-        if (options.closeTargetOnDispose && targetId) {
-          await browser.Target.closeTarget({ targetId }).catch(() => undefined);
+        let cleanupError: unknown;
+        try {
+          await browser.Target.detachFromTarget({ sessionId: attached.sessionId });
+        } catch (error) {
+          cleanupError = error;
         }
-        await browser.close().catch(() => undefined);
+        if (options.closeTargetOnDispose && targetId) {
+          try {
+            await browser.Target.closeTarget({ targetId });
+          } catch (error) {
+            cleanupError ??= error;
+          }
+        }
+        try {
+          await browser.close();
+        } catch (error) {
+          cleanupError ??= error;
+        }
+        if (cleanupError !== undefined) throw cleanupError;
       },
     };
   } catch (error) {
-    await browser.close().catch(() => undefined);
+    const cleanupFailure: Record<string, string> = {};
+    if (createdTarget && targetId) {
+      try {
+        await browser.Target.closeTarget({ targetId });
+      } catch (cleanupError) {
+        cleanupFailure.target =
+          cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+      }
+    }
+    try {
+      await browser.close();
+    } catch (cleanupError) {
+      cleanupFailure.browser =
+        cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+    }
+    if (Object.keys(cleanupFailure).length > 0) {
+      throw new BrowserAutomationError(
+        "Remote Chrome target attachment failed and cleanup was incomplete.",
+        {
+          stage: "chrome-lifecycle",
+          code: "remote-target-attach-cleanup-failed",
+          cleanupFailure,
+          recoveryHandle: {
+            transport: "cdp",
+            browserWSEndpoint: options.browserWSEndpoint,
+            targetId,
+          },
+        },
+        error,
+      );
+    }
     throw error;
   }
 }

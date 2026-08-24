@@ -61,8 +61,10 @@ trial contract and may not broaden prompt scope or cleanup.
    assistant message IDs, the normalized payload ends at that assistant, and
    the originating handoff tab remains present.
 6. Interrupt one approved long-running trial once. Confirm the signal path keeps
-   the exact task tab, releases the global routing lock, and the stored session
-   reattaches without buying a replacement model turn.
+   the exact task tab. The global routing lock must be released only after
+   positive cleanup; if cleanup is inconclusive, confirm the uncertain lock and
+   exact recovery handle are persisted and do not start another route until an
+   operator verifies native-host quiescence and recovers it explicitly.
 7. Login-expiry behavior may be tested live only if Paul separately approves the
    exact account change. Otherwise use deterministic tests to prove
    `login-required`/`workspace-required`, no cross-account failover, and the

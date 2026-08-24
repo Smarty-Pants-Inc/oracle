@@ -77,6 +77,42 @@ describe("buildBrowserConfig", () => {
       hideWindow: undefined,
     });
   });
+  test.each([
+    ["user", "paul@smartypants.ai", "Paul Bettner"],
+    ["agent", "dev1@smartypants.ai", "Smarty Dev"],
+  ] as const)(
+    "accepts the %s wrapper route and rejects the opposite account/workspace",
+    async (origin, email, workspaceName) => {
+      vi.stubEnv("ORACLE_WRAPPER_REMOTE_ONLY", "1");
+      vi.stubEnv("ORACLE_WRAPPER_INVOCATION_ORIGIN", origin);
+      try {
+        await expect(
+          buildBrowserConfig({
+            model: "gpt-5.6-sol-pro",
+            browserTransport: "obu",
+            browserAccountEmail: email,
+            browserWorkspaceName: workspaceName,
+          }),
+        ).resolves.toMatchObject({
+          chatGptAccountEmail: email,
+          chatGptWorkspaceName: workspaceName,
+        });
+        const opposite =
+          origin === "user"
+            ? { browserAccountEmail: "dev1@smartypants.ai", browserWorkspaceName: "Smarty Dev" }
+            : { browserAccountEmail: "paul@smartypants.ai", browserWorkspaceName: "Paul Bettner" };
+        await expect(
+          buildBrowserConfig({
+            model: "gpt-5.6-sol-pro",
+            browserTransport: "obu",
+            ...opposite,
+          }),
+        ).rejects.toThrow(/bound to/i);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    },
+  );
 
   test("rejects incomplete or mixed main-Chrome routes", async () => {
     await expect(

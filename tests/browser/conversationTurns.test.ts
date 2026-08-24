@@ -77,6 +77,7 @@ describe("conversation turn affinity", () => {
     expect(expressions).toHaveLength(2);
     for (const expression of expressions) {
       expect(expression).toContain('[data-testid="collapsible-user-message-content"]');
+      expect(expression).toContain('[data-message-author-role="user"]');
       expect(expression).toContain("userTextRoot");
     }
   });

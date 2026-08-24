@@ -1515,9 +1515,11 @@ function buildRunOptions(
     previousResponseId: overrides.previousResponseId ?? options.previousResponseId,
     browserResumeConversationUrl:
       overrides.browserResumeConversationUrl ?? options.browserResumeConversationUrl,
+    requestOrigin: overrides.requestOrigin ?? options.requestOrigin,
     effectiveModelId: overrides.effectiveModelId ?? options.effectiveModelId ?? options.model,
     modelOverrides: overrides.modelOverrides ?? options.modelOverrides,
     file: overrides.file ?? options.file ?? [],
+
     maxFileSizeBytes: overrides.maxFileSizeBytes ?? options.maxFileSizeBytes,
     slug: overrides.slug ?? options.slug,
     filesReport: overrides.filesReport ?? options.filesReport,
@@ -1822,6 +1824,7 @@ function buildRunOptionsFromMetadata(metadata: SessionMetadata): RunOracleOption
     models: stored.models as ModelName[] | undefined,
     previousResponseId: stored.previousResponseId,
     browserResumeConversationUrl: stored.browserResumeConversationUrl,
+    requestOrigin: stored.requestOrigin ?? metadata.requestOrigin,
     effectiveModelId: stored.effectiveModelId ?? stored.model,
     modelOverrides: stored.modelOverrides,
     reasoningEffort: stored.reasoningEffort,

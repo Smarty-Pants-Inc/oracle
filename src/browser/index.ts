@@ -131,12 +131,19 @@ import {
 } from "./conversationUrl.js";
 import { assertChatGptIdentity } from "./chatgptAccountRouter.js";
 import {
+  assertWrapperChatGptRoute,
+  parseWrapperRequestOrigin,
+  resolveWrapperRequestOrigin,
+} from "../wrapperRoute.js";
+
+import {
   acquireOpenBrowserUseRunLock,
   connectOpenBrowserUseTab,
   prepareOpenBrowserUseChatGptRoute,
   registerOpenBrowserUseTerminationHooks,
   prepareOpenBrowserUseConversationRoute,
   type OpenBrowserUseConnection,
+  type OpenBrowserUseTerminationHooks,
 } from "./openBrowserUse.js";
 
 export type { BrowserAutomationConfig, BrowserRunOptions, BrowserRunResult } from "./types.js";
@@ -1111,6 +1118,32 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       "The agent wrapper requires a stored or wrapper-selected existing-browser transport; refusing to launch or attach local Chrome.",
       { stage: "background-browser-policy" },
     );
+  }
+  if (process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1") {
+    const environmentOrigin = resolveWrapperRequestOrigin();
+    const optionOrigin = parseWrapperRequestOrigin(options.requestOrigin, "Browser request origin");
+    if (optionOrigin && environmentOrigin && optionOrigin !== environmentOrigin) {
+      throw new BrowserAutomationError("Browser and wrapper request origins do not match.", {
+        stage: "main-chrome-account-router",
+        code: "request-origin-mismatch",
+      });
+    }
+    const requestOrigin = optionOrigin ?? environmentOrigin;
+    if (!requestOrigin) {
+      throw new BrowserAutomationError(
+        'Wrapper-routed browser sessions require an explicit "user" or "agent" request origin.',
+        { stage: "main-chrome-account-router", code: "request-origin-missing" },
+      );
+    }
+    try {
+      assertWrapperChatGptRoute(requestOrigin, config);
+    } catch (error) {
+      throw new BrowserAutomationError(
+        error instanceof Error ? error.message : String(error),
+        { stage: "main-chrome-account-router", code: "account-route-mismatch" },
+        error,
+      );
+    }
   }
   const usingCopiedProfile = Boolean(config.copyProfileSource);
   if (
@@ -3348,7 +3381,7 @@ async function runRemoteBrowserMode(
   let obuConnection: OpenBrowserUseConnection | null = null;
   let obuConnectionReady: Promise<OpenBrowserUseConnection> | null = null;
   let obuRunLock: ProfileRunLock | null = null;
-  let removeObuTerminationHooks: (() => void) | null = null;
+  let removeObuTerminationHooks: OpenBrowserUseTerminationHooks | null = null;
   const chromeProfileRoot = config.remoteChromeProfileRoot ?? undefined;
   let promptBinding: ConversationTurnBinding = {};
   let submittedPromptText: string | undefined;
@@ -3432,12 +3465,41 @@ async function runRemoteBrowserMode(
   let stopThinkingMonitor: (() => void) | null = null;
   let removeDialogHandler: (() => void) | null = null;
   let runFailure: BrowserAutomationError | null = null;
+  let obuCleanupUncertain = false;
+  const markObuCleanupUncertain = async (reason: string, error?: unknown): Promise<void> => {
+    if (!usingObu) return;
+    obuCleanupUncertain = true;
+    const details = error instanceof BrowserAutomationError ? error.details : undefined;
+    const candidate = details?.recoveryHandle;
+    const recoveryHandle =
+      candidate && typeof candidate === "object" && !Array.isArray(candidate)
+        ? (candidate as Record<string, unknown>)
+        : obuConnection
+          ? {
+              transport: "obu",
+              sessionId: obuConnection.sessionId,
+              tabId: obuConnection.tabId,
+              conversationUrl: obuConnection.tabUrl ?? lastUrl ?? null,
+            }
+          : undefined;
+    try {
+      await obuRunLock?.markUncertain?.({
+        reason,
+        ...(recoveryHandle ? { recoveryHandle } : {}),
+      });
+    } catch (markError) {
+      logger(
+        `[browser] Failed to persist uncertain main-Chrome cleanup state: ${markError instanceof Error ? markError.message : String(markError)}`,
+      );
+    }
+  };
   const finalizeCompletedObuTab = async (): Promise<BrowserRunResult["warnings"]> => {
     if (!usingObu || !obuConnection) return undefined;
     try {
       await obuConnection.finalize(false);
       return undefined;
     } catch (error) {
+      await markObuCleanupUncertain("Main-Chrome task-tab finalization was inconclusive.", error);
       const message = error instanceof Error ? error.message : String(error);
       const details = error instanceof BrowserAutomationError ? error.details : undefined;
       const warning = sanitizeErrorForPersistence(message, details);
@@ -3469,10 +3531,14 @@ async function runRemoteBrowserMode(
       });
       removeObuTerminationHooks = registerOpenBrowserUseTerminationHooks({
         connection: () => obuConnection ?? obuConnectionReady,
+        preserveTab: () => {
+          obuConnection?.requestKeepTab?.();
+        },
         releaseLock: async () => {
           await obuRunLock?.release();
           obuRunLock = null;
         },
+        markLockUncertain: (details) => obuRunLock?.markUncertain?.(details),
         logger,
       });
       obuConnectionReady = connectOpenBrowserUseTab({
@@ -4634,13 +4700,18 @@ async function runRemoteBrowserMode(
   } finally {
     await conversationUrlMonitor?.stop();
     removeDialogHandler?.();
-    removeObuTerminationHooks?.();
-    removeObuTerminationHooks = null;
+    const obuTerminationHooks = removeObuTerminationHooks;
+    if (obuTerminationHooks) await obuTerminationHooks.waitForDrain();
     if (usingObu) {
-      const keepObuTab = runStatus !== "complete" && preserveBrowserOnError;
+      const keepObuTab =
+        Boolean(obuTerminationHooks?.isTerminating()) ||
+        (runStatus !== "complete" && preserveBrowserOnError);
       try {
-        await obuConnection?.finalize(keepObuTab);
+        if (obuConnection) {
+          await obuConnection.finalize(keepObuTab);
+        }
       } catch (error) {
+        await markObuCleanupUncertain("Main-Chrome task-tab finalization was inconclusive.", error);
         if (runFailure?.details) {
           (runFailure.details as Record<string, unknown>).cleanupFailure =
             error instanceof BrowserAutomationError
@@ -4648,12 +4719,19 @@ async function runRemoteBrowserMode(
               : { message: error instanceof Error ? error.message : String(error) };
         } else {
           const message = error instanceof Error ? error.message : String(error);
-          logger(`[browser] Failed to finalize main-Chrome Oracle tab: ${message}`);
+          logger(`[browser] Failed to finalize main-Chrome tab: ${message}`);
         }
+      } finally {
+        await obuTerminationHooks?.waitForDrain();
+        if (!obuCleanupUncertain && !obuTerminationHooks?.isLockUncertain()) {
+          await obuRunLock?.release().catch(() => undefined);
+        }
+        obuRunLock = null;
+        obuTerminationHooks?.();
+        removeObuTerminationHooks = null;
       }
-      await obuRunLock?.release().catch(() => undefined);
-      obuRunLock = null;
     } else {
+      removeObuTerminationHooks = null;
       try {
         await closeRemoteConnectionAfterRun({
           connectionClosedUnexpectedly,
