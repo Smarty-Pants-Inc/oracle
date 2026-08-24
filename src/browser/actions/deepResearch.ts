@@ -131,11 +131,13 @@ async function clickTrustedPoint(
 ): Promise<void> {
   const affinityGuard = buildEvaluatedChatGptPageAffinityGuard(options);
   if (Input && typeof Input.dispatchMouseEvent === "function") {
+    await options.assertPageAffinity?.("Deep Research trusted click start");
     await Input.dispatchMouseEvent({ type: "mouseMoved", x, y });
     await options.assertPageAffinity?.("Deep Research trusted click");
     await Input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", clickCount: 1 });
     await options.assertPageAffinity?.("Deep Research trusted click release");
     await Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+    await options.assertPageAffinity?.("Deep Research trusted click completion");
     return;
   }
   const expression = affinityGuard
@@ -1094,6 +1096,7 @@ export function buildDeepResearchFrameStatusExpressionForTest(): string {
 export async function checkDeepResearchStatus(
   Runtime: ChromeClient["Runtime"],
   _logger: BrowserLogger,
+  options: DeepResearchAffinityOptions = {},
 ): Promise<{
   completed: boolean;
   inProgress: boolean;
@@ -1101,8 +1104,15 @@ export async function checkDeepResearchStatus(
   textLength: number;
   placeholderOnly: boolean;
 }> {
+  await options.assertPageAffinity?.("Deep Research status read");
+  const statusProbe = buildGuardedDeepResearchProbeExpression(
+    buildDeepResearchStatusExpression(),
+    options.expectedConversationId,
+    options.expectedConversationUrl,
+  );
   const { result } = await Runtime.evaluate({
-    expression: buildDeepResearchStatusExpression(),
+    expression: statusProbe.expression,
+    ...(statusProbe.awaitPromise ? { awaitPromise: true } : {}),
     returnByValue: true,
   });
 

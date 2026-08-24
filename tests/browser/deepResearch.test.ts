@@ -110,11 +110,13 @@ describe("activateDeepResearch", () => {
     expect(events).toEqual([
       "affinity",
       "evaluate",
+      "affinity",
       "mouseMoved",
       "affinity",
       "mousePressed",
       "affinity",
       "mouseReleased",
+      "affinity",
       "affinity",
       "evaluate",
     ]);
@@ -1973,6 +1975,32 @@ describe("checkDeepResearchStatus", () => {
     expect(status.inProgress).toBe(false);
     expect(status.textLength).toBe(0);
     expect(status.placeholderOnly).toBe(false);
+  });
+
+  it("guards status reads with the exact conversation URL", async () => {
+    mockRuntime.evaluate.mockResolvedValueOnce({
+      result: {
+        value: {
+          completed: false,
+          inProgress: true,
+          hasIframe: true,
+          textLength: 12,
+        },
+      },
+    });
+    const affinity = vi.fn(async () => undefined);
+    await checkDeepResearchStatus(mockRuntime as never, mockLogger, {
+      expectedConversationId: "conv-123",
+      expectedConversationUrl: "https://chatgpt.com/c/conv-123",
+      assertPageAffinity: affinity,
+    });
+    expect(affinity).toHaveBeenCalledWith("Deep Research status read");
+    expect(mockRuntime.evaluate).toHaveBeenCalledWith(
+      expect.objectContaining({ awaitPromise: true, returnByValue: true }),
+    );
+    expect(mockRuntime.evaluate.mock.calls[0][0].expression).toContain(
+      "assertOracleChatGptPageAffinity",
+    );
   });
 
   it("does not report completed for a tool-only Deep Research placeholder", () => {
