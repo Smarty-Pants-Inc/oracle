@@ -240,15 +240,22 @@ describe("ChatGPT conversation inventory", () => {
     expect(setTimeoutStub).not.toHaveBeenCalled();
   });
 
-  test("accepts cleanup after ChatGPT replaces the page fetch function", () => {
-    const originalFetch = () => undefined;
-    const replacementFetch = () => undefined;
+  test("deactivates a retained inventory wrapper after ChatGPT replaces page fetch", async () => {
+    const originalFetch = vi.fn(() => undefined);
     const windowStub = { fetch: originalFetch } as Record<string, unknown>;
-    const runHook = Function("window", buildChatGptInventoryAuthCaptureHook()) as (
+    const runHook = Function("window", "location", buildChatGptInventoryAuthCaptureHook()) as (
       window: Record<string, unknown>,
+      location: { href: string },
     ) => void;
-    runHook(windowStub);
-    expect(windowStub.__oracleChatGptInventory).toBeDefined();
+    runHook(windowStub, { href: "https://chatgpt.com/" });
+    const inventory = windowStub.__oracleChatGptInventory as { readonly ready: boolean };
+    const oracleFetch = windowStub.fetch as (
+      input: Request,
+      init?: RequestInit,
+    ) => Promise<unknown>;
+    const replacementFetch = function (this: unknown, input: Request, init?: RequestInit) {
+      return oracleFetch.call(this, input, init);
+    };
 
     windowStub.fetch = replacementFetch;
     const runCleanup = Function("window", `return ${buildChatGptInventoryCleanupExpression()}`) as (
@@ -257,6 +264,14 @@ describe("ChatGPT conversation inventory", () => {
     expect(runCleanup(windowStub)).toBe(true);
     expect(windowStub.fetch).toBe(replacementFetch);
     expect(windowStub.__oracleChatGptInventory).toBeUndefined();
+
+    await replacementFetch(
+      new Request("https://chatgpt.com/backend-api/conversations", {
+        headers: { authorization: "Bearer a.b.c" },
+      }),
+    );
+    expect(inventory.ready).toBe(false);
+    expect(originalFetch).toHaveBeenCalledOnce();
   });
 
   test("rejects cleanup while the inventory fetch wrapper remains installed", () => {
