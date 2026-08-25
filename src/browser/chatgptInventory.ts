@@ -449,6 +449,7 @@ export function buildChatGptInventoryAuthCaptureHook(
     return userId.length > 0 && userId.length <= MAX_ACCOUNT_ID_LENGTH ? userId : "";
   };
   const originalFetch = window.fetch;
+  let active = true;
   let capturedHeaders = null;
   let retainedHeaders = null;
   let expiryTimer = null;
@@ -620,6 +621,7 @@ export function buildChatGptInventoryAuthCaptureHook(
         clearTimeout(expiryTimer);
         expiryTimer = null;
       }
+      active = false;
       capturedHeaders = null;
       retainedHeaders = null;
       if (window.fetch === wrappedFetch) window.fetch = originalFetch;
@@ -632,6 +634,7 @@ export function buildChatGptInventoryAuthCaptureHook(
       const request = input instanceof Request ? input : new Request(input, init);
       const url = new URL(request.url, location.href);
       if (
+        active &&
         !retainedHeaders &&
         request.method.toUpperCase() === "GET" &&
         url.origin === ORIGIN &&
