@@ -16,3 +16,46 @@ queue_rules:
       - check-success = smarty-ci
     merge_conditions:
       - check-success = smarty-ci
+
+# This block is the fleet template (smarty-dev#1513): every repository the fleet lands in copies it with
+# ALL pinned logins from bin/_smarty_write_bots.json, including per-class and versehq bots. Keep exact
+# sender matches and the human write-permission branch; do not grant the bots unrelated commands.
+# factory_host.py check alarms daily on a repository whose refresh block is missing.
+commands_restrictions:
+  queue:
+    conditions:
+      - or:
+          - sender-permission >= write
+          - sender = smarty-fleet-write[bot]
+          - sender = smarty-fleet-write-leads[bot]
+          - sender = smarty-fleet-write-lanes[bot]
+          - sender = smarty-fleet-write-versehq[bot]
+  # smarty-land's emergency dequeue posts as the actor that queued, the write App bot on the fleet host.
+  dequeue:
+    conditions:
+      - or:
+          - sender-permission >= write
+          - sender = smarty-fleet-write[bot]
+          - sender = smarty-fleet-write-leads[bot]
+          - sender = smarty-fleet-write-lanes[bot]
+          - sender = smarty-fleet-write-versehq[bot]
+  # The stuck-work check's R4 posts one `@mergifyio refresh` per head as the write App (smarty-dev#868);
+  # without this Mergify answers "Command disallowed" (#913, 12:38Z 2026-09-26).
+  refresh:
+    conditions:
+      - or:
+          - sender-permission >= write
+          - sender = smarty-fleet-write[bot]
+          - sender = smarty-fleet-write-leads[bot]
+          - sender = smarty-fleet-write-lanes[bot]
+          - sender = smarty-fleet-write-versehq[bot]
+  # Deprecated queue alias, still a legal restriction key in Mergify's public schema.
+  # Prefer `@mergifyio queue` for new writes; mergify_alarm.py also handles requeue refusals.
+  requeue:
+    conditions:
+      - or:
+          - sender-permission >= write
+          - sender = smarty-fleet-write[bot]
+          - sender = smarty-fleet-write-leads[bot]
+          - sender = smarty-fleet-write-lanes[bot]
+          - sender = smarty-fleet-write-versehq[bot]
