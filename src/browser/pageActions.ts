@@ -13,6 +13,8 @@ export {
 export { ensureModelSelection } from "./actions/modelSelection.js";
 export { submitPrompt, clearPromptComposer } from "./actions/promptComposer.js";
 export {
+  assertComposerPlusStayedInPlace,
+  captureComposerNavigationUrl,
   clearComposerAttachments,
   uploadAttachmentFile,
   waitForAttachmentCompletion,
@@ -29,4 +31,5 @@ export {
   buildMarkdownFallbackExtractorForTest,
   buildCopyExpressionForTest,
   buildResponseObserverExpressionForTest,
+  isRetryAssistantUiErrorText,
 } from "./actions/assistantResponse.js";

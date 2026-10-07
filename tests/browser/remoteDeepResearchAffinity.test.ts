@@ -91,7 +91,16 @@ describe("remote Deep Research completion affinity", () => {
     const conversationUrl = "https://chatgpt.com/c/deep-research";
     const Runtime = {
       enable: vi.fn().mockResolvedValue({}),
-      evaluate: vi.fn(async () => ({ result: { value: conversationUrl } })),
+      // Upstream claims the target and reads user message ids before submission.
+      evaluate: vi.fn(async (params?: { expression?: string }) => ({
+        result: {
+          value: params?.expression?.includes("oracle:target-claim")
+            ? true
+            : params?.expression?.includes('[data-chatgpt-search-unit-key$=":user"]')
+              ? []
+              : conversationUrl,
+        },
+      })),
     };
     const client = {
       DOM: undefined,
@@ -146,6 +155,7 @@ describe("remote Deep Research completion affinity", () => {
         prompt: "Research this topic",
         config: {
           archiveConversations: "never",
+          inputTimeoutMs: 50,
           modelStrategy: "ignore",
           remoteChrome: { host: "127.0.0.1", port: 9223 },
           remoteChromeBrowserWSEndpoint: browserWSEndpoint,

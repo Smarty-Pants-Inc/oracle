@@ -32,7 +32,7 @@ describe("resolveBrowserConfig", () => {
     const resolved = resolveBrowserConfig(undefined);
     expect(resolved.url).toBe(CHATGPT_URL);
     const isWindows = process.platform === "win32";
-    expect(resolved.cookieSync).toBe(!isWindows);
+    expect(resolved.cookieSync).toBe(false);
     expect(resolved.cookieNames).toEqual(DEFAULT_CHATGPT_COOKIE_NAMES);
     expect(resolved.headless).toBe(false);
     expect(resolved.hideWindow).toBe(true);

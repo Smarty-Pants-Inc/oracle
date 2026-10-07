@@ -822,6 +822,35 @@ describe("collectGeneratedImageArtifacts", () => {
     expect(checkBlockingUiWarning).toHaveBeenCalledTimes(1);
   });
 
+  test("rejects a Retry failure while waiting for image artifacts", async () => {
+    // Real timers: the fork's button fallback performs real filesystem I/O (download lock)
+    // before the first poll, which a single fake-timer advance cannot interleave with.
+    try {
+      const runtime = {
+        evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+          result: {
+            value: expression.includes("extractAssistantTurn")
+              ? { text: "Something went wrong.", turnIndex: 2, uiError: "temporary_unavailable" }
+              : [],
+          },
+        })),
+      } as unknown as ChromeClient["Runtime"];
+      const result = collectGeneratedImageArtifacts({
+        Runtime: runtime,
+        Network: {} as ChromeClient["Network"],
+        minTurnIndex: 2,
+        generateImagePath: path.join(os.tmpdir(), "generated.png"),
+        answerText: "Working on it.",
+        waitTimeoutMs: 15_000,
+      });
+      await expect(result).rejects.toMatchObject({
+        details: { stage: "assistant-ui-error", code: "chatgpt-ui-warning" },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("retries behavior button downloads after waiting for delayed image generation", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-06-12T00:00:00Z"));
@@ -876,13 +905,24 @@ describe("collectGeneratedImageArtifacts", () => {
         waitTimeoutMs: 15_000,
       });
       let settled = false;
-      void resultPromise.finally(() => {
-        settled = true;
-      });
-      for (let index = 0; index < 60 && !settled; index += 1) {
-        await vi.advanceTimersByTimeAsync(500);
-        await fs.readdir(tmpDir);
-      }
+      void resultPromise.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+      // Filesystem callbacks can outlive a fixed number of timer advances under
+      // load. Keep driving the fake clock until completion, with a real deadline.
+      await vi.waitFor(
+        async () => {
+          await vi.advanceTimersByTimeAsync(1500);
+          await fs.readdir(tmpDir);
+          expect(settled).toBe(true);
+        },
+        { timeout: 5_000, interval: 10 },
+      );
       const result = await resultPromise;
 
       expect(result.imageCount).toBe(1);

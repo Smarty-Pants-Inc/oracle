@@ -1,5 +1,13 @@
 import { describe, expect, test, vi } from "vitest";
-import { buildBrowserConfig, resolveBrowserModelLabel } from "../../src/cli/browserConfig.js";
+import {
+  buildBrowserConfig,
+  isGpt6Alias,
+  isGpt6ProAlias,
+  mapModelToBrowserLabel,
+  normalizeChatGptModelForBrowser,
+  resolveBrowserModelLabel,
+  resolveDefaultBrowserThinkingTime,
+} from "../../src/cli/browserConfig.js";
 
 describe("buildBrowserConfig", () => {
   test("uses defaults when optional flags omitted", async () => {
@@ -80,8 +88,42 @@ describe("buildBrowserConfig", () => {
   });
 
   test("maps legacy Pro aliases to the current ChatGPT Pro target", async () => {
-    const config = await buildBrowserConfig({ model: "gpt-5.5-pro" });
+    // gpt-5.5-pro is now an explicit GPT-5.5 pin (upstream); legacy generic aliases keep the fork's Pro target.
+    const config = await buildBrowserConfig({ model: "gpt-5.4-pro" });
     expect(config.desiredModel).toBe("Pro");
+  });
+
+  test("forwards configured manual-login cookie sync to browser sessions", async () => {
+    const config = await buildBrowserConfig({
+      model: "gpt-5.5-pro",
+      browserManualLogin: true,
+      browserManualLoginCookieSync: true,
+    });
+
+    expect(config.manualLoginCookieSync).toBe(true);
+    expect(config.cookieSync).toBe(true);
+  });
+
+  test("requires explicit opt-in for ordinary Chrome cookie sync", async () => {
+    await expect(
+      buildBrowserConfig({ model: "gpt-5.5-pro", browserCookieSync: true }),
+    ).resolves.toMatchObject({ cookieSync: true });
+    await expect(
+      buildBrowserConfig({
+        model: "gpt-5.5-pro",
+        browserCookieSync: true,
+        browserNoCookieSync: true,
+      }),
+    ).resolves.toMatchObject({ cookieSync: false });
+  });
+
+  test("honors explicit headless while keeping explicit false headful", async () => {
+    await expect(
+      buildBrowserConfig({ model: "gpt-5.5-pro", browserHeadless: true }),
+    ).resolves.toMatchObject({ headless: true });
+    await expect(
+      buildBrowserConfig({ model: "gpt-5.5-pro", browserHeadless: false }),
+    ).resolves.toMatchObject({ headless: undefined });
   });
 
   test("maps gpt-5.4 browser runs to Thinking 5.4", async () => {
@@ -94,6 +136,27 @@ describe("buildBrowserConfig", () => {
     expect(config.desiredModel).toBe("GPT-5.6 Sol");
     const sol = await buildBrowserConfig({ model: "gpt-5.6-sol" });
     expect(sol.desiredModel).toBe("GPT-5.6 Sol");
+  });
+  test.each(["gpt-6", "gpt-6-astra", "latest"])(
+    "maps GPT-6 alias %s to the Latest picker target without a Pro default",
+    async (model) => {
+      const config = await buildBrowserConfig({ model });
+      expect(config.desiredModel).toBe("Latest");
+      expect(config.thinkingTime).toBeUndefined();
+    },
+  );
+
+  test("maps gpt-6-pro to the Latest picker target with Pro effort", async () => {
+    await expect(buildBrowserConfig({ model: "gpt-6-pro" })).resolves.toMatchObject({
+      desiredModel: "Latest",
+      thinkingTime: "pro",
+    });
+    await expect(
+      buildBrowserConfig({ model: "gpt-6-astra", browserRequestedModel: "gpt-6-pro" }),
+    ).resolves.toMatchObject({
+      desiredModel: "Latest",
+      thinkingTime: "pro",
+    });
   });
 
   test("keeps version signal for gpt-5.5 Instant browser runs", async () => {
@@ -110,10 +173,47 @@ describe("buildBrowserConfig", () => {
     },
   );
 
-  test("keeps legacy Pro aliases and current-model selection available", async () => {
-    await expect(buildBrowserConfig({ model: "gpt-5.2-pro" })).resolves.toMatchObject({
-      desiredModel: "Pro",
+  test.each(["gpt-5-pro", "gpt-5.1-pro", "gpt-5.2-pro", "gpt-5.4-pro"])(
+    "maps current Pro browser alias %s to the fork's GPT-5.6 Sol Pro target",
+    async (model) => {
+      // Fork policy: generic Pro aliases select ChatGPT "Pro" (Intelligence slider at maximum)
+      // instead of upstream's GPT-5.6 Sol + separate Pro effort step.
+      await expect(buildBrowserConfig({ model })).resolves.toMatchObject({
+        desiredModel: "Pro",
+        thinkingTime: undefined,
+      });
+    },
+  );
+
+  test("keeps the explicit GPT-5.5 Pro alias on GPT-5.5", async () => {
+    await expect(buildBrowserConfig({ model: "gpt-5.5-pro" })).resolves.toMatchObject({
+      desiredModel: "GPT-5.5",
+      thinkingTime: "pro",
     });
+  });
+
+  test("lets an explicit effort override the current Pro alias default", async () => {
+    await expect(
+      buildBrowserConfig({ model: "gpt-5.2-pro", browserThinkingTime: "extended" }),
+    ).resolves.toMatchObject({
+      desiredModel: "Pro",
+      thinkingTime: "extended",
+    });
+  });
+
+  test("preserves Pro effort after the CLI normalizes the requested alias", async () => {
+    await expect(
+      buildBrowserConfig({
+        model: "gpt-5.6-sol",
+        browserRequestedModel: "gpt-5-pro",
+      }),
+    ).resolves.toMatchObject({
+      desiredModel: "GPT-5.6 Sol",
+      thinkingTime: "pro",
+    });
+  });
+
+  test("keeps current-model selection available for retired base aliases", async () => {
     await expect(
       buildBrowserConfig({ model: "gpt-5.2", browserModelStrategy: "current" }),
     ).resolves.toMatchObject({ modelStrategy: "current" });
@@ -125,6 +225,7 @@ describe("buildBrowserConfig", () => {
       browserModelStrategy: "current",
     });
     expect(config.modelStrategy).toBe("current");
+    expect(config.thinkingTime).toBeUndefined();
   });
 
   test("maps --copy-profile to copyProfileSource", async () => {
@@ -238,7 +339,7 @@ describe("buildBrowserConfig", () => {
       maxConcurrentTabs: 5,
       cookieSyncWaitMs: 4_000,
       cookieSync: false,
-      headless: undefined,
+      headless: true,
       hideWindow: true,
       keepBrowser: true,
       desiredModel: "Thinking 5.4",
@@ -417,6 +518,16 @@ describe("buildBrowserConfig", () => {
     ).rejects.toThrow(/attach-running/i);
   });
 
+  test("rejects headless when attach-running is enabled", async () => {
+    await expect(
+      buildBrowserConfig({
+        model: "gpt-5.2-pro",
+        browserAttachRunning: true,
+        browserHeadless: true,
+      }),
+    ).rejects.toThrow(/browser-attach-running cannot be combined with --browser-headless/);
+  });
+
   test("rejects browser-chrome-profile when attach-running is enabled", async () => {
     await expect(
       buildBrowserConfig({
@@ -532,7 +643,7 @@ describe("buildBrowserConfig", () => {
 describe("resolveBrowserModelLabel", () => {
   test("returns canonical ChatGPT label when CLI value matches API model", () => {
     expect(resolveBrowserModelLabel("gpt-5.6-sol-pro", "gpt-5.6-sol-pro")).toBe("Pro");
-    expect(resolveBrowserModelLabel("gpt-5.5-pro", "gpt-5.5-pro")).toBe("Pro");
+    expect(resolveBrowserModelLabel("gpt-5.5-pro", "gpt-5.5-pro")).toBe("GPT-5.5");
     expect(resolveBrowserModelLabel("gpt-5.5-instant", "gpt-5.5-instant")).toBe("GPT-5.5 Instant");
     expect(resolveBrowserModelLabel("gpt-5.5", "gpt-5.5")).toBe("Thinking 5.5");
     expect(resolveBrowserModelLabel("gpt-5.4-pro", "gpt-5.4-pro")).toBe("Pro");
@@ -560,5 +671,59 @@ describe("resolveBrowserModelLabel", () => {
     expect(resolveBrowserModelLabel("  ChatGPT 5.1 Thinking ", "gpt-5.1")).toBe(
       "ChatGPT 5.1 Thinking",
     );
+  });
+});
+
+describe("GPT-6 aliases", () => {
+  test("recognizes only the documented spellings", () => {
+    for (const alias of [
+      "gpt-6",
+      "gpt-6-astra",
+      "gpt-6-pro",
+      "latest",
+      "GPT-6 Astra",
+      "GPT-6 Pro",
+    ]) {
+      expect(isGpt6Alias(alias), alias).toBe(true);
+    }
+    expect(isGpt6ProAlias("gpt-6-pro")).toBe(true);
+    expect(isGpt6ProAlias("GPT-6 Pro")).toBe(true);
+    expect(isGpt6ProAlias("pro")).toBe(false);
+    expect(isGpt6ProAlias("gpt-6")).toBe(false);
+    expect(isGpt6ProAlias("gpt-6-astra")).toBe(false);
+    expect(isGpt6ProAlias("latest")).toBe(false);
+  });
+
+  test.each([
+    "gpt-6-codex",
+    "gpt-6-custom",
+    "gpt-6-astra-mini",
+    "gpt-6-pro-max",
+    "gpt-6.1",
+    "gpt-60",
+  ])("does not treat %s as a GPT-6 alias", (model) => {
+    expect(isGpt6Alias(model)).toBe(false);
+    expect(isGpt6ProAlias(model)).toBe(false);
+    expect(normalizeChatGptModelForBrowser(model as never)).toBe(model);
+  });
+
+  test("normalizes the aliases for the browser and keeps gpt-6-pro as the browser-only alias", () => {
+    expect(normalizeChatGptModelForBrowser("gpt-6")).toBe("gpt-6-astra");
+    expect(normalizeChatGptModelForBrowser("gpt-6-astra")).toBe("gpt-6-astra");
+    expect(normalizeChatGptModelForBrowser("latest" as never)).toBe("gpt-6-astra");
+    expect(normalizeChatGptModelForBrowser("gpt-6-pro" as never)).toBe("gpt-6-pro");
+    expect(mapModelToBrowserLabel("gpt-6-astra")).toBe("Latest");
+    expect(mapModelToBrowserLabel("gpt-6-pro" as never)).toBe("Latest");
+  });
+
+  test("defaults the Pro tier only for gpt-6-pro", () => {
+    expect(resolveDefaultBrowserThinkingTime({ model: "gpt-6-pro" })).toBe("pro");
+    expect(
+      resolveDefaultBrowserThinkingTime({ model: "gpt-6-astra", requestedModel: "gpt-6-pro" }),
+    ).toBe("pro");
+    expect(resolveDefaultBrowserThinkingTime({ model: "gpt-6-astra" })).toBeUndefined();
+    expect(resolveDefaultBrowserThinkingTime({ model: "gpt-6" })).toBeUndefined();
+    expect(resolveDefaultBrowserThinkingTime({ model: "latest" })).toBeUndefined();
+    expect(resolveDefaultBrowserThinkingTime({ model: "gpt-6-pro-max" })).toBeUndefined();
   });
 });

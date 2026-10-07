@@ -29,6 +29,7 @@ If Azure env/config is present but you want first-party OpenAI for one run, pass
 Notes:
 
 - Oracle calls Azure at `https://<resource>.openai.azure.com/openai/v1`.
+- When Azure is selected, `--base-url` and `OPENAI_BASE_URL` are ignored for both model metadata and requests; Azure keys are never used for OpenRouter catalog lookups.
 - For Responses API runs, Azure expects `model` to be your deployment name. Oracle fails early when an Azure endpoint is active without a deployment, except for `gpt-5.5-pro` where the CLI model id is used as the implicit deployment.
 - API runs print the selected route without secrets, for example `Provider: Azure OpenAI | endpoint: your-resource.openai.azure.com | deployment: my-deployment | key: AZURE_OPENAI_API_KEY|OPENAI_API_KEY`.
 - `AZURE_OPENAI_API_VERSION` is still accepted for back-compat, but Azure's v1 Responses endpoint does not require it.
@@ -98,11 +99,39 @@ they detach unless `--wait` is supplied, default to a 60-minute timeout, and use
 Responses background mode when the selected route supports it.
 
 `--reasoning-mode` accepts `standard` or `pro`; `--reasoning-effort` accepts all
-six GPT-5.6 effort levels. Both are API-only and restricted to the GPT-5.6
-family. Oracle rejects reasoning mode for OpenRouter and custom `--base-url`
+six GPT-5.6 effort levels. Both are API-only and supported for GPT-5.6
+and GPT-6 Astra, with Astra's restrictions below. Oracle rejects reasoning mode for OpenRouter and custom `--base-url`
 routes because those routes currently use Oracle's Chat Completions adapter,
 which cannot represent Responses API reasoning mode. The fake slug
 `gpt-5.6-pro` is rejected; use `gpt-5.6-sol-pro` or the explicit flags above.
+
+## GPT-6 Astra API
+
+Use the exact API model ID and choose reasoning mode separately:
+
+```bash
+oracle --engine api --model gpt-6-astra --reasoning-mode pro --reasoning-effort max -p "Review this architecture"
+```
+
+Oracle supports Astra's `low`, `medium`, `high`, `xhigh`, and `max` efforts and
+rejects `none` before inference. The default effort is `xhigh`; Pro is enabled
+only with `--reasoning-mode pro` and retains the long-running behavior above.
+The default model is unchanged. Browser selection maps this model to ChatGPT's
+`Latest` radio; `gpt-6-pro` additionally requests verified Pro effort. That Pro
+alias is browser-only: API calls use the exact model ID and reasoning mode above.
+The existing `current` and `ignore` strategies remain available: they retain the
+active ChatGPT model without verifying that it is Astra. CLI and MCP both honor
+these strategies, including saved MCP browser configuration.
+
+The default input budget is a conservative 272,000 tokens at the base-rate
+boundary, not the model's maximum capacity. Standard text estimates use $10 per
+million input tokens and $50 per million output tokens. Cache writes, tool fees,
+Pro execution, and inputs above the base-rate boundary can change actual billing;
+Oracle's basic estimate does not model those adjustments.
+
+References: [Astra model](https://developers.openai.com/api/docs/models/gpt-6-astra),
+[migration guidance](https://developers.openai.com/api/docs/guides/latest-model),
+and [API pricing](https://developers.openai.com/api/docs/pricing).
 
 ## Custom Base URLs (LiteLLM, Localhost)
 
@@ -147,7 +176,7 @@ Notes:
 
 - `gpt-5.6-sol-pro` is Oracle's logical Pro alias: API runs use `gpt-5.6-sol` with Pro reasoning mode, while browser runs select ChatGPT's `Pro` picker.
 - `gpt-5.1-pro` and `gpt-5.2-pro` remain legacy aliases for the same current Pro behavior.
-- If you want the classic Pro tier explicitly, use `gpt-5-pro`.
+- For API runs, use `gpt-5-pro` when you want the classic Pro tier explicitly. In browser mode, `gpt-6-pro` selects ChatGPT's GPT-6 (`Latest`) model with the Pro effort.
 
 ### Browser engine vs API base URLs
 

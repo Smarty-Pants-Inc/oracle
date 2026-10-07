@@ -34,6 +34,8 @@ JSON5 parsing, so trailing commas and comments are allowed.
     timeoutMs: 1200000,
     inputTimeoutMs: 30000,
     attachmentTimeoutMs: 90000, // wait for file upload/readiness before clicking Send (default: 45s)
+    captureProviderNative: false, // opt in to full ChatGPT conversation evidence (user config only)
+    cookieSync: false, // opt in to copying cookies from a live Chrome profile (prefer manualLogin)
     cookieSyncWaitMs: 0, // wait (ms) before retrying cookie sync when Chrome cookies are empty/locked
     assistantRecheckDelayMs: 0, // wait this long after timeout, then retry capture (0 = disabled)
     assistantRecheckTimeoutMs: 120000, // time budget for the recheck attempt (default: 2m)
@@ -44,14 +46,14 @@ JSON5 parsing, so trailing commas and comments are allowed.
     autoReattachIntervalMs: 0, // interval between auto-reattach attempts (0 = disabled)
     autoReattachTimeoutMs: 120000, // time budget per auto-reattach attempt (default: 2m)
     modelStrategy: "select", // select | current | ignore (ChatGPT only; ignored for Gemini web)
-    thinkingTime: "extended", // light | standard | extended | heavy (ChatGPT Thinking/Pro models)
+    thinkingTime: "extended", // light | standard | extended | extra-high | pro | heavy (ChatGPT Thinking/Pro models)
     researchMode: "off", // off | deep (ChatGPT Deep Research; browser only)
-    manualLogin: false, // set true to reuse a persistent automation profile and sign in once (Windows defaults to true when unset)
+    manualLogin: false, // set true to reuse a persistent automation profile and sign in once (recommended; Windows defaults to true when unset)
     manualLoginProfileDir: null, // override profile dir (or set ORACLE_BROWSER_PROFILE_DIR)
     headless: false,
     hideWindow: false,
     keepBrowser: false,
-    manualLoginCookieSync: false, // allow cookie sync even in manual-login mode
+    manualLoginCookieSync: false, // explicitly seed the manual-login profile from live Chrome cookies
   },
 
   // Azure OpenAI defaults (only used when endpoint is set)
@@ -114,7 +116,7 @@ CLI flags and explicit override environment variables → effective config (proj
 
 - The effective config starts with `~/.oracle/config.json`, then layers project `.oracle/config.json` files from parent to child. `engine`, `model`, `search`, `filesReport`, `heartbeatSeconds`, `maxFileSizeBytes`, and `apiBaseUrl` in the effective config override auto-detected values unless explicitly set on the CLI or through a supported override environment variable.
 - Project `.oracle/config.json` files can override safe workflow defaults such as `engine`, `model`, `search`, `filesReport`, `heartbeatSeconds`, `maxFileSizeBytes`, `promptSuffix`, and allowed `browser.*` workflow settings.
-- Provider routing and machine-local fields (`apiBaseUrl`, `modelOverrides`, `azure`, remote browser host/token defaults, Chrome binary/profile paths, cookie DB paths, and session retention cleanup) are ignored in project configs and are read only from the user config, environment variables, or explicit CLI flags.
+- Provider routing and machine-local fields (`apiBaseUrl`, `modelOverrides`, `azure`, remote browser host/token defaults, Chrome binary/profile paths, cookie DB paths, cookie-sync opt-ins, and session retention cleanup) are ignored in project configs and are read only from the user config, environment variables, or explicit CLI flags.
 - `ORACLE_ENGINE=api|browser` is a global override for engine selection (useful for MCP/Codex setups); it wins over `config.json`.
 - If `azure.endpoint` (or `--azure-endpoint`) is set, Oracle reads `AZURE_OPENAI_API_KEY` first and falls back to `OPENAI_API_KEY` for GPT models.
 - Remote browser defaults follow the same order: `--remote-host/--remote-token` win, then `browser.remoteHost` / `browser.remoteToken` in the config, then `ORACLE_REMOTE_HOST` / `ORACLE_REMOTE_TOKEN` if still unset.

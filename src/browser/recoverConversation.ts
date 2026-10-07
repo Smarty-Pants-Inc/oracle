@@ -10,6 +10,7 @@ import {
   harvestChatGptTab,
   openChatGptTarget,
   type ChatGptTabSummary,
+  type LiveChromeEndpoint,
 } from "./liveTabs.js";
 import {
   closeTab,
@@ -72,7 +73,7 @@ async function runRecoveryCleanup<T>(operation: () => Promise<T>, action: string
   );
 }
 
-export interface RecoveredConversation {
+export interface RecoveredConversation extends RecoveryEndpoint {
   host: string;
   port: number;
   url: string;
@@ -82,7 +83,7 @@ export interface RecoveredConversation {
   chrome: LaunchedChrome | null;
 }
 
-export interface RecoveryEndpoint {
+export interface RecoveryEndpoint extends LiveChromeEndpoint {
   host: string;
   port: number;
   browserId?: string;

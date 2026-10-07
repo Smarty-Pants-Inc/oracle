@@ -19,10 +19,11 @@ import {
   launchChrome,
   connectToChrome,
   positionChromeWindowOffscreen,
+  positionChromeWindowOnscreen,
   connectToRemoteChromeTarget,
   listRemoteChromeTargets,
 } from "./chromeLifecycle.js";
-import { resolveBrowserConfig } from "./config.js";
+import { resolveBrowserApprovalWait, resolveBrowserConfig } from "./config.js";
 import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
 import { CHATGPT_URL } from "./constants.js";
 import { CHATGPT_ORIGINS } from "./conversationUrl.js";
@@ -49,6 +50,11 @@ import {
 } from "./reattachHelpers.js";
 import { waitForDeepResearchCompletion } from "./actions/deepResearch.js";
 import { normalizeChatGptAccountDigest } from "./chatgptAccount.js";
+import { CHROME_COOKIE_SYNC_WARNING, shouldSyncBrowserCookies } from "./policies.js";
+import type { BrowserRecoveryCapture } from "./recoveryTarget.js";
+import { BrowserCancellation, withoutBrowserCancellation } from "./cancellation.js";
+import { BrowserRunCancelledError } from "../oracle/errors.js";
+
 class ReattachAffinityError extends Error {}
 
 export interface ReattachDeps {
@@ -58,16 +64,22 @@ export interface ReattachDeps {
   captureAssistantMarkdown?: typeof captureAssistantMarkdown;
   waitForDeepResearchCompletion?: typeof waitForDeepResearchCompletion;
   waitForConversationHydration?: typeof waitForResumedConversationHydration;
+  launchChrome?: typeof launchChrome;
+  connectToChrome?: typeof connectToChrome;
+  syncCookies?: typeof syncCookies;
   recoverSession?: (
     runtime: BrowserRuntimeMetadata,
     config: BrowserSessionConfig | undefined,
   ) => Promise<ReattachResult>;
   promptPreview?: string;
+  signal?: AbortSignal;
+  createTemporaryProfile?: () => Promise<string>;
 }
 
 export interface ReattachResult {
   answerText: string;
   answerMarkdown: string;
+  captureTarget?: BrowserRecoveryCapture;
 }
 
 function reattachConversationId(runtime: BrowserRuntimeMetadata): string | undefined {
@@ -116,10 +128,28 @@ export async function resumeBrowserSession(
   logger: BrowserLogger,
   deps: ReattachDeps = {},
 ): Promise<ReattachResult> {
-  const recoverSession =
-    deps.recoverSession ??
-    (async (runtimeMeta, configMeta) =>
-      resumeBrowserSessionViaNewChrome(runtimeMeta, configMeta, logger, deps));
+  const cancellation = new BrowserCancellation(deps.signal, logger);
+  try {
+    return await cancellation.run(() =>
+      resumeBrowserSessionInternal(runtime, config, logger, deps, cancellation),
+    );
+  } finally {
+    cancellation.dispose();
+  }
+}
+
+async function resumeBrowserSessionInternal(
+  runtime: BrowserRuntimeMetadata,
+  config: BrowserSessionConfig | undefined,
+  logger: BrowserLogger,
+  deps: ReattachDeps,
+  cancellation: BrowserCancellation,
+): Promise<ReattachResult> {
+  const recoverSession = deps.recoverSession
+    ? (runtimeMeta: BrowserRuntimeMetadata, configMeta: BrowserSessionConfig | undefined) =>
+        cancellation.call(() => deps.recoverSession!(runtimeMeta, configMeta))
+    : (runtimeMeta: BrowserRuntimeMetadata, configMeta: BrowserSessionConfig | undefined) =>
+        resumeBrowserSessionViaNewChrome(runtimeMeta, configMeta, logger, deps, cancellation);
   let closeAttachedConnection: (() => Promise<void>) | null = null;
   const closeAttached = async (): Promise<void> => {
     const close = closeAttachedConnection;
@@ -197,7 +227,9 @@ export async function resumeBrowserSession(
     let liveRuntime: BrowserRuntimeMetadata;
     let browserWSEndpoint: string | undefined;
     if (identityBoundRemoteSession) {
-      const liveIdentity = await resolveRemoteChromeBrowserIdentity(configuredRemoteChrome!);
+      const liveIdentity = await cancellation.call(() =>
+        resolveRemoteChromeBrowserIdentity(configuredRemoteChrome!),
+      );
       if (liveIdentity.browserId !== expectedBrowserId) {
         throw new Error("Remote Chrome browser identity changed before session reattach.");
       }
@@ -215,6 +247,7 @@ export async function resumeBrowserSession(
     const host = liveRuntime.chromeHost ?? "127.0.0.1";
     const port =
       liveRuntime.chromePort ?? inferPortFromBrowserWSEndpoint(liveRuntime.chromeBrowserWSEndpoint);
+    const approvalWaitMs = resolveBrowserApprovalWait(config?.approvalWaitMs);
     const listTargets =
       deps.listTargets ??
       (async () =>
@@ -222,38 +255,63 @@ export async function resumeBrowserSession(
           host,
           port: port ?? 9222,
           browserWSEndpoint,
+          approvalWaitMs,
+          logger,
+          signal: deps.signal,
         })) as TargetInfoLite[]);
-    const targetList = (await listTargets()) as TargetInfoLite[];
+    const targetList = (await cancellation.call(listTargets)) as TargetInfoLite[];
     const target = pickTarget(targetList, liveRuntime);
-    const connection =
-      browserWSEndpoint && !deps.connect
-        ? await connectToRemoteChromeTarget(host, port ?? 9222, logger, {
-            browserWSEndpoint,
-            targetId: target?.targetId ?? target?.id,
-            closeTargetOnDispose: false,
-          })
-        : await (async () => {
-            const client = (await (
-              deps.connect ?? ((options?: unknown) => CDP(options as CDP.Options))
-            )(
-              browserWSEndpoint
-                ? {
-                    target: browserWSEndpoint,
-                    local: true,
-                    targetId: target?.targetId ?? target?.id,
-                  }
-                : {
-                    host,
-                    port,
-                    target: target?.targetId ?? target?.id,
-                  },
-            )) as unknown as ChromeClient;
-            return { client, close: () => client.close() };
-          })();
+    const connection = await cancellation.acquire(
+      () =>
+        browserWSEndpoint && !deps.connect
+          ? connectToRemoteChromeTarget(host, port ?? 9222, logger, {
+              browserWSEndpoint,
+              targetId: target?.targetId ?? target?.id,
+              closeTargetOnDispose: false,
+              approvalWaitMs,
+            })
+          : (async () => {
+              const client = (await (
+                deps.connect ?? ((options?: unknown) => CDP(options as CDP.Options))
+              )(
+                browserWSEndpoint
+                  ? {
+                      target: browserWSEndpoint,
+                      local: true,
+                      targetId: target?.targetId ?? target?.id,
+                    }
+                  : {
+                      host,
+                      port,
+                      target: target?.targetId ?? target?.id,
+                    },
+              )) as unknown as ChromeClient;
+              return { client, close: () => client.close() };
+            })(),
+      (lateConnection) => lateConnection.close(),
+    );
     closeAttachedConnection = () => connection.close();
 
-    const client: ChromeClient = connection.client;
+    const client = cancellation.client(connection.client);
     const { Runtime, DOM, Page } = client;
+    const captureIdentity = async (): Promise<BrowserRecoveryCapture | undefined> => {
+      const targetId = target?.targetId ?? target?.id;
+      if (!targetId || !port) return undefined;
+      const { result } = await withTimeout(
+        Runtime.evaluate({ expression: "location.href", returnByValue: true }),
+        2_000,
+        "Recovery target identity unavailable",
+      );
+      return {
+        host,
+        port,
+        targetId,
+        browserWSEndpoint,
+        conversationId: extractConversationIdFromUrl(
+          typeof result?.value === "string" ? result.value : "",
+        ),
+      };
+    };
     if (Runtime?.enable) {
       await Runtime.enable();
     }
@@ -327,11 +385,13 @@ export async function resumeBrowserSession(
       deps.waitForConversationHydration ?? waitForResumedConversationHydration;
     const expectedConversationUrl =
       buildConversationUrl(runtime, resolveBrowserConfig(config ?? {}).url) ?? undefined;
-    await waitForHydration(Runtime, timeoutMs, logger, {
-      requirePriorTurns: true,
-      requirePromptReady: false,
-      expectedConversationUrl: expectedConversationUrl ?? undefined,
-    });
+    await cancellation.call(() =>
+      waitForHydration(Runtime, timeoutMs, logger, {
+        requirePriorTurns: true,
+        requirePromptReady: false,
+        expectedConversationUrl: expectedConversationUrl ?? undefined,
+      }),
+    );
     await assertPageAffinity("reattach hydration");
     const minTurnIndex =
       (await readPromptPreviewTurnIndex(Runtime, deps.promptPreview)) ??
@@ -340,56 +400,62 @@ export async function resumeBrowserSession(
       const waitForDeepResearch =
         deps.waitForDeepResearchCompletion ?? waitForDeepResearchCompletion;
       const researchResult = await withTimeout(
-        waitForDeepResearch(Runtime, logger, timeoutMs, minTurnIndex ?? undefined, Page, client, {
-          requireScopedTargetOwner: true,
-          expectedConversationId,
-          expectedConversationUrl,
-          assertPageAffinity,
-        }),
+        cancellation.call(() =>
+          waitForDeepResearch(Runtime, logger, timeoutMs, minTurnIndex ?? undefined, Page, client, {
+            requireScopedTargetOwner: true,
+            expectedConversationId,
+            expectedConversationUrl,
+            assertPageAffinity,
+          }),
+        ),
         timeoutMs + 5_000,
         "Reattach Deep Research response timed out",
       );
       await assertPageAffinity("reattach Deep Research final return");
+      const captureTarget = await captureIdentity().catch(() => undefined);
       await closeAttached();
       return {
         answerText: researchResult.text,
         answerMarkdown: researchResult.text,
+        captureTarget,
       };
     }
     const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
     await assertPageAffinity("reattach response wait");
     const answer = await withTimeout(
-      waitForResponse(
-        Runtime,
-        timeoutMs,
-        logger,
-        minTurnIndex ?? undefined,
-        expectedConversationId,
-        expectedConversationUrl,
+      cancellation.call(() =>
+        waitForResponse(
+          Runtime,
+          timeoutMs,
+          logger,
+          minTurnIndex ?? undefined,
+          expectedConversationId,
+          expectedConversationUrl,
+        ),
       ),
       timeoutMs + 5_000,
       "Reattach response timed out",
     );
     await assertPageAffinity("reattach response capture");
-    const recovered = await recoverPromptEcho(
-      Runtime,
-      answer,
-      promptEcho,
-      logger,
-      minTurnIndex,
-      timeoutMs,
-      { expectedConversationId, expectedConversationUrl, assertPageAffinity },
+    const recovered = await cancellation.call(() =>
+      recoverPromptEcho(Runtime, answer, promptEcho, logger, minTurnIndex, timeoutMs, {
+        expectedConversationId,
+        expectedConversationUrl,
+        assertPageAffinity,
+      }),
     );
 
     const markdown =
       (await withTimeout(
-        captureMarkdown(
-          Runtime,
-          recovered.meta,
-          logger,
-          expectedConversationId,
-          assertPageAffinity,
-          expectedConversationUrl,
+        cancellation.call(() =>
+          captureMarkdown(
+            Runtime,
+            recovered.meta,
+            logger,
+            expectedConversationId,
+            assertPageAffinity,
+            expectedConversationUrl,
+          ),
         ),
         15_000,
         "Reattach markdown capture timed out",
@@ -397,10 +463,18 @@ export async function resumeBrowserSession(
     const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
 
     await assertPageAffinity("reattach final return");
+    const captureTarget = await captureIdentity().catch(() => undefined);
     await closeAttached();
-    return { answerText: aligned.answerText, answerMarkdown: aligned.answerMarkdown };
+    return {
+      answerText: aligned.answerText,
+      answerMarkdown: aligned.answerMarkdown,
+      captureTarget,
+    };
   } catch (error) {
     await closeAttached();
+    if (deps.signal?.aborted || error instanceof BrowserRunCancelledError) {
+      throw new BrowserRunCancelledError();
+    }
     if (identityBoundRemoteSession || error instanceof ReattachAffinityError) {
       throw error;
     }
@@ -448,30 +522,44 @@ function inferPortFromBrowserWSEndpoint(browserWSEndpoint?: string): number | un
   }
   return undefined;
 }
-
 async function resumeBrowserSessionViaNewChrome(
   runtime: BrowserRuntimeMetadata,
   config: BrowserSessionConfig | undefined,
   logger: BrowserLogger,
   deps: ReattachDeps,
+  cancellation: BrowserCancellation,
 ): Promise<ReattachResult> {
   const resolved = resolveBrowserConfig(config ?? {});
   const manualLogin = Boolean(resolved.manualLogin);
   const userDataDir = manualLogin
     ? (resolved.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile"))
-    : await mkdtemp(path.join(os.tmpdir(), "oracle-reattach-"));
+    : await (
+        deps.createTemporaryProfile ?? (() => mkdtemp(path.join(os.tmpdir(), "oracle-reattach-")))
+      )();
   if (manualLogin) {
     await mkdir(userDataDir, { recursive: true });
   }
 
   let chrome: (LaunchedChrome & { host?: string }) | null = null;
-  let client: ChromeClient | null = null;
+  let rawClient: ChromeClient | null = null;
   let completed = false;
-  const cleanup = async (): Promise<void> => {
-    if (client && typeof client.close === "function") {
-      await client.close().catch(() => undefined);
-      client = null;
+  const cleanupProfile = async (launched: boolean): Promise<void> => {
+    if (manualLogin) {
+      if (launched) {
+        await cleanupStaleProfileState(userDataDir, logger, {
+          lockRemovalMode: "never",
+        }).catch(() => undefined);
+      }
+    } else {
+      await rm(userDataDir, { recursive: true, force: true }).catch(() => undefined);
     }
+  };
+  const cleanup = async (): Promise<void> => {
+    if (rawClient && typeof rawClient.close === "function") {
+      await rawClient.close().catch(() => undefined);
+      rawClient = null;
+    }
+    // A failed or incomplete recovery never leaves its Chrome behind, even with keepBrowser.
     const shouldStopChrome = !resolved.keepBrowser || !completed;
     if (!shouldStopChrome) return;
     if (chrome) {
@@ -481,21 +569,36 @@ async function resumeBrowserSessionViaNewChrome(
         // Best-effort cleanup; continue with profile cleanup.
       }
     }
-    if (manualLogin) {
-      if (chrome) {
-        await cleanupStaleProfileState(userDataDir, logger, {
-          lockRemovalMode: "never",
-        }).catch(() => undefined);
-      }
-    } else {
-      await rm(userDataDir, { recursive: true, force: true }).catch(() => undefined);
-    }
+    await cleanupProfile(Boolean(chrome));
   };
+  if (deps.signal?.aborted) {
+    if (!manualLogin) await cleanupProfile(false);
+    cancellation.check();
+  }
+  const launch = deps.launchChrome ?? launchChrome;
+  const connectToLaunchedChrome = deps.connectToChrome ?? connectToChrome;
 
   try {
-    chrome = await launchChrome(resolved, userDataDir, logger);
-    const chromeHost = chrome.host ?? "127.0.0.1";
-    client = await connectToChrome(chrome.port, logger, chromeHost);
+    const launched = (await cancellation.acquire(
+      () => launch(resolved, userDataDir, logger),
+      async (lateChrome) => {
+        // A browser that finished launching after cancellation is never adopted.
+        try {
+          await lateChrome.kill();
+        } catch {
+          // best-effort cleanup for a browser that finished launching after cancellation
+        }
+        await cleanupProfile(true);
+      },
+    )) as LaunchedChrome & { host?: string };
+    chrome = launched;
+    const chromeHost = launched.host ?? "127.0.0.1";
+    const connected = await cancellation.acquire(
+      () => connectToLaunchedChrome(launched.port, logger, chromeHost),
+      (lateClient) => lateClient.close(),
+    );
+    rawClient = connected;
+    const client = cancellation.client(connected);
     const { Network, Page, Runtime, DOM, Target } = client;
 
     if (Runtime?.enable) {
@@ -505,11 +608,17 @@ async function resumeBrowserSessionViaNewChrome(
       await DOM.enable();
     }
     if (!resolved.headless && resolved.hideWindow) {
-      await positionChromeWindowOffscreen(client, logger);
+      await positionChromeWindowOffscreen(client, userDataDir, logger);
+    } else if (!resolved.headless) {
+      await positionChromeWindowOnscreen(client, userDataDir, logger);
     }
     let appliedCookies = 0;
-    if (!manualLogin && resolved.cookieSync) {
-      appliedCookies = await syncCookies(Network, resolved.url, resolved.chromeProfile, logger, {
+    if (shouldSyncBrowserCookies(resolved, { manualLogin })) {
+      if (!resolved.inlineCookies) {
+        logger(CHROME_COOKIE_SYNC_WARNING);
+      }
+      const sync = deps.syncCookies ?? syncCookies;
+      appliedCookies = await sync(Network, resolved.url, resolved.chromeProfile, logger, {
         allowErrors: resolved.allowCookieErrors,
         filterNames: resolved.cookieNames ?? undefined,
         inlineCookies: resolved.inlineCookies ?? undefined,
@@ -609,11 +718,13 @@ async function resumeBrowserSessionViaNewChrome(
       (expectedConversationId ? `${CHATGPT_URL}/c/${expectedConversationId}` : undefined);
     const waitForHydration =
       deps.waitForConversationHydration ?? waitForResumedConversationHydration;
-    await waitForHydration(Runtime, resolved.inputTimeoutMs, logger, {
-      requirePriorTurns: true,
-      requirePromptReady: false,
-      expectedConversationUrl,
-    });
+    await cancellation.call(() =>
+      waitForHydration(Runtime, resolved.inputTimeoutMs, logger, {
+        requirePriorTurns: true,
+        requirePromptReady: false,
+        expectedConversationUrl,
+      }),
+    );
     await assertPageAffinity("new Chrome reattach hydration");
     const waitForResponse = deps.waitForAssistantResponse ?? waitForAssistantResponse;
     const captureMarkdown = deps.captureAssistantMarkdown ?? captureAssistantMarkdown;
@@ -623,19 +734,13 @@ async function resumeBrowserSessionViaNewChrome(
     if (resolved.researchMode === "deep") {
       const waitForDeepResearch =
         deps.waitForDeepResearchCompletion ?? waitForDeepResearchCompletion;
-      const researchResult = await waitForDeepResearch(
-        Runtime,
-        logger,
-        timeoutMs,
-        minTurnIndex ?? undefined,
-        Page,
-        client,
-        {
+      const researchResult = await cancellation.call(() =>
+        waitForDeepResearch(Runtime, logger, timeoutMs, minTurnIndex ?? undefined, Page, client, {
           requireScopedTargetOwner: true,
           expectedConversationId,
           expectedConversationUrl,
           assertPageAffinity,
-        },
+        }),
       );
       await assertPageAffinity("new Chrome reattach Deep Research final return");
       completed = true;
@@ -646,32 +751,34 @@ async function resumeBrowserSessionViaNewChrome(
     }
     const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
     await assertPageAffinity("new Chrome reattach response wait");
-    const answer = await waitForResponse(
-      Runtime,
-      timeoutMs,
-      logger,
-      minTurnIndex ?? undefined,
-      expectedConversationId,
-      expectedConversationUrl,
+    const answer = await cancellation.call(() =>
+      waitForResponse(
+        Runtime,
+        timeoutMs,
+        logger,
+        minTurnIndex ?? undefined,
+        expectedConversationId,
+        expectedConversationUrl,
+      ),
     );
     await assertPageAffinity("new Chrome reattach response capture");
-    const recovered = await recoverPromptEcho(
-      Runtime,
-      answer,
-      promptEcho,
-      logger,
-      minTurnIndex,
-      timeoutMs,
-      { expectedConversationId, expectedConversationUrl, assertPageAffinity },
+    const recovered = await cancellation.call(() =>
+      recoverPromptEcho(Runtime, answer, promptEcho, logger, minTurnIndex, timeoutMs, {
+        expectedConversationId,
+        expectedConversationUrl,
+        assertPageAffinity,
+      }),
     );
     const markdown =
-      (await captureMarkdown(
-        Runtime,
-        recovered.meta,
-        logger,
-        expectedConversationId,
-        assertPageAffinity,
-        expectedConversationUrl,
+      (await cancellation.call(() =>
+        captureMarkdown(
+          Runtime,
+          recovered.meta,
+          logger,
+          expectedConversationId,
+          assertPageAffinity,
+          expectedConversationUrl,
+        ),
       )) ?? recovered.text;
     const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
 
@@ -679,7 +786,7 @@ async function resumeBrowserSessionViaNewChrome(
     completed = true;
     return { answerText: aligned.answerText, answerMarkdown: aligned.answerMarkdown };
   } finally {
-    await cleanup();
+    await withoutBrowserCancellation(cleanup);
   }
 }
 
@@ -699,8 +806,8 @@ async function readPromptPreviewTurnIndex(
       const turns = ${buildConversationTurnListExpression()};
       let matched = null;
       for (const [index, node] of turns.entries()) {
-        const attr = (node.getAttribute('data-message-author-role') || node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
-        const isUser = attr === 'user' || Boolean(node.querySelector('[data-message-author-role="user"]'));
+        const attr = (node.getAttribute('data-message-author-role') || (node.getAttribute?.('data-content-search-unit-key') || node.getAttribute?.('data-chatgpt-search-unit-key'))?.split(':').at(-1) || node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
+        const isUser = attr === 'user' || Boolean(node.querySelector(':is([data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":user"])'));
         if (!isUser) continue;
         const text = normalize(node.innerText || node.textContent || '');
         if (text.length > 0 && (text.includes(needle) || needle.includes(text.slice(0, needle.length)))) {
@@ -714,7 +821,6 @@ async function readPromptPreviewTurnIndex(
   return typeof result?.value === "number" ? result.value : null;
 }
 
-// biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
 export const __test__ = {
   pickTarget,
   extractConversationIdFromUrl,

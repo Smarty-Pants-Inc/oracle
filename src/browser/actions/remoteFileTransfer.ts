@@ -5,6 +5,7 @@ import { waitForAttachmentVisible } from "./attachments.js";
 import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
 import { transferAttachmentViaDataTransfer } from "./attachmentDataTransfer.js";
+import { beginAttachmentEvidence } from "./attachmentEvidence.js";
 
 /**
  * Upload file to remote Chrome by transferring content via CDP
@@ -17,6 +18,7 @@ export async function uploadAttachmentViaDataTransfer(
     assertPageAffinity?: (action: string) => Promise<void>;
     expectedConversationId?: string;
     expectedAccountDigest?: string;
+    navigationUrl?: string;
   },
   attachment: BrowserAttachment,
   logger: BrowserLogger,
@@ -28,23 +30,28 @@ export async function uploadAttachmentViaDataTransfer(
 
   logger(`Transferring ${path.basename(attachment.path)} to remote browser...`);
 
-  // Find file input element
-  const documentNode = await dom.getDocument();
+  // The composer can mount before its file input; wait without dispatching an upload.
+  const deadline = Date.now() + 15_000;
   let fileInputSelector: string | undefined;
-
-  for (const selector of FILE_INPUT_SELECTORS) {
-    const result = await dom.querySelector({ nodeId: documentNode.root.nodeId, selector });
-    if (result.nodeId) {
-      fileInputSelector = selector;
-      break;
+  do {
+    const documentNode = await dom.getDocument();
+    for (const selector of FILE_INPUT_SELECTORS) {
+      const result = await dom.querySelector({ nodeId: documentNode.root.nodeId, selector });
+      if (result.nodeId) {
+        fileInputSelector = selector;
+        break;
+      }
     }
-  }
+    if (fileInputSelector) break;
+    await delay(250);
+  } while (Date.now() < deadline);
 
   if (!fileInputSelector) {
     await logDomFailure(runtime, logger, "file-input");
     throw new Error("Unable to locate ChatGPT file attachment input.");
   }
 
+  const evidenceId = await beginAttachmentEvidence(runtime, path.basename(attachment.path));
   const transferResult = await transferAttachmentViaDataTransfer(
     runtime,
     attachment,
@@ -52,13 +59,18 @@ export async function uploadAttachmentViaDataTransfer(
     deps.assertPageAffinity,
     deps.expectedConversationId,
     deps.expectedAccountDigest,
+    deps.navigationUrl,
   );
 
   logger(`File transferred: ${transferResult.fileName} (${transferResult.size} bytes)`);
 
   // Give ChatGPT a moment to process the file
   await delay(500);
-  await waitForAttachmentVisible(runtime, transferResult.fileName, 10_000, logger);
+  // An assigned FileList proves our write, not that ChatGPT accepted it. A missing chip
+  // cannot distinguish a drop from a slow upload, so never repeat this dispatch.
+  await waitForAttachmentVisible(runtime, transferResult.fileName, 10_000, logger, evidenceId, {
+    countFileInput: false,
+  });
   await deps.assertPageAffinity?.("attachment visibility confirmation");
 
   logger("Attachment queued");

@@ -1,5 +1,5 @@
 import { formatFileSections } from "../oracle/markdown.js";
-import type { BrowserAttachment } from "./types.js";
+import type { BrowserAttachment, ResolvedBrowserConfig } from "./types.js";
 import type { BrowserSessionConfig } from "../sessionManager.js";
 
 export interface AttachmentSection {
@@ -56,6 +56,20 @@ export type CookiePlan =
   | { type: "disabled"; description: string }
   | { type: "copy"; description: string };
 
+export const CHROME_COOKIE_SYNC_WARNING =
+  "Warning: copying cookies from a live Chrome profile can invalidate that browser's ChatGPT session when tokens rotate. Prefer --browser-manual-login or inline cookies when possible.";
+
+export function shouldSyncBrowserCookies(
+  config: Pick<ResolvedBrowserConfig, "cookieSync" | "manualLoginCookieSync">,
+  {
+    manualLogin,
+    profileIsPreSigned = manualLogin,
+  }: { manualLogin: boolean; profileIsPreSigned?: boolean },
+): boolean {
+  const explicitManualLoginSync = manualLogin && config.manualLoginCookieSync === true;
+  return config.cookieSync && (!profileIsPreSigned || explicitManualLoginSync);
+}
+
 export function buildCookiePlan(config?: BrowserSessionConfig): CookiePlan {
   if (config?.inlineCookies && config.inlineCookies.length > 0) {
     const source = config.inlineCookiesSource ?? "inline";
@@ -64,8 +78,12 @@ export function buildCookiePlan(config?: BrowserSessionConfig): CookiePlan {
       description: `Cookies: inline payload (${config.inlineCookies.length}) via ${source}.`,
     };
   }
-  if (config?.cookieSync === false) {
-    return { type: "disabled", description: "Cookies: sync disabled (--browser-no-cookie-sync)." };
+  if (config?.cookieSync !== true) {
+    return {
+      type: "disabled",
+      description:
+        "Cookies: Chrome copy disabled (use --browser-manual-login, inline cookies, or --browser-cookie-sync).",
+    };
   }
   const allowlist =
     config?.cookieNames && config.cookieNames.length > 0

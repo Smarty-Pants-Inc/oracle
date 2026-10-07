@@ -1,7 +1,9 @@
+import type { ProviderNativeCaptureSummary } from "./chatgptConversation.js";
 import type CDP from "chrome-remote-interface";
 import type Protocol from "devtools-protocol";
 import type {
   BrowserModelSelectionEvidence,
+  BrowserThinkingSelectionEvidence,
   BrowserRunWarning,
   BrowserRuntimeMetadata,
 } from "../sessionStore.js";
@@ -11,8 +13,18 @@ import type { ThinkingTimeLevel } from "../oracle/types.js";
 export type ChromeClient = Awaited<ReturnType<typeof CDP>>;
 export type CookieParam = Protocol.Network.CookieParam;
 export type BrowserModelStrategy = "select" | "current" | "ignore";
-export type BrowserResearchMode = "off" | "deep";
+export type BrowserResearchMode = "off" | "search" | "deep";
 export type BrowserArchiveMode = "auto" | "always" | "never";
+
+export interface BrowserResearchPlanMetadata {
+  title: string;
+  steps: string[];
+  /** Whether ChatGPT is still presenting the plan or has started executing it. */
+  phase: "planning" | "researching";
+  /** Visible plan action, for example Edit or Update. */
+  actionText?: string;
+  capturedAt: string;
+}
 
 export type BrowserLogger = ((message: string) => void) & {
   verbose?: boolean;
@@ -36,6 +48,8 @@ export interface BrowserGeneratedImage {
 
 export interface BrowserDownloadableFile {
   url: string;
+  /** Position within the assistant turn for a linkless browser download button. */
+  candidateId?: string;
   downloadUrl?: string;
   sandboxUrl?: string;
   filename?: string;
@@ -72,6 +86,8 @@ export interface BrowserAutomationConfig {
   timeoutMs?: number;
   debugPort?: number | null;
   inputTimeoutMs?: number;
+  /** Time budget for each Chrome remote-debugging approval prompt. */
+  approvalWaitMs?: number;
   /** Time budget for attachment upload/readiness before clicking send. */
   attachmentTimeoutMs?: number;
   /** Delay before rechecking the conversation after an assistant timeout. */
@@ -99,6 +115,7 @@ export interface BrowserAutomationConfig {
   keepBrowser?: boolean;
   hideWindow?: boolean;
   desiredModel?: string | null;
+  modelIsImplicitDefault?: boolean;
   modelStrategy?: BrowserModelStrategy;
   debug?: boolean;
   allowCookieErrors?: boolean;
@@ -123,16 +140,38 @@ export interface BrowserAutomationConfig {
   archiveConversations?: BrowserArchiveMode;
   /** Existing ChatGPT conversation URL to open before submitting the prompt. */
   resumeConversationUrl?: string | null;
+  /** Capture ChatGPT's own conversation document plus independent per-turn digests. */
+  captureProviderNative?: boolean;
 }
 
 export interface BrowserRunOptions {
   prompt: string;
+  /** Canonical model key, separate from a provider-specific picker label. */
+  model?: string;
+  /**
+   * Abort the run when the caller no longer wants it.
+   *
+   * A browser run outlives the request that asked for it: the model keeps
+   * thinking, the tab stays open, and the shared-profile slot stays taken. A
+   * caller that has disconnected has no way to say so without this, so the run
+   * continues to completion and its capacity is only returned by accident of
+   * finishing.
+   */
+  signal?: AbortSignal;
   attachments?: BrowserAttachment[];
   /**
    * Optional secondary submission to try if the initial prompt is rejected by ChatGPT
    * (e.g. inline file paste exceeds composer limits). Intended for auto inline->upload fallback.
    */
-  fallbackSubmission?: { prompt: string; attachments: BrowserAttachment[] };
+  fallbackSubmission?: {
+    prompt: string;
+    attachments: BrowserAttachment[];
+    prepare?: () => Promise<void>;
+    pendingBundle?: {
+      format: "text" | "zip";
+      scope: "text-only" | "all";
+    };
+  };
   config?: BrowserAutomationConfig;
   log?: BrowserLogger;
   heartbeatIntervalMs?: number;
@@ -151,6 +190,8 @@ export interface BrowserRunOptions {
    * and attached-existing tabs are still preserved for recovery/user ownership.
    */
   closeOwnedTabOnComplete?: boolean;
+  /** Close a cancelled run's owned target while keeping a shared browser process. */
+  closeOwnedTabOnCancel?: boolean;
   /** Optional hook to persist runtime info and current model evidence as soon as Chrome is ready. */
   runtimeHintCb?: (
     hint: BrowserRuntimeMetadata,
@@ -178,6 +219,8 @@ export interface BrowserRunResult {
   savedFiles?: SavedBrowserFile[];
   archive?: BrowserArchiveResult;
   modelSelection?: BrowserModelSelectionEvidence;
+  thinkingSelection?: BrowserThinkingSelectionEvidence;
+  providerNativeCapture?: ProviderNativeCaptureSummary;
   warnings?: BrowserRunWarning[];
   tookMs: number;
   answerTokens: number;
@@ -191,9 +234,12 @@ export interface BrowserRunResult {
   chromeProfileRoot?: string;
   userDataDir?: string;
   chromeTargetId?: string;
+  ownedRecoveryTarget?: BrowserRuntimeMetadata["ownedRecoveryTarget"];
   tabUrl?: string;
   conversationId?: string;
   promptSubmitted?: boolean;
+  submittedPromptHash?: string | null;
+  researchPlan?: BrowserResearchPlanMetadata;
   controllerPid?: number;
 }
 
@@ -204,6 +250,7 @@ export type ResolvedBrowserConfig = Required<
     | "chromePath"
     | "chromeCookiePath"
     | "desiredModel"
+    | "modelIsImplicitDefault"
     | "remoteChrome"
     | "remoteChromeBrowserId"
     | "remoteChromeBrowserWSEndpoint"
@@ -222,6 +269,7 @@ export type ResolvedBrowserConfig = Required<
   attachRunning?: boolean;
   browserTabRef?: string | null;
   desiredModel?: string | null;
+  modelIsImplicitDefault?: boolean;
   modelStrategy?: BrowserModelStrategy;
   thinkingTime?: ThinkingTimeLevel;
   debugPort?: number | null;

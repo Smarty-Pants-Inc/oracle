@@ -41,7 +41,6 @@ vi.mock("../../src/cli/markdownRenderer.ts", () => {
   };
 });
 
-const _sessionManagerMock = await import("../../src/sessionManager.ts");
 const markdownMock = await import("../../src/cli/markdownRenderer.ts");
 const renderMarkdownMock = markdownMock.renderMarkdownAnsi as unknown as { mockClear?: () => void };
 const readSessionMetadataMock = sessionStoreMock.readSession as unknown as ReturnType<typeof vi.fn>;
@@ -393,6 +392,43 @@ describe("attachSession rendering", () => {
         response: { status: "incomplete", incompleteReason: "incomplete-capture" },
       }),
     );
+  });
+
+  test("treats a cancelled detached session as terminal without rewriting it as error", async () => {
+    const runningMeta: SessionMetadata = {
+      ...baseMeta,
+      status: "running",
+      mode: "browser",
+      lifecycle: {
+        engine: "browser",
+        execution: "background",
+        attached: false,
+        detached: true,
+        workerPid: process.pid,
+        reattachCommand: "oracle session sess",
+      },
+    } as SessionMetadata;
+    const cancelledMeta: SessionMetadata = {
+      ...runningMeta,
+      status: "cancelled",
+      completedAt: new Date().toISOString(),
+      lifecycle: {
+        ...runningMeta.lifecycle,
+        workerPid: 2_147_483_647,
+      },
+    } as SessionMetadata;
+    readSessionMetadataMock.mockResolvedValueOnce(runningMeta).mockResolvedValue(cancelledMeta);
+    readSessionLogMock.mockResolvedValue("Browser run cancelled.");
+    readSessionRequestMock.mockResolvedValue({ prompt: "Prompt here" });
+
+    await attachSession("sess", {
+      renderMarkdown: false,
+      suppressMetadata: true,
+      propagateFailure: true,
+    });
+
+    expect(process.exitCode).toBeUndefined();
+    expect(sessionStoreMock.updateSession).not.toHaveBeenCalled();
   });
 
   test("does not reattach while the detached browser worker is alive", async () => {
@@ -821,6 +857,29 @@ describe("attachSession rendering", () => {
     expect(written).toContain("from gemini only");
     expect(written).not.toContain("gpt-5.2-pro");
     expect(sessionStoreMock.readModelLog).toHaveBeenCalledTimes(1);
+    expect(sessionStoreMock.readModelLog).toHaveBeenCalledWith("sess", "gemini-3-pro");
+  });
+
+  test("does not replay another model when the selected model has no output", async () => {
+    const metadata: SessionMetadata = {
+      ...baseMeta,
+      models: [
+        { model: "gpt-5.2-pro", status: "completed" },
+        { model: "gemini-3-pro", status: "error" },
+      ],
+    };
+    readSessionMetadataMock.mockResolvedValue(metadata);
+    readSessionRequestMock.mockResolvedValue({ prompt: "Prompt here" });
+    sessionStoreMock.readModelLog.mockResolvedValue("");
+    sessionStoreMock.readLog.mockResolvedValue("Answer:\nfrom the other model");
+    const writeSpy = vi.spyOn(process.stdout, "write");
+
+    await attachSession("sess", { renderMarkdown: false, model: "gemini-3-pro" });
+
+    expect(writeSpy.mock.calls.map((call) => call[0]).join("")).not.toContain(
+      "from the other model",
+    );
+    expect(sessionStoreMock.readLog).not.toHaveBeenCalled();
     expect(sessionStoreMock.readModelLog).toHaveBeenCalledWith("sess", "gemini-3-pro");
   });
 

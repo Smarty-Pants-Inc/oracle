@@ -107,7 +107,16 @@ async function runWithRetargetedAttachedConversation(
   let currentUrl = retargetPoint === "before-clear" ? retargetedUrl : expectedUrl;
   const Runtime = {
     enable: vi.fn().mockResolvedValue({}),
-    evaluate: vi.fn(async () => ({ result: { value: currentUrl } })),
+    // Upstream target-claim probe (claimBrowserTarget) must succeed before submission.
+    evaluate: vi.fn(async (params?: { expression?: string }) => ({
+      result: {
+        value: params?.expression?.includes("oracle:target-claim")
+          ? true
+          : params?.expression?.includes('[data-chatgpt-search-unit-key$=":user"]')
+            ? [] // upstream user-message-id probes
+            : currentUrl,
+      },
+    })),
   };
   const client = {
     DOM: {},
@@ -160,6 +169,8 @@ async function runWithRetargetedAttachedConversation(
     attachments: [{ displayPath: "/tmp/file.txt", path: "/tmp/file.txt" }],
     config: {
       archiveConversations: "never",
+      // Upstream post-submit user-message-id polling is bounded by the input timeout.
+      inputTimeoutMs: 50,
       browserTabRef: expectedUrl,
       cookieSync: false,
       headless: true,
@@ -187,7 +198,16 @@ async function runUnpinnedAttachmentRetarget(
   const answer = "a".repeat(100);
   const Runtime = {
     enable: vi.fn().mockResolvedValue({}),
-    evaluate: vi.fn(async () => ({ result: { value: currentUrl } })),
+    // Upstream target-claim probe (claimBrowserTarget) must succeed before submission.
+    evaluate: vi.fn(async (params?: { expression?: string }) => ({
+      result: {
+        value: params?.expression?.includes("oracle:target-claim")
+          ? true
+          : params?.expression?.includes('[data-chatgpt-search-unit-key$=":user"]')
+            ? [] // upstream user-message-id probes
+            : currentUrl,
+      },
+    })),
   };
   const client = {
     DOM: {},
@@ -270,6 +290,8 @@ async function runUnpinnedAttachmentRetarget(
     followUpPrompts: ["must not send"],
     config: {
       archiveConversations: "never",
+      // Upstream post-submit user-message-id polling is bounded by the input timeout.
+      inputTimeoutMs: 50,
       browserTabRef,
       cookieSync: false,
       headless: true,
@@ -290,7 +312,16 @@ async function runAttachedWorkConversationReset(
   let currentUrl = workUrl;
   const Runtime = {
     enable: vi.fn().mockResolvedValue({}),
-    evaluate: vi.fn(async () => ({ result: { value: currentUrl } })),
+    // Upstream target-claim probe (claimBrowserTarget) must succeed before submission.
+    evaluate: vi.fn(async (params?: { expression?: string }) => ({
+      result: {
+        value: params?.expression?.includes("oracle:target-claim")
+          ? true
+          : params?.expression?.includes('[data-chatgpt-search-unit-key$=":user"]')
+            ? [] // upstream user-message-id probes
+            : currentUrl,
+      },
+    })),
   };
   const client = {
     DOM: {},
@@ -370,6 +401,8 @@ async function runAttachedWorkConversationReset(
     prompt: "initial",
     config: {
       archiveConversations: "never",
+      // Upstream post-submit user-message-id polling is bounded by the input timeout.
+      inputTimeoutMs: 50,
       browserTabRef: workUrl,
       cookieSync: false,
       headless: true,

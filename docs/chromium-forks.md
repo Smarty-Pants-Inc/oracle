@@ -1,6 +1,6 @@
 # Chromium-based browsers (Chromium, Edge, Brave variants)
 
-Oracle’s browser engine assumes Google Chrome by default: it launches Chrome via `chrome-launcher` and copies cookies from Chrome’s profile/keychain so you stay signed in to ChatGPT. Chromium, Microsoft Edge, and other forks ship the same DevTools protocol, but they keep the executable and cookie store in different locations. Use the knobs below to point Oracle at those assets explicitly.
+Oracle’s browser engine assumes Google Chrome by default and launches it via `chrome-launcher`. Cookie copying from Chrome’s profile/keychain is an explicit opt-in because cloning a live ChatGPT session can invalidate the interactive browser when tokens rotate. Chromium, Microsoft Edge, and other forks ship the same DevTools protocol, but they keep the executable and cookie store in different locations. Prefer a dedicated `--browser-manual-login` profile; if you intentionally copy cookies, use `--browser-cookie-sync` with the knobs below.
 
 ## 1. Point Oracle at the right executable
 
@@ -18,12 +18,24 @@ Either pass the CLI flag or set it once in `~/.oracle/config.json`:
 
 `--browser-chrome-path` (also exposed in `oracle --debug-help`) controls which binary `chrome-launcher` starts. You can still keep `chromeProfile: "Default"` if you want to copy cookies from Chrome proper while launching Edge/Chromium.
 
+To launch the selected binary headlessly, add `--browser-headless` or set `browser.headless: true`:
+
+```bash
+oracle --engine browser \
+  --browser-chrome-path "/path/to/chromium" \
+  --browser-headless \
+  --prompt "Summarize the release notes"
+```
+
+Headless mode is opt-in; Oracle remains headful by default because some sites reject stock headless Chrome. The selected Chromium binary must provide any compatibility those sites require. Headless is a launch-only option: an explicit `--browser-headless` flag cannot be combined with `--browser-attach-running`, a saved `browser.headless` preference is ignored in attach-running mode (matching other launch-only defaults), and standalone `--remote-chrome` continues to warn and ignore headless.
+
 ## 2. Tell cookie sync where your session lives
 
 Set the new `--browser-cookie-path` flag (or `browser.chromeCookiePath` in config) to the absolute path of the fork’s `Cookies` SQLite database. When present, Oracle feeds this path straight into the internal cookie reader, skipping Chrome-only heuristics and profile-name guesses.
 
 ```bash
 oracle --engine browser \
+  --browser-cookie-sync \
   --browser-chrome-path "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" \
   --browser-cookie-path "$HOME/Library/Application Support/Microsoft Edge/Profile 1/Cookies" \
   --prompt "Summarize the release notes"
@@ -34,6 +46,7 @@ Config example (JSON5):
 ```json5
 {
   browser: {
+    cookieSync: true,
     chromePath: "/usr/bin/chromium",
     chromeCookiePath: "/home/you/.config/chromium/Default/Cookies",
     chromeProfile: null,

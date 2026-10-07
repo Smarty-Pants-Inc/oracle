@@ -65,7 +65,9 @@ describe("attachment data transfer", () => {
         vi.fn() as never,
       );
       await upload;
-      const transferExpression = expressions[0] ?? "";
+      // Upstream records attachment evidence before the transfer; pick the transfer expression itself.
+      const transferExpression =
+        expressions.find((value) => value.includes("const base64Data")) ?? "";
       expect(transferExpression).toContain('const expectedConversationId = "expected-thread"');
       expect(transferExpression.indexOf("await assertOracleChatGptPageAffinity();")).toBeLessThan(
         transferExpression.indexOf("const base64Data"),

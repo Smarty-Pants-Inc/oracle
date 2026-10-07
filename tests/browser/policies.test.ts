@@ -1,5 +1,10 @@
 import { describe, expect, test } from "vitest";
-import { buildAttachmentPlan, buildCookiePlan } from "../../src/browser/policies.js";
+import {
+  buildAttachmentPlan,
+  buildCookiePlan,
+  shouldSyncBrowserCookies,
+} from "../../src/browser/policies.js";
+import { resolveBrowserConfig } from "../../src/browser/config.js";
 
 const sections = [
   { displayPath: "a.txt", absolutePath: "/repo/a.txt", content: "hello" },
@@ -63,12 +68,56 @@ describe("buildCookiePlan", () => {
   test("disabled cookie sync plan", () => {
     const plan = buildCookiePlan({ cookieSync: false });
     expect(plan.type).toBe("disabled");
-    expect(plan.description).toContain("sync disabled");
+    expect(plan.description).toContain("Chrome copy disabled");
+  });
+
+  test("defaults to no Chrome cookie copy", () => {
+    expect(buildCookiePlan({}).type).toBe("disabled");
   });
 
   test("copy from Chrome default allowlist", () => {
-    const plan = buildCookiePlan({ cookieNames: ["__Secure-next-auth.session-token", "_account"] });
+    const plan = buildCookiePlan({
+      cookieSync: true,
+      cookieNames: ["__Secure-next-auth.session-token", "_account"],
+    });
     expect(plan.type).toBe("copy");
     expect(plan.description).toContain("__Secure-next-auth.session-token, _account");
+  });
+});
+
+describe("shouldSyncBrowserCookies", () => {
+  test("skips ordinary temporary profiles by default", () => {
+    const config = resolveBrowserConfig(undefined);
+    expect(shouldSyncBrowserCookies(config, { manualLogin: false })).toBe(false);
+  });
+
+  test("syncs ordinary temporary profiles when cookie sync is enabled", () => {
+    const config = resolveBrowserConfig({ cookieSync: true });
+    expect(shouldSyncBrowserCookies(config, { manualLogin: false })).toBe(true);
+  });
+
+  test("skips persistent manual-login profiles by default", () => {
+    const config = resolveBrowserConfig({
+      cookieSync: true,
+      manualLogin: true,
+      manualLoginCookieSync: false,
+    });
+    expect(shouldSyncBrowserCookies(config, { manualLogin: true })).toBe(false);
+  });
+
+  test("syncs persistent manual-login profiles only with the explicit opt-in", () => {
+    const config = resolveBrowserConfig({
+      cookieSync: true,
+      manualLogin: true,
+      manualLoginCookieSync: true,
+    });
+    expect(shouldSyncBrowserCookies(config, { manualLogin: true })).toBe(true);
+  });
+
+  test("does not sync a pre-signed copied profile", () => {
+    const config = resolveBrowserConfig({ cookieSync: true });
+    expect(shouldSyncBrowserCookies(config, { manualLogin: false, profileIsPreSigned: true })).toBe(
+      false,
+    );
   });
 });

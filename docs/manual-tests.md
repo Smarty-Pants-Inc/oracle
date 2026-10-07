@@ -16,6 +16,36 @@ and run the live API suite before shipping major transport changes.
 
 ## Test Cases
 
+### Recovered tab retirement
+
+Run `pnpm build && node scripts/recovery-retirement-proof.mjs` for built-CLI harvests against isolated Chrome. The synthetic matrix checks full-answer persistence before owned-tab retirement and preservation of a peer, borrowed/kept targets, active controllers, and the current generation stop control.
+
+For signed-in proof, run a Pro consultation with a short response timeout and automatic reattach disabled, then let the controller exit. Confirm the tab remains available, reattach after completion, and verify the complete answer is saved before only that owned target closes. Use `ORACLE_NO_DETACH=1` when exercising the foreground controller. Never click **Answer now**.
+
+### Attachment evidence and single-send regression (no login)
+
+Run `pnpm build && node scripts/attachment-send-proof.mjs` with Chrome installed (`CHROME_PATH` can select Chromium on Linux). This uses a disposable profile and a controlled local page, not a signed-in consultation. It exercises local and remote three-file uploads, a filename-less JPEG with a consumed FileList, sidebar-count rejection, byte integrity, delayed commitment, exact-button keyboard activation for attachment sends, and offscreen button recovery. Each send must produce exactly one trusted button activation, zero editor-Enter submissions, and one committed turn. The Linux Chrome CI job runs it too.
+
+The disposable profile and fixtures live in a temporary, non-hidden directory under your home directory and are removed afterward. This lets Snap Chromium read the same files as Node instead of looking in its private `/tmp`. An optional directory argument retains the fixtures for manual testing; that directory must also be readable by the selected browser.
+
+The attachment proof also holds composer upload progress active for longer than three seconds inside a non-editable attachment widget nested in a rich-text editor, verifies completion and send both refuse it without input, then clears it and verifies one successful send despite unrelated page progress. Readiness uses explicit loading/busy state and native/ARIA progress controls; filenames and status prose alone cannot establish an active transfer.
+
+### Browser artifact export
+
+For browser file export, run `pnpm build && node scripts/artifact-export-proof.mjs`. It uses the actual CLI and isolated Chrome with synthetic sandbox-download responses, checking answer-only defaults, opt-in binary exports, collision preservation, recorded hashes, and copy-failure warnings. This does not establish current signed-in ChatGPT download or authentication behavior.
+
+### Signed-in attachment / Work-mode guard
+
+Before the signed-in smoke, run `pnpm build && node scripts/attachment-cli-proof.mjs` for the actual CLI against isolated local and remote Chrome fixtures. It checks per-file bytes, filename-less image evidence, upload progress, final focus/readiness, canonical conversation identity, Work refusal, missing exact send controls, and single submission. Optional `--baseline-cli <path>` demonstrates the older CLI sending after a project-context switch. These synthetic pages do not establish current signed-in ChatGPT behavior.
+
+Run this after changing attachment-menu activation or Chat/Work detection. Use a signed-in persistent profile, one small attachment, and `--browser-keep-browser`; do not use **Answer now** to complete the response.
+
+1. Record the newest sidebar Chat and Work entries, then start an attachment consultation from the Chat landing page.
+2. Verify the prompt becomes a committed user turn in an ordinary `/c/<id>` Chat conversation. A project rewrite such as `/c/<id>` to `/g/<project>/.../c/<id>` is allowed only when the conversation id is unchanged. A delayed Work/conversation navigation or switch between non-conversation landing/project paths injected after upload readiness but before final dispatch must fail without keyboard or mouse send events; query, hash, and trailing-slash-only rewrites remain allowed.
+3. Verify no new Work task was created, the session records `promptSubmitted=true`, and the attachment appears in the committed user turn.
+4. Repeat from an already selected Work composer. Oracle must fail before file assignment or prompt submission with an attachment Work-mode error.
+5. For image generation, also require terminal completion and decode the downloaded image from the configured output path; `running`, a visible upload, or an enabled send button is not completion evidence.
+
 ### Quick browser port smoke
 
 - `pnpm test:browser` — verifies the Open Browser Use CLI/MCP path, then runs
@@ -82,6 +112,10 @@ Run this when touching top-level CLI startup, option parsing, signal handling, o
    `pnpm run oracle -- --perf-trace --perf-trace-path /tmp/oracle-perf.json --dry-run summary --prompt "trace smoke"`
    - Confirm the JSON contains `cli-module-ready`, `root-command-start`, `first-output`, and `exit`, and prompt/key-like argv values are redacted.
 
+### Thinking effort evidence
+
+`node scripts/effort-readiness-proof.mjs` also checks persisted and displayed effort evidence for switched, already-selected, unverified best-effort, and refused strict selections. Its bridge case runs both built CLI processes against isolated Chrome and verifies structured effort evidence survives without host PID/profile fields. The page is synthetic; fresh signed-in selection and backend effort remain separate checks.
+
 ### Lightweight Browser CLI (manual exploration)
 
 Before running any agent-driven debugging, you can rely on the TypeScript CLI in `scripts/browser-tools.ts`:
@@ -110,7 +144,7 @@ Debug note: when you have a live ChatGPT tab open under a DevTools port and need
 1. **Prompt Submission & Model Switching**
    - With Chrome signed in and cookie sync enabled, run
      ```bash
-     pnpm run oracle -- --engine browser --model gpt-5.5 \
+     pnpm run oracle -- --engine browser --browser-cookie-sync --model gpt-5.5 \
        --prompt "Line 1\nLine 2\nLine 3"
      ```
    - Observe logs for:
@@ -122,7 +156,7 @@ Debug note: when you have a live ChatGPT tab open under a DevTools port and need
 2. **Markdown Capture**
    - Prompt:
      ```bash
-     pnpm run oracle -- --engine browser --model gpt-5.5 \
+     pnpm run oracle -- --engine browser --browser-cookie-sync --model gpt-5.5 \
        --prompt "Produce a short bullet list with code fencing."
      ```
    - Expected CLI output:
@@ -140,6 +174,10 @@ Debug note: when you have a live ChatGPT tab open under a DevTools port and need
 - Confirm log shows `Cookie sync failed (continuing with override)` and the run proceeds headless/logged-out.
 - Remember: the browser composer now pastes only the user prompt (plus any inline file blocks). If you see the default “You are Oracle…” text or other system-prefixed content in the ChatGPT composer, something regressed in `assembleBrowserPrompt` and you should stop and file a bug.
 - Heartbeats: Browser runs emit `--heartbeat` status while waiting. Long Thinking/Pro runs should show `[browser] ChatGPT thinking ...` or `[browser] Waiting for ChatGPT response ...`; the log must not include reasoning text from the side panel.
+
+### Service admission and cancellation
+
+For service admission and cancellation, run `pnpm build && node scripts/serve-queue-proof.mjs`. It drives the built service and CLI clients against real isolated Chrome with synthetic pages: default 409, host-cap clamping, FIFO waiting, 503 overflow, queued/active cancellation, and distinct host sessions. Additional compiled integration runs cover lease/profile-lock waits, borrowed targets, delayed CDP replies, Chrome acquisition, and temporary-launch cleanup. `--baseline-cli <path>` uses an older client for one queued completion. This does not prove signed-in ChatGPT behavior or backend generation cancellation.
 
 ## Post-Run Validation
 
@@ -163,25 +201,34 @@ Document results (pass/fail, session IDs) in PR descriptions so reviewers can au
 Run these four smoke tests whenever we touch browser automation:
 
 1. **GPT-5.5 simple prompt**
-   `pnpm run oracle -- --engine browser --model gpt-5.5 --prompt "Give me two short markdown bullet points about tables"`
+   `pnpm run oracle -- --engine browser --browser-manual-login --model gpt-5.5 --prompt "Give me two short markdown bullet points about tables"`
    Expect two markdown bullets, no files/search referenced. Note the session ID (e.g., `give-me-two-short-markdown`).
 
 2. **GPT-5.5 simple prompt**
-   `pnpm run oracle -- --engine browser --model gpt-5.5 --prompt "List two reasons Markdown is handy"`
+   `pnpm run oracle -- --engine browser --browser-manual-login --model gpt-5.5 --prompt "List two reasons Markdown is handy"`
    Confirm the answer arrives (and only once) even if it takes ~2–3 minutes.
 
 2b. **GPT-5.5 Instant smoke**
-`pnpm run oracle -- --engine browser --model gpt-5.5-instant --prompt "Give me two short markdown bullet points about tables"`
+`pnpm run oracle -- --engine browser --browser-manual-login --model gpt-5.5-instant --prompt "Give me two short markdown bullet points about tables"`
 Expect a near-instant response (no Thinking spinner) and confirm the composer pill shows the "Instant" row, not "Thinking 5.5" or "Pro". Run after any change to the 5.5 picker tokens.
+
+2c. **GPT-5.5 Pro effort through the unified picker**
+`pnpm run oracle -- --engine browser --browser-manual-login --model gpt-5.5-pro --write-output response.txt --prompt "Say Hi!"`
+Confirm the logs report a verified GPT-5.5 model followed by `Thinking time: Pro`, and `response.txt` contains the captured answer. Exercise both a tab starting on another model and a retained tab where GPT-5.5 is already selected. Never click ChatGPT's "Answer now" shortcut while the Pro response is thinking.
 
 3. **GPT-5.5 + attachment**
    Prepare `/tmp/browser-md.txt` with a short note, then run
-   `pnpm run oracle -- --engine browser --model gpt-5.5 --prompt "Summarize the key idea from the attached note" --file /tmp/browser-md.txt`
+   `pnpm run oracle -- --engine browser --browser-manual-login --model gpt-5.5 --prompt "Summarize the key idea from the attached note" --file /tmp/browser-md.txt`
    Ensure upload logs show “Attachment queued” and the answer references the file contents explicitly.
+
+3b. **GPT-5.5 + multi-file ZIP**
+Create `/tmp/oracle-zip-smoke/src/one.txt` and `/tmp/oracle-zip-smoke/src/two.txt` with distinct sentinel text, then run
+`pnpm run oracle -- --engine browser --browser-manual-login --model gpt-5.5 --browser-attachments always --browser-bundle-format zip --prompt "Extract the attached bundle, report both relative paths, and quote each sentinel." --file /tmp/oracle-zip-smoke/src`
+Confirm Oracle uploads one `attachments-bundle.zip`, the submitted composer text includes the extraction instruction, and the answer reports both paths and sentinels from the extracted tree.
 
 4. **GPT-5.5 + attachment (verbose)**
    Prepare `/tmp/browser-report.txt` with faux metrics, then run
-   `pnpm run oracle -- --engine browser --model gpt-5.5 --prompt "Use the attachment to report current CPU and memory figures" --file /tmp/browser-report.txt --verbose`
+   `pnpm run oracle -- --engine browser --browser-manual-login --model gpt-5.5 --prompt "Use the attachment to report current CPU and memory figures" --file /tmp/browser-report.txt --verbose`
    Verify verbose logs show attachment upload and the final answer matches the file data.
 
 5. **Deep Research smoke**
@@ -251,7 +298,7 @@ Use this when you need to inspect the live ChatGPT composer (DOM state, markdown
 
    ```bash
    tmux new -d -s oracle-browser \\
-     "pnpm run oracle -- --engine browser --browser-keep-browser \\
+     "pnpm run oracle -- --engine browser --browser-manual-login --browser-keep-browser \\
       --model 'GPT-5.6 Sol Pro' --prompt 'Debug via DevTools.'"
    ```
 

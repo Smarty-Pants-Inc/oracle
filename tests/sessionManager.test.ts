@@ -1,5 +1,17 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
-import { chmod, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  rm,
+  readFile,
+  readdir,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { setOracleHomeDirOverrideForTest } from "../src/oracleHome.js";
@@ -38,6 +50,69 @@ describe("session storage setup", () => {
     const stats = await stat(sessionModule.getSessionsDir());
     expect(stats.isDirectory()).toBe(true);
   });
+
+  test("ensureSessionStorage hardens existing artifacts without following symlinks", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const migrationHome = await mkdtemp(path.join(os.tmpdir(), "oracle-session-migration-"));
+    try {
+      const sessionsDir = path.join(migrationHome, "sessions");
+      const sessionDir = path.join(sessionsDir, "existing-session");
+      const modelsDir = path.join(sessionDir, "models");
+      const nestedArtifactsDir = path.join(sessionDir, "artifacts", "nested");
+      const outsideDir = path.join(migrationHome, "outside-dir");
+      const outsideFile = path.join(migrationHome, "outside.txt");
+
+      await mkdir(modelsDir, { recursive: true });
+      await mkdir(nestedArtifactsDir, { recursive: true });
+      await mkdir(outsideDir);
+      await writeFile(path.join(sessionDir, "output.log"), "sensitive transcript", "utf8");
+      await writeFile(path.join(modelsDir, "gpt.json"), "{}", "utf8");
+      await writeFile(path.join(nestedArtifactsDir, "report.md"), "sensitive report", "utf8");
+      await writeFile(outsideFile, "outside", "utf8");
+      await symlink(outsideDir, path.join(sessionDir, "linked-dir"));
+      await symlink(outsideFile, path.join(sessionDir, "linked-file"));
+
+      for (const dir of [
+        sessionsDir,
+        sessionDir,
+        modelsDir,
+        path.dirname(nestedArtifactsDir),
+        nestedArtifactsDir,
+        outsideDir,
+      ]) {
+        await chmod(dir, 0o755);
+      }
+      for (const file of [
+        path.join(sessionDir, "output.log"),
+        path.join(modelsDir, "gpt.json"),
+        path.join(nestedArtifactsDir, "report.md"),
+        outsideFile,
+      ]) {
+        await chmod(file, 0o644);
+      }
+
+      setOracleHomeDirOverrideForTest(migrationHome);
+      await sessionModule.ensureSessionStorage();
+
+      const mode = async (targetPath: string) => (await stat(targetPath)).mode & 0o777;
+      expect(await mode(sessionsDir)).toBe(0o700);
+      expect(await mode(sessionDir)).toBe(0o700);
+      expect(await mode(modelsDir)).toBe(0o700);
+      expect(await mode(nestedArtifactsDir)).toBe(0o700);
+      expect(await mode(path.join(sessionDir, "output.log"))).toBe(0o600);
+      expect(await mode(path.join(modelsDir, "gpt.json"))).toBe(0o600);
+      expect(await mode(path.join(nestedArtifactsDir, "report.md"))).toBe(0o600);
+      expect((await lstat(path.join(sessionDir, "linked-dir"))).isSymbolicLink()).toBe(true);
+      expect((await lstat(path.join(sessionDir, "linked-file"))).isSymbolicLink()).toBe(true);
+      expect(await mode(outsideDir)).toBe(0o755);
+      expect(await mode(outsideFile)).toBe(0o644);
+    } finally {
+      setOracleHomeDirOverrideForTest(oracleHomeDir);
+      await rm(migrationHome, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("session identifiers", () => {
@@ -64,6 +139,17 @@ describe("session identifiers", () => {
 });
 
 describe("session lifecycle", () => {
+  test("new browser sessions cannot be mistaken for legacy sessions before submission", async () => {
+    const metadata = await sessionModule.initializeSession(
+      { prompt: "Pending browser prompt", model: "gpt-5.5", mode: "browser" },
+      "/tmp/cwd",
+    );
+    const stored = JSON.parse(
+      await readFile(path.join(sessionModule.getSessionsDir(), metadata.id, "meta.json"), "utf8"),
+    );
+    expect(stored.browser.runtime.submittedPromptHash).toBeNull();
+  });
+
   test("initializeSession writes metadata, request, and log files", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2025-04-01T00:00:00Z"));
@@ -277,6 +363,31 @@ describe("session lifecycle", () => {
     expect(await readFile(target, "utf8")).toBe("unchanged\n");
   });
 
+  test("session directory and log artifacts are owner-only (no world/group read)", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const meta = await sessionModule.initializeSession(
+      { prompt: "sensitive prompt", model: "gpt-5.2-pro" },
+      "/tmp/cwd",
+    );
+    const baseDir = path.join(sessionModule.getSessionsDir(), meta.id);
+    // The output log receives the full prompt + attached file contents + model response,
+    // so it must not be readable by other local users.
+    const writer = sessionModule.createSessionLogWriter(meta.id);
+    writer.writeChunk("SENSITIVE MODEL RESPONSE\n");
+    writer.stream.end();
+    await new Promise((resolve) => writer.stream.on("close", resolve));
+
+    const mode = async (p: string) => (await stat(p)).mode & 0o777;
+    expect(await mode(sessionModule.getSessionsDir())).toBe(0o700);
+    expect(await mode(baseDir)).toBe(0o700);
+    expect(await mode(path.join(baseDir, "models"))).toBe(0o700);
+    expect(await mode(path.join(baseDir, "output.log"))).toBe(0o600);
+    expect(await mode(path.join(baseDir, "models", "gpt-5.2-pro.json"))).toBe(0o600);
+    expect(await mode(path.join(baseDir, "models", "gpt-5.2-pro.log"))).toBe(0o600);
+  });
+
   test("readSessionMetadata returns null for missing sessions and updateSessionMetadata persists changes", async () => {
     expect(await sessionModule.readSessionMetadata("missing")).toBeNull();
     const meta = await sessionModule.initializeSession(
@@ -290,6 +401,35 @@ describe("session lifecycle", () => {
     const updated = await sessionModule.readSessionMetadata(meta.id);
     expect(updated?.status).toBe("complete");
     expect(updated?.promptPreview).toBe("value");
+    const sessionFiles = await readdir(path.join(sessionModule.getSessionsDir(), meta.id));
+    expect(sessionFiles.filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
+  test("retries transient metadata rename failures without leaving temporary files", async () => {
+    const meta = await sessionModule.initializeSession(
+      { prompt: "Retry metadata rename", model: "gpt-5.2-pro" },
+      "/tmp/cwd",
+    );
+    const originalRename = fs.rename.bind(fs);
+    let attempts = 0;
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (source, target) => {
+      attempts += 1;
+      if (attempts <= 2) {
+        throw Object.assign(new Error("transient Windows metadata lock"), { code: "EPERM" });
+      }
+      return originalRename(source, target);
+    });
+
+    try {
+      await sessionModule.updateSessionMetadata(meta.id, { promptPreview: "retry succeeded" });
+    } finally {
+      renameSpy.mockRestore();
+    }
+
+    expect(attempts).toBe(3);
+    expect((await sessionModule.readSessionMetadata(meta.id))?.promptPreview).toBe(
+      "retry succeeded",
+    );
     const sessionFiles = await readdir(path.join(sessionModule.getSessionsDir(), meta.id));
     expect(sessionFiles.filter((name) => name.endsWith(".tmp"))).toEqual([]);
   });
@@ -483,6 +623,44 @@ describe("session lifecycle", () => {
     );
     expect(rawAfterList.status).toBe("error");
     expect(rawAfterList.errorMessage).toMatch(/chrome/i);
+  });
+
+  test("marks running browser sessions as error when only controllerPid is recorded and it is gone", async () => {
+    // chromePid / chromePort absent → signals[] starts empty → falls through to controllerPid check
+    const meta = await sessionModule.initializeSession(
+      { prompt: "Controller dead", model: "gpt-5.2-pro", mode: "browser" },
+      "/tmp/cwd",
+    );
+    await sessionModule.updateSessionMetadata(meta.id, {
+      status: "running",
+      mode: "browser",
+      browser: {
+        runtime: {
+          controllerPid: 999_999_999, // definitely not alive
+        },
+      },
+    });
+    const refreshed = await sessionModule.readSessionMetadata(meta.id);
+    expect(refreshed?.status).toBe("error");
+    expect(refreshed?.errorMessage).toMatch(/chrome.*no longer reachable/i);
+  });
+
+  test("keeps running browser sessions when only controllerPid is recorded and it is alive", async () => {
+    const meta = await sessionModule.initializeSession(
+      { prompt: "Controller live", model: "gpt-5.2-pro", mode: "browser" },
+      "/tmp/cwd",
+    );
+    await sessionModule.updateSessionMetadata(meta.id, {
+      status: "running",
+      mode: "browser",
+      browser: {
+        runtime: {
+          controllerPid: process.pid, // current process is definitely alive
+        },
+      },
+    });
+    const refreshed = await sessionModule.readSessionMetadata(meta.id);
+    expect(refreshed?.status).toBe("running");
   });
 });
 

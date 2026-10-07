@@ -4,6 +4,7 @@ import {
   CLOUDFLARE_TITLE,
   CONVERSATION_TURN_SELECTOR,
   INPUT_SELECTORS,
+  PRE_HYDRATION_PROMPT_SELECTOR,
 } from "../constants.js";
 import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
@@ -264,6 +265,7 @@ function buildChatModeProbeExpression(): string {
       return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
     };
     const isSelected = (node) =>
+      node?.getAttribute?.('aria-pressed') === 'true' ||
       node?.getAttribute?.('aria-checked') === 'true' ||
       node?.getAttribute?.('data-state') === 'on';
     const conversationIdFromPath = (value) => {
@@ -283,9 +285,9 @@ function buildChatModeProbeExpression(): string {
     const conversationId = conversationIdFromPath(pathname);
     if (conversationId) {
       // Conversation messages can contain same-origin links to the current thread. Only sidebar
-      // history items use ChatGPT's renderer-owned menu-item anchor class.
+      // history items belong to navigation or carry the legacy menu-item marker.
       const activeHistoryLinks = Array.from(
-        document.querySelectorAll('a.__menu-item[href*="/c/"]'),
+        document.querySelectorAll('a.__menu-item[href*="/c/"], nav a[href*="/c/"]'),
       ).filter((node) => {
         try {
           const candidateUrl = new URL(node.getAttribute('href') || '', location.origin);
@@ -296,14 +298,14 @@ function buildChatModeProbeExpression(): string {
       });
       if (activeHistoryLinks.length > 0) {
         const hasWorkBadge = activeHistoryLinks.some((link) =>
-          Array.from(link.querySelectorAll('span')).some(isStructuredWorkBadge),
+          Array.from(link.querySelectorAll('span')).some(node => isStructuredWorkBadge(node) || (normalize(node.textContent) === 'work' && node.childElementCount === 0 && !node.closest('[data-thread-title]') && Boolean(link.querySelector('[data-thread-title]')))),
         );
         if (hasWorkBadge) return { status: 'work-conversation' };
 
         const ariaLabels = activeHistoryLinks
           .map((link) => normalize(link.getAttribute('aria-label')))
           .filter(Boolean);
-        if (ariaLabels.length === 0 || ariaLabels.some((aria) => /,\\s*work\\s*$/.test(aria))) {
+        if ((ariaLabels.length === 0 && !activeHistoryLinks.some(link => link.querySelector('[data-thread-title]'))) || ariaLabels.some((aria) => /,\\s*work\\s*$/.test(aria))) {
           return { status: 'conversation-unresolved' };
         }
         return { status: 'chat-conversation' };
@@ -311,6 +313,17 @@ function buildChatModeProbeExpression(): string {
       return { status: 'conversation-unresolved' };
     }
 
+    const modeGroup = document.querySelector('[role="group"][aria-label="Composer mode"]');
+    const modeButtons = modeGroup ? Array.from(modeGroup.querySelectorAll('button')).filter(isVisible) : [];
+    const selectedMode = modeButtons.find(isSelected);
+    if (normalize(selectedMode?.textContent) === 'chat') return { status: 'chat-selected' };
+    if (normalize(selectedMode?.textContent) === 'work') {
+      const chatButton = modeButtons.find(node => normalize(node.textContent) === 'chat');
+      if (chatButton) {
+        const rect = chatButton.getBoundingClientRect();
+        return { status: 'work-selected', chatPoint: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } };
+      }
+    }
     const radios = Array.from(document.querySelectorAll('button[role="radio"]')).filter(isVisible);
     const chat = radios.find((node) => normalize(node.textContent) === 'chat');
     const work = radios.find((node) => normalize(node.textContent) === 'work');
@@ -790,6 +803,15 @@ export interface ResumedConversationHydrationDeps {
   expectedConversationUrl?: string;
 }
 
+export function conversationIdFromUrl(value: string | undefined): string | null {
+  if (!value) return null;
+  try {
+    return new URL(value).pathname.match(/(?:^|\/)c\/([^/]+)/)?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * After navigating to a *resumed* ChatGPT conversation, its prior turns hydrate
  * asynchronously and ChatGPT can reset the composer mid-hydration — wiping a
@@ -930,10 +952,12 @@ async function waitForPrompt(
     const { result } = await Runtime.evaluate({
       expression: `(() => {
         const selectors = ${JSON.stringify(INPUT_SELECTORS)};
+        const placeholder = ${JSON.stringify(PRE_HYDRATION_PROMPT_SELECTOR)};
         for (const selector of selectors) {
-          const node = document.querySelector(selector);
-          if (node && !node.hasAttribute('disabled')) {
-            return true;
+          for (const node of document.querySelectorAll(selector)) {
+            if (!node.hasAttribute('disabled') && !node.matches(placeholder)) {
+              return true;
+            }
           }
         }
         return false;
@@ -966,7 +990,7 @@ export function buildCloudflareVerdictExpression(): string {
       title.includes(${JSON.stringify(CLOUDFLARE_TITLE.toLowerCase())}) ||
       (title.includes('attention required') && title.includes('cloudflare'));
     const hasAppShell = Boolean(document.querySelector(
-      '#prompt-textarea, [data-testid="prompt-textarea"], [data-testid^="conversation-turn"], [data-testid="profile-button"], main form[data-type], nav a[href*="/c/"]'
+      'form[data-chatgpt-composer], [data-turn-key], #prompt-textarea, [data-testid="prompt-textarea"], [data-testid^="conversation-turn"], [data-testid="profile-button"], main form[data-type], nav a[href*="/c/"]'
     ));
     const bodyText = String((document.body && document.body.innerText) || '')
       .toLowerCase().replace(/\\s+/g, ' ').trim();

@@ -22,7 +22,10 @@ Recommended defaults:
 - Engine: browser (`--engine browser`) unless API use is explicit
 - Pro: `--model gpt-5.6-sol-pro`
 - Base Sol: `--model gpt-5.6-sol`
-- Base Sol maximum reasoning: `--browser-thinking-time heavy` (Extra High)
+- Base Sol maximum reasoning: `--browser-thinking-time extra-high` (Extra High)
+- Explicit Pro effort on GPT-5.6 Sol: `--browser-thinking-time pro` (fails closed if Pro cannot be confirmed)
+- Browser GPT-6 Pro (ChatGPT `Latest` + Pro effort): `--model gpt-6-pro`
+- Browser GPT-5.5 with Pro effort: `--model gpt-5.5 --browser-thinking-time pro`
 - API Pro maximum reasoning: `--model gpt-5.6-sol --reasoning-mode pro --reasoning-effort max`
 - Fallback: explicitly use `--model gpt-5.5-pro` when GPT-5.6 is unavailable
 - Attachments: directories/globs plus excludes; never attach secrets by default
@@ -44,7 +47,7 @@ This fork supports GPT-5.6 on both surfaces with one stable logical Pro alias:
 For browser Pro, use:
 
 ```bash
-oracle --engine browser --model gpt-5.6-sol-pro \
+oracle --engine browser --browser-manual-login --model gpt-5.6-sol-pro \
   -p "<task>" --file "src/**"
 ```
 
@@ -104,7 +107,7 @@ and a live browser run records strict GPT-5.6 selection evidence.
   - `npx -y @steipete/oracle --dry-run summary --files-report -p "<task>" --file "src/**"`
 
 - Browser run:
-  - `oracle --engine browser --model gpt-5.6-sol --browser-thinking-time heavy -p "<task>" --file "src/**"`
+  - `oracle --engine browser --browser-manual-login --model gpt-5.6-sol --browser-thinking-time extra-high -p "<task>" --file "src/**"`
 
 - Manual paste fallback:
   - `npx -y @steipete/oracle --render-markdown --copy-markdown -p "<task>" --file "src/**"`
@@ -142,7 +145,10 @@ are essential to the question.
   Claude 4.x; availability depends on engine and provider.
 - API runs require explicit user consent because they may incur usage costs.
 - Browser attachments use `--browser-attachments auto|never|always`.
-- For many files, add `--browser-bundle-files --browser-bundle-format auto|zip`.
+- Browser uploads keep one text/source file native and bundle multiple
+  text/source files. `auto` keeps flattened text for text-only uploads; use
+  `--browser-bundle-format zip` for a filesystem tree, or `--browser-bundle-files`
+  to force every resolved attachment into one bundle.
 - Local ChatGPT launches are hidden/background-only. `--browser-attach-running`
   is rejected; use `--remote-chrome <host:port>` only with a dedicated Oracle browser.
 - Use `--browser-model-strategy select|current|ignore` to control picker

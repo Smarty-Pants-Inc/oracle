@@ -1,3 +1,4 @@
+import type { ProviderNativeCaptureSummary } from "./browser/chatgptConversation.js";
 import path from "node:path";
 import fs from "node:fs/promises";
 import { constants, createWriteStream, mkdirSync } from "node:fs";
@@ -8,6 +9,7 @@ import type {
   BrowserArchiveMode,
   BrowserArchiveResult,
   BrowserModelStrategy,
+  BrowserResearchPlanMetadata,
   BrowserResearchMode,
   CookieParam,
 } from "./browser/types.js";
@@ -41,6 +43,8 @@ export interface BrowserSessionConfig {
   timeoutMs?: number;
   debugPort?: number | null;
   inputTimeoutMs?: number;
+  /** Time budget for each Chrome remote-debugging approval prompt. */
+  approvalWaitMs?: number;
   /** Time budget for attachment upload/readiness before clicking send. */
   attachmentTimeoutMs?: number;
   /** Delay before rechecking the conversation after an assistant timeout. */
@@ -68,6 +72,8 @@ export interface BrowserSessionConfig {
   keepBrowser?: boolean;
   hideWindow?: boolean;
   desiredModel?: string | null;
+  /** The caller omitted a model and inherited Oracle's browser default. */
+  modelIsImplicitDefault?: boolean;
   modelStrategy?: BrowserModelStrategy;
   debug?: boolean;
   allowCookieErrors?: boolean;
@@ -92,6 +98,16 @@ export interface BrowserSessionConfig {
   archiveConversations?: BrowserArchiveMode;
   /** Browser-only: existing ChatGPT conversation URL to resume before submitting. */
   resumeConversationUrl?: string | null;
+  /** Capture ChatGPT's own conversation document plus independent per-turn digests. */
+  captureProviderNative?: boolean;
+}
+
+export interface BrowserRecoveryTarget {
+  host: string;
+  port: number;
+  targetId: string;
+  browserWSEndpoint?: string;
+  claimId?: string;
 }
 
 export interface BrowserRuntimeMetadata {
@@ -104,15 +120,30 @@ export interface BrowserRuntimeMetadata {
   chromeProfileRoot?: string;
   userDataDir?: string;
   chromeTargetId?: string;
+  /** Explicitly created by Oracle and eligible for retirement after persisted recovery. */
+  ownedRecoveryTarget?: BrowserRecoveryTarget;
   tabUrl?: string;
   conversationId?: string;
   /** True after Oracle has submitted the prompt to ChatGPT. */
   promptSubmitted?: boolean;
+  /** Fingerprint of committed user text and stable message ID; null until commitment is confirmed. */
+  submittedPromptHash?: string | null;
+  /** Latest Deep Research plan captured from ChatGPT's out-of-process iframe. */
+  researchPlan?: BrowserResearchPlanMetadata;
   /** PID of the controller process that launched this browser run. Helps detect orphaned sessions. */
   controllerPid?: number;
 }
 
 export type BrowserHarvestState = "running" | "completed" | "stalled" | "detached";
+
+export interface BrowserHarvestIntegrity {
+  status: "matched" | "mismatch" | "unverified";
+  observedConversationId?: string;
+  captured: Array<{ source: string; conversationId: string }>;
+  unverifiedSources: string[];
+  explicitTarget: boolean;
+  previousHarvestConversationId?: string;
+}
 
 export interface BrowserHarvestMetadata {
   targetId?: string;
@@ -130,6 +161,7 @@ export interface BrowserHarvestMetadata {
   outputMatched?: boolean;
   promptMatched?: boolean;
   runtimeRepaired?: boolean;
+  integrity?: BrowserHarvestIntegrity;
 }
 
 export type BrowserModelSelectionEvidenceStatus =
@@ -149,6 +181,25 @@ export interface BrowserModelSelectionEvidence {
   capturedAt: string;
 }
 
+export type BrowserThinkingSelectionStatus = "already-selected" | "switched" | "unverified";
+
+/**
+ * Selection-time UI evidence, separate from the model picker record.
+ * `verified` confirms the observed selected state at `capturedAt`; it does not
+ * attest backend effort or later UI changes. Strict requests throw if unconfirmed.
+ */
+export interface BrowserThinkingSelectionEvidence {
+  requestedLevel: ThinkingTimeLevel;
+  status: BrowserThinkingSelectionStatus;
+  resolvedLabel?: string | null;
+  verified: boolean;
+  strictFailClosed: boolean;
+  targetModelKind?: string | null;
+  observedModelKind?: string | null;
+  source: "chatgpt-thinking-picker";
+  capturedAt: string;
+}
+
 export interface BrowserRunWarning {
   code: string;
   severity: "warning";
@@ -162,6 +213,8 @@ export interface BrowserMetadata {
   harvest?: BrowserHarvestMetadata;
   archive?: BrowserArchiveResult;
   modelSelection?: BrowserModelSelectionEvidence;
+  thinkingSelection?: BrowserThinkingSelectionEvidence;
+  providerNativeCapture?: ProviderNativeCaptureSummary;
   warnings?: BrowserRunWarning[];
 }
 
@@ -258,6 +311,7 @@ export interface StoredRunOptions {
   modelOverrides?: ModelOverridesConfig;
   renderPlain?: boolean;
   writeOutputPath?: string;
+  writeArtifacts?: boolean;
   partialMode?: PartialMode;
   timeoutSeconds?: number | "auto";
   httpTimeoutMs?: number;
@@ -273,6 +327,7 @@ export interface StoredRunOptions {
   browserResumeConversationUrl?: string;
   aspectRatio?: string;
   geminiShowThoughts?: boolean;
+  geminiAllowModelFallback?: boolean;
 }
 
 export interface SessionArchiveRoute {
@@ -378,13 +433,90 @@ const DEFAULT_SLUG = "session";
 const MAX_SLUG_WORDS = 5;
 const MIN_CUSTOM_SLUG_WORDS = 3;
 const MAX_SLUG_WORD_LENGTH = 10;
+// Session artifacts (prompt, attached file contents, model responses) are sensitive.
+// Keep them owner-only, matching the meta.json / bridge-config posture (0o600/0o700).
+const SESSION_DIR_MODE = 0o700;
+const SESSION_FILE_MODE = 0o600;
+const sessionStorageHardening = new Map<string, Promise<void>>();
 
 async function ensureDir(dirPath: string): Promise<void> {
-  await fs.mkdir(dirPath, { recursive: true });
+  await fs.mkdir(dirPath, { recursive: true, mode: SESSION_DIR_MODE });
+}
+
+function isMissingPathError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+async function chmodIfPresent(targetPath: string, mode: number): Promise<boolean> {
+  try {
+    await fs.chmod(targetPath, mode);
+    return true;
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function hardenSessionStorageEntry(targetPath: string): Promise<void> {
+  let stats;
+  try {
+    stats = await fs.lstat(targetPath);
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      return;
+    }
+    throw error;
+  }
+
+  if (stats.isSymbolicLink()) {
+    return;
+  }
+  if (stats.isDirectory()) {
+    if (!(await chmodIfPresent(targetPath, SESSION_DIR_MODE))) {
+      return;
+    }
+    let entries: string[];
+    try {
+      entries = await fs.readdir(targetPath);
+    } catch (error) {
+      if (isMissingPathError(error)) {
+        return;
+      }
+      throw error;
+    }
+    for (const entry of entries) {
+      await hardenSessionStorageEntry(path.join(targetPath, entry));
+    }
+    return;
+  }
+  if (stats.isFile()) {
+    await chmodIfPresent(targetPath, SESSION_FILE_MODE);
+  }
 }
 
 export async function ensureSessionStorage(): Promise<void> {
-  await ensureDir(getSessionsDir());
+  const sessionsDir = getSessionsDir();
+  await ensureDir(sessionsDir);
+  if (process.platform === "win32") {
+    return;
+  }
+
+  const stats = await fs.lstat(sessionsDir);
+  if (stats.isSymbolicLink() || !stats.isDirectory()) {
+    return;
+  }
+  const identity = `${sessionsDir}:${stats.dev}:${stats.ino}`;
+  let hardening = sessionStorageHardening.get(identity);
+  if (!hardening) {
+    hardening = hardenSessionStorageEntry(sessionsDir).catch((error) => {
+      sessionStorageHardening.delete(identity);
+      throw error;
+    });
+    sessionStorageHardening.set(identity, hardening);
+  }
+  await hardening;
 }
 
 function slugify(text: string | undefined, maxWords = MAX_SLUG_WORDS): string {
@@ -707,9 +839,41 @@ async function writeSessionMetadataFile(
       encoding: "utf8",
       mode: 0o600,
     });
-    await fs.rename(temporaryPath, targetPath);
+    await renameSessionMetadataFile(temporaryPath, targetPath);
   } finally {
     await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
+  }
+}
+
+const METADATA_RENAME_RETRY_DELAYS_MS = [10, 25, 50, 100, 200, 400, 800] as const;
+const RETRIABLE_METADATA_RENAME_CODES = new Set(["EACCES", "EBUSY", "EPERM"]);
+
+function isRetriableMetadataRenameError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof error.code === "string" &&
+    RETRIABLE_METADATA_RENAME_CODES.has(error.code)
+  );
+}
+
+async function renameSessionMetadataFile(temporaryPath: string, targetPath: string): Promise<void> {
+  for (const delayMs of [0, ...METADATA_RENAME_RETRY_DELAYS_MS]) {
+    if (delayMs > 0) {
+      await wait(delayMs);
+    }
+    try {
+      await fs.rename(temporaryPath, targetPath);
+      return;
+    } catch (error) {
+      if (
+        !isRetriableMetadataRenameError(error) ||
+        delayMs === METADATA_RENAME_RETRY_DELAYS_MS.at(-1)
+      ) {
+        throw error;
+      }
+    }
   }
 }
 
@@ -754,7 +918,7 @@ async function reserveUniqueSessionDir(baseSlug: string): Promise<string> {
   for (;;) {
     const dir = sessionDir(candidate);
     try {
-      await fs.mkdir(dir, { recursive: false });
+      await fs.mkdir(dir, { recursive: false, mode: SESSION_DIR_MODE });
       return candidate;
     } catch (error) {
       if (!isFileExistsError(error)) {
@@ -821,7 +985,10 @@ export async function updateModelRunMetadata(
     ...updates,
     model,
   });
-  await fs.writeFile(modelJsonPath(sessionId, model), JSON.stringify(next, null, 2), "utf8");
+  await fs.writeFile(modelJsonPath(sessionId, model), JSON.stringify(next, null, 2), {
+    encoding: "utf8",
+    mode: SESSION_FILE_MODE,
+  });
   return next;
 }
 
@@ -865,7 +1032,15 @@ export async function initializeSession(
     })),
     cwd,
     mode,
-    browser: browserConfig ? { config: browserConfig } : undefined,
+    browser:
+      mode === "browser"
+        ? {
+            ...(browserConfig ? { config: browserConfig } : {}),
+            runtime: { submittedPromptHash: null },
+          }
+        : browserConfig
+          ? { config: browserConfig }
+          : undefined,
     notifications,
     archiveRoute,
     archiveAccountAlias,
@@ -906,6 +1081,7 @@ export async function initializeSession(
       zombieTimeoutMs: options.zombieTimeoutMs,
       zombieUseLastActivity: options.zombieUseLastActivity,
       writeOutputPath: options.writeOutputPath,
+      writeArtifacts: options.writeArtifacts,
       partialMode: options.partialMode,
       waitPreference: options.waitPreference,
       youtube: options.youtube,
@@ -916,6 +1092,7 @@ export async function initializeSession(
       browserResumeConversationUrl: options.browserResumeConversationUrl,
       aspectRatio: options.aspectRatio,
       geminiShowThoughts: options.geminiShowThoughts,
+      geminiAllowModelFallback: options.geminiAllowModelFallback,
     },
   };
   await ensureDir(modelsDir(sessionId));
@@ -930,12 +1107,15 @@ export async function initializeSession(
           status: "pending",
           log: { path: path.relative(sessionDir(sessionId), logFilePath) },
         };
-        await fs.writeFile(jsonPath, JSON.stringify(modelRecord, null, 2), "utf8");
-        await fs.writeFile(logFilePath, "", "utf8");
+        await fs.writeFile(jsonPath, JSON.stringify(modelRecord, null, 2), {
+          encoding: "utf8",
+          mode: SESSION_FILE_MODE,
+        });
+        await fs.writeFile(logFilePath, "", { encoding: "utf8", mode: SESSION_FILE_MODE });
       },
     ),
   );
-  await fs.writeFile(logPath(sessionId), "", "utf8");
+  await fs.writeFile(logPath(sessionId), "", { encoding: "utf8", mode: SESSION_FILE_MODE });
   return metadata;
 }
 
@@ -1094,9 +1274,9 @@ async function attachModelRuns(meta: SessionMetadata, sessionId: string): Promis
 export function createSessionLogWriter(sessionId: string, model?: string): SessionLogWriter {
   const targetPath = model ? modelLogPath(sessionId, model) : logPath(sessionId);
   if (model) {
-    mkdirSync(modelsDir(sessionId), { recursive: true });
+    mkdirSync(modelsDir(sessionId), { recursive: true, mode: SESSION_DIR_MODE });
   }
-  const stream = createWriteStream(targetPath, { flags: "a" });
+  const stream = createWriteStream(targetPath, { flags: "a", mode: SESSION_FILE_MODE });
   const logLine = (line = ""): void => {
     stream.write(`${line}\n`);
   };
@@ -1344,6 +1524,13 @@ async function markDeadBrowser(meta: SessionMetadata): Promise<SessionMetadata> 
   if (runtime.chromePort) {
     const host = runtime.chromeHost ?? "127.0.0.1";
     signals.push(await isPortOpen(host, runtime.chromePort));
+  }
+  // controllerPid: the foreground process that launched this browser run.
+  // When neither chromePid nor chromePort are recorded (common on Linux),
+  // signals[] is empty and the early-return below would skip the reap.
+  // Use the same isProcessAlive() primitive to fill that gap.
+  if (signals.length === 0 && runtime.controllerPid) {
+    signals.push(isProcessAlive(runtime.controllerPid));
   }
   if (signals.length === 0 || signals.some(Boolean)) {
     return meta;

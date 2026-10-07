@@ -46,7 +46,7 @@ describe("browser tab CLI helpers", () => {
     );
   });
 
-  test("keeps remote affinities distinct and treats a local digest as local", () => {
+  test("keeps remote affinities distinct and treats a local digest as local", async () => {
     const remoteSession = (id: string, browserId: string, accountDigest: string, port = 9223) =>
       ({
         id,
@@ -68,7 +68,7 @@ describe("browser tab CLI helpers", () => {
       browser: { config: { remoteChrome: { host: "127.0.0.1", port: 9223 } } },
     } as SessionMetadata;
 
-    const allEndpoints = collectUniqueEndpointsForTest([
+    const allEndpoints = await collectUniqueEndpointsForTest([
       legacy,
       remoteSession("new", "browser-new", "b".repeat(64)),
       remoteSession("old", "browser-old", "c".repeat(64)),
@@ -82,9 +82,11 @@ describe("browser tab CLI helpers", () => {
     ]);
     expect(allEndpoints.some((endpoint) => endpoint.port === 9222)).toBe(false);
 
-    const boundDefault = collectUniqueEndpointsForTest([
-      remoteSession("default", "browser-default", "d".repeat(64), 9222),
-    ]).filter((endpoint) => endpoint.port === 9222);
+    const boundDefault = (
+      await collectUniqueEndpointsForTest([
+        remoteSession("default", "browser-default", "d".repeat(64), 9222),
+      ])
+    ).filter((endpoint) => endpoint.port === 9222);
     expect(boundDefault).toEqual([
       expect.objectContaining({
         browserId: "browser-default",
@@ -97,7 +99,7 @@ describe("browser tab CLI helpers", () => {
       browser: { config: { remoteChrome: { host: "127.0.0.1", port: 9222 } } },
     } as SessionMetadata;
     expect(
-      collectUniqueEndpointsForTest([incompleteDefault]).filter(
+      (await collectUniqueEndpointsForTest([incompleteDefault])).filter(
         (endpoint) => endpoint.port === 9222,
       ),
     ).toEqual([]);
@@ -114,7 +116,7 @@ describe("browser tab CLI helpers", () => {
       },
     } as SessionMetadata;
     expect(
-      collectUniqueEndpointsForTest([localhostDefault]).filter(
+      (await collectUniqueEndpointsForTest([localhostDefault])).filter(
         (endpoint) => endpoint.port === 9222,
       ),
     ).toEqual([expect.objectContaining({ host: "localhost", browserId: "browser-localhost" })]);
@@ -135,13 +137,16 @@ describe("browser tab CLI helpers", () => {
       },
     } as SessionMetadata;
     expect(
-      collectUniqueEndpointsForTest([runtimeOnly]).filter((endpoint) => endpoint.port === 9224),
+      (await collectUniqueEndpointsForTest([runtimeOnly])).filter(
+        (endpoint) => endpoint.port === 9224,
+      ),
     ).toEqual([
-      {
+      expect.objectContaining({
         host: "127.0.0.1",
         port: 9224,
+        browserWSEndpoint: "ws://127.0.0.1:9224/devtools/browser/browser-runtime",
         accountDigest: "1".repeat(64),
-      },
+      }),
     ]);
 
     const localRuntimeDigest = {
@@ -155,7 +160,7 @@ describe("browser tab CLI helpers", () => {
       },
     } as SessionMetadata;
     expect(
-      collectUniqueEndpointsForTest([localRuntimeDigest]).filter(
+      (await collectUniqueEndpointsForTest([localRuntimeDigest])).filter(
         (endpoint) => endpoint.port === 9224,
       ),
     ).toEqual([{ host: "127.0.0.1", port: 9224, accountDigest: "1".repeat(64) }]);
@@ -170,12 +175,12 @@ describe("browser tab CLI helpers", () => {
       },
     } as SessionMetadata;
     expect(
-      collectUniqueEndpointsForTest([malformedLocalRuntimeDigest]).filter(
+      (await collectUniqueEndpointsForTest([malformedLocalRuntimeDigest])).filter(
         (endpoint) => endpoint.port === 9224,
       ),
     ).toEqual([]);
 
-    expect(collectUniqueEndpointsForTest([])).toEqual([{ host: "127.0.0.1", port: 9222 }]);
+    expect(await collectUniqueEndpointsForTest([])).toEqual([{ host: "127.0.0.1", port: 9222 }]);
   });
 
   const harvested = (overrides: Partial<ChatGptTabSummary> = {}): ChatGptTabSummary => ({

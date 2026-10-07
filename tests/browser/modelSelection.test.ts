@@ -16,9 +16,27 @@ const evaluateImmediateModelSelectionExpression = (
   buttonLabel: string,
   composerLabel = "",
   proPillLabel = "",
+  modernCheckedModel?: string,
 ): unknown => {
   const expression = buildModelSelectionExpressionForTest(targetModel);
-  const modelButton = { textContent: buttonLabel };
+  const modelButton = {
+    textContent: modernCheckedModel ? `Thinking effortThinking effort${buttonLabel}` : buttonLabel,
+    innerText: buttonLabel,
+    id: modernCheckedModel ? "current-model-trigger" : "",
+  };
+  const currentRadio = modernCheckedModel ? { textContent: modernCheckedModel } : null;
+  const currentMenu = modernCheckedModel
+    ? {
+        getAttribute: (name: string) => (name === "aria-labelledby" ? modelButton.id : null),
+        querySelector: (selector: string) => {
+          if (selector === "[data-model-picker-view]") return {};
+          if (selector.includes('[data-model-picker-view] [role="menuitemradio"]')) {
+            return currentRadio;
+          }
+          return null;
+        },
+      }
+    : null;
   const composerSignal = composerLabel ? { textContent: composerLabel } : null;
   const proPill = proPillLabel
     ? {
@@ -40,7 +58,8 @@ const evaluateImmediateModelSelectionExpression = (
       }
       return null;
     },
-    querySelectorAll: () => (proPill ? [proPill] : []),
+    querySelectorAll: (selector: string) =>
+      currentMenu && selector.includes('[role="menu"]') ? [currentMenu] : proPill ? [proPill] : [],
     title: "",
     body: { innerText: "" },
   };
@@ -77,7 +96,9 @@ const evaluateImmediateModelSelectionExpression = (
 
 const evaluateMenuModelSelectionExpression = async (
   targetModel: string,
-  option: { label: string; testId?: string } | Array<{ label: string; testId?: string }>,
+  option:
+    | { label: string; testId?: string; selectedButtonLabel?: string }
+    | Array<{ label: string; testId?: string; selectedButtonLabel?: string }>,
   extraMenus: unknown[] = [],
 ): Promise<unknown> => {
   class FakeEventTarget {
@@ -89,7 +110,7 @@ const evaluateMenuModelSelectionExpression = async (
   class FakeElement extends FakeEventTarget {
     constructor(
       public textContent: string,
-      private readonly attributes: Readonly<Record<string, string>> = {},
+      private readonly attributes: Record<string, string> = {},
       private readonly children: readonly FakeElement[] = [],
       private readonly onDispatch?: () => void,
     ) {
@@ -98,6 +119,9 @@ const evaluateMenuModelSelectionExpression = async (
 
     getAttribute(name: string): string | null {
       return this.attributes[name] ?? null;
+    }
+    setAttribute(name: string, value: string): void {
+      this.attributes[name] = value;
     }
 
     querySelector(selector: string): FakeElement | null {
@@ -142,9 +166,26 @@ const evaluateMenuModelSelectionExpression = async (
   const options = Array.isArray(option) ? option : [option];
   const modelOptions = options.map(
     (item) =>
-      new FakeElement(item.label, item.testId ? { "data-testid": item.testId } : {}, [], () => {
-        modelButton.textContent = item.label;
-      }),
+      new FakeElement(
+        item.label,
+        item.selectedButtonLabel
+          ? { role: "menuitemradio", "aria-checked": "false" }
+          : item.testId
+            ? { "data-testid": item.testId }
+            : {},
+        [],
+        () => {
+          modelButton.textContent = item.selectedButtonLabel ?? item.label;
+          if (item.selectedButtonLabel) {
+            for (const candidate of modelOptions) {
+              candidate.setAttribute(
+                "aria-checked",
+                candidate.textContent === item.label ? "true" : "false",
+              );
+            }
+          }
+        },
+      ),
   );
   const menu = new FakeElement(
     options.map((item) => item.label).join(" "),
@@ -156,6 +197,9 @@ const evaluateMenuModelSelectionExpression = async (
     querySelector: (selector: string) => {
       if (selector.includes("model-switcher-dropdown-button")) {
         return modelButton;
+      }
+      if (selector.includes("composer-model-picker-slider-advanced-view")) {
+        return modelOptions.find((item) => item.getAttribute("aria-checked") === "true") ?? null;
       }
       if (selector.includes('role="menu"') || selector.includes("data-radix")) {
         return menu;
@@ -172,9 +216,11 @@ const evaluateMenuModelSelectionExpression = async (
     body: { innerText: "" },
     dispatchEvent: () => true,
   };
-  const performanceStub = { now: () => 0 };
+  let fakeNow = 0;
+  const performanceStub = { now: () => fakeNow };
   const windowStub = { location: { href: "https://chatgpt.com/" } };
-  const immediateSetTimeout = (handler: TimerHandler): number => {
+  const immediateSetTimeout = (handler: TimerHandler, delay = 0): number => {
+    fakeNow += typeof delay === "number" ? delay : 0;
     if (typeof handler === "function") {
       handler();
     }
@@ -611,6 +657,299 @@ const evaluateIntelligenceSliderModelSelection = async (initialValue: string) =>
     FakeElement,
   );
   return { result, endPresses, value: sliderAttributes["aria-valuenow"] };
+};
+
+const evaluateAdvancedModelPickerExpression = async ({
+  targetModel = "Thinking 5.5",
+  initialModel = "GPT-5.6 Sol",
+  modelWord = "Model",
+  advancedWord = "Advanced",
+  effortWord = "Effort",
+}: {
+  targetModel?: string;
+  initialModel?: "GPT-5.5" | "GPT-5.6 Sol";
+  modelWord?: string;
+  advancedWord?: string;
+  effortWord?: string;
+} = {}) => {
+  class FakeEventTarget {
+    dispatchEvent(_event: unknown): boolean {
+      return true;
+    }
+  }
+
+  class FakeMouseEvent {
+    constructor(
+      readonly type: string,
+      readonly init?: unknown,
+    ) {}
+  }
+
+  let topMenuOpen = false;
+  let advancedVisible = false;
+  let modelSubmenuOpen = false;
+  let selectedModel: "GPT-5.5" | "GPT-5.6 Sol" = initialModel;
+  const clicks = { advanced: 0, model: 0, effort: 0, gpt55: 0 };
+
+  class FakeElement extends FakeEventTarget {
+    constructor(
+      public textContent: string,
+      private readonly attributes: Record<string, string> = {},
+      private readonly children: readonly FakeElement[] = [],
+      private readonly visible: () => boolean = () => true,
+      private readonly onClick?: () => void,
+    ) {
+      super();
+    }
+
+    getAttribute(name: string): string | null {
+      return this.attributes[name] ?? null;
+    }
+
+    setAttribute(name: string, value: string): void {
+      this.attributes[name] = value;
+    }
+
+    private descendants(): FakeElement[] {
+      return this.children.flatMap((child) => [child, ...child.descendants()]);
+    }
+
+    private matchesSelector(selector: string): boolean {
+      const role = this.attributes.role ?? "";
+      const testId = this.attributes["data-testid"] ?? "";
+      if (selector.includes("composer-model-picker-slider-advanced-view")) {
+        return testId === "composer-model-picker-slider-advanced-view";
+      }
+      if (selector.includes("composer-intelligence-picker-content")) {
+        return testId === "composer-intelligence-picker-content";
+      }
+      if (selector.includes('role="menuitemradio"') && role === "menuitemradio") return true;
+      if (selector.includes('role="menuitem"') && role === "menuitem") return true;
+      if (selector.includes('role="menu"') && role === "menu") return true;
+      if (selector.includes('role="option"') && role === "option") return true;
+      if (selector.includes("button") && this.attributes.tag === "button") return true;
+      if (selector.includes("model-switcher-") && testId.startsWith("model-switcher-")) {
+        return true;
+      }
+      return false;
+    }
+
+    querySelector(selector: string): FakeElement | null {
+      return this.descendants().find((node) => node.matchesSelector(selector)) ?? null;
+    }
+
+    querySelectorAll(selector: string): FakeElement[] {
+      return this.descendants().filter((node) => node.matchesSelector(selector));
+    }
+
+    closest(_selector: string): FakeElement | null {
+      return null;
+    }
+
+    matches(selector: string): boolean {
+      return (
+        (selector.includes("__composer-pill") &&
+          this.attributes.class?.includes("__composer-pill")) ||
+        this.matchesSelector(selector)
+      );
+    }
+
+    contains(node: unknown): boolean {
+      return this.descendants().includes(node as FakeElement);
+    }
+
+    getBoundingClientRect(): {
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+    } {
+      return this.visible()
+        ? { x: 10, y: 10, width: 120, height: 36 }
+        : { x: 0, y: 0, width: 0, height: 0 };
+    }
+
+    focus(): void {}
+
+    override dispatchEvent(event: unknown): boolean {
+      if ((event as { type?: string }).type === "click") {
+        this.onClick?.();
+      }
+      return super.dispatchEvent(event);
+    }
+  }
+
+  let modelOpener: FakeElement;
+  const gpt55Row = new FakeElement(
+    "GPT-5.5",
+    {
+      role: "menuitemradio",
+      "aria-checked": initialModel === "GPT-5.5" ? "true" : "false",
+      "data-state": initialModel === "GPT-5.5" ? "checked" : "unchecked",
+    },
+    [],
+    () => modelSubmenuOpen,
+    () => {
+      clicks.gpt55 += 1;
+      selectedModel = "GPT-5.5";
+      gpt55Row.setAttribute("aria-checked", "true");
+      gpt55Row.setAttribute("data-state", "checked");
+      gpt56Row.setAttribute("aria-checked", "false");
+      gpt56Row.setAttribute("data-state", "unchecked");
+      modelOpener.textContent = `${modelWord}GPT-5.5`;
+    },
+  );
+  const gpt56Row = new FakeElement(
+    "GPT-5.6 Sol",
+    {
+      role: "menuitemradio",
+      "aria-checked": initialModel === "GPT-5.6 Sol" ? "true" : "false",
+      "data-state": initialModel === "GPT-5.6 Sol" ? "checked" : "unchecked",
+    },
+    [],
+    () => modelSubmenuOpen,
+  );
+  const modelSubmenu = new FakeElement(
+    "GPT-5.5GPT-5.6 Sol",
+    { role: "menu", id: "advanced-model-submenu" },
+    [gpt55Row, gpt56Row],
+    () => modelSubmenuOpen,
+  );
+  modelOpener = new FakeElement(
+    `${modelWord}${initialModel}`,
+    {
+      role: "menuitem",
+      "aria-haspopup": "menu",
+      "aria-controls": "advanced-model-submenu",
+      "aria-expanded": "false",
+      "data-state": "closed",
+    },
+    [],
+    () => advancedVisible,
+    () => {
+      clicks.model += 1;
+      modelSubmenuOpen = true;
+      modelOpener.setAttribute("aria-expanded", "true");
+      modelOpener.setAttribute("data-state", "open");
+    },
+  );
+  const effortOpener = new FakeElement(
+    `${effortWord}High`,
+    { role: "menuitem", "aria-haspopup": "menu", "data-state": "closed" },
+    [],
+    () => advancedVisible,
+    () => {
+      clicks.effort += 1;
+    },
+  );
+  const advancedView = new FakeElement(
+    `${modelWord}${initialModel}EffortHigh`,
+    { "data-testid": "composer-model-picker-slider-advanced-view" },
+    [modelOpener, effortOpener],
+    () => advancedVisible,
+  );
+  const advancedToggle = new FakeElement(
+    advancedWord,
+    { role: "menuitem", "aria-label": advancedWord, "aria-expanded": "false" },
+    [],
+    () => topMenuOpen,
+    () => {
+      clicks.advanced += 1;
+      advancedVisible = true;
+      advancedToggle.setAttribute("aria-expanded", "true");
+    },
+  );
+  const pickerContent = new FakeElement(
+    "High, 3 of 5.Advanced",
+    { "data-testid": "composer-intelligence-picker-content", role: "group" },
+    [advancedToggle, advancedView],
+    () => topMenuOpen,
+  );
+  const topMenu = new FakeElement(
+    "High, 3 of 5.Advanced",
+    { role: "menu" },
+    [pickerContent],
+    () => topMenuOpen,
+  );
+  const modelButton = new FakeElement(
+    "High",
+    {
+      tag: "button",
+      class: "__composer-pill",
+      "data-testid": "model-switcher-dropdown-button",
+      "aria-haspopup": "menu",
+      "aria-expanded": "false",
+    },
+    [],
+    () => true,
+    () => {
+      topMenuOpen = !topMenuOpen;
+      modelButton.setAttribute("aria-expanded", topMenuOpen ? "true" : "false");
+      if (!topMenuOpen) {
+        modelSubmenuOpen = false;
+      }
+    },
+  );
+
+  const documentStub = {
+    title: "",
+    body: { innerText: "" },
+    getElementById: (id: string) => (id === "advanced-model-submenu" ? modelSubmenu : null),
+    querySelector: (selector: string) => {
+      if (
+        selector.includes("model-switcher-dropdown-button") ||
+        selector.includes("button.__composer-pill")
+      ) {
+        return modelButton;
+      }
+      return null;
+    },
+    querySelectorAll: (selector: string) => {
+      if (selector.includes("button.__composer-pill") || selector.includes("button[aria-label]")) {
+        return [modelButton];
+      }
+      if (selector.includes('role="menu"') || selector.includes("data-radix")) {
+        return [...(topMenuOpen ? [topMenu] : []), ...(modelSubmenuOpen ? [modelSubmenu] : [])];
+      }
+      return [];
+    },
+    dispatchEvent: () => true,
+  };
+  const windowStub = {
+    location: { href: "https://chatgpt.com/" },
+    getComputedStyle: (node: FakeElement) => ({
+      display: node.getBoundingClientRect().width > 0 ? "block" : "none",
+      visibility: "visible",
+    }),
+  };
+  let now = 0;
+  const performanceStub = { now: () => (now += 50) };
+  const immediateSetTimeout = (handler: TimerHandler): number => {
+    if (typeof handler === "function") handler();
+    return 0;
+  };
+  const expression = buildModelSelectionExpressionForTest(targetModel);
+  const evaluate = new Function(
+    "document",
+    "performance",
+    "setTimeout",
+    "window",
+    "EventTarget",
+    "MouseEvent",
+    "HTMLElement",
+    `return ${expression};`,
+  ) as (...args: unknown[]) => Promise<unknown>;
+
+  const result = await evaluate(
+    documentStub,
+    performanceStub,
+    immediateSetTimeout,
+    windowStub,
+    FakeEventTarget,
+    FakeMouseEvent,
+    FakeElement,
+  );
+  return { result, selectedModel, clicks };
 };
 
 const evaluateConfiguredModelSelectionExpression = async (
@@ -1169,6 +1508,56 @@ describe("browser model selection matchers", () => {
     ).toEqual({ status: "already-selected", label: "GPT-5.6 Sol" });
   });
 
+  it("accepts a GPT-6 composer pill as the selected Latest model", () => {
+    expect(evaluateImmediateModelSelectionExpression("Latest", "6 Pro")).toEqual({
+      status: "already-selected",
+      label: "Latest",
+    });
+  });
+
+  it("verifies the current hidden-measurement picker from its checked Latest radio", () => {
+    expect(evaluateImmediateModelSelectionExpression("Latest", "Pro", "", "", "Latest")).toEqual({
+      status: "already-selected",
+      label: "Latest",
+    });
+  });
+
+  it("does not report Latest as selected while GPT-5.6 Sol is the active model", () => {
+    expect(evaluateImmediateModelSelectionExpression("Latest", "5.6 Pro")).toBeInstanceOf(Promise);
+    expect(evaluateImmediateModelSelectionExpression("Latest", "GPT-5.6 Sol")).toBeInstanceOf(
+      Promise,
+    );
+  });
+
+  it.each(["最新", "최신"])(
+    "matches the exact localized Latest radio %s without accepting GPT-5.6 Sol",
+    async (label) => {
+      const { labelTokens } = buildModelMatchersLiteralForTest("Latest");
+      expect(labelTokens).toContain(label);
+      await expect(
+        evaluateMenuModelSelectionExpression("Latest", {
+          label,
+          selectedButtonLabel: "6 Pro",
+        }),
+      ).resolves.toMatchObject({ status: "switched", label });
+      await expect(
+        evaluateMenuModelSelectionExpression("Latest", { label: "GPT-5.6 Sol" }),
+      ).resolves.toMatchObject({ status: "option-not-found" });
+    },
+  );
+
+  it("accepts only exact localized Latest evidence after selection", () => {
+    expect(() => assertResolvedModelSelectionForTest("Latest", "最新")).not.toThrow();
+    expect(() => assertResolvedModelSelectionForTest("Latest", "최신")).not.toThrow();
+    expect(() => assertResolvedModelSelectionForTest("Latest", "최신 아님")).toThrow(
+      /requires GPT-6 Astra/,
+    );
+    expect(() => assertResolvedModelSelectionForTest("Latest", "Latest")).not.toThrow();
+    expect(() => assertResolvedModelSelectionForTest("Latest", "GPT-5.6 Sol")).toThrow(
+      /requires GPT-6 Astra/,
+    );
+  });
+
   it("includes real pointer coordinates when opening version submenus", () => {
     const expression = buildModelSelectionExpressionForTest("GPT-5.6 Sol");
     expect(expression).toContain("rect.x + rect.width / 2");
@@ -1414,6 +1803,18 @@ describe("browser model selection matchers", () => {
   it("records a visible composer model label without requiring the picker", () => {
     const result = evaluateNoModelButtonExpression("Pro", "current", "Thinking");
     expect(result).toEqual({ status: "already-selected", label: "Thinking" });
+  });
+
+  it("reports the composer pill for a Latest target under the current strategy", () => {
+    // No checked advanced radio and no picker button: must resolve on the pill without throwing.
+    expect(evaluateNoModelButtonExpression("Latest", "current", "6Pro")).toEqual({
+      status: "already-selected",
+      label: "6Pro",
+    });
+    expect(evaluateNoModelButtonExpression("Latest", "current")).toEqual({
+      status: "already-selected",
+      label: null,
+    });
   });
 
   it("keeps strict selection failed when ChatGPT hides the model picker", () => {
@@ -1673,6 +2074,7 @@ describe("browser model selection matchers", () => {
     const expression = buildModelSelectionExpressionForTest("gpt-5.5-pro");
     expect(expression).toContain('data-testid="model-switcher-dropdown-button"');
     expect(expression).toContain("button.__composer-pill[aria-haspopup=");
+    expect(expression).toContain('button[data-codex-intelligence-trigger="true"]');
     expect(expression).toContain("const findModelButton = () =>");
     expect(expression).toContain("button.__composer-pill')).find(looksLikeModelPill)");
   });
@@ -1698,6 +2100,55 @@ describe("browser model selection matchers", () => {
       endPresses: 0,
       value: "4",
     });
+  });
+
+  it("selects GPT-5.5 through the collapsed Advanced -> Model submenu", async () => {
+    const harness = await evaluateAdvancedModelPickerExpression();
+    expect(harness.result).toEqual({ status: "switched", label: "GPT-5.5" });
+    expect(harness.selectedModel).toBe("GPT-5.5");
+    expect(harness.clicks.advanced).toBeGreaterThan(0);
+    expect(harness.clicks.model).toBeGreaterThan(0);
+    expect(harness.clicks.gpt55).toBeGreaterThan(0);
+    expect(harness.clicks.effort).toBe(0);
+  });
+
+  it("verifies an already-selected GPT-5.5 from the Advanced Model opener", async () => {
+    const harness = await evaluateAdvancedModelPickerExpression({ initialModel: "GPT-5.5" });
+    expect(harness.result).toEqual({ status: "already-selected", label: "GPT-5.5" });
+    expect(harness.clicks.advanced).toBeGreaterThan(0);
+    expect(harness.clicks.model).toBe(0);
+    expect(harness.clicks.gpt55).toBe(0);
+    expect(harness.clicks.effort).toBe(0);
+  });
+
+  it.each(["NFC", "NFD"] as const)(
+    "selects models through Korean picker labels in %s",
+    async (form) => {
+      const harness = await evaluateAdvancedModelPickerExpression({
+        advancedWord: "고급".normalize(form),
+        modelWord: "모델".normalize(form),
+        effortWord: "추론 수준".normalize(form),
+      });
+      expect(harness.result).toEqual({ status: "switched", label: "GPT-5.5" });
+      expect(harness.clicks.advanced).toBeGreaterThan(0);
+      expect(harness.clicks.model).toBeGreaterThan(0);
+      expect(harness.clicks.effort).toBe(0);
+    },
+  );
+
+  it("fails closed instead of guessing an unrecognized Model opener", async () => {
+    const harness = await evaluateAdvancedModelPickerExpression({ modelWord: "Versjon" });
+    expect(harness.result).toMatchObject({ status: "option-not-found" });
+    expect(harness.selectedModel).toBe("GPT-5.6 Sol");
+    expect(harness.clicks.model).toBe(0);
+    expect(harness.clicks.effort).toBe(0);
+  });
+
+  it("positively distinguishes the Model opener from its Effort sibling", () => {
+    const expression = buildModelSelectionExpressionForTest("Thinking 5.5");
+    expect(expression).toContain("const findModelSubmenuOpener = (menu) =>");
+    expect(expression).toContain("!containsPickerWord(label, EFFORT_WORDS)");
+    expect(expression).toContain("const descendIntoAdvancedModelPicker = () =>");
   });
 
   it("does not claim a model label when the new Intelligence picker exposes only effort", async () => {

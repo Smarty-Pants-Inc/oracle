@@ -1,10 +1,6 @@
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer, CallToolResult, ServerContext } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { getCliVersion } from "../../version.js";
-import {
-  LoggingMessageNotificationParamsSchema,
-  type CallToolResult,
-} from "@modelcontextprotocol/sdk/types.js";
 import { ensureBrowserAvailable, mapConsultToRunOptions } from "../utils.js";
 import type { RunOracleOptions } from "../../oracle.js";
 import type { EngineMode } from "../../cli/engine.js";
@@ -18,7 +14,10 @@ import {
   type OracleAgentBlocker,
 } from "../../oracle/agentDiagnostics.js";
 
-async function readSessionLogTail(sessionId: string, maxBytes: number): Promise<string | null> {
+export async function readSessionLogTail(
+  sessionId: string,
+  maxBytes: number,
+): Promise<string | null> {
   try {
     const log = await sessionStore.readLog(sessionId);
     if (log.length <= maxBytes) {
@@ -36,11 +35,18 @@ import { CONSULT_PRESETS, browserThinkingTimeRawSchema, consultInputSchema } fro
 import { applyConsultPreset } from "../consultPresets.js";
 import { loadUserConfig, type UserConfig } from "../../config.js";
 import { resolveNotificationSettings } from "../../cli/notifier.js";
-import { mapModelToBrowserLabel, resolveBrowserModelLabel } from "../../cli/browserConfig.js";
+import {
+  mapModelToBrowserLabel,
+  resolveBrowserModelLabel,
+  resolveDefaultBrowserThinkingTime,
+} from "../../cli/browserConfig.js";
 import type { BrowserModelStrategy } from "../../browser/types.js";
 import { normalizeThinkingTimeLevel } from "../../oracle/thinkingTime.js";
+import type { ThinkingTimeLevel } from "../../oracle/types.js";
+import { launchDetachedSession } from "../../cli/detachedSession.js";
+import { buildSessionLifecycle } from "../../cli/sessionLifecycle.js";
 
-// Use raw shapes so the MCP SDK (with its bundled Zod) wraps them and emits valid JSON Schema.
+// Shared fields are composed into explicit schemas when registering tools.
 const consultInputShape = {
   preset: z
     .enum(CONSULT_PRESETS)
@@ -69,7 +75,7 @@ const consultInputShape = {
     .enum(["api", "browser"])
     .optional()
     .describe(
-      "Execution engine. `api` uses OpenAI/other providers. `browser` automates the ChatGPT web UI (supports attachments and ChatGPT-only model labels). When omitted, Oracle follows CLI defaults: config/ORACLE_ENGINE first, then `api` when OPENAI_API_KEY is set, otherwise `browser`.",
+      "Execution engine. `api` uses provider APIs. `browser` uses ChatGPT automation or the local Gemini web client according to the model. Picker labels apply to ChatGPT only. When omitted, Oracle follows CLI defaults: config/ORACLE_ENGINE first, then `api` when OPENAI_API_KEY is set, otherwise `browser`.",
     ),
   browserModelLabel: z
     .string()
@@ -86,12 +92,14 @@ const consultInputShape = {
   browserBundleFiles: z
     .boolean()
     .optional()
-    .describe("Browser-only: bundle many files into a single upload (helps with upload limits)."),
+    .describe(
+      "Browser-only: force one upload bundle; auto/zip includes all resolved files. Multiple text/source uploads already bundle by default (flattened text unless ZIP is selected).",
+    ),
   browserBundleFormat: z
     .enum(["auto", "text", "zip"])
     .optional()
     .describe(
-      'Browser-only: bundle upload format when browserBundleFiles is true or auto-bundling is needed. Defaults to "auto"; "auto" uses ZIP when bundled inputs include raw/binary files.',
+      'Browser-only: bundle upload format. Defaults to "auto", which keeps flattened text for text-only uploads and uses ZIP when raw files are present; "zip" forces a byte-preserving archive.',
     ),
   browserThinkingTime: browserThinkingTimeRawSchema
     .optional()
@@ -103,9 +111,9 @@ const consultInputShape = {
       "Browser-only: model picker strategy. Mirrors the CLI --browser-model-strategy flag.",
     ),
   browserResearchMode: z
-    .enum(["deep"])
+    .enum(["search", "deep"])
     .optional()
-    .describe("Browser-only: activate ChatGPT Deep Research mode for broad web research."),
+    .describe("Browser-only: explicitly select ChatGPT Web Search or Deep Research."),
   browserArchive: z
     .enum(["auto", "always", "never"])
     .optional()
@@ -134,6 +142,12 @@ const consultInputShape = {
     .describe(
       "Browser-only image output fallback path, mirroring the CLI --output option for image operations.",
     ),
+  waitForCompletion: z
+    .boolean()
+    .optional()
+    .describe(
+      "When false, start the Oracle run in a detached worker and return its sessionId immediately. Use the wait tool to block for completion without agent-side polling. Defaults to true for compatibility.",
+    ),
   dryRun: z
     .boolean()
     .optional()
@@ -150,7 +164,7 @@ const consultInputShape = {
     .describe("Optional human-friendly session id (used for later `oracle sessions` lookups)."),
 } satisfies z.ZodRawShape;
 
-const consultModelSummaryShape = z.object({
+export const consultModelSummaryShape = z.object({
   model: z.string(),
   status: z.string(),
   startedAt: z.string().optional(),
@@ -180,7 +194,7 @@ const consultModelSummaryShape = z.object({
   logPath: z.string().optional(),
 });
 
-const consultArtifactSummaryShape = z.object({
+export const consultArtifactSummaryShape = z.object({
   kind: z.enum(["transcript", "deep-research-report", "image", "file"]),
   path: z.string(),
   label: z.string().optional(),
@@ -188,7 +202,7 @@ const consultArtifactSummaryShape = z.object({
   sizeBytes: z.number().optional(),
 });
 
-const consultImageSummaryShape = consultArtifactSummaryShape.extend({
+export const consultImageSummaryShape = consultArtifactSummaryShape.extend({
   kind: z.literal("image"),
   alt: z.string().optional(),
   width: z.number().optional(),
@@ -265,6 +279,7 @@ export const consultOutputShape = {
   artifacts: z.array(consultArtifactSummaryShape).optional(),
   images: z.array(consultImageSummaryShape).optional(),
   agentBlocker: consultAgentBlockerShape.optional(),
+  detached: z.boolean().optional(),
 } satisfies z.ZodRawShape;
 
 export type ConsultModelSummary = z.infer<typeof consultModelSummaryShape>;
@@ -368,9 +383,9 @@ export function buildConsultBrowserConfig({
   runModel: string;
   inputModel?: string;
   browserModelLabel?: string;
-  browserThinkingTime?: "light" | "standard" | "extended" | "heavy";
+  browserThinkingTime?: ThinkingTimeLevel;
   browserModelStrategy?: BrowserModelStrategy;
-  browserResearchMode?: "deep";
+  browserResearchMode?: "search" | "deep";
   browserArchive?: "auto" | "always" | "never";
   browserKeepBrowser?: boolean;
 }): BrowserSessionConfig {
@@ -387,12 +402,15 @@ export function buildConsultBrowserConfig({
     ? true
     : (configuredBrowser.manualLogin ?? process.platform === "win32");
   const configuredThinkingTime = normalizeThinkingTimeLevel(configuredBrowser.thinkingTime);
+  const modelStrategy = browserModelStrategy ?? configuredBrowser.modelStrategy;
 
   return {
     ...configuredBrowser,
     url: configuredUrl,
     chatgptUrl: configuredUrl,
-    cookieSync: !manualLogin,
+    cookieSync: manualLogin
+      ? configuredBrowser.manualLoginCookieSync === true
+      : configuredBrowser.cookieSync === true,
     headless: configuredBrowser.headless ?? false,
     hideWindow: true,
     keepBrowser: browserKeepBrowser ?? configuredBrowser.keepBrowser ?? false,
@@ -400,11 +418,19 @@ export function buildConsultBrowserConfig({
     manualLoginProfileDir: manualLogin
       ? ((envProfileDir || configuredBrowser.manualLoginProfileDir) ?? null)
       : null,
-    thinkingTime: browserThinkingTime ?? configuredThinkingTime ?? undefined,
-    modelStrategy: browserModelStrategy ?? configuredBrowser.modelStrategy,
+    thinkingTime:
+      browserThinkingTime ??
+      configuredThinkingTime ??
+      resolveDefaultBrowserThinkingTime({
+        model: runModel,
+        requestedModel: inputModel,
+        modelStrategy,
+      }),
+    modelStrategy,
     researchMode: browserResearchMode ?? configuredBrowser.researchMode,
     archiveConversations: browserArchive ?? configuredBrowser.archiveConversations,
     desiredModel: desiredModelLabel || mapModelToBrowserLabel(runModel),
+    modelIsImplicitDefault: !inputModel && !userConfig.model && !browserModelLabel,
   };
 }
 
@@ -529,11 +555,15 @@ export function formatConsultDryRunResolved(details: ConsultDryRunResolved): str
   return lines;
 }
 
-type McpLoggingServer = Pick<McpServer["server"], "sendLoggingMessage">;
-
 export async function runConsultTool(
   input: unknown,
-  { server }: { server: McpLoggingServer },
+  {
+    log: requestLog,
+    launchDetached = launchDetachedSession,
+  }: {
+    log: ServerContext["mcpReq"]["log"];
+    launchDetached?: typeof launchDetachedSession;
+  },
 ): Promise<CallToolResult> {
   const textContent = (text: string) => [{ type: "text" as const, text }];
   let parsedInput;
@@ -564,6 +594,7 @@ export async function runConsultTool(
     browserKeepBrowser,
     generateImage,
     outputPath,
+    waitForCompletion = true,
     dryRun,
     slug,
   } = parsedInput;
@@ -595,26 +626,9 @@ export async function runConsultTool(
   }
   const cwd = process.cwd();
   const sendLog = (text: string, level: "info" | "debug" = "info") =>
-    server
-      .sendLoggingMessage(
-        LoggingMessageNotificationParamsSchema.parse({
-          level,
-          data: { text, bytes: Buffer.byteLength(text, "utf8") },
-        }),
-      )
-      .catch(() => {});
+    requestLog(level, { text, bytes: Buffer.byteLength(text, "utf8") }).catch(() => {});
 
   const resolvedRemote = resolveRemoteServiceConfig({ userConfig, env: process.env });
-  const imageOutputPath = runOptions.generateImage ?? runOptions.outputPath;
-  if (resolvedEngine === "browser" && resolvedRemote.host && imageOutputPath) {
-    return {
-      isError: true,
-      content: textContent(
-        "ChatGPT image output is not supported with a remote browser service: generated files are not transferred back to the MCP caller. Unset ORACLE_REMOTE_HOST to generate images locally, or omit generateImage/outputPath.",
-      ),
-    };
-  }
-
   let browserConfig: BrowserSessionConfig | undefined;
   if (resolvedEngine === "browser") {
     browserConfig = buildConsultBrowserConfig({
@@ -665,6 +679,23 @@ export async function runConsultTool(
     };
   }
 
+  if (!waitForCompletion && resolvedEngine === "browser" && resolvedRemote.host) {
+    return {
+      isError: true,
+      content: textContent(
+        "Detached MCP consults are not supported with a remote browser service yet. Keep waitForCompletion:true for this run.",
+      ),
+    };
+  }
+  if (!waitForCompletion && process.env.ORACLE_NO_DETACH === "1") {
+    return {
+      isError: true,
+      content: textContent(
+        "Detached MCP consults are disabled by ORACLE_NO_DETACH=1. Remove it or keep waitForCompletion:true.",
+      ),
+    };
+  }
+
   const browserGuard = ensureBrowserAvailable(resolvedEngine, {
     remoteHost: resolvedRemote.host,
   });
@@ -706,11 +737,63 @@ export async function runConsultTool(
       mode: resolvedEngine,
       slug,
       browserConfig,
-      waitPreference: true,
+      waitPreference: waitForCompletion,
     },
     cwd,
     notifications,
   );
+
+  if (!waitForCompletion) {
+    try {
+      await launchDetached({
+        sessionId: sessionMeta.id,
+        prepare: async (workerPid) => {
+          const lifecycle = buildSessionLifecycle({
+            engine: resolvedEngine,
+            detached: true,
+            workerPid,
+            reattachCommand: `oracle session ${sessionMeta.id}`,
+          });
+          await sessionStore.updateSession(sessionMeta.id, {
+            status: "running",
+            startedAt: new Date().toISOString(),
+            lifecycle,
+          });
+        },
+      });
+      const started = (await sessionStore.readSession(sessionMeta.id)) ?? sessionMeta;
+      const summary = `Session ${sessionMeta.id} (${started.status}; detached)`;
+      return {
+        content: textContent(
+          `${summary}\nUse the wait tool with id=${JSON.stringify(sessionMeta.id)} to wait without polling.`,
+        ),
+        structuredContent: {
+          sessionId: sessionMeta.id,
+          status: started.status,
+          output: "",
+          models: summarizeModelRunsForConsult(started.models),
+          artifacts: summarizeArtifactsForConsult(started.artifacts),
+          images: summarizeImageArtifactsForConsult(started.artifacts),
+          detached: true,
+        },
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await sessionStore
+        .updateSession(sessionMeta.id, {
+          status: "error",
+          completedAt: new Date().toISOString(),
+          errorMessage: message,
+          response: { status: "error" },
+          error: { category: "internal", message },
+        })
+        .catch(() => undefined);
+      return {
+        isError: true,
+        content: textContent(`Unable to start detached session ${sessionMeta.id}: ${message}`),
+      };
+    }
+  }
 
   const logWriter = sessionStore.createLogWriter(sessionMeta.id);
   // Stream logs to both the session log and MCP logging notifications, but avoid buffering in memory
@@ -801,11 +884,10 @@ export function registerConsultTool(server: McpServer): void {
     {
       title: "Run an oracle session",
       description:
-        'Run an Oracle session (API or ChatGPT browser automation). Use `files` to attach project context. If `engine` is omitted, Oracle follows CLI defaults: config/ORACLE_ENGINE first, then API when OPENAI_API_KEY is set, otherwise browser. Browser GPT-5.5 Pro consults can take many minutes; use `dryRun:true` first when configuring an agent and inspect `sessions`/`oracle status` before retrying. Browser manual-login uses a private Oracle Chrome profile separate from the user\'s normal Chrome; dry-run output includes first-time setup guidance when that path is active. For browser-based image/file uploads, set `browserAttachments:"always"`. For ChatGPT image generation, set `generateImage` to enable the same image wait/download path as CLI --generate-image and read returned paths from `images`. Browser consults can include `browserFollowUps` for a multi-turn ChatGPT review in one conversation. Sessions are stored under `ORACLE_HOME_DIR` (shared with the CLI).',
-      // Cast to any to satisfy SDK typings across differing Zod versions.
-      inputSchema: consultInputShape,
-      outputSchema: consultOutputShape,
+        'Run an Oracle session (API or ChatGPT browser automation). Use `files` to attach project context. If `engine` is omitted, Oracle follows CLI defaults: config/ORACLE_ENGINE first, then API when OPENAI_API_KEY is set, otherwise browser. Browser GPT-5.5 Pro consults can take many minutes; set `waitForCompletion:false` to return a durable sessionId immediately, then use `wait` to block without agent-side polling. Use `dryRun:true` first when configuring an agent and inspect `sessions`/`oracle status` before retrying. Browser manual-login uses a private Oracle Chrome profile separate from the user\'s normal Chrome; dry-run output includes first-time setup guidance when that path is active. For browser-based image/file uploads, set `browserAttachments:"always"`. For ChatGPT image generation, set `generateImage` to enable the same image wait/download path as CLI --generate-image and read returned paths from `images`. Browser consults can include `browserFollowUps` for a multi-turn ChatGPT review in one conversation. Sessions are stored under `ORACLE_HOME_DIR` (shared with the CLI).',
+      inputSchema: z.object(consultInputShape),
+      outputSchema: z.object(consultOutputShape),
     },
-    async (input: unknown) => runConsultTool(input, { server: server.server }),
+    async (input: unknown, context) => runConsultTool(input, { log: context.mcpReq.log }),
   );
 }

@@ -62,8 +62,13 @@ describe("consult MCP failure diagnostics", () => {
     resolveNotificationSettings.mockClear();
     sendLoggingMessage.mockClear();
     registerConsultTool({
-      registerTool: (_name: string, _def: unknown, fn: (input: unknown) => Promise<unknown>) => {
-        handler = fn;
+      registerTool: (
+        _name: string,
+        _def: unknown,
+        fn: (input: unknown, context: unknown) => Promise<unknown>,
+      ) => {
+        // Upstream MCP SDK v2 handlers receive a request context with the logger.
+        handler = (input) => fn(input, { mcpReq: { log: async () => undefined } });
       },
       server: { sendLoggingMessage },
     } as unknown as Parameters<typeof registerConsultTool>[0]);

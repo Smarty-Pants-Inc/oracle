@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { LaunchedChrome } from "chrome-launcher";
@@ -7,6 +7,7 @@ import type { LaunchedChrome } from "chrome-launcher";
 const cdpNewMock = vi.fn();
 const cdpCloseMock = vi.fn();
 const cdpListMock = vi.fn();
+const chromeLaunchMock = vi.fn();
 const cdpMock = Object.assign(vi.fn(), {
   // biome-ignore lint/style/useNamingConvention: CDP API uses capitalized members.
   New: cdpNewMock,
@@ -17,6 +18,11 @@ const cdpMock = Object.assign(vi.fn(), {
 });
 
 vi.mock("chrome-remote-interface", () => ({ default: cdpMock }));
+
+vi.mock("chrome-launcher", async (importOriginal) => {
+  const original = await importOriginal<typeof import("chrome-launcher")>();
+  return { ...original, launch: chromeLaunchMock };
+});
 
 vi.doMock("../../src/browser/profileState.js", async () => {
   const original = await vi.importActual<typeof import("../../src/browser/profileState.js")>(
@@ -214,6 +220,38 @@ describe("registerTerminationHooks", () => {
       vi.useRealTimers();
     }
   });
+
+  test("never kills shared manual-login Chrome from a signal hook", async () => {
+    const { registerTerminationHooks } = await import("../../src/browser/chromeLifecycle.js");
+    const chrome = {
+      kill: vi.fn().mockResolvedValue(undefined),
+      pid: 1234,
+      port: 9222,
+    };
+    const logger = vi.fn();
+    const previousExitCode = process.exitCode;
+    const removeHooks = registerTerminationHooks(
+      chrome as unknown as import("chrome-launcher").LaunchedChrome,
+      "/tmp/oracle-shared-manual-login-profile",
+      false,
+      logger,
+      {
+        isInFlight: () => false,
+        preserveUserDataDir: true,
+        preserveSharedChromeOnSignal: true,
+      },
+    );
+
+    try {
+      process.emit("SIGTERM");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(chrome.kill).not.toHaveBeenCalled();
+      expect(logger).toHaveBeenCalledWith(expect.stringContaining("leaving Chrome running"));
+    } finally {
+      removeHooks();
+      process.exitCode = previousExitCode;
+    }
+  });
 });
 
 describe("copied-profile launch flags", () => {
@@ -230,9 +268,45 @@ describe("copied-profile launch flags", () => {
     expect(options.chromeFlags).not.toContain("--password-store=basic");
     expect(options.chromeFlags).toContain("--remote-debugging-address=0.0.0.0");
   });
+
+  test("uses the native Keychain for a persistent macOS manual-login profile", async () => {
+    const { resolveChromeLaunchOptionsForTest } =
+      await import("../../src/browser/chromeLifecycle.js");
+    const flags = ["--use-mock-keychain", "--password-store=basic", "--no-first-run"];
+    const options = resolveChromeLaunchOptionsForTest(flags, false, true, "darwin");
+    expect(options.ignoreDefaultFlags).toBe(true);
+    expect(options.chromeFlags).not.toContain("--use-mock-keychain");
+    expect(options.chromeFlags).not.toContain("--password-store=basic");
+    expect(options.chromeFlags).toContain("--no-first-run");
+    expect(resolveChromeLaunchOptionsForTest(flags, false, true, "linux").ignoreDefaultFlags).toBe(
+      false,
+    );
+  });
+
+  test("keeps the old cookie mode for existing macOS profiles", async () => {
+    const { resolveChromeLaunchOptionsForTest, shouldUseNativeManualLoginKeychain } =
+      await import("../../src/browser/chromeLifecycle.js");
+    const profile = await mkdtemp(path.join(os.tmpdir(), "oracle-keychain-mode-"));
+    try {
+      expect(await shouldUseNativeManualLoginKeychain(profile, "darwin")).toBe(true);
+      await writeFile(path.join(profile, "Local State"), "{}");
+      expect(await shouldUseNativeManualLoginKeychain(profile, "darwin")).toBe(false);
+      const legacy = resolveChromeLaunchOptionsForTest([], false, false, "darwin");
+      expect(legacy.ignoreDefaultFlags).toBe(false);
+      await writeFile(path.join(profile, ".oracle-native-keychain-v1"), "native-keychain\n");
+      expect(await shouldUseNativeManualLoginKeychain(profile, "darwin")).toBe(true);
+      expect(await shouldUseNativeManualLoginKeychain(profile, "linux")).toBe(false);
+    } finally {
+      await rm(profile, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("hidden-window launch flags", () => {
+  beforeEach(() => {
+    chromeLaunchMock.mockReset();
+  });
+
   test("keeps macOS Chrome rendered in an off-screen window", async () => {
     const { buildChromeFlagsForTest } = await import("../../src/browser/chromeLifecycle.js");
     const flags = buildChromeFlagsForTest(false, undefined, true);
@@ -244,12 +318,12 @@ describe("hidden-window launch flags", () => {
     }
   });
 
-  test("does not add a window position to headless Chrome", async () => {
+  test("adds the headless launch flag without an off-screen window position", async () => {
     const { buildChromeFlagsForTest } = await import("../../src/browser/chromeLifecycle.js");
+    const flags = buildChromeFlagsForTest(true, undefined, true);
 
-    expect(buildChromeFlagsForTest(true, undefined, true)).not.toContain(
-      "--window-position=-32000,-32000",
-    );
+    expect(flags).toContain("--headless=new");
+    expect(flags).not.toContain("--window-position=-32000,-32000");
   });
 
   test("adds no-sandbox flags only when ORACLE_CHROME_NO_SANDBOX=1", async () => {
@@ -271,23 +345,208 @@ describe("hidden-window launch flags", () => {
     }
   });
 
-  test("moves a running macOS Chrome window without minimizing it", async () => {
-    const { positionChromeWindowOffscreen } = await import("../../src/browser/chromeLifecycle.js");
+  test("detaches only shared Windows profiles, never temporary or copied profiles", async () => {
+    const { shouldDetachSharedChromeForTest } =
+      await import("../../src/browser/chromeLifecycle.js");
+    expect(shouldDetachSharedChromeForTest({ manualLogin: true }, "win32")).toBe(true);
+    expect(shouldDetachSharedChromeForTest({ manualLogin: false }, "win32")).toBe(false);
+    expect(
+      shouldDetachSharedChromeForTest({ manualLogin: true, copyProfileSource: "source" }, "win32"),
+    ).toBe(false);
+    expect(shouldDetachSharedChromeForTest({ manualLogin: true }, "linux")).toBe(false);
+    expect(shouldDetachSharedChromeForTest({ manualLogin: true }, "darwin")).toBe(false);
+  });
+
+  test("detaches Windows Chrome from the controller process without opening a console", async () => {
+    const { resolveChromeChildSpawnOptionsForTest } =
+      await import("../../src/browser/chromeLifecycle.js");
+    const stdio: Array<"ignore" | number> = ["ignore", 1, 2];
+
+    expect(
+      resolveChromeChildSpawnOptionsForTest(
+        { detached: false, windowsHide: false, stdio },
+        "win32",
+      ),
+    ).toMatchObject({
+      detached: true,
+      windowsHide: true,
+      stdio,
+    });
+    expect(
+      resolveChromeChildSpawnOptionsForTest(
+        { detached: false, windowsHide: false, stdio },
+        "linux",
+      ),
+    ).toMatchObject({
+      detached: false,
+      windowsHide: false,
+      stdio,
+    });
+  });
+
+  test.skipIf(process.platform !== "darwin")(
+    "records persisted profile bounds before a fresh hidden Chrome launch",
+    async () => {
+      const { launchChrome } = await import("../../src/browser/chromeLifecycle.js");
+      const { resolveBrowserConfig } = await import("../../src/browser/config.js");
+      const userDataDir = await mkdtemp(path.join(os.tmpdir(), "oracle-prelaunch-window-"));
+      const profileDir = path.join(userDataDir, "Default");
+      await mkdir(profileDir, { recursive: true });
+      await writeFile(
+        path.join(profileDir, "Preferences"),
+        JSON.stringify({
+          browser: {
+            window_placement: {
+              left: 240,
+              top: 120,
+              right: 1340,
+              bottom: 880,
+              maximized: false,
+            },
+          },
+        }),
+        "utf8",
+      );
+      let markerAtLaunch: unknown;
+      let launchFlags: string[] = [];
+      chromeLaunchMock.mockImplementation(async (options: { chromeFlags?: string[] }) => {
+        markerAtLaunch = JSON.parse(
+          await readFile(path.join(userDataDir, "oracle-window-state.json"), "utf8"),
+        );
+        launchFlags = options.chromeFlags ?? [];
+        return { pid: 1234, port: 9222, kill: vi.fn() };
+      });
+
+      try {
+        await launchChrome(
+          resolveBrowserConfig({
+            chromePath: "/tmp/Google Chrome for Testing",
+            headless: false,
+            hideWindow: true,
+          }),
+          userDataDir,
+          vi.fn() as never,
+        );
+
+        expect(markerAtLaunch).toEqual({
+          version: 1,
+          bounds: {
+            left: 240,
+            top: 120,
+            width: 1100,
+            height: 760,
+            windowState: "normal",
+          },
+        });
+        expect(launchFlags).toContain("--window-position=-32000,-32000");
+      } finally {
+        await rm(userDataDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("restores the exact pre-hide bounds for a persistent macOS window", async () => {
+    const { positionChromeWindowOffscreen, positionChromeWindowOnscreen } =
+      await import("../../src/browser/chromeLifecycle.js");
+    const userDataDir = await mkdtemp(path.join(os.tmpdir(), "oracle-window-state-"));
     const browser = {
       getWindowForTarget: vi.fn().mockResolvedValue({ windowId: 7 }),
+      getWindowBounds: vi.fn().mockResolvedValue({
+        bounds: { left: 240, top: 120, width: 1100, height: 760, windowState: "normal" },
+      }),
       setWindowBounds: vi.fn().mockResolvedValue(undefined),
     };
     const logger = vi.fn();
 
-    await positionChromeWindowOffscreen({ Browser: browser } as never, logger as never);
+    try {
+      await positionChromeWindowOffscreen(
+        { Browser: browser } as never,
+        userDataDir,
+        logger as never,
+      );
+      await positionChromeWindowOnscreen(
+        { Browser: browser } as never,
+        userDataDir,
+        logger as never,
+      );
 
-    if (process.platform === "darwin") {
-      expect(browser.setWindowBounds).toHaveBeenCalledWith({
-        windowId: 7,
-        bounds: { left: -32_000, top: -32_000, windowState: "normal" },
-      });
-    } else {
+      if (process.platform === "darwin") {
+        expect(browser.setWindowBounds).toHaveBeenNthCalledWith(1, {
+          windowId: 7,
+          bounds: { left: -32_000, top: -32_000, windowState: "normal" },
+        });
+        expect(browser.setWindowBounds).toHaveBeenNthCalledWith(2, {
+          windowId: 7,
+          bounds: { left: 240, top: 120, width: 1100, height: 760, windowState: "normal" },
+        });
+      } else {
+        expect(browser.setWindowBounds).not.toHaveBeenCalled();
+      }
+    } finally {
+      await rm(userDataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves an unmarked user-positioned macOS window with negative bounds", async () => {
+    const { positionChromeWindowOnscreen } = await import("../../src/browser/chromeLifecycle.js");
+    const userDataDir = await mkdtemp(path.join(os.tmpdir(), "oracle-visible-window-"));
+    const browser = {
+      getWindowForTarget: vi.fn().mockResolvedValue({ windowId: 9 }),
+      getWindowBounds: vi.fn().mockResolvedValue({
+        bounds: { left: -1440, top: 120, width: 1280, height: 720, windowState: "normal" },
+      }),
+      setWindowBounds: vi.fn().mockResolvedValue(undefined),
+    };
+    const logger = vi.fn();
+
+    try {
+      await positionChromeWindowOnscreen(
+        { Browser: browser } as never,
+        userDataDir,
+        logger as never,
+      );
+
+      expect(browser.getWindowForTarget).not.toHaveBeenCalled();
+      expect(browser.getWindowBounds).not.toHaveBeenCalled();
       expect(browser.setWindowBounds).not.toHaveBeenCalled();
+    } finally {
+      await rm(userDataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("restores a pre-hide maximized macOS window without forcing normal bounds", async () => {
+    const { positionChromeWindowOffscreen, positionChromeWindowOnscreen } =
+      await import("../../src/browser/chromeLifecycle.js");
+    const userDataDir = await mkdtemp(path.join(os.tmpdir(), "oracle-maximized-window-"));
+    const browser = {
+      getWindowForTarget: vi.fn().mockResolvedValue({ windowId: 10 }),
+      getWindowBounds: vi.fn().mockResolvedValue({ bounds: { windowState: "maximized" } }),
+      setWindowBounds: vi.fn().mockResolvedValue(undefined),
+    };
+    const logger = vi.fn();
+
+    try {
+      await positionChromeWindowOffscreen(
+        { Browser: browser } as never,
+        userDataDir,
+        logger as never,
+      );
+      await positionChromeWindowOnscreen(
+        { Browser: browser } as never,
+        userDataDir,
+        logger as never,
+      );
+
+      if (process.platform === "darwin") {
+        expect(browser.setWindowBounds).toHaveBeenNthCalledWith(2, {
+          windowId: 10,
+          bounds: { windowState: "maximized" },
+        });
+      } else {
+        expect(browser.setWindowBounds).not.toHaveBeenCalled();
+      }
+    } finally {
+      await rm(userDataDir, { recursive: true, force: true });
     }
   });
 });
@@ -352,6 +611,111 @@ describe("connectWithNewTab", () => {
     expect(cdpMock).not.toHaveBeenCalled();
   });
 
+  test("remote new-task failure never attaches an unrelated conversation", async () => {
+    cdpNewMock.mockRejectedValue(new Error("cannot create tab"));
+    const { connectToRemoteChrome } = await import("../../src/browser/chromeLifecycle.js");
+    await expect(
+      connectToRemoteChrome(
+        "127.0.0.1",
+        9222,
+        vi.fn<(message: string) => void>(),
+        "about:blank",
+        undefined,
+        {
+          fallbackToDefault: false,
+        },
+      ),
+    ).rejects.toThrow(/unrelated conversation/);
+    expect(cdpMock).not.toHaveBeenCalled();
+  });
+
+  test("strict remote mode also forbids default-target fallback when the URL is omitted", async () => {
+    cdpNewMock.mockRejectedValue(new Error("cannot create tab"));
+    const { connectToRemoteChrome } = await import("../../src/browser/chromeLifecycle.js");
+    await expect(
+      connectToRemoteChrome(
+        "127.0.0.1",
+        9222,
+        vi.fn<(message: string) => void>(),
+        undefined,
+        undefined,
+        { fallbackToDefault: false },
+      ),
+    ).rejects.toThrow(/unrelated conversation/);
+    expect(cdpNewMock).toHaveBeenCalledWith({ host: "127.0.0.1", port: 9222, url: "about:blank" });
+    expect(cdpMock).not.toHaveBeenCalled();
+  });
+
+  test("strict remote attachment failure closes only its new target", async () => {
+    cdpNewMock.mockResolvedValue({ id: "owned-new-tab" });
+    cdpMock.mockRejectedValueOnce(new Error("attach failed"));
+    cdpCloseMock.mockResolvedValue(undefined);
+    const { connectToRemoteChrome } = await import("../../src/browser/chromeLifecycle.js");
+    await expect(
+      connectToRemoteChrome(
+        "127.0.0.1",
+        9222,
+        vi.fn<(message: string) => void>(),
+        "about:blank",
+        undefined,
+        { fallbackToDefault: false },
+      ),
+    ).rejects.toThrow(/unrelated conversation/);
+    expect(cdpMock).toHaveBeenCalledTimes(1);
+    expect(cdpMock).toHaveBeenCalledWith(expect.objectContaining({ target: "owned-new-tab" }));
+    expect(cdpCloseMock).toHaveBeenCalledWith({
+      host: "127.0.0.1",
+      port: 9222,
+      id: "owned-new-tab",
+    });
+  });
+
+  test("strict remote connection returns its dedicated target when available", async () => {
+    cdpNewMock.mockResolvedValue({ id: "owned-success" });
+    const client = { close: vi.fn().mockResolvedValue(undefined) };
+    cdpMock.mockResolvedValue(client);
+    cdpCloseMock.mockResolvedValue(undefined);
+    const { connectToRemoteChrome } = await import("../../src/browser/chromeLifecycle.js");
+    const result = await connectToRemoteChrome(
+      "127.0.0.1",
+      9222,
+      vi.fn<(message: string) => void>(),
+      "about:blank",
+      undefined,
+      { fallbackToDefault: false },
+    );
+    expect(result.targetId).toBe("owned-success");
+    expect(result.client).toBe(client);
+    await result.close();
+    expect(client.close).toHaveBeenCalledTimes(1);
+    expect(cdpCloseMock).toHaveBeenCalledWith({
+      host: "127.0.0.1",
+      port: 9222,
+      id: "owned-success",
+    });
+  });
+
+  test("ordinary remote runs never connect to the default tab after target creation fails", async () => {
+    cdpNewMock.mockRejectedValue(new Error("cannot create tab"));
+    // Fork policy: remote runs first bind to the live browser identity. When that probe fails,
+    // the run fails closed before any tab is created or reused.
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("probe refused")));
+    try {
+      const { runBrowserMode } = await import("../../src/browser/index.js");
+      await expect(
+        runBrowserMode({
+          prompt: "A new isolated task",
+          config: { remoteChrome: { host: "127.0.0.1", port: 9222 }, manualLogin: false },
+          log: vi.fn<(message: string) => void>(),
+        }),
+      ).rejects.toThrow(/identity probe failed/);
+      expect(cdpNewMock).not.toHaveBeenCalled();
+      expect(cdpMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   test("returns isolated target when attach succeeds", async () => {
     cdpNewMock.mockResolvedValue({ id: "target-2" });
     cdpMock.mockResolvedValue({});
@@ -391,6 +755,7 @@ describe("connectWithNewTab", () => {
 
 describe("closeBlankChromeTabs", () => {
   beforeEach(() => {
+    vi.resetModules();
     cdpMock.mockReset();
     cdpNewMock.mockReset();
     cdpCloseMock.mockReset();
@@ -537,6 +902,37 @@ describe("closeBlankChromeTabs", () => {
     expect(send).toHaveBeenCalledWith("Target.setAutoAttach", { autoAttach: true }, "session-9");
   });
 
+  test.each([true, false])(
+    "retains the browser transport with preserveTarget=%s",
+    async (preserveTarget) => {
+      const browser = {
+        Target: {
+          createTarget: vi.fn(async () => ({ targetId: "owned" })),
+          attachToTarget: vi.fn(async () => ({ sessionId: "session" })),
+          detachFromTarget: vi.fn(async () => ({})),
+          closeTarget: vi.fn(async () => ({ success: true })),
+        },
+        on: vi.fn(),
+        once: vi.fn(),
+        removeListener: vi.fn(),
+        close: vi.fn(async () => {}),
+      };
+      cdpMock.mockResolvedValueOnce(browser);
+      const { connectToRemoteChrome } = await import("../../src/browser/chromeLifecycle.js");
+      const connection = await connectToRemoteChrome(
+        "127.0.0.1",
+        9222,
+        () => {},
+        "about:blank",
+        "ws://127.0.0.1:9222/devtools/browser/test",
+      );
+      await connection.close({ preserveTarget });
+      expect(browser.Target.detachFromTarget).toHaveBeenCalledOnce();
+      expect(browser.close).not.toHaveBeenCalled();
+      expect(browser.Target.closeTarget).toHaveBeenCalledTimes(preserveTarget ? 0 : 1);
+    },
+  );
+
   test("waits on a single websocket connection attempt for Chrome approval", async () => {
     vi.useFakeTimers();
     const browserClient = {
@@ -580,9 +976,10 @@ describe("closeBlankChromeTabs", () => {
 
     expect(cdpMock).toHaveBeenCalledTimes(1);
     expect(logger).toHaveBeenCalledWith(
-      "Waiting for Chrome remote debugging approval for 127.0.0.1:9222...",
+      "[browser] Waiting for Chrome remote debugging approval for 127.0.0.1:9222...",
     );
     expect(connection.targetId).toBe("target-10");
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   test("fails after the approval wait without opening a second websocket request", async () => {
@@ -608,8 +1005,117 @@ describe("closeBlankChromeTabs", () => {
 
     expect(cdpMock).toHaveBeenCalledTimes(1);
     expect(logger).toHaveBeenCalledWith(
-      "Waiting for Chrome remote debugging approval for 127.0.0.1:9222...",
+      "[browser] Waiting for Chrome remote debugging approval for 127.0.0.1:9222...",
     );
+  });
+
+  test("keeps one approval request pending beyond 20 seconds and logs every 15 seconds", async () => {
+    vi.useFakeTimers();
+    const browser = {
+      Target: { getTargets: vi.fn(async () => ({ targetInfos: [] })) },
+      close: vi.fn(async () => {}),
+    };
+    cdpMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(() => resolve(browser), 55_000);
+        }),
+    );
+    const { listRemoteChromeTargets } = await import("../../src/browser/chromeLifecycle.js");
+    const logger = vi.fn();
+    const waiting = listRemoteChromeTargets({
+      host: "127.0.0.1",
+      port: 9222,
+      browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+      approvalWaitMs: 300_000,
+      logger,
+    });
+    await vi.advanceTimersByTimeAsync(54_999);
+    expect(cdpMock).toHaveBeenCalledTimes(1);
+    expect(browser.Target.getTargets).not.toHaveBeenCalled();
+    expect(logger.mock.calls.map(([line]) => line)).toEqual([
+      "[browser] Waiting for Chrome remote debugging approval for 127.0.0.1:9222...",
+      "[browser] Still waiting for Chrome remote debugging approval for 127.0.0.1:9222 (15s elapsed). Click Allow in an open Chrome window.",
+      "[browser] Still waiting for Chrome remote debugging approval for 127.0.0.1:9222 (30s elapsed). Click Allow in an open Chrome window.",
+      "[browser] Still waiting for Chrome remote debugging approval for 127.0.0.1:9222 (45s elapsed). Click Allow in an open Chrome window.",
+    ]);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(waiting).resolves.toEqual([]);
+    expect(browser.close).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test("retains the browser-level CDP connection when target discovery is cancelled", async () => {
+    const cancellation = new AbortController();
+    const browser = {
+      Target: { getTargets: vi.fn(() => new Promise(() => undefined)) },
+      close: vi.fn(async () => {}),
+    };
+    cdpMock.mockResolvedValueOnce(browser);
+    const { listRemoteChromeTargets } = await import("../../src/browser/chromeLifecycle.js");
+    const waiting = listRemoteChromeTargets({
+      host: "127.0.0.1",
+      port: 9222,
+      browserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+      signal: cancellation.signal,
+    });
+    await vi.waitFor(() => expect(browser.Target.getTargets).toHaveBeenCalledOnce());
+    cancellation.abort();
+
+    const { BrowserRunCancelledError: CancellationError } =
+      await import("../../src/oracle/errors.js");
+    await expect(waiting).rejects.toThrow(CancellationError);
+    expect(browser.close).not.toHaveBeenCalled();
+  });
+
+  test("releases a connection approved after its deadline without creating a tab", async () => {
+    vi.useFakeTimers();
+    const browser = {
+      Target: { createTarget: vi.fn() },
+      close: vi.fn(async () => {}),
+    };
+    cdpMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(() => resolve(browser), 21_000);
+        }),
+    );
+    const { connectToRemoteChrome } = await import("../../src/browser/chromeLifecycle.js");
+    const logger = vi.fn();
+    const waiting = connectToRemoteChrome(
+      "127.0.0.1",
+      9222,
+      logger,
+      "about:blank",
+      "ws://127.0.0.1:9222/devtools/browser/abc",
+      { approvalWaitMs: 20_000 },
+    );
+    const failure = expect(waiting).rejects.toThrow(/waited 20s/);
+    await vi.advanceTimersByTimeAsync(20_000);
+    await failure;
+    const messages = logger.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(browser.close).not.toHaveBeenCalled();
+    expect(browser.Target.createTarget).not.toHaveBeenCalled();
+    expect(logger).toHaveBeenCalledTimes(messages);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test("stops approval progress timers on non-approval connection failures", async () => {
+    vi.useFakeTimers();
+    cdpMock.mockRejectedValueOnce(new Error("ECONNREFUSED"));
+    const { connectToRemoteChrome } = await import("../../src/browser/chromeLifecycle.js");
+    await expect(
+      connectToRemoteChrome(
+        "127.0.0.1",
+        9222,
+        vi.fn<(message: string) => void>(),
+        "about:blank",
+        "ws://127.0.0.1:9222/devtools/browser/abc",
+        { approvalWaitMs: 300_000 },
+      ),
+    ).rejects.toThrow("ECONNREFUSED");
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   test("closes a browser websocket client that resolves after approval timeout", async () => {
@@ -645,7 +1151,8 @@ describe("closeBlankChromeTabs", () => {
 
       resolveClient(lateClient);
       await Promise.resolve();
-      expect(lateClient.close).toHaveBeenCalledOnce();
+      // Upstream releases the late waiter but keeps the approved shared socket for other waiters.
+      expect(lateClient.close).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
@@ -691,6 +1198,8 @@ describe("closeBlankChromeTabs", () => {
 
 describe("connectToRemoteChromeTarget", () => {
   beforeEach(() => {
+    // Upstream caches one browser connection per endpoint for the process lifetime.
+    vi.resetModules();
     cdpMock.mockReset();
   });
 
@@ -735,7 +1244,8 @@ describe("connectToRemoteChromeTarget", () => {
       targetId: "target-attach-failure",
     });
     expect(browserClient.Target.getTargets).toHaveBeenCalledOnce();
-    expect(browserClient.close).toHaveBeenCalledOnce();
+    // Upstream keeps one shared browser socket per endpoint; disposal releases it, never closes it.
+    expect(browserClient.close).not.toHaveBeenCalled();
   });
 
   test("bounds target attachment and cleans up a target created before timeout", async () => {
@@ -783,7 +1293,8 @@ describe("connectToRemoteChromeTarget", () => {
       expect(browserClient.Target.closeTarget).toHaveBeenCalledWith({
         targetId: "target-attach-timeout",
       });
-      expect(browserClient.close).toHaveBeenCalledOnce();
+      // Upstream keeps one shared browser socket per endpoint; disposal releases it, never closes it.
+      expect(browserClient.close).not.toHaveBeenCalled();
 
       resolveAttach({ sessionId: "late-session" });
       await Promise.resolve();
@@ -838,7 +1349,8 @@ describe("connectToRemoteChromeTarget", () => {
 
       await expect(closing).resolves.toBeUndefined();
       expect(browserClient.Target.getTargets).toHaveBeenCalledTimes(2);
-      expect(browserClient.close).toHaveBeenCalledOnce();
+      // Upstream keeps one shared browser socket per endpoint; disposal releases it, never closes it.
+      expect(browserClient.close).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
@@ -937,7 +1449,8 @@ describe("connectToRemoteChromeTarget", () => {
 
     await expect(connection.close()).rejects.toThrow(/remote Chrome target cleanup failed/i);
     expect(browserClient.Target.closeTarget).toHaveBeenCalledWith({ targetId: "target-cleanup" });
-    expect(browserClient.close).toHaveBeenCalledOnce();
+    // Upstream keeps one shared browser socket per endpoint; disposal releases it, never closes it.
+    expect(browserClient.close).not.toHaveBeenCalled();
   });
 
   test("bounds non-dedicated remote connection cleanup", async () => {
@@ -975,7 +1488,8 @@ describe("connectToRemoteChromeTarget", () => {
     expect(browserClient.Target.detachFromTarget).toHaveBeenCalledWith({
       sessionId: "existing-session",
     });
-    expect(browserClient.close).toHaveBeenCalledOnce();
+    // Upstream keeps one shared browser socket per endpoint; disposal releases it, never closes it.
+    expect(browserClient.close).not.toHaveBeenCalled();
   }, 2_000);
   test("bounds hung CDP commands while destroying a dedicated remote target", async () => {
     vi.useFakeTimers();
@@ -1022,7 +1536,8 @@ describe("connectToRemoteChromeTarget", () => {
 
       expect(browserClient.Target.closeTarget).toHaveBeenCalledOnce();
       expect(browserClient.Target.getTargets).toHaveBeenCalled();
-      expect(browserClient.close).toHaveBeenCalledOnce();
+      // Upstream keeps one shared browser socket per endpoint; disposal releases it, never closes it.
+      expect(browserClient.close).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
@@ -1066,10 +1581,11 @@ describe("connectToRemoteChromeTarget", () => {
 
     await expect(connection.close()).resolves.toBeUndefined();
     expect(browserClient.Target.getTargets).toHaveBeenCalledOnce();
-    expect(browserClient.close).toHaveBeenCalledOnce();
+    // Upstream keeps one shared browser socket per endpoint; disposal releases it, never closes it.
+    expect(browserClient.close).not.toHaveBeenCalled();
   });
 
-  test("preserves browser-close failures after target absence is confirmed", async () => {
+  test("retains the shared browser socket after target absence is confirmed", async () => {
     const browserClient = {
       Target: {
         createTarget: vi.fn(async () => ({ targetId: "target-browser-close" })),
@@ -1107,7 +1623,9 @@ describe("connectToRemoteChromeTarget", () => {
       },
     );
 
-    await expect(connection.close()).rejects.toThrow(/browser close failed/i);
+    // Upstream retains the shared browser socket, so a failing socket close is never reached.
+    await expect(connection.close()).resolves.toBeUndefined();
+    expect(browserClient.close).not.toHaveBeenCalled();
   });
 });
 

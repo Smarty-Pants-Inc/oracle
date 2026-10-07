@@ -453,7 +453,7 @@ describe("resolveRunOptionsFromConfig", () => {
     expect(officialSibling.runOptions.model).toBe("gpt-5.6-luna");
   });
 
-  it("maps browser engine Pro aliases to gpt-5.5-pro", () => {
+  it("maps browser engine Pro aliases to GPT-5.6 Sol", () => {
     const { resolvedEngine, runOptions } = resolveRunOptionsFromConfig({
       prompt: basePrompt,
       model: "gpt-5.1-pro",
@@ -492,6 +492,26 @@ describe("resolveRunOptionsFromConfig", () => {
     expect(resolvedEngine).toBe("api");
     expect(runOptions.model).toBe("gpt-5.6-sol-pro");
     expect(runOptions.effectiveModelId).toBe("gpt-5.6-sol");
+  });
+
+  it("maps browser engine gpt-6-pro to gpt-6-pro", () => {
+    const { resolvedEngine, runOptions } = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "gpt-6-pro",
+      engine: "browser",
+    });
+    expect(resolvedEngine).toBe("browser");
+    expect(runOptions.model).toBe("gpt-6-pro");
+  });
+
+  it("rejects gpt-6-pro for API engine runs", () => {
+    expect(() =>
+      resolveRunOptionsFromConfig({
+        prompt: basePrompt,
+        model: "gpt-6-pro",
+        engine: "api",
+      }),
+    ).toThrow("Use --model gpt-6-astra --reasoning-mode pro");
   });
 
   it("keeps gpt-5.4-pro unchanged for API engine runs", () => {
@@ -576,6 +596,40 @@ describe("resolveRunOptionsFromConfig", () => {
     expect(resolvedEngine).toBe("api");
     expect(engineCoercedToApi).toBe(true);
     expect(runOptions.baseUrl).toBe("https://api.example/v1");
+  });
+
+  it("rejects gpt-6-pro when multi-model request coerces browser engine to api mode", () => {
+    expect(() =>
+      resolveRunOptionsFromConfig({
+        prompt: basePrompt,
+        engine: "browser",
+        models: ["gpt-6-pro"],
+      }),
+    ).toThrow(/GPT-6 Pro is an API reasoning mode, not a model slug/);
+  });
+
+  it("rejects gpt-6-pro when implicit browser engine is coerced to api mode by Azure endpoint", () => {
+    const env: NodeJS.ProcessEnv = {
+      AZURE_OPENAI_ENDPOINT: "https://example-resource.openai.azure.com/",
+      AZURE_OPENAI_DEPLOYMENT: "my-gpt",
+    } as NodeJS.ProcessEnv;
+    expect(() =>
+      resolveRunOptionsFromConfig({
+        prompt: basePrompt,
+        model: "gpt-6-pro",
+        env,
+      }),
+    ).toThrow(/GPT-6 Pro is an API reasoning mode, not a model slug/);
+  });
+
+  it("resolves gpt-6-pro when single-model browser engine is preserved", () => {
+    const { runOptions, resolvedEngine } = resolveRunOptionsFromConfig({
+      prompt: basePrompt,
+      model: "gpt-6-pro",
+      engine: "browser",
+    });
+    expect(resolvedEngine).toBe("browser");
+    expect(runOptions.model).toBe("gpt-6-pro");
   });
 });
 

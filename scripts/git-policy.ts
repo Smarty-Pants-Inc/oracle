@@ -18,12 +18,10 @@ export type GitExecutionContext = {
 };
 
 export type GitPolicyEvaluation = {
-  requiresCommitHelper: boolean;
   requiresExplicitConsent: boolean;
   isDestructive: boolean;
 };
 
-const COMMIT_HELPER_SUBCOMMANDS = new Set(["add", "commit"]);
 const GUARDED_SUBCOMMANDS = new Set(["push", "pull", "merge", "rebase", "cherry-pick"]);
 const DESTRUCTIVE_SUBCOMMANDS = new Set([
   "reset",
@@ -131,13 +129,6 @@ export function analyzeGitExecution(
   };
 }
 
-export function requiresCommitHelper(subcommand: string | null): boolean {
-  if (!subcommand) {
-    return false;
-  }
-  return COMMIT_HELPER_SUBCOMMANDS.has(subcommand);
-}
-
 export function requiresExplicitGitConsent(subcommand: string | null): boolean {
   if (!subcommand) {
     return false;
@@ -170,7 +161,6 @@ export function evaluateGitPolicies(context: GitExecutionContext): GitPolicyEval
   const invocationArgv = context.invocation?.argv;
   const normalizedArgv = Array.isArray(invocationArgv) ? invocationArgv : [];
   return {
-    requiresCommitHelper: requiresCommitHelper(context.subcommand),
     requiresExplicitConsent: requiresExplicitGitConsent(context.subcommand),
     isDestructive: isDestructiveGitSubcommand(context.command, normalizedArgv),
   };

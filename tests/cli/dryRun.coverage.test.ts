@@ -126,7 +126,7 @@ describe("runDryRunSummary", () => {
     expect(joined).toContain("cookie-sync");
   });
 
-  test("browser dry run shows default cookie copy when none provided and no files attached", async () => {
+  test("browser dry run shows cookie copy disabled by default", async () => {
     const log = vi.fn();
     const assembleBrowserPromptImpl = vi.fn().mockResolvedValue({
       markdown: "[SYSTEM]\n[USER]",
@@ -154,7 +154,7 @@ describe("runDryRunSummary", () => {
     );
 
     const joined = log.mock.calls.flat().join("\n");
-    expect(joined).toContain("Cookies: copy from Chrome");
+    expect(joined).toContain("Cookies: Chrome copy disabled");
     expect(joined).toContain("No files attached");
   });
 
@@ -194,6 +194,7 @@ describe("runDryRunSummary", () => {
     );
     let joined = log.mock.calls.flat().join("\n");
     expect(joined).toContain("Browser control: attach to an already-running local Chrome session");
+    expect(joined).toContain("Cookies: Chrome copy disabled");
     expect(joined).toContain("Preview JSON");
     expect(joined).toContain('"composerText": "Preview text"');
     expect(joined).toContain('"chatgptUrl": "https://chatgpt.com/g/g-p-demo/project"');

@@ -1,14 +1,24 @@
 import type { ChromeClient, BrowserLogger } from "../types.js";
 import {
+  ACTION_BAR_COPY_BUTTON_SELECTOR,
   ANSWER_SELECTORS,
   ASSISTANT_ROLE_SELECTOR,
+  CONVERSATION_EXCHANGE_SELECTOR,
   CONVERSATION_TURN_SELECTOR,
+  CONVERSATION_UNIT_SELECTOR,
   COPY_BUTTON_SELECTOR,
   FINISHED_ACTIONS_SELECTOR,
   STOP_BUTTON_SELECTORS,
 } from "../constants.js";
-import { buildConversationTurnListExpression } from "../conversationTurns.js";
-import { buildThinkingActivePredicateJs, readThinkingActivity } from "./thinkingStatus.js";
+import {
+  buildConversationTurnListExpression,
+  buildLastAssistantMessageExpression,
+} from "../conversationTurns.js";
+import {
+  buildThinkingActivePredicateJs,
+  buildThinkingActivityDetailsPredicateJs,
+  readThinkingActivity,
+} from "./thinkingStatus.js";
 import { delay } from "../utils.js";
 import {
   logDomFailure,
@@ -18,6 +28,8 @@ import {
 import { buildClickDispatcher } from "./domEvents.js";
 import { buildEvaluatedChatGptPageAffinityGuard } from "../chatgptAccount.js";
 import { CHATGPT_ORIGINS } from "../conversationUrl.js";
+import { buildReadCompletionAnnouncementExpression } from "./completionAnnouncement.js";
+import { BrowserAutomationError } from "../../oracle/errors.js";
 
 const ASSISTANT_POLL_TIMEOUT_ERROR = "assistant-response-watchdog-timeout";
 const STOP_CONTROL_SELECTOR = STOP_BUTTON_SELECTORS.join(", ");
@@ -51,6 +63,26 @@ export interface TerminalGateState {
   lastChangeAt: number;
   barStableCycles: number;
   seen: boolean;
+}
+
+export interface CompletionAnnouncementGateState {
+  turnKey: string | null;
+  sawIncomplete: boolean;
+}
+
+export function advanceCompletionAnnouncementGate(
+  state: CompletionAnnouncementGateState,
+  turnKey: string | null,
+  statusComplete: boolean,
+): { state: CompletionAnnouncementGateState; accept: boolean } {
+  if (!turnKey) return { state: { turnKey: null, sawIncomplete: false }, accept: false };
+  const sameTurn = state.turnKey === turnKey;
+  return {
+    state: { turnKey, sawIncomplete: !statusComplete || (sameTurn && state.sawIncomplete) },
+    // A page-wide announcement is useful only after it changed from incomplete
+    // to complete while the sampled assistant turn was already present.
+    accept: statusComplete && sameTurn && state.sawIncomplete,
+  };
 }
 
 export interface TerminalSample {
@@ -140,22 +172,83 @@ function matchesThinkingStatusLabel(trimmed: string): boolean {
   return trimmed.startsWith("pro thinking") && trimmed.length <= 40;
 }
 
-export function isAnswerNowPlaceholderText(value: string): boolean {
-  const text = value.toLowerCase().replace(/\s+/g, " ").trim();
+// Single source of truth for the "Answer now" placeholder test.
+//
+// This function is ALSO injected verbatim into page expressions via
+// buildAnswerNowPlaceholderPredicateJs (it is stringified with
+// Function.prototype.toString), so it MUST stay closure-free: no imports, no module
+// constants, no helpers. Anything it references must be declared inside its own body
+// or it will throw a ReferenceError inside the renderer.
+//
+// Learned the hard way: ChatGPT's Pro UI keeps the "Answer now" skip-ahead control
+// mounted for the whole reasoning phase, so a bare `text.includes('answer now')` test
+// matched real answers that merely ended with that chrome and discarded them wholesale
+// at every extraction layer. A placeholder is short UI furniture, so this matches the
+// WHOLE trimmed string against known chrome labels behind a length cap, the way the
+// sibling predicates in this file already do.
+//
+// The cap is 60, taken from isActiveLabel in ./thinkingStatus.ts rather than the 40 used
+// by matchesThinkingStatusLabel above: 40 bounds a single status label, while the longest
+// genuine placeholder here is the composite
+// "chatgpt said: file upload request pro thinking answer now" (57 chars), which a 40 cap
+// would wrongly let through.
+export function isAnswerNowPlaceholderText(value: unknown): boolean {
+  let raw = "";
+  if (typeof value === "string") {
+    raw = value;
+  } else if (value && typeof value === "object" && "text" in value) {
+    const candidate = (value as { text?: unknown }).text;
+    if (typeof candidate === "string") raw = candidate;
+  }
+  const text = raw.toLowerCase().replace(/\s+/g, " ").trim();
   if (!text) return false;
   // Learned: "Pro thinking" shows a placeholder turn that contains "Answer now".
   // That is not the final answer and must be ignored in browser automation.
   if (text === "pro thinking" || text === "thinking" || text === "reasoning") return true;
   if (text === "chatgpt said:" || text === "chatgpt said") return true;
-  if (
-    text.includes("file upload request") &&
-    (text.includes("pro thinking") || text.includes("chatgpt said"))
-  ) {
-    return true;
+  if (text.length > 60) return false;
+  // Whole-string match: consume the text left to right, longest chrome label first.
+  // Any residue means real content is present, so this is an answer, not a placeholder.
+  const chromeLabels = [
+    "chatgpt said:",
+    "chatgpt said",
+    "file upload request",
+    "pro thinking",
+    "answer now",
+  ];
+  let rest = text;
+  let sawOwner = false; // "pro thinking" / "chatgpt said"
+  let sawGate = false; // "answer now" / "file upload request"
+  while (rest.length > 0) {
+    let matched = "";
+    for (const label of chromeLabels) {
+      if (label.length > matched.length && rest.startsWith(label)) matched = label;
+    }
+    if (!matched) return false;
+    if (matched === "answer now" || matched === "file upload request") sawGate = true;
+    else sawOwner = true;
+    rest = rest.slice(matched.length).replace(/^[\s:.,;|\u00b7\u2022-]+/, "");
   }
+  return sawGate && sawOwner;
+}
+
+export function isRetryAssistantUiErrorText(value: unknown, retryVisible: boolean): boolean {
+  if (!retryVisible || typeof value !== "string") return false;
+  const text = value.toLowerCase().replace(/\s+/g, " ").trim();
   return (
-    text.includes("answer now") && (text.includes("pro thinking") || text.includes("chatgpt said"))
+    text.includes("something went wrong") ||
+    text.includes("failed to generate") ||
+    text.includes("try again later")
   );
+}
+
+// Exported: the two page expressions below and the tests all consume this one builder,
+// so the predicate cannot drift between the node side and the renderer.
+export function buildAnswerNowPlaceholderPredicateJs(fnName: string): string {
+  // Inject the node-side definition itself so a correction can never land in only one
+  // copy. `const x = function name(){}` is a valid expression, so the exported
+  // declaration stringifies straight into the page expression.
+  return `const ${fnName} = ${isAnswerNowPlaceholderText.toString()};`;
 }
 
 function buildActiveThinkingStatusPredicateJs(fnName: string): string {
@@ -264,6 +357,8 @@ export async function waitForAssistantResponse(
         await terminateRuntimeExecution(Runtime);
         throw error;
       } else if (source === "poll") {
+        evaluationPromise.catch(() => undefined);
+        await terminateRuntimeExecution(Runtime);
         throw error;
       } else if (source === "evaluation") {
         const recovered = await recoverAssistantResponse(
@@ -427,7 +522,9 @@ export async function captureAssistantMarkdown(
     awaitPromise: true,
   });
   if (result?.value?.success && typeof result.value.markdown === "string") {
-    return result.value.markdown;
+    return result.value.fileCard
+      ? result.value.markdown.replace(/:chatgpt-content-reference\{index="\d+"\}/g, "")
+      : result.value.markdown;
   }
   const status = result?.value?.status;
   if (status === "conversation-mismatch") return null;
@@ -458,7 +555,6 @@ export function buildAssistantSnapshotExpressionForTest(
     expectedConversationUrl,
   );
 }
-
 export function buildConversationDebugExpressionForTest(): string {
   return buildConversationDebugExpression();
 }
@@ -566,6 +662,7 @@ async function parseAssistantEvaluationResult(
     typeof result.value === "object" &&
     "text" in result.value
   ) {
+    throwIfAssistantUiError(result.value as AssistantSnapshot);
     const html =
       typeof (result.value as { html?: unknown }).html === "string"
         ? ((result.value as { html?: string }).html ?? undefined)
@@ -687,6 +784,10 @@ async function pollAssistantCompletion(
 } | null> {
   const watchdogDeadline = Date.now() + timeoutMs;
   let gate = createTerminalGateState(Date.now());
+  let announcementGate: CompletionAnnouncementGateState = {
+    turnKey: null,
+    sawIncomplete: false,
+  };
   while (Date.now() < watchdogDeadline) {
     // Check abort signal to stop polling when another path won the race
     if (abortSignal?.aborted) {
@@ -705,9 +806,28 @@ async function pollAssistantCompletion(
       if (isGeneratedImageAssistantAnswer(normalized)) {
         return normalized;
       }
+      const turnIndex = typeof snapshot?.turnIndex === "number" ? snapshot.turnIndex : null;
+      const turnKey =
+        typeof minTurnIndex === "number" && turnIndex !== null && turnIndex >= minTurnIndex
+          ? `${turnIndex}:${normalized.meta.messageId ?? normalized.meta.turnId ?? ""}`
+          : null;
+      const statusComplete = await readPageResponseCompleteStatus(Runtime);
+      const announcement = advanceCompletionAnnouncementGate(
+        announcementGate,
+        turnKey,
+        statusComplete,
+      );
+      announcementGate = announcement.state;
+      const trackedComplete =
+        turnIndex !== null && (await readTrackedCompletionAnnouncement(Runtime, turnIndex));
       const [stopVisible, barVisible, thinkingActivity] = await Promise.all([
         isStopButtonVisible(Runtime),
-        isCompletionVisible(Runtime, normalized.meta, minTurnIndex),
+        isCompletionVisible(
+          Runtime,
+          normalized.meta,
+          minTurnIndex,
+          trackedComplete || announcement.accept,
+        ),
         readThinkingActivity(Runtime),
       ]);
       const decision = classifyTurnTerminal(
@@ -777,9 +897,30 @@ function buildStopButtonVisibilityPredicateJs(fnName: string): string {
 
 export const buildStopButtonVisibilityExpressionForTest = buildStopButtonVisibilityExpression;
 
+// Legacy controls live inside the assistant turn. Current search-unit markup
+// puts the finished-turn bar after the assistant unit in the same exchange.
+function buildTurnActionLocatorJs(fnName: string): string {
+  const unitLiteral = JSON.stringify(CONVERSATION_UNIT_SELECTOR);
+  const exchangeLiteral = JSON.stringify(CONVERSATION_EXCHANGE_SELECTOR);
+  return `const ${fnName} = (turn, inTurnSelector, besideSelector) => {
+    const assistant = ${buildLastAssistantMessageExpression("turn")};
+    const safe = control => !control.closest('[data-user-message-bubble], [data-content-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":user"], [data-message-author-role="user"], pre, code');
+    const inside = Array.from((assistant || turn).querySelectorAll(inTurnSelector)).find(safe);
+    if (inside) return inside;
+    const exchange = assistant?.closest?.(${exchangeLiteral}) || turn;
+    if (!exchange) return null;
+    return Array.from(exchange.querySelectorAll(besideSelector)).find(
+      (control) =>
+        safe(control) && (control.closest(${unitLiteral}) === assistant ||
+          (!control.closest(${unitLiteral}) && assistant && Boolean(assistant.compareDocumentPosition(control) & 4))),
+    ) ?? null;
+  };`;
+}
+
 function buildCompletionVisibilityExpression(
   meta: { turnId?: string | null; messageId?: string | null },
   minTurnIndex?: number,
+  allowPageStatus = false,
 ): string {
   const expectedMessageId = meta.messageId ? JSON.stringify(meta.messageId) : "null";
   const expectedTurnId = meta.turnId ? JSON.stringify(meta.turnId) : "null";
@@ -796,14 +937,18 @@ function buildCompletionVisibilityExpression(
     const ASSISTANT_SELECTOR = '${ASSISTANT_ROLE_SELECTOR}';
     const isAssistantTurn = (node) => {
       if (!(node instanceof HTMLElement)) return false;
+      const searchKey = (node.getAttribute('data-content-search-unit-key') || node.getAttribute('data-chatgpt-search-unit-key') || '').toLowerCase();
+      if (searchKey.endsWith(':user')) return false;
+      if (searchKey.endsWith(':assistant')) return true;
       const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
       if (turnAttr === 'assistant') return true;
-      const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
+      const role = (node.getAttribute('data-message-author-role') || (node.getAttribute?.('data-content-search-unit-key') || node.getAttribute?.('data-chatgpt-search-unit-key'))?.split(':').at(-1) || node.dataset?.messageAuthorRole || '').toLowerCase();
       if (role === 'assistant') return true;
       const testId = (node.getAttribute('data-testid') || '').toLowerCase();
       if (testId.includes('assistant')) return true;
       return Boolean(node.querySelector(ASSISTANT_SELECTOR) || node.querySelector('[data-testid*="assistant"]'));
     };
+    ${buildTurnActionLocatorJs("findTurnAction")}
 
     const turns = ${buildConversationTurnListExpression()};
     let lastAssistantTurn = null;
@@ -821,11 +966,11 @@ function buildCompletionVisibilityExpression(
     if (hasExpectedIdentity) {
       const identityNodes = [
         lastAssistantTurn,
-        ...Array.from(lastAssistantTurn.querySelectorAll('[data-message-id], [data-testid]')),
+        ...Array.from(lastAssistantTurn.querySelectorAll('[data-message-id], [data-testid], [data-content-search-unit-key], [data-chatgpt-search-unit-key], [data-turn-key]')),
       ];
       const identityMatches = identityNodes.some((node) =>
-        (EXPECTED_MESSAGE_ID && node.getAttribute?.('data-message-id') === EXPECTED_MESSAGE_ID) ||
-        (EXPECTED_TURN_ID && node.getAttribute?.('data-testid') === EXPECTED_TURN_ID),
+        (EXPECTED_MESSAGE_ID && (node.getAttribute?.('data-message-id') || node.getAttribute?.('data-chatgpt-selection-message-id') || node.getAttribute?.('data-chatgpt-search-message-ids')?.split(' ')[0] || node.getAttribute?.('data-content-search-unit-key') || node.getAttribute?.('data-chatgpt-search-unit-key')) === EXPECTED_MESSAGE_ID) ||
+        (EXPECTED_TURN_ID && (node.getAttribute?.('data-turn-key') || node.getAttribute?.('data-testid')) === EXPECTED_TURN_ID),
       );
       if (!identityMatches) return false;
     } else if (MIN_TURN_INDEX < 0 || lastAssistantIndex < MIN_TURN_INDEX) {
@@ -834,7 +979,12 @@ function buildCompletionVisibilityExpression(
       return false;
     }
 
-    if (lastAssistantTurn.querySelector('${FINISHED_ACTIONS_SELECTOR}')) return true;
+    if (${allowPageStatus}) return true;
+    const finished = ${JSON.stringify(FINISHED_ACTIONS_SELECTOR)};
+    if (findTurnAction(lastAssistantTurn, finished, finished)) return true;
+    const assistantRoot = ${buildLastAssistantMessageExpression("lastAssistantTurn")};
+    if (assistantRoot?.querySelector('button[aria-label="Download file"]:not(:disabled):not([aria-disabled="true"])') &&
+        assistantRoot.querySelector('button[aria-label^="Open preview of "][aria-busy="false"]')) return true;
     const markdowns = lastAssistantTurn.querySelectorAll('.markdown');
     return Array.from(markdowns).some((node) => (node.textContent || '').trim() === 'Done');
   })()`;
@@ -848,14 +998,42 @@ async function isCompletionVisible(
     completionVisible?: boolean;
   },
   minTurnIndex?: number,
+  allowPageStatus = false,
 ): Promise<boolean> {
   if (hasScopedCompletionProof(meta)) return true;
   try {
     const { result } = await Runtime.evaluate({
-      expression: buildCompletionVisibilityExpression(meta, minTurnIndex),
+      expression: buildCompletionVisibilityExpression(meta, minTurnIndex, allowPageStatus),
       returnByValue: true,
     });
     return Boolean(result?.value);
+  } catch {
+    return false;
+  }
+}
+
+async function readPageResponseCompleteStatus(Runtime: ChromeClient["Runtime"]): Promise<boolean> {
+  try {
+    const { result } = await Runtime.evaluate({
+      expression: `Array.from(document.querySelectorAll('[role="status"][aria-live="polite"]')).some((status) => (status.textContent || '').trim() === 'Response complete')`,
+      returnByValue: true,
+    });
+    return result?.value === true;
+  } catch {
+    return false;
+  }
+}
+
+async function readTrackedCompletionAnnouncement(
+  Runtime: ChromeClient["Runtime"],
+  turnIndex: number,
+): Promise<boolean> {
+  try {
+    const { result } = await Runtime.evaluate({
+      expression: buildReadCompletionAnnouncementExpression(turnIndex),
+      returnByValue: true,
+    });
+    return result?.value === true;
   } catch {
     return false;
   }
@@ -876,6 +1054,7 @@ function normalizeAssistantSnapshot(snapshot: AssistantSnapshot | null): {
     completionVisible?: boolean;
   };
 } | null {
+  throwIfAssistantUiError(snapshot);
   const text = snapshot?.text ? cleanAssistantText(snapshot.text) : "";
   if (!text.trim()) {
     return null;
@@ -899,6 +1078,22 @@ function normalizeAssistantSnapshot(snapshot: AssistantSnapshot | null): {
       ...(snapshot?.completionVisible === true ? { completionVisible: true } : {}),
     },
   };
+}
+
+export function throwIfAssistantUiError(snapshot: AssistantSnapshot | null): void {
+  if (snapshot?.uiError !== "temporary_unavailable") return;
+  throw new BrowserAutomationError(
+    "ChatGPT could not generate the submitted assistant turn and offered Retry.",
+    {
+      stage: "assistant-ui-error",
+      code: "chatgpt-ui-warning",
+      uiWarning: {
+        type: "temporary_unavailable",
+        message: "ChatGPT offered Retry for the submitted assistant turn.",
+        source: "assistant-turn",
+      },
+    },
+  );
 }
 
 function isGeneratedImageAssistantAnswer(answer: { html?: string } | null): boolean {
@@ -968,15 +1163,7 @@ function buildAssistantSnapshotExpression(
     // Learned: the default turn DOM misses project view; keep a fallback extractor.
     ${buildAssistantExtractor("extractAssistantTurn")}
     const extracted = extractAssistantTurn();
-    const isPlaceholder = (snapshot) => {
-      const normalized = String(snapshot?.text ?? '').toLowerCase().trim();
-      if (normalized === 'pro thinking' || normalized === 'thinking' || normalized === 'reasoning') return true;
-      if (normalized === 'chatgpt said:' || normalized === 'chatgpt said') return true;
-      if (normalized.includes('file upload request') && (normalized.includes('pro thinking') || normalized.includes('chatgpt said'))) {
-        return true;
-      }
-      return normalized.includes('answer now') && (normalized.includes('pro thinking') || normalized.includes('chatgpt said'));
-    };
+    ${buildAnswerNowPlaceholderPredicateJs("isPlaceholder")}
     ${buildActiveThinkingStatusPredicateJs("isActiveThinkingStatus")}
     if (
       extracted &&
@@ -1030,6 +1217,7 @@ function buildResponseObserverExpression(
     const SELECTORS = ${selectorsLiteral};
     const STOP_SELECTOR = ${JSON.stringify(STOP_CONTROL_SELECTOR)};
     const FINISHED_SELECTOR = '${FINISHED_ACTIONS_SELECTOR}';
+    ${buildTurnActionLocatorJs("findTurnAction")}
     const ASSISTANT_SELECTOR = ${assistantLiteral};
     const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
     const EXPECTED_CONVERSATION_URL = ${expectedConversationUrlLiteral};
@@ -1086,24 +1274,19 @@ function buildResponseObserverExpression(
       if (!EXPECTED_CONVERSATION_ID) return true;
       return current?.id === EXPECTED_CONVERSATION_ID;
     };
-    const isAnswerNowPlaceholder = (snapshot) => {
-      const normalized = String(snapshot?.text ?? '').toLowerCase().trim();
-      if (normalized === 'pro thinking' || normalized === 'thinking' || normalized === 'reasoning') return true;
-      if (normalized === 'chatgpt said:' || normalized === 'chatgpt said') return true;
-      if (normalized.includes('file upload request') && (normalized.includes('pro thinking') || normalized.includes('chatgpt said'))) {
-        return true;
-      }
-      return normalized.includes('answer now') && (normalized.includes('pro thinking') || normalized.includes('chatgpt said'));
-    };
+    ${buildAnswerNowPlaceholderPredicateJs("isAnswerNowPlaceholder")}
     ${buildActiveThinkingStatusPredicateJs("isActiveThinkingStatus")}
     ${buildThinkingActivePredicateJs("isThinkingActiveNow")}
 
     // Helper to detect assistant turns - must match buildAssistantExtractor logic for consistency.
     const isAssistantTurn = (node) => {
       if (!(node instanceof HTMLElement)) return false;
+      const searchKey = (node.getAttribute('data-content-search-unit-key') || node.getAttribute('data-chatgpt-search-unit-key') || '').toLowerCase();
+      if (searchKey.endsWith(':user')) return false;
+      if (searchKey.endsWith(':assistant')) return true;
       const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
       if (turnAttr === 'assistant') return true;
-      const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
+      const role = (node.getAttribute('data-message-author-role') || (node.getAttribute?.('data-content-search-unit-key') || node.getAttribute?.('data-chatgpt-search-unit-key'))?.split(':').at(-1) || node.dataset?.messageAuthorRole || '').toLowerCase();
       if (role === 'assistant') return true;
       const testId = (node.getAttribute('data-testid') || '').toLowerCase();
       if (testId.includes('assistant')) return true;
@@ -1207,7 +1390,7 @@ function buildResponseObserverExpression(
       }
       if (!lastAssistantTurn) return false;
       // Check for action buttons in this specific turn
-      if (lastAssistantTurn.querySelector(FINISHED_SELECTOR)) return true;
+      if (findTurnAction(lastAssistantTurn, FINISHED_SELECTOR, FINISHED_SELECTOR)) return true;
       // Check for "Done" text in this turn's markdown
       const markdowns = lastAssistantTurn.querySelectorAll('.markdown');
       return Array.from(markdowns).some((n) => (n.textContent || '').trim() === 'Done');
@@ -1311,14 +1494,19 @@ function buildAssistantExtractor(functionName: string): string {
   const assistantLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
   return `const ${functionName} = () => {
     ${buildClickDispatcher()}
+    ${buildThinkingActivityDetailsPredicateJs("readRetryThinkingActivity")}
+    const isRetryAssistantUiError = ${isRetryAssistantUiErrorText.toString()};
     const ASSISTANT_SELECTOR = ${assistantLiteral};
     const isAssistantTurn = (node) => {
       if (!(node instanceof HTMLElement)) return false;
+      const searchKey = (node.getAttribute('data-content-search-unit-key') || node.getAttribute('data-chatgpt-search-unit-key') || '').toLowerCase();
+      if (searchKey.endsWith(':user')) return false;
+      if (searchKey.endsWith(':assistant')) return true;
       const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
       if (turnAttr === 'assistant') {
         return true;
       }
-      const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
+      const role = (node.getAttribute('data-message-author-role') || (node.getAttribute?.('data-content-search-unit-key') || node.getAttribute?.('data-chatgpt-search-unit-key'))?.split(':').at(-1) || node.dataset?.messageAuthorRole || '').toLowerCase();
       if (role === 'assistant') {
         return true;
       }
@@ -1352,15 +1540,18 @@ function buildAssistantExtractor(functionName: string): string {
       if (!isAssistantTurn(turn)) {
         continue;
       }
-      const messageRoot = turn.querySelector(ASSISTANT_SELECTOR) ?? turn;
+      const messageRoot = ${buildLastAssistantMessageExpression("turn")} ?? turn;
       expandCollapsibles(messageRoot);
       const preferred =
         (messageRoot.matches?.('.markdown') || messageRoot.matches?.('[data-message-content]') ? messageRoot : null) ||
+        Array.from(messageRoot.querySelectorAll('[data-markdown-text-style="assistant-message"]'))
+          .filter(node => node.getAttribute('data-markdown-text-tone') !== 'tertiary').at(-1) ||
         messageRoot.querySelector('.markdown') ||
         messageRoot.querySelector('[data-message-content]') ||
         messageRoot.querySelector('[data-testid*="message"]') ||
         messageRoot.querySelector('[data-testid*="assistant"]') ||
         messageRoot.querySelector('.prose') ||
+        messageRoot.querySelector('[class*="MarkdownRoot"]') ||
         messageRoot.querySelector('[class*="markdown"]');
       const contentRoot = preferred ?? messageRoot;
       if (!contentRoot) {
@@ -1368,14 +1559,30 @@ function buildAssistantExtractor(functionName: string): string {
       }
       const innerText = contentRoot?.innerText ?? '';
       const textContent = contentRoot?.textContent ?? '';
-      const text = innerText.trim().length > 0 ? innerText : textContent;
-      const html = contentRoot?.innerHTML ?? '';
-      const messageId = messageRoot.getAttribute('data-message-id');
-      const turnId = messageRoot.getAttribute('data-testid');
+      const fileNames = Array.from(messageRoot.querySelectorAll('button[aria-label^="Open preview of "][aria-busy="false"]'))
+        .map(node => node.getAttribute('aria-label').slice('Open preview of '.length));
+      const text = innerText.trim().length > 0 ? innerText : textContent.trim().length > 0 ? textContent : fileNames.join('\\n');
+      const html = fileNames.length > 0 ? messageRoot.innerHTML : contentRoot?.innerHTML ?? '';
+      const messageId = messageRoot.getAttribute('data-message-id') || messageRoot.getAttribute?.('data-chatgpt-selection-message-id') || messageRoot.getAttribute('data-chatgpt-search-message-ids')?.split(' ')[0] || messageRoot.getAttribute('data-content-search-unit-key') || messageRoot.getAttribute('data-chatgpt-search-unit-key');
+      const turnId = turn.getAttribute('data-turn-key') || messageRoot.getAttribute('data-testid');
       const generatedImages = Array.from(messageRoot.querySelectorAll('img')).filter((img) =>
         String(img?.src || '').includes('/backend-api/estuary/content?id=file_')
       );
       const normalizedText = String(text || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+      const retryVisible = Array.from(turn.querySelectorAll('button, [role="button"]')).some((button) => {
+        const label = String(button.innerText || button.textContent || button.getAttribute?.('aria-label') || '')
+          .toLowerCase()
+          .replace(/\\s+/g, ' ')
+          .trim();
+        if (label !== 'retry' || !(button instanceof HTMLElement)) return false;
+        const rect = button.getBoundingClientRect();
+        const style = window.getComputedStyle(button);
+        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' &&
+          !(style.opacity !== '' && Number(style.opacity) === 0);
+      });
+      if (isRetryAssistantUiError(text, retryVisible) && !readRetryThinkingActivity().strong) {
+        return { text, html, messageId, turnId, turnIndex: index, uiError: 'temporary_unavailable' };
+      }
       const imageOnlyChrome =
         !normalizedText ||
         normalizedText === 'edit' ||
@@ -1407,7 +1614,7 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
       document.querySelector('[role="main"]'),
     ].filter(Boolean);
     if (roots.length === 0) return null;
-    const markdownSelector = '.markdown,[data-message-content],[data-testid*="message"],.prose,[class*="markdown"]';
+    const markdownSelector = '.markdown,[data-message-content],[data-testid*="message"],.prose,[class*="MarkdownRoot"],[class*="markdown"]';
     const isExcluded = (node) =>
       Boolean(
         node?.closest?.(
@@ -1416,7 +1623,7 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
       );
     const scoreRoot = (node) => {
       const actions = node.querySelectorAll('${FINISHED_ACTIONS_SELECTOR}').length;
-      const assistants = node.querySelectorAll('[data-message-author-role="assistant"], [data-turn="assistant"]').length;
+      const assistants = node.querySelectorAll(':is([data-message-author-role="assistant"], [data-content-search-unit-key$=":assistant"], [data-chatgpt-search-unit-key$=":assistant"]), [data-turn="assistant"]').length;
       const markdowns = node.querySelectorAll(markdownSelector).length;
       return actions * 10 + assistants * 5 + markdowns;
     };
@@ -1434,13 +1641,19 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
     const turnNodes = ${buildConversationTurnListExpression()};
     const hasTurns = turnNodes.length > 0;
     const resolveTurnIndex = (node) => {
-      const idx = turnNodes.findIndex((turn) => turn === node || turn.contains?.(node));
-      return idx >= 0 ? idx : null;
+      // Current ChatGPT DOM can return nested outer/inner turn containers.
+      // The last containing node is the specific turn; the first is a wrapper
+      // that also contains the user and falsely predates the submit baseline.
+      for (let idx = turnNodes.length - 1; idx >= 0; idx -= 1) {
+        const turn = turnNodes[idx];
+        if (turn === node || turn.contains?.(node)) return idx;
+      }
+      return null;
     };
     const normalize = (value) => String(value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
     const collectLastUser = (scope) => {
       if (!scope?.querySelectorAll) return null;
-      const userTurns = Array.from(scope.querySelectorAll('[data-message-author-role="user"], [data-turn="user"]'));
+      const userTurns = Array.from(scope.querySelectorAll(':is([data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":user"]), [data-turn="user"]'));
       return userTurns[userTurns.length - 1] ?? null;
     };
     const lastUser = collectLastUser(root) || collectLastUser(document);
@@ -1466,29 +1679,32 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
     const markdowns = Array.from(root.querySelectorAll(markdownSelector))
       .filter((node) => !isExcluded(node))
       .filter((node) => {
-        const container = node.closest('[data-message-author-role], [data-turn]');
+        const container = node.closest(':is([data-message-author-role], [data-content-search-unit-key], [data-chatgpt-search-unit-key]), [data-turn]');
         if (!container) return true;
         const role =
-          (container.getAttribute('data-message-author-role') || container.getAttribute('data-turn') || '').toLowerCase();
+          (container.getAttribute('data-message-author-role') || (container.getAttribute?.('data-content-search-unit-key') || container.getAttribute?.('data-chatgpt-search-unit-key'))?.split(':').at(-1) || container.getAttribute('data-turn') || '').toLowerCase();
         return role !== 'user';
       });
     if (markdowns.length === 0) return null;
     const actionButtons = Array.from(root.querySelectorAll('${FINISHED_ACTIONS_SELECTOR}'));
+    // ChatGPT's current Pro layout can omit the per-turn action bar. Its live
+    // completion announcement is positive evidence once the sampled answer is
+    // after the current user turn; an empty/working announcement is not.
     const actionMarkdowns = [];
     for (const button of actionButtons) {
       const container =
         button.closest('${CONVERSATION_TURN_SELECTOR}') ||
-        button.closest('[data-message-author-role="assistant"], [data-turn="assistant"]') ||
-        button.closest('[data-message-author-role], [data-turn]') ||
+        button.closest(':is([data-message-author-role="assistant"], [data-content-search-unit-key$=":assistant"], [data-chatgpt-search-unit-key$=":assistant"]), [data-turn="assistant"]') ||
+        button.closest(':is([data-message-author-role], [data-content-search-unit-key], [data-chatgpt-search-unit-key]), [data-turn]') ||
         button.closest('[data-testid*="assistant"]');
       if (!container || container === root || container === document.body) continue;
       const scoped = Array.from(container.querySelectorAll(markdownSelector))
         .filter((node) => !isExcluded(node))
         .filter((node) => {
-          const roleNode = node.closest('[data-message-author-role], [data-turn]');
+          const roleNode = node.closest(':is([data-message-author-role], [data-content-search-unit-key], [data-chatgpt-search-unit-key]), [data-turn]');
           if (!roleNode) return true;
           const role =
-            (roleNode.getAttribute('data-message-author-role') || roleNode.getAttribute('data-turn') || '').toLowerCase();
+            (roleNode.getAttribute('data-message-author-role') || (roleNode.getAttribute?.('data-content-search-unit-key') || roleNode.getAttribute?.('data-chatgpt-search-unit-key'))?.split(':').at(-1) || roleNode.getAttribute('data-turn') || '').toLowerCase();
           return role !== 'user';
         });
       if (scoped.length === 0) continue;
@@ -1497,20 +1713,20 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
       }
     }
     const assistantMarkdowns = markdowns.filter((node) => {
-      const container = node.closest('[data-message-author-role], [data-turn], [data-testid*="assistant"]');
+      const container = node.closest(':is([data-message-author-role], [data-content-search-unit-key], [data-chatgpt-search-unit-key]), [data-turn], [data-testid*="assistant"]');
       if (!container) return false;
       const role =
-        (container.getAttribute('data-message-author-role') || container.getAttribute('data-turn') || '').toLowerCase();
+        (container.getAttribute('data-message-author-role') || (container.getAttribute?.('data-content-search-unit-key') || container.getAttribute?.('data-chatgpt-search-unit-key'))?.split(':').at(-1) || container.getAttribute('data-turn') || '').toLowerCase();
       if (role === 'assistant') return true;
       const testId = (container.getAttribute('data-testid') || '').toLowerCase();
       return testId.includes('assistant');
     });
     const hasAssistantIndicators = Boolean(
       root.querySelector('${FINISHED_ACTIONS_SELECTOR}') ||
-        root.querySelector('[data-message-author-role="assistant"], [data-turn="assistant"], [data-testid*="assistant"]'),
+        root.querySelector(':is([data-message-author-role="assistant"], [data-content-search-unit-key$=":assistant"], [data-chatgpt-search-unit-key$=":assistant"]), [data-turn="assistant"], [data-testid*="assistant"]'),
     );
     const allowMarkdownFallback = hasAssistantIndicators || hasTurns || Boolean(userText);
-    const candidates =
+    const rawCandidates =
       actionMarkdowns.length > 0
         ? actionMarkdowns
         : assistantMarkdowns.length > 0
@@ -1518,6 +1734,13 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
           : allowMarkdownFallback
             ? markdowns
             : [];
+    // Inline citation/code spans also have "markdown" in their class name.
+    // Prefer the complete message root, otherwise the last inline span can be
+    // mistaken for the full assistant answer (including during artifact saves).
+    const blockCandidates = rawCandidates.filter((node) =>
+      node.matches?.('.markdown,.prose,[data-message-content],[class*="MarkdownRoot"]'),
+    );
+    const candidates = blockCandidates.length > 0 ? blockCandidates : rawCandidates;
     for (let i = candidates.length - 1; i >= 0; i -= 1) {
       const node = candidates[i];
       if (!node) continue;
@@ -1611,7 +1834,7 @@ function buildCopyExpression(
     const locateButton = () => {
       const hint = ${JSON.stringify(meta ?? {})};
       if (hint?.messageId) {
-        const node = document.querySelector('[data-message-id="' + hint.messageId + '"]');
+        const node = Array.from(document.querySelectorAll('[data-message-id], [data-content-search-unit-key], [data-chatgpt-search-message-ids]')).find(node => (node.getAttribute('data-message-id') || node.getAttribute('data-chatgpt-search-message-ids')?.split(' ')[0] || node.getAttribute('data-content-search-unit-key')) === hint.messageId)?.closest('[data-turn-key]') || Array.from(document.querySelectorAll('[data-message-id]')).find(node => node.getAttribute('data-message-id') === hint.messageId);
         const buttons = node ? Array.from(node.querySelectorAll('${COPY_BUTTON_SELECTOR}')) : [];
         const button = buttons.at(-1) ?? null;
         if (button) {
@@ -1619,7 +1842,7 @@ function buildCopyExpression(
         }
       }
       if (hint?.turnId) {
-        const node = document.querySelector('[data-testid="' + hint.turnId + '"]');
+        const node = Array.from(document.querySelectorAll('[data-turn-key], [data-testid]')).find(node => (node.getAttribute('data-turn-key') || node.getAttribute('data-testid')) === hint.turnId);
         const buttons = node ? Array.from(node.querySelectorAll('${COPY_BUTTON_SELECTOR}')) : [];
         const button = buttons.at(-1) ?? null;
         if (button) {
@@ -1630,15 +1853,26 @@ function buildCopyExpression(
       const ASSISTANT_SELECTOR = '${ASSISTANT_ROLE_SELECTOR}';
       const isAssistantTurn = (node) => {
         if (!(node instanceof HTMLElement)) return false;
+        const searchKey = (node.getAttribute('data-content-search-unit-key') || node.getAttribute('data-chatgpt-search-unit-key') || '').toLowerCase();
+        if (searchKey.endsWith(':user')) return false;
+        if (searchKey.endsWith(':assistant')) return true;
         const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
         if (turnAttr === 'assistant') return true;
-        const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
+        const role = (node.getAttribute('data-message-author-role') || (node.getAttribute?.('data-content-search-unit-key') || node.getAttribute?.('data-chatgpt-search-unit-key'))?.split(':').at(-1) || node.dataset?.messageAuthorRole || '').toLowerCase();
         if (role === 'assistant') return true;
         const testId = (node.getAttribute('data-testid') || '').toLowerCase();
         if (testId.includes('assistant')) return true;
         return Boolean(node.querySelector(ASSISTANT_SELECTOR) || node.querySelector('[data-testid*="assistant"]'));
       };
+      ${buildTurnActionLocatorJs("findTurnAction")}
       const turns = ${buildConversationTurnListExpression()};
+      const lastAssistantTurn = [...turns].reverse().find((turn) => isAssistantTurn(turn));
+      const actionBarButton = lastAssistantTurn
+        ? findTurnAction(lastAssistantTurn, BUTTON_SELECTOR, ${JSON.stringify(ACTION_BAR_COPY_BUTTON_SELECTOR)})
+        : null;
+      if (actionBarButton) return actionBarButton;
+      // Never copy an earlier exchange while the current search unit is still streaming.
+      if (lastAssistantTurn?.matches?.(${JSON.stringify(CONVERSATION_EXCHANGE_SELECTOR + ", " + CONVERSATION_UNIT_SELECTOR)})) return null;
       for (let i = turns.length - 1; i >= 0; i -= 1) {
         const turn = turns[i];
         if (!isAssistantTurn(turn)) continue;
@@ -1736,7 +1970,8 @@ function buildCopyExpression(
           const readIntercepted = () => {
             const markdown = interception.state.text ?? '';
             const updatedAt = interception.state.updatedAt ?? 0;
-            return { success: Boolean(markdown.trim()), markdown, updatedAt };
+            return { success: Boolean(markdown.trim()), markdown, updatedAt,
+              fileCard: Boolean((${buildLastAssistantMessageExpression(`button.closest(${JSON.stringify(CONVERSATION_TURN_SELECTOR)})`)})?.querySelector('button[aria-label="Download file"]')) };
           };
 
           let lastText = '';
@@ -1803,6 +2038,7 @@ interface AssistantSnapshot {
   turnId?: string | null;
   turnIndex?: number | null;
   completionVisible?: boolean;
+  uiError?: "temporary_unavailable";
 }
 
 const LANGUAGE_TAGS = new Set(

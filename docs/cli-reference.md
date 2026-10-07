@@ -21,19 +21,20 @@ This is the curated cheatsheet. The authoritative source is always `oracle --hel
 
 ## Core consult flags
 
-| Flag                              | Purpose                                                                                          |
-| --------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `-p, --prompt <text>`             | Required prompt.                                                                                 |
-| `-f, --file <paths...>`           | Files / dirs / globs. Repeatable. `!` prefix = exclude.                                          |
-| `-e, --engine <api\|browser>`     | Force engine. Default: auto-pick.                                                                |
-| `-m, --model <name>`              | Single model. See [Mythical Pro Agents](mythical-pro-agents.md).                                 |
-| `--models <list>`                 | Comma-separated multi-model run (API only).                                                      |
-| `--slug <name>`                   | Stable session slug.                                                                             |
-| `--render`                        | Print the assembled bundle to stdout.                                                            |
-| `--copy`                          | Copy the bundle to the clipboard.                                                                |
-| `--write-output <path>`           | Save the final answer to a file; multi-model runs add per-model files plus `<stem>.oracle.json`. |
-| `--files-report`                  | Print per-file token usage.                                                                      |
-| `--dry-run [summary\|json\|full]` | Preview without sending.                                                                         |
+| Flag                              | Purpose                                                                                                                             |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `-p, --prompt <text>`             | Required prompt.                                                                                                                    |
+| `-f, --file <paths...>`           | Files / dirs / globs. Repeatable. `!` prefix = exclude.                                                                             |
+| `-e, --engine <api\|browser>`     | Force engine. Default: auto-pick.                                                                                                   |
+| `-m, --model <name>`              | Single model. See [Mythical Pro Agents](mythical-pro-agents.md).                                                                    |
+| `--models <list>`                 | Comma-separated multi-model run (API only).                                                                                         |
+| `--slug <name>`                   | Stable session slug.                                                                                                                |
+| `--render`                        | Print the assembled bundle to stdout.                                                                                               |
+| `--copy`                          | Copy the bundle to the clipboard.                                                                                                   |
+| `--write-output <path>`           | Save the final answer to a file; multi-model runs add per-model files plus `<stem>.oracle.json`.                                    |
+| `--write-artifacts`               | Browser runs only: also copy captured files beside `--write-output`, preserving canonical artifacts and existing destination files. |
+| `--files-report`                  | Print per-file token usage.                                                                                                         |
+| `--dry-run [summary\|json\|full]` | Preview without sending.                                                                                                            |
 
 ## Followup / lineage
 
@@ -78,39 +79,42 @@ See [OpenAI / Azure / OpenRouter](openai-endpoints.md) and [OpenRouter](openrout
 
 ## Browser mode
 
-| Flag                                                                           | Purpose                                                      |
-| ------------------------------------------------------------------------------ | ------------------------------------------------------------ |
-| `--chatgpt-url <url>`                                                          | Target a ChatGPT workspace / project folder.                 |
-| `--browser-model-strategy <select\|current\|ignore>`                           | Control ChatGPT model picker.                                |
-| `--browser-manual-login`                                                       | Use persistent profile + manual login (no Keychain).         |
-| `--browser-attach-running`                                                     | Rejected by this fork's background-only policy.              |
-| `--browser-tab <ref>`                                                          | Reuse an existing tab (`current`, id, URL, title substring). |
-| `--browser-thinking-time <light\|standard\|extended\|heavy>`                   | Pro / Thinking model intensity.                              |
-| `--browser-research deep`                                                      | Activate Deep Research mode.                                 |
-| `--browser-follow-up <prompt>`                                                 | Multi-turn in the same ChatGPT conversation.                 |
-| `--browser-port <port>`                                                        | Pin Chrome DevTools port.                                    |
-| `--browser-inline-cookies[(-file)] <…>`                                        | Supply cookies inline (no Keychain / Chrome).                |
-| `--browser-timeout`, `--browser-input-timeout`, `--browser-attachment-timeout` | Overall / input / attachment readiness timeouts (h/m/s/ms).  |
-| `--browser-recheck-delay`, `--browser-recheck-timeout`                         | Delayed retry after a timeout.                               |
-| `--browser-auto-reattach-delay/-interval/-timeout`                             | Poll the existing tab when ChatGPT redirects mid-load.       |
-| `--browser-reuse-wait`                                                         | Wait for shared Chrome profile before launching.             |
-| `--browser-profile-lock-timeout`                                               | Wait for the manual-login profile lock.                      |
-| `--browser-max-concurrent-tabs`                                                | Soft limit for shared-profile parallel runs (default 3).     |
-| `--browser-keep-browser`                                                       | Keep the browser open after the run.                         |
-| `--browser-headless`, `--browser-hide-window`                                  | Compatibility flags; local ChatGPT launch is always hidden.  |
-| `--browser-attachments <auto\|never\|always>`                                  | Attach files inline vs upload.                               |
-| `--browser-bundle-files`, `--browser-bundle-format <auto\|text\|zip>`          | Bundle browser uploads as text or byte-preserving ZIP.       |
-| `--browser-chrome-path`, `--browser-cookie-path`                               | Override Chrome / cookie store discovery (Linux / Windows).  |
+| Flag                                                                           | Purpose                                                                                                                      |
+| ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| `--chatgpt-url <url>`                                                          | Target a ChatGPT workspace / project folder.                                                                                 |
+| `--browser-model-strategy <select\|current\|ignore>`                           | Control ChatGPT model picker.                                                                                                |
+| `--browser-manual-login`                                                       | Use persistent profile + manual login (no Keychain).                                                                         |
+| `--browser-cookie-sync`                                                        | Explicitly copy cookies from live Chrome; prefer manual login because token rotation can invalidate the live session.        |
+| `--browser-attach-running`                                                     | Rejected by this fork's background-only policy.                                                                              |
+| `--browser-tab <ref>`                                                          | Reuse an existing tab (`current`, id, URL, title substring).                                                                 |
+| `--browser-thinking-time <light\|standard\|extended\|extra-high\|pro\|heavy>`  | Effort intensity; `pro` selects the Pro tier and fails closed if unconfirmed, other unmatched tiers keep the current effort. |
+| `--browser-research <mode>`                                                    | Select `off`, `search` (Web Search), or `deep` (Deep Research); default off.                                                 |
+| `--browser-follow-up <prompt>`                                                 | Multi-turn in the same ChatGPT conversation.                                                                                 |
+| `--browser-port <port>`                                                        | Pin Chrome DevTools port.                                                                                                    |
+| `--browser-inline-cookies[(-file)] <…>`                                        | Supply cookies inline (no Keychain / Chrome).                                                                                |
+| `--browser-timeout`, `--browser-input-timeout`, `--browser-attachment-timeout` | Overall / input / attachment readiness timeouts (h/m/s/ms).                                                                  |
+| `--browser-recheck-delay`, `--browser-recheck-timeout`                         | Delayed retry after a timeout.                                                                                               |
+| `--browser-auto-reattach-delay/-interval/-timeout`                             | Poll the existing tab when ChatGPT redirects mid-load.                                                                       |
+| `--browser-reuse-wait`                                                         | Wait for shared Chrome profile before launching.                                                                             |
+| `--browser-profile-lock-timeout`                                               | Wait for the manual-login profile lock.                                                                                      |
+| `--browser-max-concurrent-tabs`                                                | Soft limit for shared-profile parallel runs (default 3).                                                                     |
+| `--browser-keep-browser`                                                       | Keep the browser open after the run.                                                                                         |
+| `--browser-headless`, `--browser-hide-window`                                  | Compatibility flags; local ChatGPT launch is always hidden.                                                                  |
+| `--browser-attachments <auto\|never\|always>`                                  | Attach files inline vs upload.                                                                                               |
+| `--browser-bundle-files`, `--browser-bundle-format <auto\|text\|zip>`          | Multi-file source uploads bundle by default; `auto` keeps flattened text unless ZIP is selected or raw files are present.    |
+| `--browser-chrome-path`, `--browser-cookie-path`                               | Override Chrome / cookie store discovery (Linux / Windows).                                                                  |
 
 See [Browser Mode](browser-mode.md) for usage.
 
 ## Remote browser
 
-| Flag                          | Purpose                                      |
-| ----------------------------- | -------------------------------------------- |
-| `--remote-host <host:port>`   | Use a remote `oracle serve` host.            |
-| `--remote-token <secret>`     | Auth for the remote host.                    |
-| `--remote-chrome <host:port>` | Attach to an existing remote Chrome session. |
+| Flag                                  | Purpose                                                                                           |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `--remote-host <host:port>`           | Use a remote `oracle serve` host.                                                                 |
+| `--remote-token <secret>`             | Auth for the remote host.                                                                         |
+| `--remote-chrome <host:port>`         | Attach to an existing remote Chrome session.                                                      |
+| `serve --max-concurrent-runs <count>` | Opt into bounded concurrent admission; effective capacity cannot exceed the host browser tab cap. |
+| `serve --max-queued-runs <count>`     | Waiting requests in opt-in mode (default 8; zero disables waiting).                               |
 
 ## Approved ChatGPT conversation export
 
@@ -179,5 +183,7 @@ complete email-bound affinity. Use `--json` for a machine-readable result.
 ## See also
 
 - `oracle --help` — short usage.
-- `oracle --help --verbose` — every flag, including hidden ones.
+- `oracle --help --verbose` (or `oracle -h --verbose`) — primary and advanced help. Either flag order works; `oracle --debug-help` shows only the advanced groups.
 - [Configuration](configuration.md) — `~/.oracle/config.json` and project `.oracle/config.json` defaults.
+
+Provider-native evidence: `--browser-capture-provider-native` saves the full ChatGPT conversation record and independent text digests with session artifacts. It is opt-in; `--no-browser-capture-provider-native` overrides a saved preference. See [provider-native evidence](browser-mode.md#provider-native-conversation-evidence) for retained data, fidelity, and fallback behavior.

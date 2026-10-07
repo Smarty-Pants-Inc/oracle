@@ -22,6 +22,7 @@ export interface BridgeHostCliOptions {
   sshExtraArgs?: string;
   background?: boolean;
   foreground?: boolean;
+  respawn?: boolean;
   print?: boolean;
   printToken?: boolean;
 }
@@ -30,18 +31,45 @@ interface ReverseTunnelHandle {
   stop: () => void;
 }
 
+export async function resolveBridgeHostToken(
+  cliToken: string | undefined,
+  respawn: boolean | undefined,
+  artifactPath: string,
+): Promise<string> {
+  const explicit = cliToken?.trim();
+  if (explicit && explicit !== "auto") {
+    return explicit;
+  }
+  // The internal --respawn child (spawned by --background) reuses the token the
+  // parent already wrote to the connection artifact, so the credential never
+  // travels through argv or the environment. Every other start — including a
+  // direct `--foreground` restart — generates a fresh credential.
+  if (!explicit && respawn) {
+    const existing = await readArtifactToken(artifactPath);
+    if (existing) {
+      return existing;
+    }
+  }
+  return randomBytes(16).toString("hex");
+}
+
+async function readArtifactToken(filePath: string): Promise<string | undefined> {
+  try {
+    const parsed = JSON.parse(await fs.readFile(filePath, "utf8")) as { remoteToken?: unknown };
+    const token = typeof parsed.remoteToken === "string" ? parsed.remoteToken.trim() : "";
+    return token || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function runBridgeHost(options: BridgeHostCliOptions): Promise<void> {
   const bindRaw = options.bind?.trim() || "127.0.0.1:9473";
   const { hostname: bindHost, port: bindPort } = parseHostPort(bindRaw);
 
-  const tokenRaw = options.token?.trim() || "auto";
-  const token = tokenRaw === "auto" ? randomBytes(16).toString("hex") : tokenRaw;
-  if (!token.trim()) {
-    throw new Error("Token is required (use --token auto to generate one).");
-  }
-
   const writeConnectionPath =
     options.writeConnection?.trim() || path.join(getOracleHomeDir(), "bridge-connection.json");
+  const token = await resolveBridgeHostToken(options.token, options.respawn, writeConnectionPath);
 
   const sshTarget = options.ssh?.trim();
   const sshRemotePort =
@@ -86,7 +114,6 @@ export async function runBridgeHost(options: BridgeHostCliOptions): Promise<void
   if (options.background) {
     await spawnBridgeHostInBackground({
       bind: bindRaw,
-      token,
       writeConnectionPath,
       sshTarget,
       sshRemotePort,
@@ -293,7 +320,6 @@ function splitArgs(input: string): string[] {
 
 async function spawnBridgeHostInBackground({
   bind,
-  token,
   writeConnectionPath,
   sshTarget,
   sshRemotePort,
@@ -301,7 +327,6 @@ async function spawnBridgeHostInBackground({
   sshExtraArgs,
 }: {
   bind: string;
-  token: string;
   writeConnectionPath: string;
   sshTarget?: string;
   sshRemotePort?: number;
@@ -313,7 +338,7 @@ async function spawnBridgeHostInBackground({
   const logPath = path.join(oracleHome, "bridge-host.log");
   const pidPath = path.join(oracleHome, "bridge-host.pid");
 
-  const logHandle = await fs.open(logPath, "a");
+  const logHandle = await fs.open(logPath, "a", 0o600);
   const stdio: Array<"ignore" | number> = ["ignore", logHandle.fd, logHandle.fd];
 
   const scriptPath = process.argv[1];
@@ -325,10 +350,9 @@ async function spawnBridgeHostInBackground({
     "bridge",
     "host",
     "--foreground",
+    "--respawn",
     "--bind",
     bind,
-    "--token",
-    token,
     "--write-connection",
     writeConnectionPath,
   ];

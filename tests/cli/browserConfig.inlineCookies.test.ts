@@ -27,6 +27,8 @@ describe("buildBrowserConfig inline cookies", () => {
       const config = await buildBrowserConfig({ browserInlineCookiesFile: file, model });
       expect(config.inlineCookies?.[0]?.name).toBe("__Secure-next-auth.session-token");
       expect(config.inlineCookiesSource).toBe("inline-file");
+      expect(config.cookieSync).toBe(true);
+      expect(config.manualLoginCookieSync).toBe(true);
     } finally {
       await fs.rm(tmp, { recursive: true, force: true });
     }
@@ -48,7 +50,7 @@ describe("buildBrowserConfig inline cookies", () => {
     }
   });
 
-  test("ignores ~/.oracle/cookies.json when cookie sync is enabled", async () => {
+  test("uses ~/.oracle/cookies.json when Chrome cookie copy is not enabled", async () => {
     const fakeHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-home-"));
     const oracleDir = path.join(fakeHome, ".oracle");
     setOracleHomeDirOverrideForTest(oracleDir);
@@ -59,11 +61,12 @@ describe("buildBrowserConfig inline cookies", () => {
       JSON.stringify([{ name: "cf_clearance", value: "token", domain: "chatgpt.com" }]),
     );
     const config = await buildBrowserConfig({ model });
-    expect(config.inlineCookies).toBeUndefined();
-    expect(config.inlineCookiesSource).toBeNull();
+    expect(config.inlineCookies?.[0]?.name).toBe("cf_clearance");
+    expect(config.inlineCookiesSource).toBe("home:cookies.json");
+    expect(config.cookieSync).toBe(true);
   });
 
-  test("uses ~/.oracle/cookies.json when cookie sync is disabled", async () => {
+  test("prefers explicit Chrome cookie copy over ~/.oracle/cookies.json", async () => {
     const fakeHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-home-"));
     const oracleDir = path.join(fakeHome, ".oracle");
     setOracleHomeDirOverrideForTest(oracleDir);
@@ -73,8 +76,24 @@ describe("buildBrowserConfig inline cookies", () => {
       homeFile,
       JSON.stringify([{ name: "cf_clearance", value: "token", domain: "chatgpt.com" }]),
     );
+    const config = await buildBrowserConfig({ model, browserCookieSync: true });
+    expect(config.inlineCookies).toBeUndefined();
+    expect(config.inlineCookiesSource).toBeNull();
+    expect(config.cookieSync).toBe(true);
+  });
+
+  test("uses ~/.oracle/cookies.json with the legacy no-copy flag", async () => {
+    const fakeHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-home-"));
+    const oracleDir = path.join(fakeHome, ".oracle");
+    setOracleHomeDirOverrideForTest(oracleDir);
+    await fs.mkdir(oracleDir, { recursive: true });
+    await fs.writeFile(
+      path.join(oracleDir, "cookies.json"),
+      JSON.stringify([{ name: "cf_clearance", value: "token", domain: "chatgpt.com" }]),
+    );
     const config = await buildBrowserConfig({ model, browserNoCookieSync: true });
     expect(config.inlineCookies?.[0]?.name).toBe("cf_clearance");
     expect(config.inlineCookiesSource).toBe("home:cookies.json");
+    expect(config.cookieSync).toBe(true);
   });
 });

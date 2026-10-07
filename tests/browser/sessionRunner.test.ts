@@ -1,3 +1,6 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import type { RunOracleOptions } from "../../src/oracle.js";
 import type { BrowserSessionConfig } from "../../src/sessionStore.js";
@@ -5,6 +8,8 @@ import {
   buildBrowserRunWarningsForTest,
   runBrowserSessionExecution,
 } from "../../src/browser/sessionRunner.js";
+import { BrowserRunCancelledError } from "../../src/oracle/errors.js";
+import type { BrowserPromptArtifacts } from "../../src/browser/prompt.js";
 
 const baseRunOptions: RunOracleOptions = {
   prompt: "Hello world",
@@ -16,9 +21,177 @@ const baseRunOptions: RunOracleOptions = {
 const baseConfig: BrowserSessionConfig = {};
 
 describe("runBrowserSessionExecution", () => {
+  test("does not start prompt preparation for an already cancelled run", async () => {
+    const cancellation = new AbortController();
+    cancellation.abort();
+    const assemblePrompt = vi.fn();
+    const executeBrowser = vi.fn();
+
+    await expect(
+      runBrowserSessionExecution(
+        {
+          runOptions: baseRunOptions,
+          browserConfig: baseConfig,
+          cwd: "/repo",
+          log: vi.fn(),
+          signal: cancellation.signal,
+        },
+        { assemblePrompt, executeBrowser },
+      ),
+    ).rejects.toThrow(BrowserRunCancelledError);
+
+    expect(assemblePrompt).not.toHaveBeenCalled();
+    expect(executeBrowser).not.toHaveBeenCalled();
+  });
+
+  test("cancellation wins during prompt preparation and cleans late bundles", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-cancel-preparation-"));
+    const bundleDir = path.join(root, "oracle-browser-bundle-test");
+    const bundlePath = path.join(bundleDir, "context.txt");
+    const cancellation = new AbortController();
+    let resolvePrompt!: (value: BrowserPromptArtifacts) => void;
+    const assemblePrompt = vi.fn(
+      () =>
+        new Promise<BrowserPromptArtifacts>((resolve) => {
+          resolvePrompt = resolve;
+        }),
+    );
+    const executeBrowser = vi.fn();
+
+    try {
+      const execution = runBrowserSessionExecution(
+        {
+          runOptions: baseRunOptions,
+          browserConfig: { inputTimeoutMs: 60_000 },
+          cwd: "/repo",
+          log: vi.fn(),
+          signal: cancellation.signal,
+        },
+        { assemblePrompt, executeBrowser },
+      );
+      cancellation.abort();
+      await expect(execution).rejects.toThrow(BrowserRunCancelledError);
+
+      await fs.mkdir(bundleDir, { recursive: true });
+      await fs.writeFile(bundlePath, "public test bundle", "utf8");
+      resolvePrompt({
+        markdown: "prompt",
+        composerText: "prompt",
+        estimatedInputTokens: 1,
+        attachments: [{ path: bundlePath, displayPath: "context.txt", generatedBundle: true }],
+        inlineFileCount: 0,
+        tokenEstimateIncludesInlineFiles: false,
+        attachmentsPolicy: "auto",
+        attachmentMode: "bundle",
+        fallback: null,
+        bundled: { originalCount: 1, bundlePath },
+      });
+
+      await vi.waitFor(async () => {
+        await expect(fs.stat(bundleDir)).rejects.toThrow();
+      });
+      expect(executeBrowser).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves browser cancellation as a cancellation", async () => {
+    const cancellation = new AbortController();
+    const executeBrowser = vi.fn(async () => {
+      throw new BrowserRunCancelledError();
+    });
+
+    await expect(
+      runBrowserSessionExecution(
+        {
+          runOptions: baseRunOptions,
+          browserConfig: baseConfig,
+          cwd: "/repo",
+          log: vi.fn(),
+          signal: cancellation.signal,
+        },
+        {
+          assemblePrompt: async () => ({
+            markdown: "prompt",
+            composerText: "prompt",
+            estimatedInputTokens: 1,
+            attachments: [],
+            inlineFileCount: 0,
+            tokenEstimateIncludesInlineFiles: false,
+            attachmentsPolicy: "auto",
+            attachmentMode: "inline",
+            fallback: null,
+          }),
+          executeBrowser,
+        },
+      ),
+    ).rejects.toThrow(BrowserRunCancelledError);
+  });
+
+  test("bounds browser prompt preparation with the configured input timeout", async () => {
+    vi.useFakeTimers();
+    const executeBrowser = vi.fn();
+    const execution = runBrowserSessionExecution(
+      {
+        runOptions: baseRunOptions,
+        browserConfig: { inputTimeoutMs: 25 },
+        cwd: "/repo",
+        log: vi.fn(),
+      },
+      {
+        assemblePrompt: () => new Promise(() => {}),
+        executeBrowser,
+      },
+    );
+    const failure = expect(execution).rejects.toMatchObject({
+      name: "BrowserAutomationError",
+      category: "browser-automation",
+      message: expect.stringContaining("--browser-input-timeout"),
+      details: {
+        stage: "prepare-prompt",
+        code: "prompt-preparation-timeout",
+        timeoutMs: 25,
+      },
+    });
+
+    try {
+      await vi.advanceTimersByTimeAsync(25);
+      await failure;
+      expect(executeBrowser).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("preserves prompt preparation errors without starting the browser", async () => {
+    const executeBrowser = vi.fn();
+    const preparationError = new Error("failed to read requested input file");
+
+    await expect(
+      runBrowserSessionExecution(
+        {
+          runOptions: baseRunOptions,
+          browserConfig: { inputTimeoutMs: 1_000 },
+          cwd: "/repo",
+          log: vi.fn(),
+        },
+        {
+          assemblePrompt: async () => {
+            throw preparationError;
+          },
+          executeBrowser,
+        },
+      ),
+    ).rejects.toBe(preparationError);
+
+    expect(executeBrowser).not.toHaveBeenCalled();
+  });
+
   test("logs stats and returns usage/runtime", async () => {
     const log = vi.fn();
     const persistRuntimeHint = vi.fn();
+    const cancellation = new AbortController();
     const executeBrowser = vi.fn(async (options) => {
       await options.runtimeHintCb?.(
         {
@@ -41,7 +214,19 @@ describe("runBrowserSessionExecution", () => {
       return {
         answerText: "ok",
         answerMarkdown: "ok",
-        artifacts: [{ kind: "transcript" as const, path: "/tmp/transcript.md" }],
+        artifacts: [
+          { kind: "file" as const, path: "/tmp/report.md", sha256: "a".repeat(64) },
+          { kind: "transcript" as const, path: "/tmp/transcript.md" },
+        ],
+        savedFiles: [
+          {
+            kind: "file" as const,
+            path: "/tmp/report.md",
+            sha256: "a".repeat(64),
+            url: "https://chatgpt.com/backend-api/files/report",
+            filename: "report.md",
+          },
+        ],
         tookMs: 1000,
         answerTokens: 12,
         answerChars: 20,
@@ -53,6 +238,12 @@ describe("runBrowserSessionExecution", () => {
           },
         ],
         conversationId: "foo",
+        researchPlan: {
+          title: "Release status",
+          steps: ["Read official sources"],
+          phase: "researching" as const,
+          capturedAt: "2026-09-02T00:00:00.000Z",
+        },
       };
     });
     const result = await runBrowserSessionExecution(
@@ -61,6 +252,7 @@ describe("runBrowserSessionExecution", () => {
         browserConfig: baseConfig,
         cwd: "/repo",
         log,
+        signal: cancellation.signal,
       },
       {
         assemblePrompt: async () => ({
@@ -84,8 +276,18 @@ describe("runBrowserSessionExecution", () => {
       reasoningTokens: 0,
       totalTokens: 54,
     });
-    expect(result.runtime).toMatchObject({ chromePid: undefined, conversationId: "foo" });
-    expect(result.artifacts).toEqual([{ kind: "transcript", path: "/tmp/transcript.md" }]);
+    expect(result.runtime).toMatchObject({
+      chromePid: undefined,
+      conversationId: "foo",
+      researchPlan: { title: "Release status", phase: "researching" },
+    });
+    expect(result.artifacts).toEqual([
+      { kind: "file", path: "/tmp/report.md", sha256: "a".repeat(64) },
+      { kind: "transcript", path: "/tmp/transcript.md" },
+    ]);
+    expect(result.savedFiles).toEqual([
+      expect.objectContaining({ path: "/tmp/report.md", sha256: "a".repeat(64) }),
+    ]);
     expect(result.warnings).toEqual([
       expect.objectContaining({ code: "browser-cleanup-incomplete" }),
     ]);
@@ -96,7 +298,50 @@ describe("runBrowserSessionExecution", () => {
       expect.objectContaining({ chromePort: 9999, chromeHost: "127.0.0.1", chromeTargetId: "t-1" }),
       expect.objectContaining({ resolvedLabel: "Pro", verified: true }),
     );
+    expect(executeBrowser).toHaveBeenCalledWith(
+      expect.objectContaining({
+        signal: cancellation.signal,
+        closeOwnedTabOnCancel: true,
+      }),
+    );
     expect(log).toHaveBeenCalled();
+  });
+
+  test("preserves an explicit keep-browser preference during cancellation", async () => {
+    const executeBrowser = vi.fn(async () => ({
+      answerText: "ok",
+      answerMarkdown: "ok",
+      tookMs: 1000,
+      answerTokens: 1,
+      answerChars: 2,
+    }));
+
+    await runBrowserSessionExecution(
+      {
+        runOptions: baseRunOptions,
+        browserConfig: { keepBrowser: true },
+        cwd: "/repo",
+        log: vi.fn(),
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 1,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser,
+      },
+    );
+
+    expect(executeBrowser).toHaveBeenCalledWith(
+      expect.objectContaining({ closeOwnedTabOnCancel: false }),
+    );
   });
 
   test("passes browser resume conversation URL to executeBrowser", async () => {
@@ -170,6 +415,11 @@ describe("runBrowserSessionExecution", () => {
           tookMs: 1000,
           answerTokens: 12,
           answerChars: 20,
+          providerNativeCapture: {
+            status: "unavailable" as const,
+            answerFidelity: "unknown" as const,
+            failure: { reason: "no-conversation-id" as const },
+          },
           modelSelection: {
             requestedModel: "GPT-5.5 Pro",
             resolvedLabel: "Pro",
@@ -183,6 +433,10 @@ describe("runBrowserSessionExecution", () => {
       },
     );
 
+    expect(result.providerNativeCapture).toMatchObject({
+      status: "unavailable",
+      failure: { reason: "no-conversation-id" },
+    });
     expect(result.modelSelection).toMatchObject({
       requestedModel: "GPT-5.5 Pro",
       resolvedLabel: "Pro",
@@ -537,6 +791,49 @@ describe("runBrowserSessionExecution", () => {
     expect(log.mock.calls.some((call) => String(call[0]).includes("ChatGPT thinking"))).toBe(true);
   });
 
+  test("prints each approval wait and heartbeat without verbose mode", async () => {
+    const log = vi.fn();
+    await runBrowserSessionExecution(
+      {
+        runOptions: { ...baseRunOptions, verbose: false },
+        browserConfig: baseConfig,
+        cwd: "/repo",
+        log,
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 5,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser: async ({ log: automationLog }) => {
+          automationLog?.(
+            "[browser] Waiting for Chrome remote debugging approval for 127.0.0.1:9222...",
+          );
+          automationLog?.(
+            "[browser] Still waiting for Chrome remote debugging approval for 127.0.0.1:9222 (15s elapsed). Click Allow in an open Chrome window.",
+          );
+          return {
+            answerText: "text",
+            answerMarkdown: "markdown",
+            tookMs: 1,
+            answerTokens: 1,
+            answerChars: 4,
+          };
+        },
+      },
+    );
+    expect(
+      log.mock.calls.filter((call) => String(call[0]).includes("remote debugging approval")),
+    ).toHaveLength(2);
+  });
+
   test("prints browser follow-up progress logs even when not verbose", async () => {
     const log = vi.fn();
     await runBrowserSessionExecution(
@@ -704,11 +1001,95 @@ describe("runBrowserSessionExecution", () => {
     );
     expect(executeBrowser).toHaveBeenCalledWith(
       expect.objectContaining({
-        fallbackSubmission: {
+        fallbackSubmission: expect.objectContaining({
           prompt: "fallback prompt",
           attachments: [expect.objectContaining({ path: "/repo/a.txt", displayPath: "a.txt" })],
-        },
+          prepare: expect.any(Function),
+        }),
       }),
+    );
+  });
+
+  test("removes generated browser bundles after execution even when the run fails", async () => {
+    const bundleDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-browser-bundle-"));
+    const bundlePath = path.join(bundleDir, "attachments-bundle.zip");
+    await fs.writeFile(bundlePath, "zip");
+    const executeBrowser = vi.fn(async () => {
+      throw new Error("browser exploded");
+    });
+
+    await expect(
+      runBrowserSessionExecution(
+        {
+          runOptions: baseRunOptions,
+          browserConfig: baseConfig,
+          cwd: "/repo",
+          log: vi.fn(),
+        },
+        {
+          assemblePrompt: async () => ({
+            markdown: "prompt",
+            composerText: "prompt",
+            estimatedInputTokens: 5,
+            attachments: [
+              {
+                path: bundlePath,
+                displayPath: bundlePath,
+                sizeBytes: 3,
+                generatedBundle: true,
+              },
+            ],
+            inlineFileCount: 0,
+            tokenEstimateIncludesInlineFiles: false,
+            attachmentsPolicy: "always",
+            attachmentMode: "bundle",
+            fallback: null,
+          }),
+          executeBrowser,
+        },
+      ),
+    ).rejects.toThrow(/browser exploded/i);
+
+    await expect(fs.access(bundleDir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("redacts inline cookies from verbose logs without changing execution credentials", async () => {
+    const log = vi.fn();
+    const inlineCookies = [
+      { name: "synthetic-session", value: "synthetic-cookie-value", domain: ".chatgpt.com" },
+    ];
+    const executeBrowser = vi.fn(async () => ({
+      answerText: "text",
+      answerMarkdown: "markdown",
+      tookMs: 10,
+      answerTokens: 1,
+      answerChars: 5,
+    }));
+    await runBrowserSessionExecution(
+      {
+        runOptions: { ...baseRunOptions, verbose: true },
+        browserConfig: { inlineCookies },
+        cwd: "/repo",
+        log,
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 1,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser,
+      },
+    );
+    expect(log.mock.calls.flat().join("\n")).not.toContain("synthetic-cookie-value");
+    expect(executeBrowser).toHaveBeenCalledWith(
+      expect.objectContaining({ config: expect.objectContaining({ inlineCookies }) }),
     );
   });
 

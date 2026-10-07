@@ -4,6 +4,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { delay } from "./utils.js";
+import { formatWebSocketHost } from "./detect.js";
 
 export type ProfileStateLogger = (message: string) => void;
 
@@ -20,6 +21,7 @@ const execFileAsync = promisify(execFile);
 const CHROME_TERMINATION_TIMEOUT_MS = 5_000;
 const CHROME_FORCE_TERMINATION_TIMEOUT_MS = 2_000;
 const CHROME_TERMINATION_POLL_MS = 50;
+let ownProcessStartTime: Promise<number | null> | undefined;
 
 export function getDevToolsActivePortPaths(userDataDir: string): string[] {
   return DEVTOOLS_ACTIVE_PORT_RELATIVE_PATHS.map((relative) => path.join(userDataDir, relative));
@@ -112,7 +114,7 @@ function findChromeDebugTargetForProfileFromProcessList(
     const lower = command.toLowerCase();
     if (!Number.isFinite(pid) || pid <= 0) continue;
     if (!lower.includes("chrome") && !lower.includes("chromium")) continue;
-    if (!lower.includes("user-data-dir") || !command.includes(userDataDir)) continue;
+    if (!isChromeCommandForUserDataDir(command, userDataDir)) continue;
     const portMatch = command.match(/--remote-debugging-port(?:=|\s+)(\d+)/);
     const port = Number.parseInt(portMatch?.[1] ?? "", 10);
     if (!Number.isFinite(port) || port <= 0) continue;
@@ -142,6 +144,22 @@ export async function terminateRecordedChromeForProfile(
     return false;
   }
   try {
+    if (process.platform === "win32") {
+      await execFileAsync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+        maxBuffer: 1024 * 1024,
+        windowsHide: true,
+        timeout: 5000,
+      });
+      for (let attempt = 0; attempt < 30 && isProcessAlive(pid); attempt += 1) {
+        await delay(100);
+      }
+      if (isProcessAlive(pid)) {
+        logger?.(`Shared manual-login Chrome pid ${pid} remained alive after termination.`);
+        return false;
+      }
+      logger?.(`Terminated shared manual-login Chrome pid ${pid}`);
+      return true;
+    }
     process.kill(pid, "SIGTERM");
     if (await waitForChromeProfileProcessesToExit(userDataDir, CHROME_TERMINATION_TIMEOUT_MS)) {
       logger?.(`Terminated shared manual-login Chrome pid ${pid}`);
@@ -163,6 +181,10 @@ export async function terminateRecordedChromeForProfile(
     logger?.(`Chrome processes for ${userDataDir} did not exit after SIGKILL`);
     return false;
   } catch (error) {
+    if (!isProcessAlive(pid)) {
+      logger?.(`Terminated shared manual-login Chrome pid ${pid}`);
+      return true;
+    }
     const message = error instanceof Error ? error.message : String(error);
     logger?.(`Failed to terminate shared manual-login Chrome pid ${pid}: ${message}`);
     return false;
@@ -183,12 +205,60 @@ async function waitForChromeProfileProcessesToExit(
 
 function isChromeCommandForUserDataDir(command: string | null, userDataDir: string): boolean {
   if (!command) return false;
-  const lower = command.toLowerCase();
+  // ps flattens POSIX argv: an unquoted profile may contain spaces, so its
+  // boundary is the next Chrome switch/startup URL or the end, not the first whitespace.
+  const matches = [
+    ...command.matchAll(
+      /(?:^|\s)(?:"--user-data-dir=([^"]*)"|--user-data-dir(?:=|\s+)(?:"([^"]*)"|'([^']*)'|([^\r\n]+?)(?=\s+(?:"?--|about:blank(?:\s|$))|\s*$)))/giu,
+    ),
+  ];
+  if (matches.length !== 1) return false;
+  const match = matches[0]!;
+  const commandProfile = match[1] ?? match[2] ?? match[3] ?? match[4];
+  if (!commandProfile || !startsWithChromeExecutable(command)) return false;
   return (
-    (lower.includes("chrome") || lower.includes("chromium")) &&
-    lower.includes("user-data-dir") &&
-    command.includes(userDataDir)
+    normalizeProfilePathForComparison(commandProfile) ===
+    normalizeProfilePathForComparison(userDataDir)
   );
+}
+
+function startsWithChromeExecutable(command: string): boolean {
+  const names =
+    /^(?:google chrome(?: canary| beta| dev| for testing)?|google-chrome(?:-stable|-beta|-dev|-unstable)?|chrome|chromium|chromium-browser|chrome-headless-shell)(?:\.exe)?$/iu;
+  const trimmed = command.trimStart();
+  const quoted = trimmed.match(/^(?:"([^"]+)"|'([^']+)')(?=\s|$)/u);
+  let executable: string;
+  if (quoted) {
+    executable = quoted[1] ?? quoted[2]!;
+  } else {
+    const optionsStart = trimmed.search(/\s+"?--/u);
+    executable = optionsStart < 0 ? trimmed : trimmed.slice(0, optionsStart);
+    // macOS ps leaves the standard Google Chrome bundle path unquoted. Other
+    // whitespace is ambiguous with argv entries; never mistake a later argument
+    // named chrome for the executable that owns this PID.
+    if (
+      /\s/u.test(
+        executable.replace(
+          /google chrome(?: canary| beta| dev| for testing)?(?:\.app)?/giu,
+          "chrome",
+        ),
+      )
+    )
+      return false;
+  }
+  return names.test(executable.split(/[\\/]/u).at(-1) ?? "");
+}
+
+function normalizeProfilePathForComparison(value: string): string {
+  let normalized = path.normalize(path.resolve(value));
+  if (process.platform === "win32") {
+    normalized = normalized.replace(/^\\\\\?\\/u, "").toLowerCase();
+  }
+  const root = path.parse(normalized).root;
+  while (normalized.length > root.length && /[\\/]$/u.test(normalized)) {
+    normalized = normalized.slice(0, -1);
+  }
+  return normalized;
 }
 
 export function isChromeCommandForUserDataDirForTest(
@@ -214,6 +284,46 @@ export function isProcessAlive(pid: number): boolean {
       return true;
     }
     return false;
+  }
+}
+
+export async function readProcessStartTimeMs(pid: number): Promise<number | null> {
+  if (!Number.isFinite(pid) || pid <= 0) return null;
+  if (Math.trunc(pid) === process.pid) {
+    // Use the same OS identity as peer controllers, not wall time minus uptime.
+    // Cache our own PID only: it cannot be reused during this process's lifetime.
+    return (ownProcessStartTime ??= queryProcessStartTimeMs(process.pid).then((startedAt) => {
+      // A transient probe failure is not a permanent process identity.
+      if (startedAt === null) ownProcessStartTime = undefined;
+      return startedAt;
+    }));
+  }
+  return queryProcessStartTimeMs(pid);
+}
+
+async function queryProcessStartTimeMs(pid: number): Promise<number | null> {
+  try {
+    const executable = process.platform === "win32" ? "powershell.exe" : "ps";
+    const args =
+      process.platform === "win32"
+        ? [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            `$process = Get-Process -Id ${Math.trunc(pid)} -ErrorAction Stop; $process.StartTime.ToUniversalTime().ToString('o')`,
+          ]
+        : ["-p", String(Math.trunc(pid)), "-o", "lstart="];
+    const { stdout } = await execFileAsync(executable, args, {
+      maxBuffer: 1024 * 1024,
+      windowsHide: true,
+      timeout: 5000,
+      // Keep ps timestamps parseable regardless of the user's locale.
+      env: { ...process.env, LC_ALL: "C" },
+    });
+    const startedAt = Date.parse(String(stdout ?? "").trim());
+    return Number.isFinite(startedAt) ? startedAt : null;
+  } catch {
+    return null;
   }
 }
 
@@ -249,6 +359,7 @@ export async function acquireProfileRunLock(
     pollMs?: number;
     logger?: ProfileStateLogger;
     sessionId?: string;
+    signal?: AbortSignal;
   },
 ): Promise<ProfileRunLock | null> {
   const timeoutMs = options.timeoutMs;
@@ -265,6 +376,7 @@ export async function acquireProfileRunLock(
   let warned = false;
 
   for (;;) {
+    options.signal?.throwIfAborted();
     try {
       const payload: ProfileRunLockRecord = {
         pid: process.pid,
@@ -288,7 +400,7 @@ export async function acquireProfileRunLock(
       let existing = parseProfileRunLock(await readFile(lockPath, "utf8").catch(() => null));
       if (!existing) {
         // Likely partial write / corruption; re-read once, then delete (user preference: delete unreadable lockfiles).
-        await delay(200);
+        await delay(200, options.signal);
         existing = parseProfileRunLock(await readFile(lockPath, "utf8").catch(() => null));
         if (!existing) {
           options.logger?.("Oracle profile lock unreadable; deleting lockfile.");
@@ -313,7 +425,7 @@ export async function acquireProfileRunLock(
           `Oracle profile lock still held by pid ${existing.pid} after ${Math.round(elapsed / 1000)}s`,
         );
       }
-      await delay(Math.min(pollMs, timeoutMs - elapsed));
+      await delay(Math.min(pollMs, timeoutMs - elapsed), options.signal);
     }
   }
 }
@@ -528,17 +640,22 @@ export async function verifyDevToolsReachable({
   attempts?: number;
   timeoutMs?: number;
 }): Promise<{ ok: true } | { ok: false; error: string }> {
-  const versionUrl = `http://${host}:${port}/json/version`;
+  const versionUrl = `http://${formatWebSocketHost(host)}:${port}/json/version`;
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), timeoutMs);
-      const response = await fetch(versionUrl, { signal: controller.signal });
-      clearTimeout(timeout);
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+      try {
+        const response = await fetch(versionUrl, { signal: controller.signal });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        return { ok: true };
+      } finally {
+        // Headers can arrive before a stalled body; bound and clean up the whole request.
+        clearTimeout(timeout);
+        controller.abort();
       }
-      return { ok: true };
     } catch (error) {
       if (attempt < attempts - 1) {
         await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
@@ -648,13 +765,21 @@ async function isChromeUsingUserDataDir(userDataDir: string): Promise<boolean> {
 
 async function readProcessCommand(pid: number): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync(
-      "ps",
-      ["-p", String(Math.trunc(pid)), "-o", "command="],
-      {
-        maxBuffer: 1024 * 1024,
-      },
-    );
+    const executable = process.platform === "win32" ? "powershell.exe" : "ps";
+    const args =
+      process.platform === "win32"
+        ? [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            `(Get-CimInstance Win32_Process -Filter 'ProcessId = ${Math.trunc(pid)}').CommandLine`,
+          ]
+        : ["-p", String(Math.trunc(pid)), "-o", "command="];
+    const { stdout } = await execFileAsync(executable, args, {
+      maxBuffer: 1024 * 1024,
+      windowsHide: true,
+      timeout: 5000,
+    });
     const command = String(stdout ?? "").trim();
     return command || null;
   } catch {

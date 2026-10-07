@@ -36,14 +36,19 @@ running   gpt-5.2-pro   api     03/01 09:22 AM      1400        -  │  └─ i
 pending   gpt-5.2-pro   api     03/01 09:25 AM       900        -  └─ risk-check
 ```
 
+## Token usage and cost
+
+API usage summaries and saved sessions include reported reasoning tokens. Gemini's thought tokens are included in output usage; OpenAI reasoning is already part of output, and xAI reasoning is added only when the reported total identifies it as separate. Reasoning is a breakdown of output, not an additional amount to add to the total. Costs are estimates based on these counts and Oracle's configured rates.
+
 ## Replaying
 
 ```bash
 oracle session <id>            # print metadata + answer
-oracle session <id> --render   # print the prompt that was sent
+oracle session <id> --path     # print stored session paths
+oracle session <id> --render   # render the stored prompt and answer as Markdown
 ```
 
-Use the slug or a unique id prefix; Oracle resolves both.
+Use the slug or a unique id prefix; Oracle resolves both. `session` and `status` accept `--model <name>` to filter a listing or replay one model’s output. For replay, `--hide-prompt` omits the stored prompt, `--render` requests Markdown rendering, and `--verbose-render` shows rendering diagnostics. Both commands render automatically on a rich terminal; redirected output remains plain text.
 
 ## Reattach
 
@@ -73,6 +78,10 @@ oracle --wait --model gpt-5.6-sol-pro -p "Long architecture review" --file "src/
 ```
 
 For API runs, `--wait` executes the request in the foreground. Local Pro browser runs use a detached worker even with `--wait`, while the original CLI stays attached to the session log. This lets the browser worker capture and save the answer if the foreground CLI exits unexpectedly. Pressing Ctrl-C still cancels the worker and exits with code 130.
+
+MCP callers can make the same ownership split explicit for any local run: call `consult` with `waitForCompletion:false`, then call `wait` with the returned session id. `wait.timeoutMs` bounds only the caller's wait; timeout, request cancellation, or MCP transport closure does not cancel the detached worker. Omit the timeout to wait until a terminal status, or use `0` for an immediate snapshot.
+
+Reattachment recognizes prompt echoes even when spacing or line breaks differ, and keeps waiting for assistant content instead of treating the echoed prompt as an answer.
 
 For browser runs, ChatGPT sometimes redirects mid-page-load. The auto-reattach flags poll the existing tab without manual intervention:
 
@@ -135,6 +144,40 @@ oracle status --clear --hours 168   # delete sessions older than a week
 ## Slugs
 
 Every run gets a default slug derived from the prompt. Override with `--slug "my-thing"` for stable names you can reference later (`oracle session my-thing`).
+
+## Browser harvest identity
+
+`oracle session <id> --harvest` and `--live` reuse the saved Chrome transport,
+including the browser WebSocket endpoint and approval wait for attach-running
+sessions. This supports Chrome configurations without HTTP target discovery.
+If the saved tab is gone, recovery reopens the saved conversation through the
+same endpoint. Keep Chrome running with remote debugging enabled and allow its
+connection prompt when requested; transport failures identify the operation and
+endpoint instead of displaying an empty error. Transient ChatGPT status notices
+appended outside the user content do not invalidate the submitted prompt hash;
+the stable user message ID and exact prompt text must still match.
+
+Browser harvest and live-tail compare the observed conversation with saved
+runtime, archive, artifact-source, and transcript-header identities. A mismatch
+is retained under `browser.harvest.integrity` and shown as a browser warning;
+an implicit harvest fails with `conversation-identity-mismatch` before exporting
+the newly harvested answer. Existing transcripts and answer logs are preserved.
+
+Implicit harvest also waits for an assistant answer paired with the latest user
+turn, up to the saved browser input timeout. New browser sessions record a
+fingerprint of each rendered, committed user turn and its stable message ID
+before waiting for its answer, including repeated follow-ups. A mismatch preserves the original output; an unconfirmed
+submission requires waiting or explicit tab inspection.
+
+Older sessions without a fingerprint retain their existing recovery behavior,
+with a warning that only latest user/assistant pairing can be checked. Their
+submitted file context cannot be reconstructed reliably from saved metadata.
+
+An explicit `--browser-tab` override still permits inspecting another target,
+but records the mismatch and does not reassign the original capture. Unavailable
+recorded transcript headers or unreadable recorded conversation URLs are marked
+`unverified`. Matching known conversation IDs
+does not by itself prove that an answer belongs to the original prompt.
 
 ## Naming conventions
 

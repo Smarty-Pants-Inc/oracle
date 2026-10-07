@@ -3,6 +3,9 @@ import { createHash } from "node:crypto";
 import chalk from "chalk";
 import { sessionStore } from "../sessionStore.js";
 import type { SessionMetadata } from "../sessionStore.js";
+import { resolveBrowserConfig } from "../browser/config.js";
+import { formatWebSocketHost, readDevToolsActivePortInfo } from "../browser/detect.js";
+import { browserPromptFingerprint } from "../browser/promptFingerprint.js";
 import {
   collectChatGptTabs,
   DEFAULT_REMOTE_CHROME_HOST,
@@ -12,6 +15,7 @@ import {
   harvestChatGptTab,
   sessionMatchesTab,
   type ChatGptTabSummary,
+  type LiveChromeEndpoint,
 } from "../browser/liveTabs.js";
 import {
   isRecoveredConversationHarvestReady,
@@ -20,9 +24,13 @@ import {
 import { resolveOutputPath } from "./writeOutputPath.js";
 import { browserIdFromWebSocketEndpoint } from "../browser/profileState.js";
 import { normalizeChatGptAccountDigest } from "../browser/chatgptAccount.js";
+import { persistBrowserHarvest } from "./harvestIntegrity.js";
+import { completeOwnedBrowserHarvest } from "./recoveredBrowserHarvest.js";
+import type { BrowserHarvestIntegrity } from "../sessionManager.js";
 
 const LIVE_POLL_MS = 2000;
 const DEFAULT_STALL_THRESHOLD_MS = 60_000;
+const HARVEST_FRESHNESS_POLL_MS = 250;
 
 function isRecoverableMissingTabError(message: string): boolean {
   return (
@@ -49,6 +57,57 @@ function finishRecoveredChrome(
   } catch {
     // best-effort cleanup
   }
+}
+
+function harvestMatchesSessionPrompt(
+  harvested: ChatGptTabSummary,
+  fingerprint: string | undefined,
+): boolean {
+  const answer = harvested.lastAssistantMarkdown ?? harvested.lastAssistantText;
+  if (harvested.assistantFollowsLatestUser !== true || !answer?.trim()) return false;
+  return (
+    fingerprint === undefined ||
+    (typeof harvested.lastUserMessageId === "string" &&
+      harvested.lastUserMessageId.trim().length > 0 &&
+      // ChatGPT can append transient status text outside the user's content after submission.
+      // Keep legacy full-container hashes valid and require an exact match for either form.
+      [harvested.lastUserTextRaw ?? harvested.lastUserText, harvested.lastUserContentText].some(
+        (text) =>
+          typeof text === "string" &&
+          browserPromptFingerprint(text, harvested.lastUserMessageId!) === fingerprint,
+      ))
+  );
+}
+
+async function harvestSessionPrompt(
+  meta: SessionMetadata,
+  options: Parameters<typeof harvestChatGptTab>[0],
+  requireSessionPrompt = true,
+): Promise<ChatGptTabSummary> {
+  const fingerprint = requireSessionPrompt ? meta.browser?.runtime?.submittedPromptHash : undefined;
+  if (fingerprint === null) {
+    throw new Error(
+      "This browser session has no confirmed submitted user turn; retry after submission or use --browser-tab to inspect a specific tab.",
+    );
+  }
+  if (requireSessionPrompt && fingerprint === undefined) {
+    console.warn(
+      "Legacy browser session: submitted-turn identity is unavailable; verifying only latest user/assistant pairing.",
+    );
+  }
+  const freshnessTimeoutMs = resolveBrowserConfig(meta.browser?.config).inputTimeoutMs;
+  const deadline = Date.now() + freshnessTimeoutMs;
+  let harvested = await harvestChatGptTab(options);
+  while (!harvestMatchesSessionPrompt(harvested, fingerprint) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, HARVEST_FRESHNESS_POLL_MS));
+    harvested = await harvestChatGptTab(options);
+  }
+  if (!harvestMatchesSessionPrompt(harvested, fingerprint)) {
+    throw new Error(
+      `Latest ChatGPT turn did not contain an assistant answer paired with this session prompt after ${Math.ceil(freshnessTimeoutMs / 1000)}s; refusing to harvest stale output.`,
+    );
+  }
+  return harvested;
 }
 
 export interface BrowserHarvestOptions {
@@ -99,9 +158,15 @@ function hasRemoteAffinityMarker(meta: SessionMetadata | null | undefined): bool
   );
 }
 
-function sessionBrowserEndpoint(
-  meta: SessionMetadata | null | undefined,
-): { host: string; port: number; browserId?: string; accountDigest?: string } | null {
+async function sessionBrowserEndpoint(meta: SessionMetadata | null | undefined): Promise<
+  | (LiveChromeEndpoint & {
+      host: string;
+      port: number;
+      browserId?: string;
+      accountDigest?: string;
+    })
+  | null
+> {
   const runtime = meta?.browser?.runtime ?? {};
   const config = meta?.browser?.config ?? meta?.options?.browserConfig;
   const remote = config?.remoteChrome;
@@ -146,9 +211,51 @@ function sessionBrowserEndpoint(
     }
     return null;
   }
+  const approvalWaitMs = resolveBrowserConfig(meta?.browser?.config).approvalWaitMs;
   if (!requiresRemoteAffinity) {
-    return { host, port, ...(accountDigest ? { accountDigest } : {}) };
+    let browserWSEndpoint = runtime.chromeBrowserWSEndpoint;
+    let livePort = port;
+    if (browserWSEndpoint) {
+      const active = runtime.chromeProfileRoot
+        ? await readDevToolsActivePortInfo(runtime.chromeProfileRoot, { host }).catch(() => null)
+        : null;
+      if (active) {
+        browserWSEndpoint = active.browserWSEndpoint;
+        livePort = active.port;
+      } else {
+        // A restarted Chrome can keep its port while changing its browser socket ID.
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 1000);
+        try {
+          const response = await fetch(`http://${formatWebSocketHost(host)}:${port}/json/version`, {
+            signal: controller.signal,
+          });
+          if (response.ok) {
+            const version = (await response.json()) as { webSocketDebuggerUrl?: string };
+            const advertised = new URL(version.webSocketDebuggerUrl ?? "");
+            if (advertised.pathname.startsWith("/devtools/browser/")) {
+              const refreshed = new URL(browserWSEndpoint);
+              refreshed.pathname = advertised.pathname;
+              browserWSEndpoint = refreshed.toString();
+            }
+          }
+        } catch {
+          // Attach-running Chrome may disable HTTP discovery; keep its saved socket.
+        } finally {
+          clearTimeout(timeout);
+          controller.abort();
+        }
+      }
+    }
+    return {
+      host,
+      port: livePort,
+      ...(browserWSEndpoint ? { browserWSEndpoint, approvalWaitMs } : {}),
+      ...(accountDigest ? { accountDigest } : {}),
+    };
   }
+  // Remote-affinity sessions are bound to one browser identity: never refresh the socket to a
+  // different (restarted) browser; fail closed instead.
   const configuredBrowserWSEndpoint = config?.remoteChromeBrowserWSEndpoint?.trim();
   const runtimeBrowserWSEndpoint = runtime.chromeBrowserWSEndpoint?.trim();
   const browserWSEndpoint = runtimeBrowserWSEndpoint ?? configuredBrowserWSEndpoint;
@@ -179,12 +286,16 @@ function isLoopbackHost(host: string): boolean {
   );
 }
 
-function collectUniqueEndpoints(
+async function collectUniqueEndpoints(
   metas: SessionMetadata[],
-): Array<{ host: string; port: number; browserId?: string; accountDigest?: string }> {
+): Promise<
+  Array<
+    LiveChromeEndpoint & { host: string; port: number; browserId?: string; accountDigest?: string }
+  >
+> {
   const entries = new Map<
     string,
-    { host: string; port: number; browserId?: string; accountDigest?: string }
+    LiveChromeEndpoint & { host: string; port: number; browserId?: string; accountDigest?: string }
   >();
   let suppressRawDefault = process.env.ORACLE_WRAPPER_REMOTE_ONLY === "1";
   for (const meta of metas) {
@@ -199,25 +310,25 @@ function collectUniqueEndpoints(
       suppressRawDefault = true;
     }
     try {
-      const endpoint = sessionBrowserEndpoint(meta);
+      const endpoint = await sessionBrowserEndpoint(meta);
       if (!endpoint) continue;
-      const key = `${endpoint.host.toLowerCase()}:${endpoint.port}\t${endpoint.browserId ?? ""}\t${endpoint.accountDigest ?? ""}`;
+      const key = `${endpoint.host.toLowerCase()}:${endpoint.port}\t${endpoint.browserWSEndpoint ?? "http"}\t${endpoint.browserId ?? ""}\t${endpoint.accountDigest ?? ""}`;
       if (!entries.has(key)) entries.set(key, endpoint);
     } catch {
       // Named operations fail closed; global discovery skips incomplete legacy sessions.
     }
   }
   if (!suppressRawDefault) {
-    entries.set(`${DEFAULT_REMOTE_CHROME_HOST}:${DEFAULT_REMOTE_CHROME_PORT}\t\t`, {
+    entries.set(`${DEFAULT_REMOTE_CHROME_HOST}:${DEFAULT_REMOTE_CHROME_PORT}\thttp\t\t`, {
       host: DEFAULT_REMOTE_CHROME_HOST,
       port: DEFAULT_REMOTE_CHROME_PORT,
     });
   }
   return Array.from(entries.values());
 }
-export function collectUniqueEndpointsForTest(
+export async function collectUniqueEndpointsForTest(
   metas: SessionMetadata[],
-): Array<{ host: string; port: number; browserId?: string; accountDigest?: string }> {
+): Promise<Array<{ host: string; port: number; browserId?: string; accountDigest?: string }>> {
   return collectUniqueEndpoints(metas);
 }
 
@@ -371,7 +482,10 @@ async function persistHarvest(
   sessionId: string,
   meta: SessionMetadata,
   harvested: ChatGptTabSummary,
-): Promise<void> {
+  explicitTarget = false,
+): Promise<BrowserHarvestIntegrity> {
+  // Upstream integrity check first: it records the harvest and refuses conflicting identities.
+  const integrity = await persistBrowserHarvest(sessionId, harvested, explicitTarget);
   let persistedOutput: string | undefined;
   try {
     const outputPath = resolveOutputPath(meta.options.writeOutputPath, meta.cwd ?? process.cwd());
@@ -381,17 +495,40 @@ async function persistHarvest(
   } catch {
     // Harvesting remains useful even when the original output artifact is unavailable.
   }
-  const browser = recoverBrowserMetadataFromHarvestForTest(meta, harvested, persistedOutput);
-  await sessionStore.updateSession(sessionId, { browser });
+  // Fork runtime repair: only when the harvested tab provably matches the session.
+  const latest = (await sessionStore.readSession(sessionId)) ?? meta;
+  const recovered = recoverBrowserMetadataFromHarvestForTest(latest, harvested, persistedOutput);
+  const browser =
+    integrity.status === "mismatch"
+      ? { ...(latest.browser ?? {}), harvest: { ...recovered.harvest, runtimeRepaired: false } }
+      : recovered;
+  await sessionStore.updateSession(sessionId, {
+    browser: { ...browser, harvest: { ...browser.harvest, integrity } },
+  });
+  return integrity;
 }
 
-function printHarvestSummary(sessionId: string, harvested: ChatGptTabSummary): void {
+function printHarvestSummary(
+  sessionId: string,
+  harvested: ChatGptTabSummary,
+  integrity: BrowserHarvestIntegrity,
+): void {
   console.log(chalk.bold(`Session: ${sessionId}`));
   console.log(`Target: ${harvested.targetId}`);
   console.log(`State: ${formatBrowserTabState(harvested)}`);
   console.log(`Model: ${harvested.currentModelLabel || "(unknown)"}`);
   console.log(`URL: ${harvested.url}`);
   console.log(`Assistant turns: ${harvested.assistantCount}`);
+  console.log(
+    `Capture identity: ${integrity.status}${integrity.explicitTarget ? " (explicit target)" : ""}`,
+  );
+  if (integrity.status === "mismatch") {
+    console.log(
+      chalk.yellow(
+        "Explicit harvest target differs from the saved capture; original artifacts are unchanged.",
+      ),
+    );
+  }
   console.log(
     `Signals: stop=${harvested.stopExists ? "yes" : "no"} send=${harvested.sendExists ? "yes" : "no"}`,
   );
@@ -421,7 +558,7 @@ async function maybeWriteHarvestOutput(
 
 export async function showBrowserTabsStatus(): Promise<void> {
   const metas = await sessionStore.listSessions();
-  const endpoints = collectUniqueEndpoints(metas);
+  const endpoints = await collectUniqueEndpoints(metas);
   let printedAny = false;
   for (const endpoint of endpoints) {
     let tabs: ChatGptTabSummary[];
@@ -466,7 +603,7 @@ export async function harvestSessionBrowserOutput(
   if (!meta) {
     throw new Error(`No session found with ID ${sessionId}.`);
   }
-  const recordedEndpoint = sessionBrowserEndpoint(meta);
+  const recordedEndpoint = await sessionBrowserEndpoint(meta);
   const initialEndpoint = recordedEndpoint ?? {
     host: DEFAULT_REMOTE_CHROME_HOST,
     port: DEFAULT_REMOTE_CHROME_PORT,
@@ -491,9 +628,11 @@ export async function harvestSessionBrowserOutput(
         existingEndpoint: recordedEndpoint ?? undefined,
       });
       recoveredChrome = recovered.chrome;
-      return harvestChatGptTab({
+      return harvestSessionPrompt(meta, {
         host: recovered.host,
         port: recovered.port,
+        browserWSEndpoint: recovered.browserWSEndpoint,
+        approvalWaitMs: recovered.approvalWaitMs,
         browserId: recovered.browserId,
         accountDigest: recovered.accountDigest,
         ref: recovered.ref,
@@ -506,11 +645,15 @@ export async function harvestSessionBrowserOutput(
       harvested = await recoverAndHarvest();
     } else {
       try {
-        harvested = await harvestChatGptTab({
-          ...initialEndpoint,
-          ref,
-          stallWindowMs: options.stallWindowMs,
-        });
+        harvested = await harvestSessionPrompt(
+          meta,
+          {
+            ...initialEndpoint,
+            ref,
+            stallWindowMs: options.stallWindowMs,
+          },
+          !options.browserTabRef,
+        );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (!isRecoverableMissingTabError(message) || !recoverIfMissing) {
@@ -520,8 +663,13 @@ export async function harvestSessionBrowserOutput(
       }
     }
 
-    await persistHarvest(sessionId, meta, harvested);
-    printHarvestSummary(sessionId, harvested);
+    const integrity = await persistHarvest(
+      sessionId,
+      meta,
+      harvested,
+      Boolean(options.browserTabRef),
+    );
+    printHarvestSummary(sessionId, harvested, integrity);
     const output = harvested.lastAssistantMarkdown ?? harvested.lastAssistantText ?? "";
     if (options.writeOutputPath) {
       await maybeWriteHarvestOutput(options.writeOutputPath, meta.cwd ?? process.cwd(), output);
@@ -529,6 +677,7 @@ export async function harvestSessionBrowserOutput(
     if (!options.quietOutput && output) {
       process.stdout.write(`${output}${output.endsWith("\n") ? "" : "\n"}`);
     }
+    await completeOwnedBrowserHarvest(sessionId, harvested, integrity, (line) => console.log(line));
     return harvested;
   } finally {
     finishRecoveredChrome(recoveredChrome, options.closeAfterRecover);
@@ -543,8 +692,8 @@ export async function liveTailSessionBrowserOutput(
   if (!meta) {
     throw new Error(`No session found with ID ${sessionId}.`);
   }
-  const recordedEndpoint = sessionBrowserEndpoint(meta);
-  let endpoint = recordedEndpoint ?? {
+  const recordedEndpoint = await sessionBrowserEndpoint(meta);
+  let endpoint: Parameters<typeof harvestChatGptTab>[0] = recordedEndpoint ?? {
     host: DEFAULT_REMOTE_CHROME_HOST,
     port: DEFAULT_REMOTE_CHROME_PORT,
   };
@@ -579,6 +728,8 @@ export async function liveTailSessionBrowserOutput(
       endpoint = {
         host: recovered.host,
         port: recovered.port,
+        browserWSEndpoint: recovered.browserWSEndpoint,
+        approvalWaitMs: recovered.approvalWaitMs,
         browserId: recovered.browserId,
         accountDigest: recovered.accountDigest,
       };
@@ -606,8 +757,8 @@ export async function liveTailSessionBrowserOutput(
           `[${new Date().toISOString()}] state=${harvested.state} stop=${harvested.stopExists ? "yes" : "no"} ` +
           `send=${harvested.sendExists ? "yes" : "no"} model=${harvested.currentModelLabel || "(unknown)"} ` +
           `snippet=${snippet(harvested.lastAssistantSnippet || fullText, 160)}`;
+        await persistHarvest(sessionId, meta, harvested, Boolean(options.browserTabRef));
         console.log(statusLine);
-        await persistHarvest(sessionId, meta, harvested);
       }
 
       const derivedState = harvested.stopExists
@@ -627,8 +778,13 @@ export async function liveTailSessionBrowserOutput(
           ...harvested,
           state: derivedState,
         };
-        await persistHarvest(sessionId, meta, finalHarvest);
-        printHarvestSummary(sessionId, finalHarvest);
+        const integrity = await persistHarvest(
+          sessionId,
+          meta,
+          finalHarvest,
+          Boolean(options.browserTabRef),
+        );
+        printHarvestSummary(sessionId, finalHarvest, integrity);
         const output = finalHarvest.lastAssistantMarkdown ?? finalHarvest.lastAssistantText ?? "";
         if (options.writeOutputPath) {
           await maybeWriteHarvestOutput(options.writeOutputPath, meta.cwd ?? process.cwd(), output);
@@ -636,6 +792,9 @@ export async function liveTailSessionBrowserOutput(
         if (output) {
           process.stdout.write(`${output}${output.endsWith("\n") ? "" : "\n"}`);
         }
+        await completeOwnedBrowserHarvest(sessionId, finalHarvest, integrity, (line) =>
+          console.log(line),
+        );
         return finalHarvest;
       }
 

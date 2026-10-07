@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import os from "node:os";
@@ -60,6 +61,7 @@ import {
   OracleTransportError,
   runOracle,
 } from "../../src/oracle.ts";
+import { BrowserRunCancelledError } from "../../src/oracle/errors.ts";
 import {
   runMultiModelApiSession,
   type ModelExecutionResult,
@@ -155,8 +157,11 @@ beforeEach(() => {
   });
   sessionStoreMock.readModelLog.mockResolvedValue("model log body");
   sessionStoreMock.sessionsDir.mockReturnValue("/tmp/.oracle/sessions");
+  sessionStoreMock.getPaths.mockResolvedValue({ log: "/tmp/.oracle/sessions/sess-1/output.log" });
   vi.spyOn(fsPromises, "mkdir").mockResolvedValue(undefined);
   vi.spyOn(fsPromises, "writeFile").mockResolvedValue(undefined);
+  vi.spyOn(fsPromises, "appendFile").mockResolvedValue(undefined);
+  vi.spyOn(fsPromises, "copyFile").mockResolvedValue(undefined);
 });
 
 describe("performSessionRun", () => {
@@ -1133,6 +1138,162 @@ describe("performSessionRun", () => {
     ]);
   });
 
+  test("preserves browser saved files beside write-output without overwriting collisions", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "oracle-browser-output-"));
+    const canonicalDir = path.join(tmpDir, "session", "artifacts");
+    const outputDir = path.join(tmpDir, "output");
+    const failureOutputDir = path.join(tmpDir, "failed-output");
+    fs.mkdirSync(canonicalDir, { recursive: true });
+    fs.mkdirSync(outputDir, { recursive: true });
+    const canonicalPath = path.join(canonicalDir, "report.md");
+    const canonicalBytes = Buffer.from("# Saved report\n\nAuthenticated artifact bytes.\n", "utf8");
+    const sha256 = createHash("sha256").update(canonicalBytes).digest("hex");
+    fs.writeFileSync(canonicalPath, canonicalBytes);
+    const collidingPath = path.join(outputDir, "report.md");
+    fs.writeFileSync(collidingPath, "existing file must survive\n", "utf8");
+
+    const savedFile = {
+      kind: "file" as const,
+      path: canonicalPath,
+      label: "report.md",
+      mimeType: "text/markdown",
+      sizeBytes: canonicalBytes.length,
+      sourceUrl: "sandbox:/mnt/data/report.md",
+      sha256,
+      validation: { type: "generic" as const, ok: true },
+      transfer: { status: "not-needed" as const },
+      origin: { mode: "local" as const },
+      url: "https://chatgpt.com/backend-api/files/report",
+      sandboxUrl: "sandbox:/mnt/data/report.md",
+      filename: "report.md",
+    };
+    vi.mocked(runBrowserSessionExecution).mockResolvedValue({
+      usage: { inputTokens: 10, outputTokens: 5, reasoningTokens: 0, totalTokens: 15 },
+      elapsedMs: 500,
+      runtime: { chromePid: 1, chromePort: 9222, userDataDir: "/tmp/chrome" },
+      answerText: "sandbox:/mnt/data/report.md",
+      artifacts: [savedFile],
+      savedFiles: [savedFile],
+      providerNativeCapture: {
+        status: "unavailable",
+        answerFidelity: "unknown",
+        failure: { reason: "challenged" },
+      },
+      thinkingSelection: {
+        requestedLevel: "pro",
+        status: "switched",
+        resolvedLabel: "Pro",
+        verified: true,
+        strictFailClosed: true,
+        source: "chatgpt-thinking-picker",
+        capturedAt: "2026-09-07T00:00:00Z",
+      },
+    });
+    vi.mocked(fsPromises.mkdir).mockImplementation(async (target, options) => {
+      fs.mkdirSync(target, options);
+      return undefined;
+    });
+    vi.mocked(fsPromises.writeFile).mockImplementation(async (target, data) => {
+      fs.writeFileSync(target as fs.PathLike, data as string, "utf8");
+    });
+    vi.mocked(fsPromises.copyFile).mockImplementation(async (source, destination, mode) => {
+      fs.copyFileSync(source, destination, mode);
+    });
+
+    try {
+      const answerPath = path.join(outputDir, "answer.md");
+      await performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: { ...baseRunOptions, writeOutputPath: answerPath },
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: tmpDir,
+        log,
+        write,
+        version: cliVersion,
+      });
+
+      expect(fs.readFileSync(answerPath, "utf8")).toBe("sandbox:/mnt/data/report.md\n");
+      expect(fs.existsSync(path.join(outputDir, "report-2.md"))).toBe(false);
+      expect(fsPromises.copyFile).not.toHaveBeenCalled();
+
+      await performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: { ...baseRunOptions, writeOutputPath: answerPath, writeArtifacts: true },
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: tmpDir,
+        log,
+        write,
+        version: cliVersion,
+      });
+
+      const adjacentPath = path.join(outputDir, "report-2.md");
+      expect(fs.readFileSync(answerPath, "utf8")).toBe("sandbox:/mnt/data/report.md\n");
+      expect(fs.readFileSync(canonicalPath)).toEqual(canonicalBytes);
+      expect(fs.readFileSync(collidingPath, "utf8")).toBe("existing file must survive\n");
+      expect(fs.readFileSync(adjacentPath)).toEqual(canonicalBytes);
+      expect(createHash("sha256").update(fs.readFileSync(adjacentPath)).digest("hex")).toBe(sha256);
+
+      const successUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+      expect(successUpdate).toMatchObject({
+        status: "completed",
+        browser: {
+          thinkingSelection: { requestedLevel: "pro", verified: true },
+          providerNativeCapture: {
+            status: "unavailable",
+            answerFidelity: "unknown",
+            failure: { reason: "challenged" },
+          },
+        },
+        artifacts: expect.arrayContaining([
+          expect.objectContaining({ path: canonicalPath, sha256 }),
+          expect.objectContaining({ path: adjacentPath, sha256, sizeBytes: canonicalBytes.length }),
+        ]),
+      });
+      expect(log.mock.calls.map((call) => call[0]).join("\n")).toContain(
+        `Saved write-output file artifact to ${adjacentPath} sha256=${sha256}`,
+      );
+
+      const copyError = Object.assign(new Error("simulated copy failure"), { code: "EIO" });
+      vi.mocked(fsPromises.copyFile).mockRejectedValueOnce(copyError);
+      const failureAnswerPath = path.join(failureOutputDir, "answer.md");
+      await performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: { ...baseRunOptions, writeOutputPath: failureAnswerPath, writeArtifacts: true },
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: tmpDir,
+        log,
+        write,
+        version: cliVersion,
+      });
+
+      expect(fs.readFileSync(failureAnswerPath, "utf8")).toBe("sandbox:/mnt/data/report.md\n");
+      expect(fs.existsSync(path.join(failureOutputDir, "report.md"))).toBe(false);
+      expect(fs.readFileSync(canonicalPath)).toEqual(canonicalBytes);
+      const failureUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+      expect(failureUpdate).toMatchObject({
+        status: "completed",
+        browser: {
+          thinkingSelection: { requestedLevel: "pro", verified: true },
+          warnings: [
+            expect.objectContaining({
+              code: "browser-output-artifact-copy-failed",
+              message: expect.stringContaining("simulated copy failure"),
+            }),
+          ],
+        },
+        artifacts: [expect.objectContaining({ path: canonicalPath, sha256 })],
+      });
+      expect(log.mock.calls.map((call) => call[0]).join("\n")).toContain(
+        `Failed to copy saved file artifact ${canonicalPath}`,
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   test("write-output failures warn but keep session successful", async () => {
     const liveResult: RunOracleResult = {
       mode: "live",
@@ -1210,6 +1371,58 @@ describe("performSessionRun", () => {
     expect(result).toBe(expected);
   });
 
+  test.each([null, "previous-turn-fingerprint"])(
+    "preserves pending fingerprint state after preparation fails (previous: %s)",
+    async (submittedPromptHash) => {
+      vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(
+        new BrowserAutomationError("preparation failed", { stage: "execute-browser" }),
+      );
+      const sessionMeta = {
+        ...baseSessionMeta,
+        browser: {
+          config: { desiredModel: "Old Pro" },
+          runtime: {
+            submittedPromptHash,
+            promptSubmitted: true,
+            tabUrl: "https://chatgpt.com/c/old",
+          },
+          modelSelection: {
+            requestedModel: "Old Pro",
+            resolvedLabel: "Old Pro",
+            strategy: "select" as const,
+            status: "already-selected" as const,
+            verified: true,
+            source: "chatgpt-model-picker" as const,
+            capturedAt: "2026-07-02T00:00:00.000Z",
+          },
+        },
+      };
+
+      await expect(
+        performSessionRun({
+          sessionMeta,
+          runOptions: baseRunOptions,
+          mode: "browser",
+          browserConfig: { chromePath: null },
+          cwd: "/tmp",
+          log,
+          write,
+          version: cliVersion,
+        }),
+      ).rejects.toThrow("preparation failed");
+
+      const updates = sessionStoreMock.updateSession.mock.calls;
+      expect(updates[0]?.[1]?.status).toBe("running");
+      expect(updates.at(-1)?.[1]?.status).toBe("error");
+      for (const update of [updates[0]?.[1], updates.at(-1)?.[1]]) {
+        expect(update?.browser).toEqual({
+          config: { chromePath: null },
+          runtime: { submittedPromptHash: null },
+        });
+      }
+    },
+  );
+
   test("records metadata when browser automation fails", async () => {
     const automationError = new BrowserAutomationError("automation failed", {
       stage: "execute-browser",
@@ -1262,6 +1475,268 @@ describe("performSessionRun", () => {
     expect(logLines).not.toContain("Next steps (browser fallback)");
     expect(logLines).not.toContain("--engine api");
     expect(logLines).not.toContain("This run did not return cleanly");
+  });
+
+  test("records browser cancellation truthfully for the session and model", async () => {
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(new BrowserRunCancelledError());
+
+    await expect(
+      performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      }),
+    ).rejects.toThrow(BrowserRunCancelledError);
+
+    expect(sessionStoreMock.updateModelRun).toHaveBeenCalledWith(
+      baseSessionMeta.id,
+      "gpt-5.2-pro",
+      expect.objectContaining({ status: "cancelled", completedAt: expect.any(String) }),
+    );
+    expect(sessionStoreMock.updateSession).toHaveBeenCalledWith(
+      baseSessionMeta.id,
+      expect.objectContaining({
+        status: "cancelled",
+        completedAt: expect.any(String),
+        response: { status: "cancelled" },
+      }),
+    );
+  });
+
+  test("cancellation during normal browser output persistence cannot commit completion", async () => {
+    const cancellation = new AbortController();
+    vi.mocked(runBrowserSessionExecution).mockResolvedValueOnce({
+      usage: { inputTokens: 1, outputTokens: 1, reasoningTokens: 0, totalTokens: 2 },
+      elapsedMs: 10,
+      runtime: { chromePort: 9222 },
+      answerText: "answer",
+    });
+    let finishOutput!: () => void;
+    vi.mocked(fsPromises.writeFile).mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishOutput = resolve;
+        }),
+    );
+
+    const execution = performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: { ...baseRunOptions, writeOutputPath: "/tmp/browser-cancelled.md" },
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+      signal: cancellation.signal,
+    });
+    await vi.waitFor(() => expect(fsPromises.writeFile).toHaveBeenCalledOnce());
+    cancellation.abort();
+    finishOutput();
+
+    await expect(execution).rejects.toThrow(BrowserRunCancelledError);
+    expect(sessionStoreMock.updateSession).toHaveBeenLastCalledWith(
+      baseSessionMeta.id,
+      expect.objectContaining({ status: "cancelled" }),
+    );
+    expect(sessionStoreMock.updateSession).not.toHaveBeenCalledWith(
+      baseSessionMeta.id,
+      expect.objectContaining({ status: "completed" }),
+    );
+  });
+
+  test("cancels during an auto-reattach delay without starting recovery", async () => {
+    const cancellation = new AbortController();
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(
+      new BrowserAutomationError("recoverable disconnect", {
+        stage: "connection-lost",
+        recoverableDisconnect: true,
+        runtime: {
+          chromePort: 9222,
+          tabUrl: "https://chatgpt.com/c/demo",
+          promptSubmitted: true,
+        },
+      }),
+    );
+
+    const execution = performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: {
+        chromePath: null,
+        autoReattachDelayMs: 60_000,
+        autoReattachIntervalMs: 1_000,
+      },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+      signal: cancellation.signal,
+    });
+    await vi.waitFor(() =>
+      expect(log).toHaveBeenCalledWith(expect.stringContaining("Auto-reattach starting")),
+    );
+    cancellation.abort();
+
+    await expect(execution).rejects.toThrow(BrowserRunCancelledError);
+    expect(vi.mocked(resumeBrowserSession)).not.toHaveBeenCalled();
+    expect(sessionStoreMock.updateSession).toHaveBeenCalledWith(
+      baseSessionMeta.id,
+      expect.objectContaining({ status: "cancelled" }),
+    );
+  });
+
+  test("cancellation interrupts an active auto-reattach attempt", async () => {
+    const cancellation = new AbortController();
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(
+      new BrowserAutomationError("recoverable disconnect", {
+        stage: "connection-lost",
+        recoverableDisconnect: true,
+        runtime: {
+          chromePort: 9222,
+          tabUrl: "https://chatgpt.com/c/demo",
+          promptSubmitted: true,
+        },
+      }),
+    );
+    vi.mocked(resumeBrowserSession).mockImplementationOnce(() => new Promise(() => undefined));
+
+    const execution = performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+      signal: cancellation.signal,
+    });
+    await vi.waitFor(() => expect(resumeBrowserSession).toHaveBeenCalledTimes(1));
+    cancellation.abort();
+
+    await expect(execution).rejects.toThrow(BrowserRunCancelledError);
+    expect(sessionStoreMock.updateSession).toHaveBeenLastCalledWith(
+      baseSessionMeta.id,
+      expect.objectContaining({ status: "cancelled" }),
+    );
+    expect(sessionStoreMock.updateSession).not.toHaveBeenCalledWith(
+      baseSessionMeta.id,
+      expect.objectContaining({ status: "completed" }),
+    );
+  });
+
+  test("cancellation during recovered artifact persistence cannot commit completion", async () => {
+    const cancellation = new AbortController();
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(
+      new BrowserAutomationError("recoverable disconnect", {
+        stage: "connection-lost",
+        recoverableDisconnect: true,
+        runtime: {
+          chromePort: 9222,
+          tabUrl: "https://chatgpt.com/c/demo",
+          promptSubmitted: true,
+        },
+      }),
+    );
+    vi.mocked(resumeBrowserSession).mockResolvedValueOnce({
+      answerText: "recovered answer",
+      answerMarkdown: "recovered answer",
+    });
+    let finishArtifacts!: (value: []) => void;
+    vi.mocked(ensureSessionArtifacts).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishArtifacts = resolve;
+        }),
+    );
+
+    const execution = performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+      signal: cancellation.signal,
+    });
+    await vi.waitFor(() => expect(ensureSessionArtifacts).toHaveBeenCalledOnce());
+    cancellation.abort();
+    finishArtifacts([]);
+
+    await expect(execution).rejects.toThrow(BrowserRunCancelledError);
+    expect(sessionStoreMock.updateSession).toHaveBeenLastCalledWith(
+      baseSessionMeta.id,
+      expect.objectContaining({ status: "cancelled" }),
+    );
+    expect(sessionStoreMock.updateSession).not.toHaveBeenCalledWith(
+      baseSessionMeta.id,
+      expect.objectContaining({ status: "completed" }),
+    );
+  });
+
+  test("recovery completion remains terminal once its final session write begins", async () => {
+    const cancellation = new AbortController();
+    vi.mocked(runBrowserSessionExecution).mockRejectedValueOnce(
+      new BrowserAutomationError("recoverable disconnect", {
+        stage: "connection-lost",
+        recoverableDisconnect: true,
+        runtime: {
+          chromePort: 9222,
+          tabUrl: "https://chatgpt.com/c/demo",
+          promptSubmitted: true,
+        },
+      }),
+    );
+    vi.mocked(resumeBrowserSession).mockResolvedValueOnce({
+      answerText: "recovered answer",
+      answerMarkdown: "recovered answer",
+    });
+    let completionStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      completionStarted = resolve;
+    });
+    let finishCompletion!: () => void;
+    sessionStoreMock.updateSession.mockImplementation((_id, patch) => {
+      if (patch.status !== "completed") return Promise.resolve();
+      completionStarted();
+      return new Promise<void>((resolve) => {
+        finishCompletion = resolve;
+      });
+    });
+
+    const execution = performSessionRun({
+      sessionMeta: baseSessionMeta,
+      runOptions: baseRunOptions,
+      mode: "browser",
+      browserConfig: { chromePath: null },
+      cwd: "/tmp",
+      log,
+      write,
+      version: cliVersion,
+      signal: cancellation.signal,
+    });
+    await started;
+    cancellation.abort();
+    finishCompletion();
+
+    await expect(execution).resolves.toBeUndefined();
+    expect(sessionStoreMock.updateSession).not.toHaveBeenCalledWith(
+      baseSessionMeta.id,
+      expect.objectContaining({ status: "cancelled" }),
+    );
+    expect(sessionStoreMock.updateSession).toHaveBeenLastCalledWith(
+      baseSessionMeta.id,
+      expect.objectContaining({ status: "completed" }),
+    );
   });
 
   test("preserves persisted runtime hints when browser automation fails without runtime details", async () => {
@@ -2070,7 +2545,7 @@ describe("performSessionRun", () => {
 
     expect(vi.mocked(resumeBrowserSession)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(sendSessionNotification)).toHaveBeenCalledTimes(1);
-    expect(sessionStoreMock.createLogWriter).toHaveBeenCalledTimes(1);
+    expect(fsPromises.appendFile).toHaveBeenCalledTimes(1);
     expect(sessionStoreMock.updateSession.mock.calls.at(-1)?.[1]).toMatchObject({
       status: "error",
       errorMessage: "metadata write failed",

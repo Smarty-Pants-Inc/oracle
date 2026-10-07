@@ -469,7 +469,9 @@ function buildArchiveConversationExpression({
           label.includes('conversation options') ||
           label.includes('open menu') ||
           label.includes('więcej') ||
-          label.includes('opcje')
+          label.includes('opcje') ||
+          label === 'その他' ||
+          label.includes('会話オプション')
         );
       const headerCandidates = labelled
         .filter(({ rect }) => rect.top < 180 && rect.right > window.innerWidth - 420)
@@ -489,8 +491,17 @@ function buildArchiveConversationExpression({
 	      return candidates.find((element) => {
 	        const label = labelFor(element);
 	        if (!label) return false;
-	        if (label.includes('unarchive') || label.includes('restore')) return false;
-	        return label.includes('archive') || label.includes('archiwizuj');
+	        if (
+	          label.includes('unarchive') ||
+	          label.includes('restore') ||
+	          label.includes('アーカイブを解除')
+	        ) return false;
+	        return (
+	          label.includes('archive') ||
+	          label.includes('archiwizuj') ||
+	          label === 'アーカイブ' ||
+	          label.includes('アーカイブする')
+	        );
 	      }) ?? null;
 	    };
 	    const findArchiveConfirmationButton = () => {
@@ -499,8 +510,18 @@ function buildArchiveConversationExpression({
 	      return candidates.find((element) => {
 	        const label = labelFor(element);
 	        if (!label) return false;
-	        if (label.includes('unarchive') || label.includes('restore')) return false;
-	        return label === 'archive' || label === 'archiwizuj' || label.includes('archive conversation');
+	        if (
+	          label.includes('unarchive') ||
+	          label.includes('restore') ||
+	          label.includes('アーカイブを解除')
+	        ) return false;
+	        return (
+	          label === 'archive' ||
+	          label === 'archiwizuj' ||
+	          label.includes('archive conversation') ||
+	          label === 'アーカイブ' ||
+	          label.includes('アーカイブする')
+	        );
 	      }) ?? null;
 	    };
 	    const hasUnarchiveMenuItem = () => {
@@ -511,7 +532,8 @@ function buildArchiveConversationExpression({
 	          label.includes('unarchive') ||
 	          label.includes('restore') ||
 	          label.includes('przywróć') ||
-	          label.includes('przywroc')
+	          label.includes('przywroc') ||
+	          label.includes('アーカイブを解除')
 	        );
 	      });
 	    };
@@ -525,7 +547,9 @@ function buildArchiveConversationExpression({
 	        visibleText.includes('conversation archived') ||
 	        visibleText.includes('chat archived') ||
 	        visibleText.includes('zarchiwizowano') ||
-	        visibleText.includes('archiwum')
+	        visibleText.includes('archiwum') ||
+	        visibleText.includes('アーカイブしました') ||
+	        visibleText.includes('アーカイブされました')
 	      );
 	    };
     const waitForArchiveConfirmation = async () => {

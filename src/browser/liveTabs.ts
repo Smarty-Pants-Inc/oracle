@@ -7,7 +7,7 @@ import {
   INPUT_SELECTORS,
   MODEL_BUTTON_SELECTOR,
   SEND_BUTTON_SELECTORS,
-  STOP_BUTTON_SELECTOR,
+  STOP_BUTTON_SELECTORS,
 } from "./constants.js";
 import { captureAssistantMarkdown, readAssistantSnapshot } from "./actions/assistantResponse.js";
 import { buildConversationTurnListExpression } from "./conversationTurns.js";
@@ -43,13 +43,16 @@ export interface ChromeTarget {
   url?: string;
 }
 
-interface HostPort {
+export interface LiveChromeEndpoint {
   host?: string;
   port?: number;
   browserWSEndpoint?: string;
   browserId?: string;
   accountDigest?: string;
+  approvalWaitMs?: number;
 }
+
+type HostPort = LiveChromeEndpoint;
 
 export interface ChatGptTabSummary {
   host?: string;
@@ -70,6 +73,9 @@ export interface ChatGptTabSummary {
   lastUserTurnIndex?: number;
   lastAssistantSnippet: string;
   lastUserText: string;
+  lastUserTextRaw?: string;
+  lastUserContentText?: string;
+  lastUserMessageId?: string;
   lastUserSnippet: string;
   focused: boolean;
   visibilityState: string;
@@ -82,13 +88,13 @@ export interface ChatGptTabSummary {
   lastAssistantTurnId?: string;
 }
 
-interface ResolveChatGptTabOptions extends HostPort {
+interface ResolveChatGptTabOptions extends LiveChromeEndpoint {
   ref?: string;
   closeTargetOnDispose?: boolean;
   expectedConversationUrl?: string;
 }
 
-interface InspectChatGptTabOptions extends HostPort {
+interface InspectChatGptTabOptions extends LiveChromeEndpoint {
   target: ChromeTarget;
   expectedConversationId?: string;
   expectedConversationUrl?: string;
@@ -115,10 +121,15 @@ function trimToSnippet(text: string, max = 140): string {
   return `${normalized.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
 }
 
-function normalizeHostPort(input: HostPort = {}): { host: string; port: number } {
+function normalizeHostPort(
+  input: LiveChromeEndpoint = {},
+): LiveChromeEndpoint & { host: string; port: number } {
   return {
     host: input.host ?? DEFAULT_REMOTE_CHROME_HOST,
     port: input.port ?? DEFAULT_REMOTE_CHROME_PORT,
+    ...(input.browserWSEndpoint
+      ? { browserWSEndpoint: input.browserWSEndpoint, approvalWaitMs: input.approvalWaitMs }
+      : {}),
   };
 }
 
@@ -136,6 +147,18 @@ async function refreshBoundBrowserEndpoint(options: HostPort): Promise<string | 
     throw new Error("Remote Chrome browser identity changed before live tab inspection.");
   }
   return liveIdentity.browserWSEndpoint;
+}
+
+function chromeTransportError(
+  operation: string,
+  endpoint: LiveChromeEndpoint,
+  error: unknown,
+): Error {
+  const detail = error instanceof Error ? error.message.trim() : String(error ?? "").trim();
+  return new Error(
+    `Unable to ${operation} on Chrome at ${endpoint.host}:${endpoint.port}. ${detail || "Chrome returned no error details."} Check that Chrome is running and remote debugging is enabled, then retry and allow the connection prompt.`,
+    { cause: error },
+  );
 }
 
 function normalizeUrl(value: unknown): string {
@@ -256,7 +279,7 @@ function buildTabInspectionExpression(
   const answerSelectorsLiteral = JSON.stringify(ANSWER_SELECTORS);
   const assistantRoleLiteral = escapeLiteral(ASSISTANT_ROLE_SELECTOR);
   const modelButtonSelectorLiteral = escapeLiteral(MODEL_BUTTON_SELECTOR);
-  const stopSelectorLiteral = escapeLiteral(STOP_BUTTON_SELECTOR);
+  const stopSelectorLiteral = escapeLiteral(STOP_BUTTON_SELECTORS.join(","));
   const expectedConversationLiteral =
     typeof expectedConversationId === "string" && expectedConversationId.trim().length > 0
       ? JSON.stringify(expectedConversationId.trim())
@@ -314,26 +337,25 @@ function buildTabInspectionExpression(
         const label = normalize(node.textContent || node.getAttribute('aria-label') || node.getAttribute('title'));
         return LOGIN_CTA.test(label);
       });
-      const stopButton = document.querySelector(STOP_BUTTON_SELECTOR);
-      const stopExists = Boolean(stopButton && isVisible(stopButton));
+      const stopExists = Array.from(document.querySelectorAll(STOP_BUTTON_SELECTOR)).some(isVisible);
       const sendButton = firstVisible(SEND_SELECTORS);
       const sendExists = Boolean(sendButton);
       const promptNode = firstVisible(INPUT_SELECTORS);
       const promptReady = Boolean(promptNode);
       const turns = ${buildConversationTurnListExpression()};
       const assistantTurns = turns.filter((turn) => {
-        const role = normalize(turn.getAttribute('data-message-author-role') || turn.getAttribute('data-turn')).toLowerCase();
+        const role = normalize(turn.getAttribute('data-message-author-role') || (turn.getAttribute?.('data-content-search-unit-key') || turn.getAttribute?.('data-chatgpt-search-unit-key'))?.split(':').at(-1) || turn.getAttribute('data-turn')).toLowerCase();
         if (role === 'assistant') return true;
         return Boolean(turn.querySelector(ASSISTANT_ROLE_SELECTOR));
       });
       const fallbackUserTurns = Array.from(
-        document.querySelectorAll('[data-message-author-role="user"], [data-turn="user"]'),
+        document.querySelectorAll(':is([data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":user"]), [data-turn="user"]'),
       );
       const userTurns = turns.filter((turn) => {
-        const role = normalize(turn.getAttribute('data-message-author-role') || turn.getAttribute('data-turn')).toLowerCase();
+        const role = normalize(turn.getAttribute('data-message-author-role') || (turn.getAttribute?.('data-content-search-unit-key') || turn.getAttribute?.('data-chatgpt-search-unit-key'))?.split(':').at(-1) || turn.getAttribute('data-turn')).toLowerCase();
         if (role === 'user') return true;
         return Boolean(
-          turn.querySelector('[data-message-author-role="user"], [data-turn="user"]'),
+          turn.querySelector(':is([data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":user"]), [data-turn="user"]'),
         );
       });
       const answerNode = ANSWER_SELECTORS
@@ -386,6 +408,9 @@ function buildTabInspectionExpression(
       const assistantCount = new Set(assistantOwners).size;
       const lastAssistantText = normalize(lastAssistantNode?.textContent);
       const lastUserText = normalize(lastUserTurn?.textContent);
+      const lastUserMessage = lastUserTurn?.matches?.(':is([data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":user"])')
+        ? lastUserTurn : lastUserTurn?.querySelector?.(':is([data-message-author-role="user"], [data-content-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":user"])');
+      const userContent = lastUserMessage?.querySelectorAll?.('[data-user-message-bubble="true"], [class~="whitespace-pre-wrap"]');
       const authenticated = !loginButtonExists && (promptReady || sendExists || stopExists || assistantCount > 0);
       return {
         title: normalize(document.title),
@@ -402,6 +427,9 @@ function buildTabInspectionExpression(
         lastAssistantTurnIndex,
         lastUserTurnIndex,
         lastUserText,
+        lastUserTextRaw: (lastUserMessage?.querySelector?.('[data-user-message-bubble="true"]') || lastUserMessage)?.textContent,
+        lastUserContentText: userContent?.length === 1 ? userContent[0].textContent : undefined,
+        lastUserMessageId: lastUserMessage?.getAttribute?.('data-message-id') || lastUserMessage?.getAttribute?.('data-chatgpt-selection-message-id') || lastUserMessage?.getAttribute?.('data-chatgpt-search-message-ids')?.split(' ')[0] || lastUserMessage?.closest?.('[data-turn-key]')?.getAttribute?.('data-turn-key') || lastUserMessage?.getAttribute?.('data-content-search-unit-key') || lastUserMessage?.getAttribute?.('data-chatgpt-search-unit-key'),
         visibilityState: document.visibilityState,
         focused: Boolean(document.hasFocus?.()),
       };
@@ -412,10 +440,16 @@ export function buildTabInspectionExpressionForTest(expectedConversationId?: str
   return buildTabInspectionExpression(expectedConversationId);
 }
 
-export async function listChatGptTargets(options: HostPort = {}): Promise<ChromeTarget[]> {
-  const { host, port } = normalizeHostPort(options);
-  const targets = (await CDP.List({ host, port })) as ChromeTarget[];
-  return targets.filter(isChatGptTarget);
+export async function listChatGptTargets(
+  options: LiveChromeEndpoint = {},
+): Promise<ChromeTarget[]> {
+  const endpoint = normalizeHostPort(options);
+  try {
+    const targets = await listRemoteChromeTargets(endpoint);
+    return targets.filter(isChatGptTarget);
+  } catch (error) {
+    throw chromeTransportError("list ChatGPT tabs", endpoint, error);
+  }
 }
 
 export async function openChatGptTarget(
@@ -427,7 +461,8 @@ export async function openChatGptTarget(
     onTargetCreated?: (targetId: string) => void;
   } = {},
 ): Promise<string> {
-  const { host, port } = normalizeHostPort(options);
+  const endpoint = normalizeHostPort(options);
+  const { host, port } = endpoint;
   const url = options.url ?? "https://chatgpt.com/";
   requireChatGptUrl(url, "opening a ChatGPT tab");
   const reportHandoffError = (error: unknown): void => {
@@ -466,6 +501,7 @@ export async function openChatGptTarget(
     try {
       connection = await connectToRemoteChromeTarget(host, port, noopLogger, {
         browserWSEndpoint: options.browserWSEndpoint,
+        approvalWaitMs: options.approvalWaitMs,
         targetUrl: url,
         closeTargetOnDispose: false,
         onTargetCreated: (targetId) => {
@@ -477,8 +513,9 @@ export async function openChatGptTarget(
       if (createdTargetId) {
         await closeAfterHandoffFailure(createdTargetId, error);
       }
-      reportHandoffError(error);
-      throw error;
+      const failure = chromeTransportError("open saved ChatGPT conversation", endpoint, error);
+      reportHandoffError(failure);
+      throw failure;
     }
     const targetId = connection.targetId ?? createdTargetId;
     if (!targetId) {
@@ -500,7 +537,12 @@ export async function openChatGptTarget(
     }
     return targetId;
   }
-  const target = await CDP.New({ host, port, url });
+  let target: Awaited<ReturnType<typeof CDP.New>>;
+  try {
+    target = await CDP.New({ host, port, url });
+  } catch (error) {
+    throw chromeTransportError("open saved ChatGPT conversation", { host, port }, error);
+  }
   const targetId = target.id;
   if (!targetId) throw new Error("Remote Chrome did not return a target id.");
   try {
@@ -511,33 +553,33 @@ export async function openChatGptTarget(
   return targetId;
 }
 
-async function connectToTarget(
-  host: string,
-  port: number,
-  targetId: string,
-  browserWSEndpoint?: string,
-) {
-  if (browserWSEndpoint) {
-    const connection = await connectToRemoteChromeTarget(host, port, noopLogger, {
-      browserWSEndpoint,
-      targetId,
-      closeTargetOnDispose: false,
-    });
-    Object.defineProperty(connection.client, "close", {
-      configurable: true,
-      value: connection.close,
-    });
-    return connection.client;
-  }
-  const client = await CDP({ host, port, target: targetId });
+async function connectToTarget(options: LiveChromeEndpoint, targetId: string) {
+  const endpoint = normalizeHostPort(options);
+  const { host, port } = endpoint;
+  const connection = await connectToRemoteChromeTarget(host, port, noopLogger, {
+    browserWSEndpoint: endpoint.browserWSEndpoint,
+    approvalWaitMs: endpoint.approvalWaitMs,
+    targetId,
+    closeTargetOnDispose: false,
+  }).catch((error: unknown) => {
+    throw chromeTransportError("inspect ChatGPT tab", endpoint, error);
+  });
+  const client = Object.create(connection.client) as typeof connection.client;
+  // Session-bound clients detach only; the owning connection also closes its browser socket.
+  client.close = connection.close;
   const { Runtime, DOM } = client;
-  if (Runtime?.enable) {
-    await Runtime.enable();
+  try {
+    if (Runtime?.enable) {
+      await Runtime.enable();
+    }
+    if (DOM?.enable) {
+      await DOM.enable();
+    }
+    return client;
+  } catch (error) {
+    await connection.close().catch(() => undefined);
+    throw error;
   }
-  if (DOM?.enable) {
-    await DOM.enable();
-  }
-  return client;
 }
 
 export async function inspectChatGptTab(
@@ -551,7 +593,7 @@ export async function inspectChatGptTab(
     throw new Error("inspectChatGptTab requires a target with targetId.");
   }
 
-  const client = await connectToTarget(host, port, targetId, options.browserWSEndpoint);
+  const client = await connectToTarget(options, targetId);
   const { Runtime } = client;
   try {
     const initialUrl = await assertChatGptTabOrigin(Runtime, "live tab inspection");
@@ -591,6 +633,9 @@ export async function inspectChatGptTab(
       lastAssistantTurnIndex?: number;
       lastUserTurnIndex?: number;
       lastUserText?: string;
+      lastUserTextRaw?: string;
+      lastUserContentText?: string;
+      lastUserMessageId?: string;
       visibilityState?: string;
       focused?: boolean;
       scopeMismatch?: boolean;
@@ -666,6 +711,9 @@ export async function inspectChatGptTab(
           : undefined,
       lastAssistantSnippet: trimToSnippet(lastAssistantText),
       lastUserText,
+      lastUserTextRaw: info.lastUserTextRaw,
+      lastUserContentText: info.lastUserContentText,
+      lastUserMessageId: info.lastUserMessageId,
       lastUserSnippet: trimToSnippet(lastUserText),
       focused: Boolean(info.focused),
       visibilityState: typeof info.visibilityState === "string" ? info.visibilityState : "",
@@ -708,13 +756,20 @@ export function classifyTabState(
   return "detached";
 }
 
-export async function collectChatGptTabs(options: HostPort = {}): Promise<ChatGptTabSummary[]> {
+export async function collectChatGptTabs(
+  options: LiveChromeEndpoint = {},
+): Promise<ChatGptTabSummary[]> {
   const { host, port } = normalizeHostPort(options);
   const browserWSEndpoint = await refreshBoundBrowserEndpoint(options);
   const targets = browserWSEndpoint
-    ? ((await listRemoteChromeTargets({ host, port, browserWSEndpoint })) as ChromeTarget[]).filter(
-        isChatGptTarget,
-      )
+    ? (
+        (await listRemoteChromeTargets({
+          host,
+          port,
+          browserWSEndpoint,
+          approvalWaitMs: options.approvalWaitMs,
+        })) as ChromeTarget[]
+      ).filter(isChatGptTarget)
     : await listChatGptTargets({ host, port });
   return collectChatGptTabsFromTargets(
     host,
@@ -908,9 +963,14 @@ export async function resolveChatGptTab(
   const { host, port } = normalizeHostPort(options);
   const browserWSEndpoint = await refreshBoundBrowserEndpoint(options);
   const targets = browserWSEndpoint
-    ? ((await listRemoteChromeTargets({ host, port, browserWSEndpoint })) as ChromeTarget[]).filter(
-        isChatGptTarget,
-      )
+    ? (
+        (await listRemoteChromeTargets({
+          host,
+          port,
+          browserWSEndpoint,
+          approvalWaitMs: options.approvalWaitMs,
+        })) as ChromeTarget[]
+      ).filter(isChatGptTarget)
     : await listChatGptTargets({ host, port });
   const exactTarget = resolveExactChatGptTarget(targets, options.ref);
   const expectedConversationUrl =
@@ -992,6 +1052,7 @@ export async function connectToExistingChatGptTab(
         host,
         port,
         browserWSEndpoint,
+        approvalWaitMs: options.approvalWaitMs,
       })) as ChromeTarget[]
     ).filter(isChatGptTarget);
     const exactTarget = resolveExactChatGptTarget(targets, options.ref);
@@ -1030,6 +1091,7 @@ export async function connectToExistingChatGptTab(
     );
     const connection = await connectToRemoteChromeTarget(host, port, noopLogger, {
       browserWSEndpoint,
+      approvalWaitMs: options.approvalWaitMs,
       targetId: tab.targetId,
       closeTargetOnDispose: options.closeTargetOnDispose ?? false,
     });
@@ -1075,7 +1137,10 @@ export async function connectToExistingChatGptTab(
   if (!targetId) {
     throw new Error("Resolved ChatGPT tab is missing a target id.");
   }
-  const client = await connectToTarget(host, port, targetId);
+  const client = await connectToTarget(
+    { host, port, approvalWaitMs: options.approvalWaitMs },
+    targetId,
+  );
   try {
     await revalidateConnectedChatGptTab(
       client,
@@ -1143,7 +1208,7 @@ export async function harvestChatGptTab(
     resolved.url,
     "live tab resolution",
   );
-  const client = await connectToTarget(host, port, resolved.targetId, browserWSEndpoint);
+  const client = await connectToTarget({ ...options, browserWSEndpoint }, resolved.targetId);
   try {
     const { Runtime } = client;
     await revalidateConnectedChatGptTab(
@@ -1271,6 +1336,9 @@ export async function harvestChatGptTab(
       harvested.authenticated = followup.authenticated;
       harvested.loginButtonExists = followup.loginButtonExists;
       harvested.lastUserText = followup.lastUserText;
+      harvested.lastUserTextRaw = followup.lastUserTextRaw;
+      harvested.lastUserContentText = followup.lastUserContentText;
+      harvested.lastUserMessageId = followup.lastUserMessageId;
       harvested.lastUserSnippet = followup.lastUserSnippet;
       harvested.assistantFollowsLatestUser = followup.assistantFollowsLatestUser;
       harvested.lastAssistantTurnIndex = followup.lastAssistantTurnIndex;

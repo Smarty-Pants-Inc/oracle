@@ -6,7 +6,7 @@ import path from "node:path";
 import { mkdir, readFile, rename, rm, stat } from "node:fs/promises";
 import type { BrowserRunOptions } from "../browserMode.js";
 import type { BrowserRunResult } from "../browserMode.js";
-import type { BrowserAttachment, SavedBrowserFile } from "../browser/types.js";
+import type { BrowserAttachment, SavedBrowserFile, SavedBrowserImage } from "../browser/types.js";
 import {
   appendArtifacts,
   computeFileSha256,
@@ -18,38 +18,102 @@ import {
 } from "../browser/artifacts.js";
 import {
   MAX_REMOTE_ARTIFACT_BYTES,
+  pickRemoteImageMetadata,
   type RemoteArtifactDescriptor,
   type RemoteRunPayload,
   type RemoteRunEvent,
   type RemoteAttachmentPayload,
 } from "./types.js";
+import { materializeStagedFallbackBundle } from "../browser/prompt.js";
+import { checkRemoteHealth } from "./health.js";
 import { parseHostPort } from "../bridge/connection.js";
+import { BrowserRunCancelledError } from "../oracle/errors.js";
+import { resolveSiblingImagePath } from "../browser/chatgptImages.js";
+import { resolveBrowserProvider, resolveRemoteBrowserModel } from "../browser/provider.js";
+import type { BrowserExecutorOptions } from "../browser/executor.js";
 
 interface RemoteExecutorOptions {
   host: string;
   token?: string;
+  runOptions?: BrowserExecutorOptions;
 }
 
-export function createRemoteBrowserExecutor({ host, token }: RemoteExecutorOptions) {
+type TransferredBrowserArtifact = SavedBrowserFile | SavedBrowserImage;
+
+export function createRemoteBrowserExecutor({ host, token, runOptions }: RemoteExecutorOptions) {
   // Return a drop-in replacement for runBrowserMode so the browser session runner can stay unchanged.
   return async function remoteBrowserExecutor(
     options: BrowserRunOptions,
   ): Promise<BrowserRunResult> {
+    const model = resolveRemoteBrowserModel(
+      options.model ?? runOptions?.model,
+      options.config?.desiredModel,
+    );
+    const gemini = resolveBrowserProvider(model) === "gemini";
+    if (
+      gemini &&
+      (runOptions?.editImage ||
+        runOptions?.generateImage ||
+        options.generateImagePath ||
+        options.outputPath)
+    ) {
+      throw new Error(
+        "Remote Gemini image generation and editing are not supported; run these requests locally.",
+      );
+    }
+    if (options.config?.researchMode === "search") {
+      throw new Error(
+        "Web Search is a local browser pilot; --remote-host does not negotiate this capability yet. Use local Chrome or --browser-attach-running.",
+      );
+    }
+    const callerSignal = options.signal;
+    const imageOutputRequested = Boolean(options.generateImagePath || options.outputPath);
+    if (callerSignal?.aborted)
+      throw new BrowserRunCancelledError("Browser run cancelled before the request was sent.");
+    if (callerSignal || imageOutputRequested) {
+      const health = await checkRemoteHealth({ host, token, signal: callerSignal });
+      if (callerSignal?.aborted) throw new BrowserRunCancelledError();
+      if (
+        imageOutputRequested &&
+        (!health.ok ||
+          health.capabilities?.generatedImages !== true ||
+          health.capabilities.artifactProtocolVersion !== 1)
+      ) {
+        throw new Error(
+          "Remote host cannot capture and transfer generated images; upgrade Oracle on the host and retry. The image request was not sent.",
+        );
+      }
+      if (callerSignal && health.capabilities?.runCancellation !== true)
+        throw new Error(
+          "Remote host does not support run cancellation; upgrade the host before using an AbortSignal.",
+        );
+    }
     const payload: RemoteRunPayload = {
       prompt: options.prompt,
       attachments: await serializeAttachments(options.attachments ?? []),
-      fallbackSubmission: options.fallbackSubmission
-        ? {
-            prompt: options.fallbackSubmission.prompt,
-            attachments: await serializeAttachments(options.fallbackSubmission.attachments ?? []),
-          }
-        : undefined,
-      browserConfig: options.config ?? {},
+      fallbackSubmission: await serializeFallback(options.fallbackSubmission, { host, token }),
+      browserConfig: {
+        ...options.config,
+        // Keep old hosts fail-closed for Gemini even when the picker label is unrelated.
+        ...(gemini ? { desiredModel: model } : {}),
+        inlineCookies: null,
+        inlineCookiesSource: null,
+      },
       options: {
+        model,
+        ...(gemini
+          ? {
+              youtube: runOptions?.youtube,
+              geminiShowThoughts: runOptions?.geminiShowThoughts,
+              geminiAllowModelFallback: runOptions?.geminiAllowModelFallback,
+            }
+          : {}),
         heartbeatIntervalMs: options.heartbeatIntervalMs,
         verbose: options.verbose,
         sessionId: options.sessionId,
         followUpPrompts: options.followUpPrompts,
+        cancelOnDisconnect: callerSignal ? true : undefined,
+        imageOutputRequested,
       },
     };
 
@@ -57,16 +121,23 @@ export function createRemoteBrowserExecutor({ host, token }: RemoteExecutorOptio
     const { hostname, port } = parseHost(host);
 
     return new Promise<BrowserRunResult>((resolve, reject) => {
-      const transferredFiles: SavedBrowserFile[] = [];
+      if (callerSignal?.aborted) {
+        reject(new Error("Browser run cancelled before the request was sent."));
+        return;
+      }
+      const transferredArtifacts: TransferredBrowserArtifact[] = [];
       const transferFailures: string[] = [];
       const transferPromises: Promise<void>[] = [];
       let artifactTransferQueue = Promise.resolve();
+      const preferredImagePath = options.generateImagePath ?? options.outputPath;
+      let preferredImageIndex = 0;
       let settled = false;
       let resolved: BrowserRunResult | null = null;
 
       const fail = (error: Error) => {
         if (settled) return;
         settled = true;
+        callerSignal?.removeEventListener("abort", onCallerAbort);
         reject(error);
       };
 
@@ -108,7 +179,7 @@ export function createRemoteBrowserExecutor({ host, token }: RemoteExecutorOptio
                     resolved = result;
                   },
                   onArtifact: (artifact) => {
-                    transferredFiles.push(artifact);
+                    transferredArtifacts.push(artifact);
                   },
                   onArtifactFailure: (message) => {
                     transferFailures.push(message);
@@ -117,6 +188,15 @@ export function createRemoteBrowserExecutor({ host, token }: RemoteExecutorOptio
                     const queued = artifactTransferQueue.then(transfer);
                     artifactTransferQueue = queued.catch(() => undefined);
                     return queued;
+                  },
+                  resolvePreferredImagePath: (descriptor) => {
+                    if (!preferredImagePath) return undefined;
+                    const extension = path.extname(descriptor.filename).slice(1) || "png";
+                    return resolveSiblingImagePath(
+                      path.resolve(preferredImagePath),
+                      preferredImageIndex++,
+                      extension,
+                    );
                   },
                   onError: fail,
                 });
@@ -135,17 +215,76 @@ export function createRemoteBrowserExecutor({ host, token }: RemoteExecutorOptio
                 fail(new Error("Remote browser run completed without a result."));
                 return;
               }
+              if (preferredImagePath) {
+                const images = transferredArtifacts.filter((artifact) => artifact.kind === "image");
+                if (
+                  images.length === 0 ||
+                  images.length !== preferredImageIndex ||
+                  resolved.warnings?.some(
+                    (warning) => warning.code === "remote-image-registration-failed",
+                  )
+                ) {
+                  fail(
+                    new Error(
+                      "Remote image output was not fully delivered. Inspect the bridge host's generated images and the artifact transfer diagnostics before retrying.",
+                    ),
+                  );
+                  return;
+                }
+              }
               settled = true;
-              resolve(mergeTransferredArtifacts(resolved, transferredFiles, transferFailures));
+              callerSignal?.removeEventListener("abort", onCallerAbort);
+              resolve(mergeTransferredArtifacts(resolved, transferredArtifacts, transferFailures));
             })().catch(fail);
           });
           res.on("error", fail);
         },
       );
       req.on("error", fail);
+
+      // Destroying the request closes the socket, which is how the service learns
+      // to abort: its own disconnect handler fires and releases the slot and the
+      // browser tab.
+      const onCallerAbort = () => {
+        req.destroy();
+        fail(new BrowserRunCancelledError("Browser run cancelled: the caller aborted."));
+      };
+      callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
+
       req.write(body);
       req.end();
     });
+  };
+}
+
+async function serializeFallback(
+  fallback: BrowserRunOptions["fallbackSubmission"],
+  remote: RemoteExecutorOptions,
+): Promise<RemoteRunPayload["fallbackSubmission"]> {
+  if (!fallback) return undefined;
+  if (fallback.pendingBundle) {
+    const health = await checkRemoteHealth(remote);
+    if (!health.ok || health.capabilities?.deferredFallbackBundling !== true) {
+      // Older hosts ignore bundle metadata, so send a ready-to-upload fallback.
+      const prepared = await materializeStagedFallbackBundle({
+        composerText: fallback.prompt,
+        attachments: fallback.attachments,
+        ...fallback.pendingBundle,
+      });
+      try {
+        return {
+          prompt: prepared.composerText,
+          attachments: await serializeAttachments(prepared.attachments),
+        };
+      } finally {
+        await rm(path.dirname(prepared.bundled.bundlePath), { recursive: true, force: true });
+      }
+    }
+  }
+  return {
+    prompt: fallback.prompt,
+    attachments: await serializeAttachments(fallback.attachments),
+    bundle: fallback.pendingBundle,
   };
 }
 
@@ -183,9 +322,10 @@ function handleEvent(params: {
   port: number;
   token?: string;
   onResult: (result: BrowserRunResult) => void;
-  onArtifact: (artifact: SavedBrowserFile) => void;
+  onArtifact: (artifact: TransferredBrowserArtifact) => void;
   onArtifactFailure: (message: string) => void;
   enqueueArtifactTransfer: (transfer: () => Promise<void>) => Promise<void>;
+  resolvePreferredImagePath: (descriptor: RemoteArtifactDescriptor) => string | undefined;
   onError: (error: Error) => void;
 }): Promise<void> | null {
   let event: RemoteRunEvent;
@@ -224,6 +364,10 @@ function handleEvent(params: {
       String(event.artifact?.filename ?? ""),
       "artifact.bin",
     );
+    const preferredPath =
+      event.artifact.kind === "image"
+        ? params.resolvePreferredImagePath(event.artifact)
+        : undefined;
     const transfer = params.enqueueArtifactTransfer(() =>
       transferRemoteArtifact({
         hostname: params.hostname,
@@ -231,12 +375,18 @@ function handleEvent(params: {
         token: params.token,
         descriptor: event.artifact,
         sessionId: params.options.sessionId,
+        preferredPath,
+        signal: params.options.signal,
         log: params.options.log,
       })
         .then((artifact) => {
           params.onArtifact(artifact);
         })
         .catch((error) => {
+          if (params.options.signal?.aborted) {
+            params.onError(new BrowserRunCancelledError());
+            return;
+          }
           const message = error instanceof Error ? error.message : String(error);
           const fallback = `Oracle captured the browser text response, but bridge artifact transfer failed for ${displayFilename}. Open the ChatGPT browser on the bridge host, download the ZIP/file shown in the current response, and copy it to a cloud-readable path. Reason: ${message}`;
           params.options.log?.(`[browser] ${fallback}`);
@@ -257,17 +407,22 @@ async function transferRemoteArtifact(params: {
   token?: string;
   descriptor: RemoteArtifactDescriptor;
   sessionId?: string;
+  preferredPath?: string;
   log?: BrowserRunOptions["log"];
-}): Promise<SavedBrowserFile> {
+  signal?: AbortSignal;
+}): Promise<TransferredBrowserArtifact> {
+  params.signal?.throwIfAborted();
   validateRemoteArtifactDescriptor(params.descriptor);
   const sessionId = params.sessionId ?? params.descriptor.runId;
   const artifactsDir = resolveSessionArtifactsDir(sessionId);
-  await mkdir(artifactsDir, { recursive: true });
   const filename = sanitizeArtifactFilename(
     params.descriptor.filename,
     `artifact-${params.descriptor.artifactId}.bin`,
   );
-  const finalPath = await resolveUniqueArtifactPath(path.join(artifactsDir, filename));
+  const finalPath = params.preferredPath
+    ? path.resolve(params.preferredPath)
+    : await resolveUniqueArtifactPath(path.join(artifactsDir, filename));
+  await mkdir(path.dirname(finalPath), { recursive: true });
   const partPath = `${finalPath}.part-${params.descriptor.artifactId}`;
   const artifactPath = `/runs/${encodeURIComponent(params.descriptor.runId)}/artifacts/${encodeURIComponent(
     params.descriptor.artifactId,
@@ -281,6 +436,7 @@ async function transferRemoteArtifact(params: {
     token: params.token,
     targetPath: partPath,
     descriptor: params.descriptor,
+    signal: params.signal,
   }).catch(async (error) => {
     await rm(partPath, { force: true }).catch(() => undefined);
     throw error;
@@ -306,11 +462,14 @@ async function transferRemoteArtifact(params: {
     throw new Error(`${validation.type} validation failed: ${validation.error ?? "invalid"}`);
   }
 
+  if (params.signal?.aborted) {
+    await rm(partPath, { force: true });
+    throw new BrowserRunCancelledError();
+  }
   await rename(partPath, finalPath);
   params.log?.(`[browser] Transferred artifact to ${finalPath}`);
   const publishedFilename = path.basename(finalPath);
-  return {
-    kind: "file",
+  const baseArtifact = {
     path: finalPath,
     label: publishedFilename,
     mimeType: sanitizeArtifactMimeType(params.descriptor.mimeType),
@@ -322,6 +481,17 @@ async function transferRemoteArtifact(params: {
     origin: { mode: "bridge" },
     url: "bridge-artifact",
     finalUrl: "bridge-artifact",
+  } as const;
+  if (params.descriptor.kind === "image") {
+    return {
+      ...baseArtifact,
+      kind: "image",
+      ...pickRemoteImageMetadata(params.descriptor.image),
+    };
+  }
+  return {
+    ...baseArtifact,
+    kind: "file",
     filename: publishedFilename,
   };
 }
@@ -333,6 +503,7 @@ async function downloadArtifactToFile(params: {
   token?: string;
   targetPath: string;
   descriptor: RemoteArtifactDescriptor;
+  signal?: AbortSignal;
 }): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const req = http.request(
@@ -341,6 +512,7 @@ async function downloadArtifactToFile(params: {
         port: params.port,
         path: params.path,
         method: "GET",
+        signal: params.signal,
         headers: params.token ? { authorization: `Bearer ${params.token}` } : undefined,
       },
       (res) => {
@@ -397,7 +569,7 @@ function validateRemoteArtifactDescriptor(descriptor: RemoteArtifactDescriptor):
   if (
     !descriptor ||
     typeof descriptor !== "object" ||
-    descriptor.kind !== "file" ||
+    (descriptor.kind !== "file" && descriptor.kind !== "image") ||
     typeof descriptor.runId !== "string" ||
     !/^[a-zA-Z0-9_-]{1,128}$/.test(descriptor.runId) ||
     typeof descriptor.artifactId !== "string" ||
@@ -415,11 +587,18 @@ function validateRemoteArtifactDescriptor(descriptor: RemoteArtifactDescriptor):
 
 function mergeTransferredArtifacts(
   result: BrowserRunResult,
-  transferredFiles: SavedBrowserFile[],
+  transferredArtifacts: TransferredBrowserArtifact[],
   transferFailures: string[],
 ): BrowserRunResult {
-  const artifacts = appendArtifacts(result.artifacts, transferredFiles);
+  const transferredFiles = transferredArtifacts.filter(
+    (artifact): artifact is SavedBrowserFile => artifact.kind === "file",
+  );
+  const transferredImages = transferredArtifacts.filter(
+    (artifact): artifact is SavedBrowserImage => artifact.kind === "image",
+  );
+  const artifacts = appendArtifacts(result.artifacts, transferredArtifacts);
   const savedFiles = appendSavedFiles(result.savedFiles, transferredFiles);
+  const savedImages = appendSavedImages(result.savedImages, transferredImages);
   const warnings = [
     ...(result.warnings ?? []),
     ...transferFailures.map((message) => ({
@@ -432,8 +611,24 @@ function mergeTransferredArtifacts(
     ...result,
     artifacts,
     savedFiles,
+    savedImages,
     warnings: warnings.length > 0 ? warnings : undefined,
   };
+}
+
+function appendSavedImages(
+  existing: SavedBrowserImage[] | undefined,
+  additions: SavedBrowserImage[],
+): SavedBrowserImage[] | undefined {
+  const merged = new Map<string, SavedBrowserImage>();
+  for (const artifact of existing ?? []) {
+    merged.set(artifact.path, artifact);
+  }
+  for (const artifact of additions) {
+    merged.set(artifact.path, artifact);
+  }
+  const values = Array.from(merged.values());
+  return values.length > 0 ? values : undefined;
 }
 
 function appendSavedFiles(

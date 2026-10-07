@@ -13,6 +13,7 @@ import { sessionStore, wait } from "../sessionStore.js";
 import { formatTokenCount, formatTokenValue } from "../oracle/runUtils.js";
 import type { BrowserLogger } from "../browser/types.js";
 import { resumeBrowserSession } from "../browser/reattach.js";
+import { retireRecoveredBrowserTarget } from "../browser/recoveryTarget.js";
 import { hasRecoverableChatGptConversation } from "../browser/reattachability.js";
 import {
   appendArtifacts,
@@ -33,6 +34,7 @@ import {
 import { formatSessionExecutionLabel } from "./sessionLifecycle.js";
 import {
   formatBrowserModelSelectionEvidence,
+  formatBrowserThinkingSelectionEvidence,
   formatSessionBrowserModelWithRequestedKey,
   resolveSessionBrowserModelDisplayName,
 } from "../browser/modelDisplay.js";
@@ -126,11 +128,12 @@ async function writeReattachAnswer(
     );
     return;
   }
-  const logWriter = sessionStore.createLogWriter(sessionId);
-  logWriter.logLine("[reattach] captured assistant response from existing Chrome tab");
-  logWriter.logLine("Answer:");
-  logWriter.logLine(body);
-  logWriter.stream.end();
+  const paths = await sessionStore.getPaths(sessionId);
+  await fs.appendFile(
+    paths.log,
+    `[reattach] captured assistant response from existing Chrome tab\nAnswer:\n${body}\n`,
+    "utf8",
+  );
 }
 
 async function saveReattachBrowserArtifacts(
@@ -180,17 +183,17 @@ export async function showStatus({
   modelFilter,
 }: ShowStatusOptions): Promise<void> {
   const metas = await sessionStore.listSessions();
-  const { entries, truncated, total } = sessionStore.filterSessions(metas, {
+  const matchingMetas = modelFilter
+    ? metas.filter((entry) => matchesModel(entry, modelFilter))
+    : metas;
+  const { entries, truncated, total } = sessionStore.filterSessions(matchingMetas, {
     hours,
     includeAll,
     limit,
   });
-  const filteredEntries = modelFilter
-    ? entries.filter((entry) => matchesModel(entry, modelFilter))
-    : entries;
   const richTty = process.stdout.isTTY && chalk.level > 0;
   const responseOwners = buildResponseOwnerIndex(metas);
-  if (!filteredEntries.length) {
+  if (!entries.length) {
     console.log(CLEANUP_TIP);
     if (showExamples) {
       printStatusExamples();
@@ -199,7 +202,7 @@ export async function showStatus({
   }
   console.log(chalk.bold("Recent Sessions"));
   console.log(formatSessionTableHeader(richTty));
-  const treeRows = buildStatusTreeRows(filteredEntries, responseOwners);
+  const treeRows = buildStatusTreeRows(entries, responseOwners);
   for (const row of treeRows) {
     const line = formatSessionTableRow(row.entry, { rich: richTty, displaySlug: row.displaySlug });
     const detachedParent =
@@ -373,6 +376,7 @@ export async function attachSession(
           config: metadata.browser?.config,
           runtime,
           modelSelection: metadata.browser?.modelSelection,
+          thinkingSelection: metadata.browser?.thinkingSelection,
           warnings: metadata.browser?.warnings,
         },
         artifacts,
@@ -381,6 +385,9 @@ export async function attachSession(
         transport: undefined,
       });
       console.log(chalk.green("Reattach succeeded; session marked completed."));
+      await retireRecoveredBrowserTarget(sessionId, result.captureTarget, (line) =>
+        console.log(dim(line)),
+      );
       metadata = (await sessionStore.readSession(sessionId)) ?? metadata;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -481,7 +488,10 @@ export async function attachSession(
   }
 
   const shouldTrimIntro =
-    initialStatus === "completed" || initialStatus === "partial" || initialStatus === "error";
+    initialStatus === "completed" ||
+    initialStatus === "partial" ||
+    initialStatus === "error" ||
+    initialStatus === "cancelled";
   if (options?.renderPrompt !== false) {
     const prompt = await readStoredPrompt(sessionId);
     if (prompt) {
@@ -613,13 +623,17 @@ export async function attachSession(
 
   await printNew();
 
-  // biome-ignore lint/nursery/noUnnecessaryConditions: deliberate infinite poll
   while (true) {
     const latest = await sessionStore.readSession(sessionId);
     if (!latest) {
       break;
     }
-    if (latest.status === "completed" || latest.status === "partial" || latest.status === "error") {
+    if (
+      latest.status === "completed" ||
+      latest.status === "partial" ||
+      latest.status === "error" ||
+      latest.status === "cancelled"
+    ) {
       await printNew();
       flushRemainder();
       if (!options?.suppressMetadata) {
@@ -651,7 +665,11 @@ export async function attachSession(
       if (!settled) {
         break;
       }
-      if (settled.status === "completed" || settled.status === "partial") {
+      if (
+        settled.status === "completed" ||
+        settled.status === "partial" ||
+        settled.status === "cancelled"
+      ) {
         continue;
       }
       await printNew();
@@ -743,13 +761,21 @@ export function formatUserErrorMetadata(metadata?: SessionUserErrorMetadata): st
 
 export function formatBrowserEvidence(metadata: SessionMetadata): string[] | null {
   const browser = metadata.browser;
-  if (!browser?.modelSelection && (!browser?.warnings || browser.warnings.length === 0)) {
+  if (
+    !browser?.modelSelection &&
+    !browser?.thinkingSelection &&
+    (!browser?.warnings || browser.warnings.length === 0)
+  ) {
     return null;
   }
   const lines: string[] = [];
   const evidence = browser.modelSelection;
   if (evidence) {
     lines.push(`model ${formatBrowserModelSelectionEvidence(evidence, metadata.model)}`);
+  }
+  const thinkingEvidence = browser.thinkingSelection;
+  if (thinkingEvidence) {
+    lines.push(`effort ${formatBrowserThinkingSelectionEvidence(thinkingEvidence)}`);
   }
   for (const warning of browser.warnings ?? []) {
     lines.push(`warning ${warning.code}: ${warning.message}`);
@@ -977,7 +1003,11 @@ async function buildSessionLogForDisplay(
   const models = freshMetadata.models ?? fallbackMeta.models ?? [];
   if (models.length === 0) {
     if (normalizedFilter) {
-      return await sessionStore.readModelLog(sessionId, modelFilter as string);
+      const modelLog = await sessionStore.readModelLog(
+        sessionId,
+        freshMetadata.model ?? (modelFilter as string),
+      );
+      return modelLog || sessionStore.readLog(sessionId);
     }
     return await sessionStore.readLog(sessionId);
   }
@@ -997,7 +1027,8 @@ async function buildSessionLogForDisplay(
     sections.push(`=== ${model.model} ===\n${body}`.trimEnd());
   }
   if (!hasContent) {
-    // Fallback for runs that recorded output only in the session log (e.g., browser runs without per-model logs).
+    if (normalizedFilter && models.length > 1) return "";
+    // Single-model browser runs may record output only in the session log.
     return await sessionStore.readLog(sessionId);
   }
   return sections.join("\n\n");

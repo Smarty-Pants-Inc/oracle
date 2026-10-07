@@ -49,7 +49,7 @@ oracle --engine browser --browser-manual-login \
   --file "src/storage/**/*.ts"
 ```
 
-`--browser-manual-login` skips Keychain cookie copy (no permission popups) and reuses a persistent automation profile under `~/.oracle/browser/`.
+`--browser-manual-login` skips Keychain cookie copy (no permission popups) and reuses a persistent automation profile under `~/.oracle/browser-profile`. This is the recommended browser authentication path. Live Chrome cookie copying is disabled by default; existing setups that intentionally depend on it can add `--browser-cookie-sync` or set `browser.cookieSync=true`.
 
 ### Render and copy
 

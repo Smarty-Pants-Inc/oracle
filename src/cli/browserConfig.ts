@@ -7,6 +7,7 @@ import { normalizeThinkingTimeLevel } from "../oracle/thinkingTime.js";
 import { CHATGPT_URL, DEFAULT_MODEL_STRATEGY, DEFAULT_MODEL_TARGET } from "../browser/constants.js";
 import { normalizeChatgptUrl } from "../browser/utils.js";
 import { parseDuration } from "../duration.js";
+import { resolveBrowserApprovalWait } from "../browser/config.js";
 import { normalizeBrowserModelStrategy } from "../browser/modelStrategy.js";
 import type {
   BrowserArchiveMode,
@@ -26,14 +27,26 @@ const DEFAULT_BROWSER_ATTACHMENT_TIMEOUT_MS = 45_000;
 const DEFAULT_BROWSER_RECHECK_TIMEOUT_MS = 120_000;
 const DEFAULT_BROWSER_AUTO_REATTACH_TIMEOUT_MS = 120_000;
 const DEFAULT_CHROME_PROFILE = "Default";
+const CURRENT_CHATGPT_PRO_ALIASES = new Set([
+  "gpt-5-pro",
+  "gpt-5.1-pro",
+  "gpt-5.2-pro",
+  "gpt-5.4-pro",
+]);
 
 // Ordered array: most specific models first to ensure correct selection.
 // The browser label is passed to the model picker which fuzzy-matches against ChatGPT's UI.
 const BROWSER_MODEL_LABELS: [ModelName, string][] = [
   // Most specific first (e.g., "gpt-5.2-thinking" before "gpt-5.2")
+  // GPT-6 (Astra) has no entry of its own in the ChatGPT picker: it is the "Latest" radio of the
+  // advanced view, and "GPT-6 Pro" is that radio with the power slider at Pro (composer pill "6 Pro").
+  ["gpt-6-pro", "Latest"],
+  ["gpt-6-astra", "Latest"],
+  // Fork default: logical GPT-5.6 Sol Pro selects ChatGPT's "Pro" target.
+  ["gpt-5.6-sol-pro", "Pro"],
   ["gpt-5.6-sol", "GPT-5.6 Sol"],
   ["gpt-5.6", "GPT-5.6 Sol"],
-  ["gpt-5.5-pro", "Pro"],
+  ["gpt-5.5-pro", "GPT-5.5"],
   ["gpt-5.5-instant", "GPT-5.5 Instant"],
   ["gpt-5.5", "Thinking 5.5"],
   ["gpt-5.4-pro", "Pro"],
@@ -63,6 +76,7 @@ export interface BrowserFlagOptions {
   browserUrl?: string;
   browserTimeout?: string;
   browserInputTimeout?: string;
+  browserApprovalWait?: string;
   browserAttachmentTimeout?: string;
   browserRecheckDelay?: string;
   browserRecheckTimeout?: string;
@@ -73,6 +87,7 @@ export interface BrowserFlagOptions {
   browserAutoReattachInterval?: string;
   browserAutoReattachTimeout?: string;
   browserCookieWait?: string;
+  browserCookieSync?: boolean;
   browserNoCookieSync?: boolean;
   browserInlineCookiesFile?: string;
   browserCookieNames?: string;
@@ -82,13 +97,17 @@ export interface BrowserFlagOptions {
   browserKeepBrowser?: boolean;
   browserManualLogin?: boolean;
   browserManualLoginProfileDir?: string | null;
+  browserManualLoginCookieSync?: boolean;
   copyProfile?: string;
   remoteHost?: string;
-  /** Thinking time intensity: 'light', 'standard', 'extended', 'heavy' */
+  /** Thinking time intensity: 'light', 'standard', 'extended', 'extra-high', 'pro', 'heavy' */
   browserThinkingTime?: ThinkingTimeLevel;
   browserResearch?: BrowserResearchMode;
   browserArchive?: BrowserArchiveMode;
+  browserCaptureProviderNative?: boolean;
   browserModelLabel?: string;
+  /** Original model request before browser alias normalization. */
+  browserRequestedModel?: ModelName;
   browserModelStrategy?: BrowserModelStrategy;
   browserAllowCookieErrors?: boolean;
   remoteChrome?: string;
@@ -102,6 +121,13 @@ export interface BrowserFlagOptions {
 
 export function normalizeChatGptModelForBrowser(model: ModelName): ModelName {
   const normalized = model.toLowerCase() as ModelName;
+  // Browser-only alias: gpt-6-pro keeps its name so the Pro tier default survives (label "Latest").
+  if (isGpt6ProAlias(normalized)) {
+    return "gpt-6-pro" as ModelName;
+  }
+  if (isGpt6Alias(normalized)) {
+    return "gpt-6-astra";
+  }
   if (!normalized.startsWith("gpt-") || normalized.includes("codex")) {
     return model;
   }
@@ -109,6 +135,7 @@ export function normalizeChatGptModelForBrowser(model: ModelName): ModelName {
   if (
     normalized === "gpt-5.6-sol" ||
     normalized === "gpt-5.6" ||
+    normalized === "gpt-5.5-pro" ||
     normalized === "gpt-5.5-instant" ||
     normalized === "gpt-5.5" ||
     normalized === "gpt-5.4"
@@ -116,15 +143,10 @@ export function normalizeChatGptModelForBrowser(model: ModelName): ModelName {
     return normalized;
   }
 
-  // Pro variants resolve to the fork's current logical Pro target.
-  if (
-    normalized === "gpt-5.6-sol-pro" ||
-    normalized === "gpt-5.5-pro" ||
-    normalized === "gpt-5-pro" ||
-    normalized === "gpt-5.1-pro" ||
-    normalized === "gpt-5.2-pro" ||
-    normalized === "gpt-5.4-pro"
-  ) {
+  // Pro variants: the fork keeps its logical GPT-5.6 Sol Pro target (ChatGPT "Pro" picker).
+  // Explicit gpt-5.5-pro stays pinned to GPT-5.5 (handled above, upstream behavior), and
+  // gpt-6-pro selects GPT-6 "Latest" with the Pro effort (handled at the top).
+  if (normalized === "gpt-5.6-sol-pro" || isCurrentChatGptProAlias(normalized)) {
     return "gpt-5.6-sol-pro";
   }
 
@@ -139,6 +161,48 @@ export function normalizeChatGptModelForBrowser(model: ModelName): ModelName {
   }
 
   return model;
+}
+
+// Documented spellings only: gpt-6, gpt-6-astra, gpt-6-pro (plus their label forms such as
+// "GPT-6 Pro") and "latest" map to ChatGPT's "Latest" model. Any other gpt-6-* id (gpt-6-codex,
+// gpt-6-custom, ...) is not an alias and must pass through unchanged for custom/OpenRouter use.
+const GPT6_ALIAS_PATTERN = /^gpt[-_ ]?6(?:[-_ ](?:astra|pro))?$/;
+const GPT6_PRO_ALIAS_PATTERN = /^gpt[-_ ]?6[-_ ]pro$/;
+
+export function isGpt6Alias(model: string | undefined): boolean {
+  const normalized = model?.trim().toLowerCase() ?? "";
+  return normalized === "latest" || GPT6_ALIAS_PATTERN.test(normalized);
+}
+
+export function isGpt6ProAlias(model: string | undefined): boolean {
+  return GPT6_PRO_ALIAS_PATTERN.test(model?.trim().toLowerCase() ?? "");
+}
+
+export function isCurrentChatGptProAlias(model: string | undefined): boolean {
+  return CURRENT_CHATGPT_PRO_ALIASES.has(model?.trim().toLowerCase() ?? "");
+}
+
+export function resolveDefaultBrowserThinkingTime({
+  model,
+  requestedModel,
+  modelStrategy,
+}: {
+  model: string;
+  requestedModel?: string;
+  modelStrategy?: BrowserModelStrategy;
+}): ThinkingTimeLevel | undefined {
+  const strategy = normalizeBrowserModelStrategy(modelStrategy) ?? DEFAULT_MODEL_STRATEGY;
+  if (strategy !== "select") return undefined;
+  const normalizedModel = normalizeChatGptModelForBrowser(model as ModelName);
+  // The fork's GPT-5.6 Sol Pro target selects Pro through the model picker itself
+  // (Intelligence slider at maximum), so it does not add a separate effort default.
+  if (normalizedModel === "gpt-5.6-sol-pro") return undefined;
+  return isCurrentChatGptProAlias(requestedModel ?? model) ||
+    isGpt6ProAlias(requestedModel ?? model) ||
+    normalizedModel === "gpt-6-pro" ||
+    normalizedModel === "gpt-5.5-pro"
+    ? "pro"
+    : undefined;
 }
 
 export async function buildBrowserConfig(
@@ -172,6 +236,13 @@ export async function buildBrowserConfig(
     !isChatGptModel && normalizedOverride.length > 0 && normalizedOverride !== baseModel;
   const modelStrategy =
     normalizeBrowserModelStrategy(options.browserModelStrategy) ?? DEFAULT_MODEL_STRATEGY;
+  const thinkingTime =
+    normalizeThinkingTimeLevel(options.browserThinkingTime) ??
+    resolveDefaultBrowserThinkingTime({
+      model: options.model,
+      requestedModel: options.browserRequestedModel,
+      modelStrategy,
+    });
   assertBrowserModelAvailable(options.model, modelStrategy);
   const cookieNames = parseCookieNames(
     options.browserCookieNames ?? process.env.ORACLE_BROWSER_COOKIE_NAMES,
@@ -183,7 +254,10 @@ export async function buildBrowserConfig(
     envFile: process.env.ORACLE_BROWSER_COOKIES_FILE,
     cwd: process.cwd(),
   });
-  if (inline?.source?.startsWith("home:") && options.browserNoCookieSync !== true) {
+  const chromeCookieSyncRequested =
+    options.browserNoCookieSync !== true &&
+    (options.browserCookieSync === true || options.browserManualLoginCookieSync === true);
+  if (inline?.source?.startsWith("home:") && chromeCookieSyncRequested) {
     inline = undefined;
   }
 
@@ -252,6 +326,7 @@ export async function buildBrowserConfig(
           DEFAULT_BROWSER_INPUT_TIMEOUT_MS,
         )
       : undefined,
+    approvalWaitMs: resolveBrowserApprovalWait(options.browserApprovalWait),
     attachmentTimeoutMs: options.browserAttachmentTimeout
       ? parseBrowserDuration(
           options.browserAttachmentTimeout,
@@ -296,14 +371,21 @@ export async function buildBrowserConfig(
     cookieSyncWaitMs: options.browserCookieWait
       ? parseBrowserDuration(options.browserCookieWait, "--browser-cookie-wait", 0)
       : undefined,
-    cookieSync: options.browserNoCookieSync ? false : undefined,
+    cookieSync: inline?.cookies?.length
+      ? true
+      : options.browserNoCookieSync
+        ? false
+        : options.browserCookieSync === true || options.browserManualLoginCookieSync === true
+          ? true
+          : undefined,
     cookieNames,
     inlineCookies: inline?.cookies,
     inlineCookiesSource: inline?.source ?? null,
-    headless: undefined, // disable headless; Cloudflare blocks it
+    headless: options.browserHeadless === true ? true : undefined,
     keepBrowser: options.browserKeepBrowser ? true : undefined,
     manualLogin: options.browserManualLogin === undefined ? undefined : options.browserManualLogin,
     manualLoginProfileDir: options.browserManualLoginProfileDir ?? undefined,
+    manualLoginCookieSync: inline?.cookies?.length ? true : options.browserManualLoginCookieSync,
     copyProfileSource: options.copyProfile ?? undefined,
     hideWindow: remoteChrome ? undefined : true,
     desiredModel,
@@ -315,9 +397,13 @@ export async function buildBrowserConfig(
     remoteChromeBrowserId: expectedBrowserId,
     remoteChromeBrowserWSEndpoint: browserWSEndpoint,
     browserTabRef: options.browserTab ?? undefined,
-    thinkingTime: normalizeThinkingTimeLevel(options.browserThinkingTime) ?? undefined,
-    researchMode: options.browserResearch === "deep" ? "deep" : "off",
+    thinkingTime,
+    researchMode:
+      options.browserResearch === "deep" || options.browserResearch === "search"
+        ? options.browserResearch
+        : "off",
     archiveConversations: options.browserArchive,
+    captureProviderNative: options.browserCaptureProviderNative,
   };
 }
 
@@ -352,7 +438,9 @@ function validateAttachRunningOptions(
   const conflicts = [
     options.browserChromeProfile ? "--browser-chrome-profile" : null,
     options.browserCookiePath ? "--browser-cookie-path" : null,
+    options.browserCookieSync ? "--browser-cookie-sync" : null,
     options.browserNoCookieSync ? "--browser-no-cookie-sync" : null,
+    options.browserHeadless ? "--browser-headless" : null,
     options.browserHideWindow ? "--browser-hide-window" : null,
     options.browserKeepBrowser ? "--browser-keep-browser" : null,
     options.browserManualLogin ? "--browser-manual-login" : null,
@@ -417,13 +505,17 @@ export function resolveBrowserModelLabel(input: string | undefined, model: Model
     return mapModelToBrowserLabel(model);
   }
   const normalizedInput = trimmed.toLowerCase();
-  if (normalizedInput === model.toLowerCase()) {
+  if (
+    normalizedInput === model.toLowerCase() ||
+    (isGpt6Alias(normalizedInput) && (model === "gpt-6-astra" || model === "gpt-6-pro")) ||
+    (isGpt6ProAlias(normalizedInput) && model === "gpt-6-pro")
+  ) {
     return mapModelToBrowserLabel(model);
   }
   return trimmed;
 }
 
-function parseRemoteChromeTarget(raw: string): { host: string; port: number } {
+export function parseRemoteChromeTarget(raw: string): { host: string; port: number } {
   const target = raw.trim();
   if (!target) {
     throw new Error(

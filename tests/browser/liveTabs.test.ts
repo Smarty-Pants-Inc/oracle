@@ -17,6 +17,7 @@ import {
   type ChromeTarget,
 } from "../../src/browser/liveTabs.js";
 import type { SessionMetadata } from "../../src/sessionStore.js";
+import { FakeDocument, FakeElement } from "./domFixture.js";
 
 const remoteChromeMocks = vi.hoisted(() => ({
   closeTab: vi.fn(),
@@ -163,6 +164,90 @@ function makeRemoteTabConnection(
 }
 
 describe("liveTabs helpers", () => {
+  test("keeps speaker labels and controls out of the raw user fingerprint text", () => {
+    const text = "if active:\n  run()";
+    const user = new FakeElement(
+      "div",
+      { "data-message-author-role": "user", "data-message-id": "current-message" },
+      [],
+      text,
+    );
+    const speaker = new FakeElement("span", {}, [], "You said:");
+    const copy = new FakeElement("button", {}, [], "Copy");
+    const turn = new FakeElement(
+      "article",
+      { "data-testid": "conversation-turn-0", "data-turn": "user" },
+      [speaker, user, copy],
+    );
+    const order = [turn, speaker, user, copy];
+    for (const node of order)
+      Object.assign(node, {
+        compareDocumentPosition: (other: FakeElement) =>
+          order.indexOf(other) > order.indexOf(node) ? 4 : 2,
+        contains: (other: FakeElement) => node === other || node.children.includes(other),
+      });
+    const observed = new Function(
+      "document",
+      "Element",
+      "window",
+      "location",
+      `return ${buildTabInspectionExpressionForTest()}`,
+    )(
+      new FakeDocument([turn]),
+      FakeElement,
+      { getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }) },
+      { href: "https://chatgpt.com/c/test" },
+    );
+    expect(observed.lastUserTextRaw).toBe(text);
+    expect(observed.lastUserMessageId).toBe("current-message");
+  });
+
+  test("separates the user content from a later provider error notice", () => {
+    const text = "Explain: Something went wrong. Please try again.";
+    const content = new FakeElement("div", { class: "whitespace-pre-wrap" }, [], text);
+    const notice = new FakeElement("div", {}, [], "Something went wrong. Please try again.");
+    const user = new FakeElement(
+      "div",
+      { "data-message-author-role": "user", "data-message-id": "saved" },
+      [content, notice],
+    );
+    const observed = new Function(
+      "document",
+      "Element",
+      "window",
+      "location",
+      `return ${buildTabInspectionExpressionForTest()}`,
+    )(
+      new FakeDocument([user]),
+      FakeElement,
+      { getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }) },
+      { href: "https://chatgpt.com/c/saved" },
+    );
+    expect(observed.lastUserContentText).toBe(text);
+    expect(observed.lastUserTextRaw).toContain(text);
+    expect(observed.lastUserTextRaw).not.toBe(text);
+  });
+
+  test("keeps a visible composer stop control running even behind a hidden legacy control", () => {
+    const hidden = new FakeElement("button", { "data-testid": "stop-button" });
+    hidden.getBoundingClientRect = () => ({ width: 0, height: 0, x: 0, y: 0 });
+    const visible = new FakeElement("button", { "data-testid": "composer-stop-button" });
+    const document = new FakeDocument([hidden, visible]);
+    const observed = new Function(
+      "document",
+      "Element",
+      "window",
+      "location",
+      `return ${buildTabInspectionExpressionForTest()}`,
+    )(
+      document,
+      FakeElement,
+      { getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }) },
+      { href: "https://chatgpt.com/c/test" },
+    );
+    expect(observed.stopExists).toBe(true);
+    expect(classifyTabState(observed)).toBe("running");
+  });
   test("excludes fallback answer nodes contained by the latest user turn", () => {
     const expression = buildTabInspectionExpressionForTest();
     expect(expression).toContain("!lastUserTurn.contains?.(node)");

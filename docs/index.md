@@ -10,7 +10,7 @@ After installing (`brew install steipete/tap/oracle` or `npm i -g @steipete/orac
 
 ```bash
 # Browser path — no API key, drives ChatGPT directly (default: GPT-5.6 Sol Pro).
-oracle --engine browser -p "Review the storage layer for schema drift" --file "src/**/*.ts"
+oracle --engine browser --browser-manual-login -p "Review the storage layer for schema drift" --file "src/**/*.ts"
 
 # API path — multi-model cross-check in one run.
 oracle -p "Cross-check the data layer assumptions" \

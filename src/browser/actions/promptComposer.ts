@@ -1,4 +1,6 @@
+import { withoutBrowserCancellation } from "../cancellation.js";
 import type { ChromeClient, BrowserLogger } from "../types.js";
+import { randomUUID } from "node:crypto";
 import {
   INPUT_SELECTORS,
   PROMPT_PRIMARY_SELECTOR,
@@ -15,8 +17,20 @@ import { extractStableConversationIdFromUrl } from "../conversationUrl.js";
 import { isChatGptUrl } from "../liveTabs.js";
 import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
+import {
+  assertComposerNavigationSnapshot,
+  assertComposerPlusStayedInPlace,
+  buildAttachmentNamePattern,
+  composerNavigationIdentityFromUrl,
+} from "./attachments.js";
+import { buildComposerNavigationValidationExpression } from "./attachmentContext.js";
 import { buildClickDispatcher } from "./domEvents.js";
+import { stageAttachmentPrompt } from "./attachmentPrompt.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
+import { buildAttachmentEvidenceExpression } from "./attachmentEvidence.js";
+import { buildAttachmentProgressExpression } from "./attachmentProgress.js";
+import { buildInstallCompletionAnnouncementExpression } from "./completionAnnouncement.js";
+import { activateWebSearch } from "./webSearch.js";
 
 const ENTER_KEY_EVENT = {
   key: "Enter",
@@ -25,6 +39,12 @@ const ENTER_KEY_EVENT = {
   nativeVirtualKeyCode: 13,
 } as const;
 const ENTER_KEY_TEXT = "\r";
+const ESCAPE_KEY_EVENT = {
+  key: "Escape",
+  code: "Escape",
+  windowsVirtualKeyCode: 27,
+  nativeVirtualKeyCode: 27,
+} as const;
 
 export interface AttachmentReadyExpectation {
   name: string;
@@ -42,23 +62,43 @@ export async function submitPrompt(
   deps: {
     runtime: ChromeClient["Runtime"];
     input: ChromeClient["Input"];
+    page?: ChromeClient["Page"];
     attachmentNames?: AttachmentReadyInput[];
+    attachmentNavigationUrl?: string;
     baselineTurns?: number | null;
     inputTimeoutMs?: number | null;
     attachmentTimeoutMs?: number | null;
     onPromptSubmitted?: () => Promise<void> | void;
     assertPageAffinity: (action: string) => Promise<void>;
+    webSearch?: boolean;
   },
   prompt: string,
   logger: BrowserLogger,
 ): Promise<PromptCommitEvidence> {
   const { runtime, input } = deps;
+  const hasAttachments = Array.isArray(deps.attachmentNames) && deps.attachmentNames.length > 0;
+  if (hasAttachments && !deps.attachmentNavigationUrl) {
+    throw new BrowserAutomationError(
+      "Oracle cannot safely submit attachments without the pre-upload ChatGPT page identity.",
+      {
+        stage: "submit-prompt",
+        code: "attachment-navigation-identity-unavailable",
+      },
+    );
+  }
+  if (hasAttachments) {
+    await assertComposerPlusStayedInPlace(runtime, deps.attachmentNavigationUrl!);
+  }
 
   await waitForDomReady(runtime, logger, deps.inputTimeoutMs ?? undefined);
   await deps.assertPageAffinity("prompt composer focus");
-  const encodedPrompt = JSON.stringify(prompt);
-  const focusResult = await runtime.evaluate({
-    expression: `(() => {
+  let observedLength: number;
+  if (hasAttachments) {
+    observedLength = await stageAttachmentPrompt(runtime, prompt, deps.attachmentNavigationUrl!);
+  } else {
+    const encodedPrompt = JSON.stringify(prompt);
+    const focusResult = await runtime.evaluate({
+      expression: `(() => {
       ${buildClickDispatcher()}
       const SELECTORS = ${JSON.stringify(INPUT_SELECTORS)};
       const isVisible = (node) => {
@@ -102,25 +142,103 @@ export async function submitPrompt(
       }
       return { focused: false };
     })()`,
-    returnByValue: true,
-    awaitPromise: true,
-  });
-  if (!focusResult.result?.value?.focused) {
-    await logDomFailure(runtime, logger, "focus-textarea");
-    throw new Error("Failed to focus prompt textarea");
-  }
+      returnByValue: true,
+      awaitPromise: true,
+    });
+    if (!focusResult.result?.value?.focused) {
+      await logDomFailure(runtime, logger, "focus-textarea");
+      throw new Error("Failed to focus prompt textarea");
+    }
 
-  await deps.assertPageAffinity("prompt text insertion");
-  await input.insertText({ text: prompt });
+    await deps.assertPageAffinity("prompt text insertion");
+    // ProseMirror can treat typed newlines as submission; paste without pressing Enter.
+    let pastedMultiline = false;
+    if (prompt.includes("\n")) {
+      const pasteResult = await runtime.evaluate({
+        expression: `(() => {
+        const selectors = ${JSON.stringify(INPUT_SELECTORS)};
+        const visible = (node) => { const r = node?.getBoundingClientRect?.(); return Boolean(r && r.width > 0 && r.height > 0); };
+        const editor = selectors.map((s) => document.querySelector(s)).find((n) => n && visible(n));
+        if (editor instanceof HTMLTextAreaElement) return { used: false };
+        if (!editor?.isContentEditable) return { used: true, complete: false };
+        const text = ${encodedPrompt};
+        // ChatGPT converts a single large paste (seen above ~10k chars) into a "Pasted text"
+        // file chip and leaves the editor empty, so paste in chunks well under that size.
+        const CHUNK = 4000;
+        const chips = () => document.querySelectorAll('form button[aria-label^="Remove Pasted text"]').length;
+        const chipsBefore = chips();
+        editor.focus();
+        for (let i = 0; i < text.length;) {
+          let end = Math.min(i + CHUNK, text.length);
+          if (end < text.length && /[\\uD800-\\uDBFF]/.test(text[end - 1])) end--;
+          if (text[end - 1] === '\\r' && text[end] === '\\n') end--;
+          const data = new DataTransfer();
+          const chunk = text.slice(i, end).replace(/\\r\\n?/g, '\\n');
+          data.setData('text/plain', chunk);
+          // Explicit hard breaks preserve blank lines that a plain-text paragraph parser can collapse.
+          const paragraph = document.createElement('p');
+          paragraph.style.whiteSpace = 'pre-wrap';
+          paragraph.textContent = chunk;
+          data.setData('text/html', paragraph.outerHTML.replace(/\\n/g, '<br>'));
+          editor.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+          i = end;
+        }
+        // innerText adds layout spacing between paragraphs. Read actual hard breaks and block
+        // boundaries instead, ignoring only ProseMirror's decorative trailing break.
+        const readText = node => {
+          if (node.nodeType === 3) return node.nodeValue || '';
+          if (node.nodeName === 'BR') return node.classList.contains('ProseMirror-trailingBreak') ? '' : '\\n';
+          const children = Array.from(node.childNodes || []);
+          return children.map((child, index) => {
+            const previous = children[index - 1];
+            const block = value => /^(P|DIV|PRE|LI)$/.test(value?.nodeName || '');
+            return (index > 0 && (block(child) || block(previous)) ? '\\n' : '') + readText(child);
+          }).join('');
+        };
+        const normalize = value => value.replace(/\\r\\n?/g, '\\n');
+        const landed = normalize(readText(editor));
+        const expected = normalize(text);
+        const convertedToFile = chips() > chipsBefore;
+        return { used: true, length: landed.length, expected: expected.length, complete: landed === expected, convertedToFile };
+      })()`,
+        returnByValue: true,
+      });
+      const pasted = pasteResult.result?.value as
+        | {
+            used?: boolean;
+            length?: number;
+            expected?: number;
+            complete?: boolean;
+            convertedToFile?: boolean;
+          }
+        | undefined;
+      if (pasted?.used !== false) {
+        const complete = pasted?.complete === true && !pasted.convertedToFile;
+        if (!complete) {
+          // Never fall back to typing here: a typed newline submits the first line only.
+          throw new BrowserAutomationError(
+            `ChatGPT did not accept the pasted prompt intact (${pasted?.length ?? 0}/${pasted?.expected ?? 0} chars${pasted?.convertedToFile ? ", converted to a file" : ""}); nothing was sent.`,
+            { stage: "submit-prompt", code: "prompt-paste-incomplete" },
+          );
+        }
+      }
+      pastedMultiline = Boolean(pasted?.used && (pasted.length ?? 0) > 0);
+      logger(
+        `Prompt delivery: ${pastedMultiline ? "paste (multi-line, contenteditable)" : "typed"}`,
+      );
+    }
+    if (!pastedMultiline) {
+      await input.insertText({ text: prompt });
+    }
 
-  // Some pages (notably ChatGPT when subscriptions/widgets load) need a brief settle
-  // before the send button becomes enabled; give it a short breather to avoid races.
-  await delay(500);
+    // Some pages (notably ChatGPT when subscriptions/widgets load) need a brief settle
+    // before the send button becomes enabled; give it a short breather to avoid races.
+    await delay(500);
 
-  const primarySelectorLiteral = JSON.stringify(PROMPT_PRIMARY_SELECTOR);
-  const fallbackSelectorLiteral = JSON.stringify(PROMPT_FALLBACK_SELECTOR);
-  const verification = await runtime.evaluate({
-    expression: `(() => {
+    const primarySelectorLiteral = JSON.stringify(PROMPT_PRIMARY_SELECTOR);
+    const fallbackSelectorLiteral = JSON.stringify(PROMPT_FALLBACK_SELECTOR);
+    const verification = await runtime.evaluate({
+      expression: `(() => {
       const editor = document.querySelector(${primarySelectorLiteral});
       const fallback = document.querySelector(${fallbackSelectorLiteral});
       const inputSelectors = ${JSON.stringify(INPUT_SELECTORS)};
@@ -144,20 +262,20 @@ export async function submitPrompt(
         activeValue: active ? readValue(active) : '',
       };
     })()`,
-    returnByValue: true,
-  });
+      returnByValue: true,
+    });
 
-  const editorTextRaw = verification.result?.value?.editorText ?? "";
-  const fallbackValueRaw = verification.result?.value?.fallbackValue ?? "";
-  const activeValueRaw = verification.result?.value?.activeValue ?? "";
-  const editorTextTrimmed = editorTextRaw?.trim?.() ?? "";
-  const fallbackValueTrimmed = fallbackValueRaw?.trim?.() ?? "";
-  const activeValueTrimmed = activeValueRaw?.trim?.() ?? "";
-  if (!editorTextTrimmed && !fallbackValueTrimmed && !activeValueTrimmed) {
-    // Learned: occasionally Input.insertText doesn't land in the editor; force textContent/value + input events.
-    await deps.assertPageAffinity("prompt fallback text insertion");
-    await runtime.evaluate({
-      expression: `(() => {
+    const editorTextRaw = verification.result?.value?.editorText ?? "";
+    const fallbackValueRaw = verification.result?.value?.fallbackValue ?? "";
+    const activeValueRaw = verification.result?.value?.activeValue ?? "";
+    const editorTextTrimmed = editorTextRaw?.trim?.() ?? "";
+    const fallbackValueTrimmed = fallbackValueRaw?.trim?.() ?? "";
+    const activeValueTrimmed = activeValueRaw?.trim?.() ?? "";
+    if (!editorTextTrimmed && !fallbackValueTrimmed && !activeValueTrimmed) {
+      // Learned: occasionally Input.insertText doesn't land in the editor; force textContent/value + input events.
+      await deps.assertPageAffinity("prompt fallback text insertion");
+      await runtime.evaluate({
+        expression: `(() => {
         const fallback = document.querySelector(${fallbackSelectorLiteral});
         if (fallback) {
           fallback.value = ${encodedPrompt};
@@ -171,12 +289,11 @@ export async function submitPrompt(
           editor.dispatchEvent(new InputEvent('input', { bubbles: true, data: ${encodedPrompt}, inputType: 'insertFromPaste' }));
         }
       })()`,
-    });
-  }
+      });
+    }
 
-  const promptLength = prompt.length;
-  const postVerification = await runtime.evaluate({
-    expression: `(() => {
+    const postVerification = await runtime.evaluate({
+      expression: `(() => {
       const editor = document.querySelector(${primarySelectorLiteral});
       const fallback = document.querySelector(${fallbackSelectorLiteral});
       const inputSelectors = ${JSON.stringify(INPUT_SELECTORS)};
@@ -200,16 +317,18 @@ export async function submitPrompt(
         activeValue: active ? readValue(active) : '',
       };
     })()`,
-    returnByValue: true,
-  });
-  const observedEditor = postVerification.result?.value?.editorText ?? "";
-  const observedFallback = postVerification.result?.value?.fallbackValue ?? "";
-  const observedActive = postVerification.result?.value?.activeValue ?? "";
-  const observedLength = Math.max(
-    observedEditor.length,
-    observedFallback.length,
-    observedActive.length,
-  );
+      returnByValue: true,
+    });
+    const observedEditor = postVerification.result?.value?.editorText ?? "";
+    const observedFallback = postVerification.result?.value?.fallbackValue ?? "";
+    const observedActive = postVerification.result?.value?.activeValue ?? "";
+    observedLength = Math.max(
+      observedEditor.length,
+      observedFallback.length,
+      observedActive.length,
+    );
+  }
+  const promptLength = prompt.length;
   if (promptLength >= 50_000 && observedLength > 0 && observedLength < promptLength - 2_000) {
     // Learned: very large prompts can truncate silently; fail fast so we can fall back to file uploads.
     await logDomFailure(runtime, logger, "prompt-too-large");
@@ -252,35 +371,52 @@ export async function submitPrompt(
     });
   }
 
+  if (deps.webSearch) await activateWebSearch(runtime, input, prompt, logger);
+  await warnIfChatListRateLimited(runtime, logger);
+
+  // Install before the click: a short answer can complete while commit verification runs.
+  await runtime
+    .evaluate({
+      expression: buildInstallCompletionAnnouncementExpression(deps.baselineTurns),
+      returnByValue: true,
+    })
+    .catch(() => undefined);
+
   const clicked = await attemptSendButton(
     runtime,
     input,
     logger,
     deps?.attachmentNames,
     deps?.attachmentTimeoutMs,
+    deps?.page,
+    deps?.attachmentNavigationUrl,
     deps.assertPageAffinity,
   );
   if (!clicked) {
     await deps.assertPageAffinity("prompt send");
-    await input.dispatchKeyEvent({
-      type: "keyDown",
-      ...ENTER_KEY_EVENT,
-      text: ENTER_KEY_TEXT,
-      unmodifiedText: ENTER_KEY_TEXT,
-    });
-    await input.dispatchKeyEvent({
-      type: "keyUp",
-      ...ENTER_KEY_EVENT,
-    });
+    await dispatchEnterKey(input);
     logger("Submitted prompt via Enter key");
   } else {
-    logger("Clicked send button");
+    logger("Activated send button");
   }
   await deps.onPromptSubmitted?.();
 
   const commitTimeoutMs = Math.max(60_000, deps.inputTimeoutMs ?? 0);
   // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
   return await verifyPromptCommitted(runtime, prompt, commitTimeoutMs, logger, commitBaselineTurns);
+}
+
+async function dispatchEnterKey(Input: ChromeClient["Input"]): Promise<void> {
+  await Input.dispatchKeyEvent({
+    type: "keyDown",
+    ...ENTER_KEY_EVENT,
+    text: ENTER_KEY_TEXT,
+    unmodifiedText: ENTER_KEY_TEXT,
+  });
+  await Input.dispatchKeyEvent({
+    type: "keyUp",
+    ...ENTER_KEY_EVENT,
+  });
 }
 
 export async function clearPromptComposer(
@@ -390,15 +526,50 @@ async function waitForDomReady(
   logger?.(`Page did not reach ready/composer state within ${timeoutMs}ms; continuing cautiously.`);
 }
 
+export function buildChatListRateLimitExpressionForTest(): string {
+  return `(() => {
+    // A resumed conversation may still be usable while the unrelated sidebar list is limited.
+    if (/\\/c\\/[^/]+/.test(location.pathname || '')) return false;
+    const chatListUnavailable = Array.from(document.querySelectorAll('[role="status"]')).some((node) =>
+      /loading chats|unable to load history|チャット.*読み込|履歴.*読み込/i.test((node.textContent || '').trim())
+    );
+    if (!chatListUnavailable) return false;
+    if (typeof performance === 'undefined' || typeof performance.getEntriesByType !== 'function') return false;
+    return performance.getEntriesByType('resource')
+      .filter((entry) => {
+        try { return new URL(entry.name, location.href).pathname === '/backend-api/conversations'; }
+        catch { return false; }
+      })
+      .slice(-5)
+      .some((entry) => entry.responseStatus === 429);
+  })()`;
+}
+
+export async function warnIfChatListRateLimited(
+  Runtime: ChromeClient["Runtime"],
+  logger: BrowserLogger,
+): Promise<void> {
+  const response = await Runtime.evaluate({
+    expression: buildChatListRateLimitExpressionForTest(),
+    returnByValue: true,
+  }).catch(() => null);
+  if (response?.result?.value === true) {
+    logger(
+      "[browser] ChatGPT is rate-limiting its conversation list (HTTP 429); attempting the composer send anyway.",
+    );
+  }
+}
+
 function buildAttachmentReadyExpression(attachmentNames: AttachmentReadyInput[]): string {
   const attachmentExpectations = attachmentNames.map((attachment) => {
     const name = typeof attachment === "string" ? attachment : attachment.name;
     const normalized = name.toLowerCase().replace(/\s+/g, " ").trim();
+    const generatedBundle = typeof attachment === "object" && attachment.generatedBundle === true;
     return {
       name: normalized,
       stem: normalized.replace(/\.[a-z0-9]{1,10}$/i, ""),
-      extension: normalized.match(/(\.[a-z0-9]{1,10})$/i)?.[1] ?? "",
-      generatedBundle: typeof attachment === "object" && attachment.generatedBundle === true,
+      namePattern: buildAttachmentNamePattern(normalized, generatedBundle)?.source ?? "",
+      generatedBundle,
     };
   });
   const namesLiteral = JSON.stringify(attachmentExpectations);
@@ -406,74 +577,13 @@ function buildAttachmentReadyExpression(attachmentNames: AttachmentReadyInput[])
     const expected = ${namesLiteral};
     const sendSelectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
     const normalize = (value) => String(value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
-    const hasNameBoundary = (text, name) => {
-      if (!name) return false;
-      let from = 0;
-      while (from < text.length) {
-        const index = text.indexOf(name, from);
-        if (index === -1) return false;
-        const previous = text[index - 1] || '';
-        const next = text[index + name.length] || '';
-        const previousOk = !previous || !/[a-z0-9._-]/.test(previous);
-        const nextOk = !next || !/[a-z0-9._-]/.test(next);
-        if (previousOk && nextOk) return true;
-        from = index + name.length;
-      }
-      return false;
-    };
-    const hasStemFileBoundary = (text, stem) => {
-      if (!stem) return false;
-      let from = 0;
-      while (from < text.length) {
-        const index = text.indexOf(stem, from);
-        if (index === -1) return false;
-        const previous = text[index - 1] || '';
-        const next = text[index + stem.length] || '';
-        const previousOk = !previous || !/[a-z0-9._-]/.test(previous);
-        const nextOk = !next || !/[a-z0-9._-]/.test(next);
-        if (previousOk && nextOk) return true;
-        from = index + stem.length;
-      }
-      return false;
-    };
-    const hasBareStemBoundary = (text, stem) => {
-      if (!stem) return false;
-      let from = 0;
-      while (from < text.length) {
-        const index = text.indexOf(stem, from);
-        if (index === -1) return false;
-        const previous = text[index - 1] || '';
-        const next = text[index + stem.length] || '';
-        const previousOk = !previous || !/[a-z0-9._-]/.test(previous);
-        const nextOk = !next || !/[a-z0-9._(-]/.test(next);
-        if (previousOk && nextOk) return true;
-        from = index + stem.length;
-      }
-      return false;
-    };
-    const hasExtensionBoundary = (text, extension) => {
-      if (!extension) return false;
-      let from = 0;
-      while (from < text.length) {
-        const index = text.indexOf(extension, from);
-        if (index === -1) return false;
-        const next = text[index + extension.length] || '';
-        if (!next || !/[a-z0-9]/.test(next)) return true;
-        from = index + extension.length;
-      }
-      return false;
-    };
     const matchesExpected = (value, item) => {
       const text = normalize(value);
       if (!text) return false;
-      if (hasNameBoundary(text, item.name)) return true;
-      if (item.generatedBundle && hasBareStemBoundary(text, item.stem)) return true;
+      const namePattern = item.namePattern ? new RegExp(item.namePattern, 'iu') : null;
       if (
-        item.stem &&
-        item.stem.length >= 4 &&
-        item.extension &&
-        text.includes(item.stem + '(') &&
-        hasExtensionBoundary(text, item.extension)
+        namePattern &&
+        String(value || '').split('\\n').some((candidate) => namePattern.test(normalize(candidate)))
       ) {
         return true;
       }
@@ -519,6 +629,8 @@ function buildAttachmentReadyExpression(attachmentNames: AttachmentReadyInput[])
       'button[aria-label*="Remove attachment"]',
       '[aria-label*="remove attachment"]',
       'button[aria-label*="remove attachment"]',
+      // ChatGPT also renders uploaded tiles as a bare "Remove <filename>" button.
+      'button[aria-label^="Remove "]',
     ];
     const sendButton = sendSelectors
       .map((selector) => document.querySelector(selector))
@@ -572,12 +684,13 @@ function buildAttachmentReadyExpression(attachmentNames: AttachmentReadyInput[])
       };
       pushAttrs(node);
       pushText(node);
-      return pieces.join(' ').toLowerCase();
+      return pieces.join('\\n').toLowerCase();
     };
     const collectLabelHaystack = (node) => {
       if (!node) return '';
       const pieces = [collectOwnLabelHaystack(node)];
       const push = (el) => {
+        if (!el || el === composer || el.querySelector?.('textarea,[contenteditable="true"]')) return;
         const text = collectOwnLabelHaystack(el);
         if (text) pieces.push(text);
       };
@@ -585,7 +698,7 @@ function buildAttachmentReadyExpression(attachmentNames: AttachmentReadyInput[])
       push(parent);
       const grandparent = parent?.parentElement;
       push(grandparent);
-      return pieces.join(' ').toLowerCase();
+      return pieces.join('\\n').toLowerCase();
     };
     const attachmentRoots = Array.from(new Set([composer])).filter(Boolean);
     const collectChipNodes = () => {
@@ -605,33 +718,20 @@ function buildAttachmentReadyExpression(attachmentNames: AttachmentReadyInput[])
       return collected;
     };
     const chipNodes = collectChipNodes();
-    const chipLabels = chipNodes.map((node) => collectLabelHaystack(node));
-    const chipOwnLabels = chipNodes.map((node) => collectOwnLabelHaystack(node));
-    const hasEllipsisSuffix = (label) => {
-      const marker = label.includes('…') ? '…' : label.includes('...') ? '...' : '';
-      if (!marker) return false;
-      return normalize(label.split(marker)[1] || '').length > 0;
-    };
-    const chipOwnLabelsWithVisibleNames = chipOwnLabels.filter((label) =>
-      /\\.[a-z][a-z0-9]{0,9}(?:\\b|$)/i.test(label) ||
-      hasEllipsisSuffix(label),
-    );
-    const visibleExtensionLabelsMatchExpected = chipOwnLabelsWithVisibleNames.every((label) =>
-      expected.some((item) => matchesExpected(label, item)),
-    );
-    const visibleStemOnlyMismatch = chipOwnLabels.some((label) =>
-      expected.some(
-        (item) =>
-          !item.generatedBundle &&
-          item.stem &&
-          hasStemFileBoundary(label, item.stem) &&
-          !matchesExpected(label, item),
-      ),
-    );
-
+    const chipLabels = chipNodes.map((node) => {
+      // Bare filename labels stand alone; generic controls need the adjacent chip's text.
+      const removeLabel = node.tagName?.toLowerCase() === 'button'
+        ? node.getAttribute('aria-label') || ''
+        : '';
+      return /^remove /i.test(removeLabel) && !/^remove (?:attachment|file|image|photo)$/i.test(removeLabel)
+        ? removeLabel.toLowerCase()
+        : collectLabelHaystack(node);
+    });
+    const uploadEvidence = ${buildAttachmentEvidenceExpression(attachmentExpectations.map((item) => item.name))};
     const chipsReady = (() => {
       const used = new Set();
-      return expected.every((item) => {
+      return expected.every((item, expectedIndex) => {
+        if (uploadEvidence[expectedIndex]) return true;
         const index = chipLabels.findIndex((label, candidateIndex) =>
           !used.has(candidateIndex) && matchesExpected(label, item),
         );
@@ -649,35 +749,7 @@ function buildAttachmentReadyExpression(attachmentNames: AttachmentReadyInput[])
         ),
       ),
     );
-    // Count-based fallback: if we cannot match names individually (ChatGPT may strip
-    // the filename out of attribute-readable text into a deeply nested span), but we
-    // do see at least as many distinct "Remove" affordances as attachments we
-    // uploaded, trust the upload without double-counting nested chip/remove nodes.
-    const removeAffordances = [];
-    const removeSeen = new Set();
-    for (const root of attachmentRoots) {
-      for (const node of Array.from(root.querySelectorAll(
-        '[aria-label*="Remove" i], [aria-label*="remove" i], button[aria-label*="Remove" i], button[aria-label*="remove" i]',
-      ))) {
-        if (!(node instanceof HTMLElement)) continue;
-        if (node.closest('textarea,[contenteditable="true"]')) continue;
-        const aria = (node.getAttribute?.('aria-label') ?? '').toLowerCase();
-        const fileSpecific = aria.includes('remove file') || aria.includes('remove attachment');
-        const attachmentOwner = node.closest(
-          '[data-testid*="chip"], [data-testid*="attachment"], [data-testid*="upload"], [data-testid*="file"]',
-        );
-        if (!fileSpecific && !attachmentOwner) continue;
-        if (removeSeen.has(node)) continue;
-        removeSeen.add(node);
-        removeAffordances.push(node);
-      }
-    }
-    const countReady =
-      !visibleStemOnlyMismatch &&
-      visibleExtensionLabelsMatchExpected &&
-      removeAffordances.length >= expected.length;
-
-    return chipsReady || inputsReady || countReady;
+    return (chipsReady || inputsReady) && !${buildAttachmentProgressExpression("composer")};
   })()`;
 }
 
@@ -688,11 +760,23 @@ export function buildAttachmentReadyExpressionForTest(attachmentNames: Attachmen
 async function attemptSendButton(
   Runtime: ChromeClient["Runtime"],
   Input: ChromeClient["Input"],
-  _logger?: BrowserLogger,
+  logger?: BrowserLogger,
   attachmentNames?: AttachmentReadyInput[],
   attachmentTimeoutMs?: number | null,
+  Page?: ChromeClient["Page"],
+  attachmentNavigationUrl?: string,
   assertPageAffinity?: (action: string) => Promise<void>,
 ): Promise<boolean> {
+  const needAttachment = Array.isArray(attachmentNames) && attachmentNames.length > 0;
+  if (needAttachment && !attachmentNavigationUrl) {
+    throw new BrowserAutomationError(
+      "Oracle cannot safely submit attachments without the pre-upload ChatGPT page identity.",
+      {
+        stage: "submit-prompt",
+        code: "attachment-navigation-identity-unavailable",
+      },
+    );
+  }
   const script = `(() => {
     ${buildClickDispatcher()}
     const selectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
@@ -721,10 +805,19 @@ async function attemptSendButton(
     }
     const button = candidates.find((node) => isVisible(node) && isEnabled(node)) || null;
     if (!button) return { status: 'missing' };
-    button.scrollIntoView({ block: 'center', inline: 'center' });
     const rect = button.getBoundingClientRect();
     if (rect.width > 0 && rect.height > 0) {
-      return { status: 'point', x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+      const x = rect.left + rect.width / 2;
+      const y = rect.top + rect.height / 2;
+      // Scrolling an already-visible composer can trigger ChatGPT's layout snap.
+      // If scrolling is necessary, discard these coordinates and measure later.
+      if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) {
+        button.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        return { status: 'settling' };
+      }
+      const hit = document.elementFromPoint(x, y);
+      if (!hit || !button.contains(hit)) return { status: 'settling' };
+      return { status: 'point', x, y };
     }
     return { status: 'fallback' };
   })()`;
@@ -743,21 +836,75 @@ async function attemptSendButton(
   // shorter historical deadline.
   const timeoutMs = sendButtonTimeoutMs(attachmentNames, attachmentTimeoutMs);
   const deadline = Date.now() + timeoutMs;
-  // Attachment upload completion is verified before this step. Treat ChatGPT's enabled
-  // send control as authoritative instead of blocking on a second, drift-prone DOM matcher.
+  let previousPoint: { x: number; y: number } | undefined;
+  let activated = false;
+  let foundButton = false;
+  let attachmentMenuChecked = !needAttachment;
   while (Date.now() < deadline) {
+    if (needAttachment) {
+      const ready = await Runtime.evaluate({
+        expression: buildAttachmentReadyExpression(attachmentNames),
+        returnByValue: true,
+      });
+      if (!ready?.result?.value) {
+        await delay(150);
+        continue;
+      }
+    }
+    if (!attachmentMenuChecked) {
+      await activatePageForTrustedInput(Page, logger);
+      activated = true;
+      await dismissOpenComposerPlusMenu(Runtime, Input, logger);
+      attachmentMenuChecked = true;
+      previousPoint = undefined;
+      await delay(150);
+      continue;
+    }
+    if (needAttachment) {
+      await assertPageAffinity?.("prompt send");
+      if (
+        await activateExactAttachmentSendButton(
+          Runtime,
+          Input,
+          logger,
+          attachmentNavigationUrl,
+          attachmentNames,
+        )
+      ) {
+        return true;
+      }
+      previousPoint = undefined;
+      await delay(100);
+      continue;
+    }
+    // Activating the target can trigger a final compositor/layout pass. Do it before
+    // measuring the button so the trusted click never uses stale coordinates.
+    if (!activated) {
+      await activatePageForTrustedInput(Page, logger);
+      activated = true;
+    }
     const { result } = await Runtime.evaluate({ expression: script, returnByValue: true });
     const value = result.value as
-      | { status?: "fallback" | "missing" | "point"; x?: number; y?: number }
+      | { status?: "fallback" | "missing" | "point" | "settling"; x?: number; y?: number }
       | string
       | undefined;
     const status = typeof value === "string" ? value : value?.status;
+    if (status === "point" || status === "settling") foundButton = true;
     if (
       status === "point" &&
       typeof value === "object" &&
       typeof value.x === "number" &&
       typeof value.y === "number"
     ) {
+      if (
+        !previousPoint ||
+        Math.abs(previousPoint.x - value.x) > 1 ||
+        Math.abs(previousPoint.y - value.y) > 1
+      ) {
+        previousPoint = { x: value.x, y: value.y };
+        await delay(150);
+        continue;
+      }
       await assertPageAffinity?.("prompt send");
       await clickTrustedPoint(Runtime, Input, value.x, value.y);
       return true;
@@ -773,6 +920,7 @@ async function attemptSendButton(
     if (status === "missing") {
       break;
     }
+    previousPoint = undefined;
     await delay(100);
   }
   if (Array.isArray(attachmentNames) && attachmentNames.length > 0) {
@@ -783,7 +931,7 @@ async function attemptSendButton(
       .then((response) => Boolean(response?.result?.value))
       .catch(() => null);
     throw new BrowserAutomationError(
-      `Attachments never reached a clickable send button after ${Math.ceil(
+      `Attachments never reached the exact ready send button after ${Math.ceil(
         timeoutMs / 1000,
       )}s; tune --browser-attachment-timeout.`,
       {
@@ -795,7 +943,252 @@ async function attemptSendButton(
       },
     );
   }
+  if (foundButton) {
+    throw new BrowserAutomationError("Send button did not settle before input timeout.", {
+      stage: "submit-prompt",
+      code: "send-button-unstable",
+    });
+  }
   return false;
+}
+
+async function activateExactAttachmentSendButton(
+  Runtime: ChromeClient["Runtime"],
+  Input: ChromeClient["Input"],
+  logger?: BrowserLogger,
+  attachmentNavigationUrl?: string,
+  attachmentNames: AttachmentReadyInput[] = [],
+): Promise<boolean> {
+  const exactSendSelectors = [
+    'button[data-testid="send-button"]',
+    'form button[type="submit"][aria-label="Send"]',
+  ];
+  const probe = await Runtime.evaluate({
+    expression: `(() => {
+      const selectors = ${JSON.stringify(exactSendSelectors)};
+      const button = selectors.map((selector) => document.querySelector(selector)).find(Boolean);
+      if (!(button instanceof HTMLElement)) return { status: 'absent' };
+      const rect = button.getBoundingClientRect();
+      const style = window.getComputedStyle(button);
+      const enabled = !button.hasAttribute('disabled') &&
+        button.getAttribute('aria-disabled') !== 'true' &&
+        button.getAttribute('data-disabled') !== 'true' &&
+        style.pointerEvents !== 'none' &&
+        style.display !== 'none' &&
+        style.visibility !== 'hidden';
+      if (rect.width <= 0 || rect.height <= 0 || !enabled) return { status: 'unavailable' };
+      button.focus({ preventScroll: true });
+      return { status: document.activeElement === button ? 'focused' : 'unavailable' };
+    })()`,
+    returnByValue: true,
+  });
+  const status = (probe?.result?.value as { status?: string } | undefined)?.status;
+  if (status !== "focused") {
+    return false;
+  }
+  if (!Input || typeof Input.dispatchKeyEvent !== "function") {
+    throw new BrowserAutomationError(
+      "ChatGPT's attachment send button is ready but Oracle cannot activate it safely.",
+      {
+        stage: "submit-prompt",
+        code: "attachment-send-keyboard-unavailable",
+      },
+    );
+  }
+  const expectedIdentity = composerNavigationIdentityFromUrl(attachmentNavigationUrl ?? "");
+  if (!expectedIdentity || !attachmentNavigationUrl) {
+    throw new BrowserAutomationError("Attachment page identity is unavailable before dispatch.", {
+      stage: "submit-prompt",
+      code: "attachment-navigation-identity-unavailable",
+    });
+  }
+  const guardId = randomUUID();
+  // Recheck at event delivery too: a SPA can navigate after the CDP probe returns.
+  let delivery: { sawKeyDown?: boolean; blocked?: unknown } | undefined;
+  try {
+    const boundary = await Runtime.evaluate({
+      expression: `(() => {
+        const selectors = ${JSON.stringify(exactSendSelectors)};
+        const button = selectors.map((selector) => document.querySelector(selector)).find(Boolean);
+        const check = () => {
+          const navigation = ${buildComposerNavigationValidationExpression(attachmentNavigationUrl)};
+          const rect = button?.getBoundingClientRect();
+          const style = button ? window.getComputedStyle(button) : null;
+          return {
+            ...navigation,
+            focused: button instanceof HTMLElement && document.activeElement === button &&
+              selectors.map((selector) => document.querySelector(selector)).find(Boolean) === button &&
+              !button.hasAttribute('disabled') && button.getAttribute('aria-disabled') !== 'true' &&
+              button.getAttribute('data-disabled') !== 'true' && rect.width > 0 && rect.height > 0 &&
+              style.display !== 'none' && style.visibility !== 'hidden' && style.pointerEvents !== 'none',
+            attachmentsReady: ${buildAttachmentReadyExpression(attachmentNames)},
+          };
+        };
+        const safeCheck = () => {
+          try { return check(); } catch { return { currentUrl: location.href, contextMatches: false, focused: false, attachmentsReady: false }; }
+        };
+        const snapshot = safeCheck();
+        if (!snapshot.contextMatches || !snapshot.focused || !snapshot.attachmentsReady) return snapshot;
+        const existing = window.__oracleAttachmentDispatchGuard;
+        if (existing && !existing.finished) return { ...snapshot, focused: false };
+        existing?.cleanup?.();
+        const guard = { id: ${JSON.stringify(guardId)}, sawKeyDown: false, blocked: null, finished: false };
+        const detach = () => {
+          window.removeEventListener('keydown', onKeyDown, true);
+          window.removeEventListener('keyup', onKeyUp, true);
+          window.removeEventListener('click', onClick, true);
+          guard.finished = true;
+        };
+        const cancel = (event, state) => {
+          event.preventDefault(); event.stopImmediatePropagation(); guard.blocked = state;
+        };
+        const onKeyDown = event => {
+          if (event.key !== 'Enter' || !event.isTrusted) return;
+          guard.sawKeyDown = true;
+          const state = safeCheck();
+          if (!state.contextMatches || !state.focused || !state.attachmentsReady) cancel(event, state);
+        };
+        const onKeyUp = event => {
+          if (event.key === 'Enter' && event.isTrusted && guard.blocked) { cancel(event, guard.blocked); detach(); }
+        };
+        const onClick = event => {
+          if (!guard.sawKeyDown || !(event.target instanceof Node) ||
+              !(button.contains(event.target) || event.target instanceof Element &&
+                selectors.some((selector) => event.target.closest(selector) === button))) return;
+          const state = safeCheck();
+          if (guard.blocked || !state.contextMatches || !state.focused || !state.attachmentsReady) cancel(event, guard.blocked ?? state);
+          detach();
+        };
+        guard.cleanup = () => { detach(); if (window.__oracleAttachmentDispatchGuard === guard) delete window.__oracleAttachmentDispatchGuard; };
+        window.__oracleAttachmentDispatchGuard = guard;
+        window.addEventListener('keydown', onKeyDown, true);
+        window.addEventListener('keyup', onKeyUp, true);
+        window.addEventListener('click', onClick, true);
+        return snapshot;
+      })()`,
+      returnByValue: true,
+    });
+    const snapshot = boundary?.result?.value as
+      | { focused?: boolean; attachmentsReady?: boolean }
+      | undefined;
+    assertComposerNavigationSnapshot(attachmentNavigationUrl, snapshot);
+    if (snapshot?.focused !== true || snapshot.attachmentsReady !== true) return false;
+    await Input.dispatchKeyEvent({
+      type: "keyDown",
+      ...ENTER_KEY_EVENT,
+      text: ENTER_KEY_TEXT,
+      unmodifiedText: ENTER_KEY_TEXT,
+    });
+    await Input.dispatchKeyEvent({ type: "keyUp", ...ENTER_KEY_EVENT });
+  } finally {
+    const result = await withoutBrowserCancellation(() =>
+      Runtime.evaluate({
+        expression: `(() => {
+        const guard = window.__oracleAttachmentDispatchGuard;
+        if (guard?.id !== ${JSON.stringify(guardId)}) return null;
+        const summary = { sawKeyDown: guard.sawKeyDown, blocked: guard.blocked };
+        guard.cleanup(); return summary;
+      })()`,
+        returnByValue: true,
+      }).catch(() => undefined),
+    );
+    delivery = result?.result?.value as typeof delivery;
+  }
+  if (delivery?.blocked) {
+    assertComposerNavigationSnapshot(attachmentNavigationUrl, delivery.blocked);
+    throw new BrowserAutomationError(
+      "Attachment focus or upload readiness changed at dispatch; the send was stopped.",
+      {
+        stage: "submit-prompt",
+        code: "attachment-send-not-ready",
+      },
+    );
+  }
+  if (delivery?.sawKeyDown !== true) {
+    throw new BrowserAutomationError(
+      "Attachment input delivery could not be verified; do not retry automatically.",
+      {
+        stage: "submit-prompt",
+        code: "attachment-send-ambiguous",
+      },
+    );
+  }
+  logger?.("Activated exact attachment send button via keyboard");
+  return true;
+}
+
+async function dismissOpenComposerPlusMenu(
+  Runtime: ChromeClient["Runtime"],
+  Input: ChromeClient["Input"],
+  logger?: BrowserLogger,
+): Promise<boolean> {
+  const probe = await Runtime.evaluate({
+    expression: `(() => {
+      const selectors = ['#composer-plus-btn', 'button[data-testid="composer-plus-btn"]'];
+      const button = selectors
+        .map(selector => document.querySelector(selector))
+        .find(node => node instanceof HTMLElement && node.getBoundingClientRect().width > 0 && node.getBoundingClientRect().height > 0);
+      if (!(button instanceof HTMLElement)) return { status: 'absent' };
+      if (button.getAttribute('aria-expanded') !== 'true') return { status: 'closed' };
+      button.focus({ preventScroll: true });
+      return { status: 'open', focused: document.activeElement === button };
+    })()`,
+    returnByValue: true,
+  });
+  const status = (probe?.result?.value as { status?: string } | undefined)?.status;
+  if (status !== "open") {
+    return false;
+  }
+  if (!Input || typeof Input.dispatchKeyEvent !== "function") {
+    throw new BrowserAutomationError(
+      "ChatGPT's attachment menu is still open and Oracle cannot dismiss it safely before sending.",
+      {
+        stage: "submit-prompt",
+        code: "attachment-menu-dismiss-unavailable",
+      },
+    );
+  }
+  await Input.dispatchKeyEvent({ type: "keyDown", ...ESCAPE_KEY_EVENT });
+  await Input.dispatchKeyEvent({ type: "keyUp", ...ESCAPE_KEY_EVENT });
+
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const state = await Runtime.evaluate({
+      expression: `(() => {
+        const selectors = ['#composer-plus-btn', 'button[data-testid="composer-plus-btn"]'];
+        return !selectors.some(selector =>
+          document.querySelector(selector)?.getAttribute?.('aria-expanded') === 'true'
+        );
+      })()`,
+      returnByValue: true,
+    });
+    if (state?.result?.value === true) {
+      logger?.("Closed attachment menu before send");
+      return true;
+    }
+    await delay(50);
+  }
+  throw new BrowserAutomationError(
+    "ChatGPT's attachment menu did not close before send; prompt was left staged.",
+    {
+      stage: "submit-prompt",
+      code: "attachment-menu-stuck-open",
+    },
+  );
+}
+
+async function activatePageForTrustedInput(
+  Page: ChromeClient["Page"] | undefined,
+  logger?: BrowserLogger,
+): Promise<void> {
+  if (!Page || typeof Page.bringToFront !== "function") {
+    return;
+  }
+  await Page.bringToFront().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    logger?.(`[browser] Could not bring ChatGPT target to front before trusted click: ${message}`);
+  });
+  await delay(150);
 }
 
 async function clickTrustedPoint(
@@ -1072,17 +1465,8 @@ async function verifyPromptCommitted(
     );
     await logDomFailure(Runtime, logger, "prompt-commit");
   }
-  if (prompt.trim().length >= 50_000) {
-    throw new BrowserAutomationError(
-      "Prompt did not appear in conversation before timeout (likely too large).",
-      {
-        stage: "submit-prompt",
-        code: "prompt-too-large",
-        promptLength: prompt.trim().length,
-        timeoutMs,
-      },
-    );
-  }
+  // Input was already dispatched. Even a large staged prompt may commit late;
+  // classifying this as truncation would let the runner submit an upload fallback.
   throw new BrowserAutomationError(
     "Prompt did not appear in conversation before timeout (send may have failed)",
     {
@@ -1144,9 +1528,10 @@ function summarizeCommitProbe(probe: CommitProbeState): Record<string, unknown> 
   };
 }
 
-// biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
 export const __test__ = {
+  activateExactAttachmentSendButton,
   attemptSendButton,
+  dismissOpenComposerPlusMenu,
   sendButtonTimeoutMs,
   verifyPromptCommitted,
 };

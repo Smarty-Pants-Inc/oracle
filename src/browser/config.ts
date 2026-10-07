@@ -11,6 +11,7 @@ import {
 } from "./tabLeaseRegistry.js";
 import type { BrowserAutomationConfig, ResolvedBrowserConfig } from "./types.js";
 import { normalizeChatgptUrl } from "./utils.js";
+import { parseDuration } from "../duration.js";
 import os from "node:os";
 import path from "node:path";
 
@@ -39,6 +40,7 @@ export const DEFAULT_BROWSER_CONFIG: ResolvedBrowserConfig = {
   timeoutMs: 1_200_000,
   debugPort: null,
   inputTimeoutMs: 60_000,
+  approvalWaitMs: 20_000,
   attachmentTimeoutMs: 45_000,
   assistantRecheckDelayMs: 0,
   assistantRecheckTimeoutMs: 120_000,
@@ -48,7 +50,7 @@ export const DEFAULT_BROWSER_CONFIG: ResolvedBrowserConfig = {
   autoReattachDelayMs: 0,
   autoReattachIntervalMs: 0,
   autoReattachTimeoutMs: 120_000,
-  cookieSync: true,
+  cookieSync: false,
   cookieNames: DEFAULT_CHATGPT_COOKIE_NAMES,
   cookieSyncWaitMs: 0,
   inlineCookies: null,
@@ -72,6 +74,7 @@ export const DEFAULT_BROWSER_CONFIG: ResolvedBrowserConfig = {
   researchMode: "off",
   archiveConversations: "auto",
   resumeConversationUrl: null,
+  captureProviderNative: false,
 };
 
 export function resolveBrowserConfig(
@@ -100,7 +103,6 @@ export function resolveBrowserConfig(
   const isWindows = process.platform === "win32";
   const manualLogin =
     config?.manualLogin ?? (isWindows ? true : DEFAULT_BROWSER_CONFIG.manualLogin);
-  const cookieSyncDefault = isWindows ? false : DEFAULT_BROWSER_CONFIG.cookieSync;
   const resolvedProfileDir = resolveManualLoginProfileDir(
     config?.manualLoginProfileDir,
     process.env.ORACLE_BROWSER_PROFILE_DIR,
@@ -121,6 +123,7 @@ export function resolveBrowserConfig(
     timeoutMs: config?.timeoutMs ?? defaultTimeoutMs,
     debugPort: config?.debugPort ?? debugPortEnv ?? DEFAULT_BROWSER_CONFIG.debugPort,
     inputTimeoutMs: config?.inputTimeoutMs ?? DEFAULT_BROWSER_CONFIG.inputTimeoutMs,
+    approvalWaitMs: resolveBrowserApprovalWait(config?.approvalWaitMs),
     attachmentTimeoutMs: config?.attachmentTimeoutMs ?? DEFAULT_BROWSER_CONFIG.attachmentTimeoutMs,
     assistantRecheckDelayMs:
       config?.assistantRecheckDelayMs ?? DEFAULT_BROWSER_CONFIG.assistantRecheckDelayMs,
@@ -137,7 +140,7 @@ export function resolveBrowserConfig(
       config?.autoReattachIntervalMs ?? DEFAULT_BROWSER_CONFIG.autoReattachIntervalMs,
     autoReattachTimeoutMs:
       config?.autoReattachTimeoutMs ?? DEFAULT_BROWSER_CONFIG.autoReattachTimeoutMs,
-    cookieSync: config?.cookieSync ?? cookieSyncDefault,
+    cookieSync: config?.cookieSync ?? DEFAULT_BROWSER_CONFIG.cookieSync,
     cookieNames: config?.cookieNames ?? DEFAULT_BROWSER_CONFIG.cookieNames,
     cookieSyncWaitMs: config?.cookieSyncWaitMs ?? DEFAULT_BROWSER_CONFIG.cookieSyncWaitMs,
     inlineCookies: config?.inlineCookies ?? DEFAULT_BROWSER_CONFIG.inlineCookies,
@@ -170,6 +173,8 @@ export function resolveBrowserConfig(
     archiveConversations,
     resumeConversationUrl:
       config?.resumeConversationUrl ?? DEFAULT_BROWSER_CONFIG.resumeConversationUrl,
+    captureProviderNative:
+      config?.captureProviderNative ?? DEFAULT_BROWSER_CONFIG.captureProviderNative,
     manualLogin,
     manualLoginProfileDir: manualLogin ? resolvedProfileDir : null,
     manualLoginCookieSync:
@@ -177,8 +182,8 @@ export function resolveBrowserConfig(
   };
 }
 
-function normalizeResearchMode(value: unknown): "off" | "deep" {
-  return value === "deep" ? "deep" : "off";
+function normalizeResearchMode(value: unknown): "off" | "search" | "deep" {
+  return value === "deep" || value === "search" ? value : "off";
 }
 
 function normalizeArchiveMode(value: unknown): "auto" | "always" | "never" {
@@ -211,4 +216,16 @@ function resolveManualLoginProfileDir(...candidates: Array<string | null | undef
     if (profileDir) return profileDir;
   }
   return path.join(os.homedir(), ".oracle", "browser-profile");
+}
+
+export function resolveBrowserApprovalWait(value?: string | number): number {
+  const raw = value ?? process.env.ORACLE_BROWSER_APPROVAL_WAIT?.trim();
+  if (raw === undefined || raw === "") return DEFAULT_BROWSER_CONFIG.approvalWaitMs;
+  const parsed = typeof raw === "number" ? raw : parseDuration(raw, Number.NaN);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > 2_147_483_647) {
+    throw new Error(
+      "Invalid browser approval wait: use a positive duration up to 2147483647ms (for example --browser-approval-wait 5m, browser.approvalWaitMs: 300000, or ORACLE_BROWSER_APPROVAL_WAIT=5m).",
+    );
+  }
+  return parsed;
 }
