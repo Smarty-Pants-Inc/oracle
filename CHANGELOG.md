@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Files: apply default-ignored directory names only below the directory or glob base passed to `--file`, so a bundle under `/tmp` or a `build/` folder is no longer dropped when oracle runs from elsewhere; fixes #531, thanks @postoso.
+
 ## 0.21.4 - 2026-10-01
 
 **Highlights:** Reliable ChatGPT Chat/Work automation and accurate provider reasoning-token accounting.
