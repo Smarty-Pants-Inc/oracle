@@ -11,8 +11,9 @@ queue_rules:
     queue_conditions:
       - base = main
       - -draft
-      - check-success = smarty-review
-      - check-success = smarty-land-ready
+      # The fleet's live gates (smarty-dev#2409): review/astra replaces the retired smarty-review /
+      # smarty-land-ready checks, which no longer post, so no PR could enter this queue.
+      - check-success = review/astra
       - check-success = smarty-ci
     merge_conditions:
       - check-success = smarty-ci
