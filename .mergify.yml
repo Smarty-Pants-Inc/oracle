@@ -9,6 +9,7 @@ queue_rules:
     checks_timeout: 30 min
     merge_method: merge
     queue_conditions:
+      - -check-failure = review/security  # a failed security verdict refuses admission, label or not
       - base = main
       - -draft
       # The fleet's live gates (smarty-dev#2409): review/astra replaces the retired smarty-review /
@@ -16,6 +17,7 @@ queue_rules:
       - check-success = review/astra
       - check-success = smarty-ci
     merge_conditions:
+      - -check-failure = review/security  # a failed security verdict refuses admission, label or not
       - check-success = smarty-ci
 
 # This block is the fleet template (smarty-dev#1513): every repository the fleet lands in copies it with
